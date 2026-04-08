@@ -721,16 +721,20 @@ mark_provisioned(void)
 
 #ifndef __FreeBSD__
 /*
- * Checkpoint thread: blocks on SIGUSR1, then performs a live checkpoint.
+ * Checkpoint thread: blocks on SIGUSR1, then performs a migration checkpoint.
  *
  * On SIGUSR1:
  * 1. Pause the VM (VM_PAUSE — pauses all vCPUs + kernel timer devices)
- * 2. Export all state to /tmp/vm.checkpoint
- * 3. Resume the VM (VM_RESUME)
+ * 2. Export all state to /checkpoints/vm.checkpoint
+ * 3. VM stays PAUSED — the GZ migration script takes over:
+ *    - takes a final ZFS incremental snapshot
+ *    - transfers checkpoint + ZFS to destination
+ *    - on success: vmadm stop on source
+ *    - on failure: operator can resume manually
  *
- * The VM pauses briefly (~10-100ms) for the checkpoint, then continues
- * running. Pair with "zfs snapshot" for a full point-in-time restore
- * that captures both VM state AND disk state.
+ * The file /checkpoints/vm.checkpoint acts as a rendezvous point
+ * between bhyve (which writes it) and the GZ migration script
+ * (which reads and transfers it).
  */
 static void *
 checkpoint_thread(void *arg)
@@ -748,7 +752,7 @@ checkpoint_thread(void *arg)
 			continue;
 
 		fprintf(stderr, "checkpoint: SIGUSR1 received, "
-		    "checkpointing VM...\n");
+		    "pausing VM for migration...\n");
 
 		/* Pause the VM (vCPUs + kernel devices) */
 		if (vm_pause_instance(ctx) != 0) {
@@ -757,30 +761,36 @@ checkpoint_thread(void *arg)
 			continue;
 		}
 
-		/* Export state to the pre-opened checkpoint fd */
+		/* Export state to checkpoint file */
 		int ckpt_fd = open("/checkpoints/vm.checkpoint",
 		    O_WRONLY | O_CREAT | O_TRUNC, 0600);
 		if (ckpt_fd < 0) {
 			fprintf(stderr, "checkpoint: open failed: %s\n",
 			    strerror(errno));
-		}
-		int rv = -1;
-		if (ckpt_fd >= 0) {
-			rv = bhyve_migrate_export(ctx, guest_ncpus, ckpt_fd);
-			(void) close(ckpt_fd);
+			/* Resume on failure */
+			(void) vm_resume_instance(ctx);
+			continue;
 		}
 
-		/* Resume the VM */
-		if (vm_resume_instance(ctx) != 0) {
-			fprintf(stderr, "checkpoint: VM_RESUME failed: %s\n",
-			    strerror(errno));
-		}
+		int rv = bhyve_migrate_export(ctx, guest_ncpus, ckpt_fd);
+		(void) close(ckpt_fd);
 
 		if (rv == 0) {
 			fprintf(stderr, "checkpoint: saved to "
-			    "/checkpoints/vm.checkpoint\n");
+			    "/checkpoints/vm.checkpoint — "
+			    "VM PAUSED for migration\n");
+			/*
+			 * VM stays paused. The GZ migration script will:
+			 * 1. zfs snapshot @final
+			 * 2. zfs send -i @base @final to dest
+			 * 3. scp checkpoint to dest
+			 * 4. start dest VM with -o migrate.restore=
+			 * 5. vmadm stop source (kills this process)
+			 */
 		} else {
-			fprintf(stderr, "checkpoint: export failed\n");
+			fprintf(stderr, "checkpoint: export failed, "
+			    "resuming VM\n");
+			(void) vm_resume_instance(ctx);
 		}
 	}
 
@@ -990,14 +1000,24 @@ main(int argc, char *argv[])
 
 #ifndef __FreeBSD__
 	/*
-	 * If migrate.restore is set, import VM state from checkpoint file
-	 * before starting vCPUs. This restores all kernel device state,
-	 * vCPU registers, FPU, and userspace device state.
+	 * Migration restore: import VM state from checkpoint file before
+	 * starting vCPUs.
 	 *
-	 * Usage: bhyve ... -o migrate.restore=/checkpoints/vm.checkpoint
+	 * Check (in order):
+	 * 1. -o migrate.restore=<path> (explicit)
+	 * 2. /checkpoints/vm.checkpoint (auto-detect)
+	 *
+	 * Auto-detection allows the GZ migration script to simply place
+	 * the checkpoint file and start the VM with vmadm — no need to
+	 * modify bhyve's command line or config.
 	 */
 	{
 		const char *restore_path = get_config_value("migrate.restore");
+		if (restore_path == NULL) {
+			/* Auto-detect: check standard checkpoint location */
+			if (access("/checkpoints/vm.checkpoint", R_OK) == 0)
+				restore_path = "/checkpoints/vm.checkpoint";
+		}
 		if (restore_path != NULL) {
 			int rfd = open(restore_path, O_RDONLY);
 			if (rfd < 0) {
@@ -1006,6 +1026,13 @@ main(int argc, char *argv[])
 				    restore_path, strerror(errno));
 				exit(4);
 			}
+			/*
+			 * Pause the VM before importing state. Kernel
+			 * device state writes (VMM_TIME, etc.) require
+			 * the VM to be paused.
+			 */
+			(void) vm_pause_instance(ctx);
+
 			fprintf(stderr,
 			    "migrate: restoring from %s\n", restore_path);
 			if (bhyve_migrate_import(ctx, guest_ncpus, rfd) != 0) {
@@ -1014,6 +1041,11 @@ main(int argc, char *argv[])
 				exit(4);
 			}
 			(void) close(rfd);
+			/* Remove checkpoint after successful import */
+			(void) unlink(restore_path);
+
+			/* Resume so vCPU threads can start */
+			(void) vm_resume_instance(ctx);
 			fprintf(stderr, "migrate: restore complete\n");
 		}
 	}
