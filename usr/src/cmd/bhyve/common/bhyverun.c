@@ -1031,7 +1031,15 @@ main(int argc, char *argv[])
 			 * device state writes (VMM_TIME, etc.) require
 			 * the VM to be paused.
 			 */
-			(void) vm_pause_instance(ctx);
+			if (vm_pause_instance(ctx) != 0) {
+				fprintf(stderr,
+				    "migrate: VM_PAUSE failed: %s "
+				    "(continuing anyway)\n",
+				    strerror(errno));
+			} else {
+				fprintf(stderr,
+				    "migrate: VM paused for import\n");
+			}
 
 			fprintf(stderr,
 			    "migrate: restoring from %s\n", restore_path);
@@ -1059,6 +1067,13 @@ main(int argc, char *argv[])
 
 			/* Resume so vCPU threads can start */
 			(void) vm_resume_instance(ctx);
+
+			/*
+			 * Signal to bhyve_start_vcpu that we're restoring
+			 * from checkpoint — don't reset run states.
+			 */
+			set_config_bool("migrate.restored", true);
+
 			fprintf(stderr, "migrate: restore complete\n");
 		}
 	}
@@ -1066,6 +1081,10 @@ main(int argc, char *argv[])
 
 	/*
 	 * Add all vCPUs.
+	 *
+	 * When restoring from a migration checkpoint, set
+	 * migrate.skip_vcpu_reset so that bhyve_start_vcpu doesn't
+	 * overwrite the imported run state / register state.
 	 */
 	for (int vcpuid = 0; vcpuid < guest_ncpus; vcpuid++) {
 #ifdef	__FreeBSD__

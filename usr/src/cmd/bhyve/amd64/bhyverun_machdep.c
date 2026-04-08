@@ -363,8 +363,12 @@ bhyve_start_vcpu(struct vcpu *vcpu, bool bsp, bool suspend)
 		/*
 		 * On illumos, all APs are spun up halted and run-state
 		 * transitions (INIT, SIPI, etc) are handled in-kernel.
+		 *
+		 * Skip spinup_ap when restoring from migration checkpoint —
+		 * the AP state was already imported.
 		 */
-		spinup_ap(vcpu, 0);
+		if (!get_config_bool_default("migrate.restored", false))
+			spinup_ap(vcpu, 0);
 #endif
 
 		bhyve_init_vcpu(vcpu);
@@ -382,13 +386,13 @@ bhyve_start_vcpu(struct vcpu *vcpu, bool bsp, bool suspend)
 
 #ifndef	__FreeBSD__
 	/*
-	 * The value of 'suspend' for the BSP depends on whether the -d
-	 * (suspend_at_boot) flag was given to bhyve. Regardless of that
-	 * value we always want to set the BSP to VRS_RUN and all others to
-	 * VRS_HALT.
+	 * Skip run_state reset when restoring from migration checkpoint —
+	 * the imported run state must be preserved.
 	 */
-	error = vm_set_run_state(vcpu, bsp ? VRS_RUN : VRS_HALT, 0);
-	assert(error == 0);
+	if (!get_config_bool_default("migrate.restored", false)) {
+		error = vm_set_run_state(vcpu, bsp ? VRS_RUN : VRS_HALT, 0);
+		assert(error == 0);
+	}
 #endif
 
 	fbsdrun_addcpu(vcpu_id(vcpu), suspend);
