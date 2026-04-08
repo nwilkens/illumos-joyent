@@ -66,21 +66,54 @@ static const struct {
 	(sizeof (kern_dev_classes) / sizeof (kern_dev_classes[0]))
 
 /*
- * Per-vCPU data classes.
+ * Per-vCPU data classes that work via VM_DATA_READ/WRITE.
+ *
+ * NOTE: VDC_REGISTER and VDC_FPU are NOT implemented via VM_DATA_READ.
+ * VDC_REGISTER would panic the kernel. VDC_FPU is explicitly unimplemented.
+ * Use VM_GET/SET_REGISTER_SET and VM_GET/SET_FPU ioctls instead.
  */
 static const struct {
 	uint16_t	class;
 	uint16_t	version;
 	const char	*name;
 } vcpu_classes[] = {
-	{ 2 /* VDC_REGISTER */,		1,	"registers" },
 	{ 3 /* VDC_MSR */,		1,	"msrs" },
-	{ 4 /* VDC_FPU */,		1,	"fpu" },
 	{ 5 /* VDC_LAPIC */,		1,	"lapic" },
 	{ 6 /* VDC_VMM_ARCH */,	1,	"vmm_arch" },
 };
 #define	N_VCPU_CLASSES \
 	(sizeof (vcpu_classes) / sizeof (vcpu_classes[0]))
+
+/*
+ * General registers to save/restore via vm_get/set_register_set.
+ * Matches the Rust VMM implementation's VCPU_REGS list.
+ */
+static const int vcpu_regs[] = {
+	VM_REG_GUEST_RAX, VM_REG_GUEST_RBX, VM_REG_GUEST_RCX,
+	VM_REG_GUEST_RDX, VM_REG_GUEST_RSI, VM_REG_GUEST_RDI,
+	VM_REG_GUEST_RBP, VM_REG_GUEST_RSP, VM_REG_GUEST_R8,
+	VM_REG_GUEST_R9,  VM_REG_GUEST_R10, VM_REG_GUEST_R11,
+	VM_REG_GUEST_R12, VM_REG_GUEST_R13, VM_REG_GUEST_R14,
+	VM_REG_GUEST_R15, VM_REG_GUEST_RIP, VM_REG_GUEST_RFLAGS,
+	VM_REG_GUEST_CR0, VM_REG_GUEST_CR3, VM_REG_GUEST_CR2,
+	VM_REG_GUEST_CR4, VM_REG_GUEST_DR7, VM_REG_GUEST_EFER,
+	VM_REG_GUEST_XCR0,
+};
+#define	N_VCPU_REGS	(sizeof (vcpu_regs) / sizeof (vcpu_regs[0]))
+
+/*
+ * Segment descriptor registers — need base/limit/access via vm_get/set_desc.
+ */
+static const int vcpu_seg_descs[] = {
+	VM_REG_GUEST_CS,  VM_REG_GUEST_DS,  VM_REG_GUEST_ES,
+	VM_REG_GUEST_FS,  VM_REG_GUEST_GS,  VM_REG_GUEST_SS,
+	VM_REG_GUEST_TR,  VM_REG_GUEST_LDTR,
+	VM_REG_GUEST_GDTR, VM_REG_GUEST_IDTR,
+};
+#define	N_VCPU_SEG_DESCS (sizeof (vcpu_seg_descs) / sizeof (vcpu_seg_descs[0]))
+
+/* FPU buffer size — max 2 pages per kernel limit */
+#define	FPU_BUF_SIZE	8192
 
 /*
  * Read kernel device state via VM_DATA_READ.
@@ -158,6 +191,78 @@ bhyve_migrate_export(struct vmctx *ctx, int ncpus, int fd)
 		if (rv != 0)
 			continue;
 
+		struct vcpu *vcpu = vm_vcpu_open(ctx, cpu);
+		if (vcpu == NULL)
+			continue;
+
+		/*
+		 * 2a. General registers via vm_get_register_set (batch).
+		 */
+		{
+			uint64_t regvals[N_VCPU_REGS];
+			if (vm_get_register_set(vcpu, N_VCPU_REGS,
+			    vcpu_regs, regvals) == 0) {
+				nvlist_add_byte_array(cpu_nvl, "registers",
+				    (uchar_t *)regvals,
+				    (uint_t)sizeof (regvals));
+			} else {
+				fprintf(stderr,
+				    "mig: vm_get_register_set vcpu%d: %s\n",
+				    cpu, strerror(errno));
+			}
+		}
+
+		/*
+		 * 2b. Segment descriptors (base/limit/access).
+		 * Packed as: [reg_id:u32, base:u64, limit:u32, access:u32]
+		 */
+		{
+			uint8_t segbuf[N_VCPU_SEG_DESCS * 20];
+			uint8_t *p = segbuf;
+			int seg_ok = 1;
+			for (uint_t i = 0; i < N_VCPU_SEG_DESCS; i++) {
+				uint64_t base;
+				uint32_t limit, access;
+				if (vm_get_desc(vcpu, vcpu_seg_descs[i],
+				    &base, &limit, &access) != 0) {
+					fprintf(stderr,
+					    "mig: vm_get_desc vcpu%d "
+					    "reg%d: %s\n",
+					    cpu, vcpu_seg_descs[i],
+					    strerror(errno));
+					seg_ok = 0;
+					break;
+				}
+				uint32_t regid = (uint32_t)vcpu_seg_descs[i];
+				memcpy(p, &regid, 4); p += 4;
+				memcpy(p, &base, 8); p += 8;
+				memcpy(p, &limit, 4); p += 4;
+				memcpy(p, &access, 4); p += 4;
+			}
+			if (seg_ok) {
+				nvlist_add_byte_array(cpu_nvl, "seg_descs",
+				    segbuf, (uint_t)sizeof (segbuf));
+			}
+		}
+
+		/*
+		 * 2c. FPU state via VM_GET_FPU.
+		 */
+		{
+			uint8_t fpubuf[FPU_BUF_SIZE];
+			if (vm_get_fpu(vcpu, fpubuf, sizeof (fpubuf)) == 0) {
+				nvlist_add_byte_array(cpu_nvl, "fpu",
+				    fpubuf, (uint_t)sizeof (fpubuf));
+			} else {
+				fprintf(stderr, "mig: vm_get_fpu vcpu%d: %s\n",
+				    cpu, strerror(errno));
+			}
+		}
+
+		/*
+		 * 2d. Kernel per-vCPU classes via VM_DATA_READ
+		 *     (MSRs, LAPIC, VMM_ARCH).
+		 */
 		for (uint_t i = 0; i < N_VCPU_CLASSES; i++) {
 			uint32_t len = 0;
 			void *data;
@@ -174,9 +279,8 @@ bhyve_migrate_export(struct vmctx *ctx, int ncpus, int fd)
 			free(data);
 		}
 
-		/* Save vCPU run state */
-		struct vcpu *vcpu = vm_vcpu_open(ctx, cpu);
-		if (vcpu != NULL) {
+		/* 2e. vCPU run state */
+		{
 			enum vcpu_run_state rstate;
 			uint8_t sipi_vec;
 			if (vm_get_run_state(vcpu, &rstate, &sipi_vec) == 0) {
@@ -185,9 +289,10 @@ bhyve_migrate_export(struct vmctx *ctx, int ncpus, int fd)
 				nvlist_add_uint64(cpu_nvl, "sipi_vector",
 				    (uint64_t)sipi_vec);
 			}
-			if (cpu != 0)
-				vm_vcpu_close(vcpu);
 		}
+
+		if (cpu != 0)
+			vm_vcpu_close(vcpu);
 
 		(void) snprintf(key, sizeof (key), "vcpu.%d", cpu);
 		nvlist_add_nvlist(nvl, key, cpu_nvl);
@@ -249,6 +354,13 @@ bhyve_migrate_import(struct vmctx *ctx, int ncpus, int fd)
 		return (-1);
 	}
 
+	/* Sanity check: reject absurdly large payloads (max 256MB) */
+	if (packed_len > (256 * 1024 * 1024)) {
+		fprintf(stderr, "mig: payload too large: %llu bytes\n",
+		    (unsigned long long)packed_len);
+		return (-1);
+	}
+
 	packed = malloc(packed_len);
 	if (packed == NULL)
 		return (-1);
@@ -305,6 +417,68 @@ bhyve_migrate_import(struct vmctx *ctx, int ncpus, int fd)
 		if (nvlist_lookup_nvlist(nvl, key, &cpu_nvl) != 0)
 			continue;
 
+		struct vcpu *vcpu = vm_vcpu_open(ctx, cpu);
+		if (vcpu == NULL)
+			continue;
+
+		/* 2a. Restore general registers */
+		{
+			uchar_t *regdata;
+			uint_t reglen;
+			if (nvlist_lookup_byte_array(cpu_nvl, "registers",
+			    &regdata, &reglen) == 0 &&
+			    reglen == sizeof (uint64_t) * N_VCPU_REGS) {
+				(void) vm_set_register_set(vcpu, N_VCPU_REGS,
+				    vcpu_regs, (uint64_t *)regdata);
+			}
+		}
+
+		/* 2b. Restore segment descriptors */
+		{
+			uchar_t *segdata;
+			uint_t seglen;
+			if (nvlist_lookup_byte_array(cpu_nvl, "seg_descs",
+			    &segdata, &seglen) == 0 &&
+			    seglen == N_VCPU_SEG_DESCS * 20) {
+				uint8_t *p = segdata;
+				for (uint_t i = 0; i < N_VCPU_SEG_DESCS; i++) {
+					uint32_t regid;
+					uint64_t base;
+					uint32_t limit, access;
+					memcpy(&regid, p, 4); p += 4;
+					memcpy(&base, p, 8); p += 8;
+					memcpy(&limit, p, 4); p += 4;
+					memcpy(&access, p, 4); p += 4;
+					/*
+					 * Validate regid matches expected
+					 * segment register to prevent
+					 * arbitrary register writes from
+					 * a crafted checkpoint.
+					 */
+					if ((int)regid != vcpu_seg_descs[i]) {
+						fprintf(stderr,
+						    "mig: bad seg regid %u "
+						    "at index %u\n", regid, i);
+						break;
+					}
+					(void) vm_set_desc(vcpu, (int)regid,
+					    base, limit, access);
+				}
+			}
+		}
+
+		/* 2c. Restore FPU state */
+		{
+			uchar_t *fpudata;
+			uint_t fpulen;
+			if (nvlist_lookup_byte_array(cpu_nvl, "fpu",
+			    &fpudata, &fpulen) == 0 &&
+			    fpulen <= FPU_BUF_SIZE) {
+				(void) vm_set_fpu(vcpu, fpudata, fpulen);
+			}
+		}
+
+		/* 2d. Restore kernel per-vCPU classes (MSRs, LAPIC, VMM_ARCH) */
 		for (uint_t i = 0; i < N_VCPU_CLASSES; i++) {
 			uchar_t *data;
 			uint_t len;
@@ -323,10 +497,9 @@ bhyve_migrate_import(struct vmctx *ctx, int ncpus, int fd)
 			}
 		}
 
-		/* Restore vCPU run state */
-		uint64_t val;
-		struct vcpu *vcpu = vm_vcpu_open(ctx, cpu);
-		if (vcpu != NULL) {
+		/* 2e. Restore vCPU run state */
+		{
+			uint64_t val;
 			enum vcpu_run_state rstate = VRS_HALT;
 			uint8_t sipi_vec = 0;
 			if (nvlist_lookup_uint64(cpu_nvl, "run_state",
@@ -336,9 +509,10 @@ bhyve_migrate_import(struct vmctx *ctx, int ncpus, int fd)
 			    &val) == 0)
 				sipi_vec = (uint8_t)val;
 			(void) vm_set_run_state(vcpu, rstate, sipi_vec);
-			if (cpu != 0)
-				vm_vcpu_close(vcpu);
 		}
+
+		if (cpu != 0)
+			vm_vcpu_close(vcpu);
 	}
 
 	/*
