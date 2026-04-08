@@ -493,17 +493,18 @@ uart_ns16550_init(uart_intr_func_t intr_assert, uart_intr_func_t intr_deassert,
 int
 uart_ns16550_save(struct uart_ns16550_softc *sc, nvlist_t *nvl)
 {
-	nvlist_add_number(nvl, "uart.data", sc->data);
-	nvlist_add_number(nvl, "uart.ier", sc->ier);
-	nvlist_add_number(nvl, "uart.lcr", sc->lcr);
-	nvlist_add_number(nvl, "uart.mcr", sc->mcr);
-	nvlist_add_number(nvl, "uart.lsr", sc->lsr);
-	nvlist_add_number(nvl, "uart.msr", sc->msr);
-	nvlist_add_number(nvl, "uart.fcr", sc->fcr);
-	nvlist_add_number(nvl, "uart.scr", sc->scr);
-	nvlist_add_number(nvl, "uart.dll", sc->dll);
-	nvlist_add_number(nvl, "uart.dlh", sc->dlh);
-	nvlist_add_bool(nvl, "uart.thre_int_pending", sc->thre_int_pending);
+	nvlist_add_uint64(nvl, "uart.data", (uint64_t)sc->data);
+	nvlist_add_uint64(nvl, "uart.ier", (uint64_t)sc->ier);
+	nvlist_add_uint64(nvl, "uart.lcr", (uint64_t)sc->lcr);
+	nvlist_add_uint64(nvl, "uart.mcr", (uint64_t)sc->mcr);
+	nvlist_add_uint64(nvl, "uart.lsr", (uint64_t)sc->lsr);
+	nvlist_add_uint64(nvl, "uart.msr", (uint64_t)sc->msr);
+	nvlist_add_uint64(nvl, "uart.fcr", (uint64_t)sc->fcr);
+	nvlist_add_uint64(nvl, "uart.scr", (uint64_t)sc->scr);
+	nvlist_add_uint64(nvl, "uart.dll", (uint64_t)sc->dll);
+	nvlist_add_uint64(nvl, "uart.dlh", (uint64_t)sc->dlh);
+	nvlist_add_boolean_value(nvl, "uart.thre_int_pending",
+	    sc->thre_int_pending ? B_TRUE : B_FALSE);
 
 	return (0);
 }
@@ -511,17 +512,31 @@ uart_ns16550_save(struct uart_ns16550_softc *sc, nvlist_t *nvl)
 int
 uart_ns16550_restore(struct uart_ns16550_softc *sc, nvlist_t *nvl)
 {
-	sc->data = (uint8_t)nvlist_get_number(nvl, "uart.data");
-	sc->ier = (uint8_t)nvlist_get_number(nvl, "uart.ier");
-	sc->lcr = (uint8_t)nvlist_get_number(nvl, "uart.lcr");
-	sc->mcr = (uint8_t)nvlist_get_number(nvl, "uart.mcr");
-	sc->lsr = (uint8_t)nvlist_get_number(nvl, "uart.lsr");
-	sc->msr = (uint8_t)nvlist_get_number(nvl, "uart.msr");
-	sc->fcr = (uint8_t)nvlist_get_number(nvl, "uart.fcr");
-	sc->scr = (uint8_t)nvlist_get_number(nvl, "uart.scr");
-	sc->dll = (uint8_t)nvlist_get_number(nvl, "uart.dll");
-	sc->dlh = (uint8_t)nvlist_get_number(nvl, "uart.dlh");
-	sc->thre_int_pending = nvlist_get_bool(nvl, "uart.thre_int_pending");
+	uint64_t val;
+	boolean_t bval;
+
+	(void) nvlist_lookup_uint64(nvl, "uart.data", &val);
+	sc->data = (uint8_t)val;
+	(void) nvlist_lookup_uint64(nvl, "uart.ier", &val);
+	sc->ier = (uint8_t)val;
+	(void) nvlist_lookup_uint64(nvl, "uart.lcr", &val);
+	sc->lcr = (uint8_t)val;
+	(void) nvlist_lookup_uint64(nvl, "uart.mcr", &val);
+	sc->mcr = (uint8_t)val;
+	(void) nvlist_lookup_uint64(nvl, "uart.lsr", &val);
+	sc->lsr = (uint8_t)val;
+	(void) nvlist_lookup_uint64(nvl, "uart.msr", &val);
+	sc->msr = (uint8_t)val;
+	(void) nvlist_lookup_uint64(nvl, "uart.fcr", &val);
+	sc->fcr = (uint8_t)val;
+	(void) nvlist_lookup_uint64(nvl, "uart.scr", &val);
+	sc->scr = (uint8_t)val;
+	(void) nvlist_lookup_uint64(nvl, "uart.dll", &val);
+	sc->dll = (uint8_t)val;
+	(void) nvlist_lookup_uint64(nvl, "uart.dlh", &val);
+	sc->dlh = (uint8_t)val;
+	(void) nvlist_lookup_boolean_value(nvl, "uart.thre_int_pending", &bval);
+	sc->thre_int_pending = (bval == B_TRUE);
 
 	return (0);
 }

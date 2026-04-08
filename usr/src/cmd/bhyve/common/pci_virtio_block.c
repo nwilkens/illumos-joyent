@@ -658,9 +658,9 @@ pci_vtblk_save(struct pci_devinst *pi, nvlist_t *nvl)
 	vi_save_common(&sc->vbsc_vs, nvl);
 
 	/* Save block-specific config */
-	nvlist_add_byte_array(nvl, "vtblk.cfg", (const uint8_t *)&sc->vbsc_cfg,
-	    sizeof (sc->vbsc_cfg));
-	nvlist_add_number(nvl, "vtblk.wce", sc->vbsc_wce);
+	nvlist_add_byte_array(nvl, "vtblk.cfg", (uchar_t *)&sc->vbsc_cfg,
+	    (uint_t)sizeof (sc->vbsc_cfg));
+	nvlist_add_uint64(nvl, "vtblk.wce", (uint64_t)sc->vbsc_wce);
 
 	return (0);
 }
@@ -674,13 +674,15 @@ pci_vtblk_restore(struct pci_devinst *pi, nvlist_t *nvl)
 	vi_restore_common(&sc->vbsc_vs, nvl);
 
 	/* Restore block-specific config */
-	const uint8_t *cfg;
-	size_t len;
-	cfg = nvlist_get_byte_array(nvl, "vtblk.cfg", &len);
-	if (cfg != NULL && len == sizeof (sc->vbsc_cfg))
+	uchar_t *cfg;
+	uint_t len;
+	uint64_t val;
+	if (nvlist_lookup_byte_array(nvl, "vtblk.cfg", &cfg, &len) == 0 &&
+	    len == sizeof (sc->vbsc_cfg))
 		memcpy(&sc->vbsc_cfg, cfg, sizeof (sc->vbsc_cfg));
 
-	sc->vbsc_wce = (int)nvlist_get_number(nvl, "vtblk.wce");
+	if (nvlist_lookup_uint64(nvl, "vtblk.wce", &val) == 0)
+		sc->vbsc_wce = (int)val;
 
 	return (0);
 }

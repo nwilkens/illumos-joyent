@@ -2105,6 +2105,9 @@ done:
 }
 
 #ifndef __FreeBSD__
+#include <machine/vmm.h>
+#include <vmmapi.h>
+
 /*
  * Save/restore helpers for virtio common state (migration).
  *
@@ -2119,39 +2122,41 @@ vi_save_common(struct virtio_softc *vs, nvlist_t *nvl)
 {
 	struct virtio_consts *vc = vs->vs_vc;
 
-	nvlist_add_number(nvl, "vi.negotiated_caps", vs->vs_negotiated_caps);
-	nvlist_add_number(nvl, "vi.status", vs->vs_status);
-	nvlist_add_number(nvl, "vi.isr", vs->vs_isr);
-	nvlist_add_number(nvl, "vi.msix_cfg_idx", vs->vs_msix_cfg_idx);
-	nvlist_add_number(nvl, "vi.curq", vs->vs_curq);
-	nvlist_add_number(nvl, "vi.flags", (uint64_t)vs->vs_flags);
-	nvlist_add_number(nvl, "vi.mode", (uint64_t)vs->vs_mode);
-	nvlist_add_number(nvl, "vi.nvq", vc->vc_nvq);
+	nvlist_add_uint64(nvl, "vi.negotiated_caps",
+	    (uint64_t)vs->vs_negotiated_caps);
+	nvlist_add_uint64(nvl, "vi.status", (uint64_t)vs->vs_status);
+	nvlist_add_uint64(nvl, "vi.isr", (uint64_t)vs->vs_isr);
+	nvlist_add_uint64(nvl, "vi.msix_cfg_idx",
+	    (uint64_t)vs->vs_msix_cfg_idx);
+	nvlist_add_uint64(nvl, "vi.curq", (uint64_t)vs->vs_curq);
+	nvlist_add_uint64(nvl, "vi.flags", (uint64_t)vs->vs_flags);
+	nvlist_add_uint64(nvl, "vi.mode", (uint64_t)vs->vs_mode);
+	nvlist_add_uint64(nvl, "vi.nvq", (uint64_t)vc->vc_nvq);
 
 	for (int i = 0; i < vc->vc_nvq; i++) {
 		struct vqueue_info *vq = &vs->vs_queues[i];
 		char name[32];
 
 		(void) snprintf(name, sizeof (name), "vq.%d.qsize", i);
-		nvlist_add_number(nvl, name, vq->vq_qsize);
+		nvlist_add_uint64(nvl, name, (uint64_t)vq->vq_qsize);
 		(void) snprintf(name, sizeof (name), "vq.%d.pfn", i);
-		nvlist_add_number(nvl, name, vq->vq_pfn);
+		nvlist_add_uint64(nvl, name, (uint64_t)vq->vq_pfn);
 		(void) snprintf(name, sizeof (name), "vq.%d.flags", i);
-		nvlist_add_number(nvl, name, vq->vq_flags);
+		nvlist_add_uint64(nvl, name, (uint64_t)vq->vq_flags);
 		(void) snprintf(name, sizeof (name), "vq.%d.last_avail", i);
-		nvlist_add_number(nvl, name, vq->vq_last_avail);
+		nvlist_add_uint64(nvl, name, (uint64_t)vq->vq_last_avail);
 		(void) snprintf(name, sizeof (name), "vq.%d.next_used", i);
-		nvlist_add_number(nvl, name, vq->vq_next_used);
+		nvlist_add_uint64(nvl, name, (uint64_t)vq->vq_next_used);
 		(void) snprintf(name, sizeof (name), "vq.%d.save_used", i);
-		nvlist_add_number(nvl, name, vq->vq_save_used);
+		nvlist_add_uint64(nvl, name, (uint64_t)vq->vq_save_used);
 		(void) snprintf(name, sizeof (name), "vq.%d.msix_idx", i);
-		nvlist_add_number(nvl, name, vq->vq_msix_idx);
+		nvlist_add_uint64(nvl, name, (uint64_t)vq->vq_msix_idx);
 		(void) snprintf(name, sizeof (name), "vq.%d.desc_gpa", i);
-		nvlist_add_number(nvl, name, vq->vq_desc_gpa);
+		nvlist_add_uint64(nvl, name, (uint64_t)vq->vq_desc_gpa);
 		(void) snprintf(name, sizeof (name), "vq.%d.avail_gpa", i);
-		nvlist_add_number(nvl, name, vq->vq_avail_gpa);
+		nvlist_add_uint64(nvl, name, (uint64_t)vq->vq_avail_gpa);
 		(void) snprintf(name, sizeof (name), "vq.%d.used_gpa", i);
-		nvlist_add_number(nvl, name, vq->vq_used_gpa);
+		nvlist_add_uint64(nvl, name, (uint64_t)vq->vq_used_gpa);
 	}
 
 	return (0);
@@ -2162,16 +2167,25 @@ vi_restore_common(struct virtio_softc *vs, nvlist_t *nvl)
 {
 	struct virtio_consts *vc = vs->vs_vc;
 
-	vs->vs_negotiated_caps = nvlist_get_number(nvl, "vi.negotiated_caps");
-	vs->vs_status = (uint8_t)nvlist_get_number(nvl, "vi.status");
-	vs->vs_isr = (uint8_t)nvlist_get_number(nvl, "vi.isr");
-	vs->vs_msix_cfg_idx = (uint16_t)nvlist_get_number(nvl,
-	    "vi.msix_cfg_idx");
-	vs->vs_curq = (int)nvlist_get_number(nvl, "vi.curq");
-	vs->vs_flags = (virtio_flags_t)nvlist_get_number(nvl, "vi.flags");
-	vs->vs_mode = (virtio_mode_t)nvlist_get_number(nvl, "vi.mode");
+	uint64_t val;
 
-	int nvq = (int)nvlist_get_number(nvl, "vi.nvq");
+	(void) nvlist_lookup_uint64(nvl, "vi.negotiated_caps", &val);
+	vs->vs_negotiated_caps = val;
+	(void) nvlist_lookup_uint64(nvl, "vi.status", &val);
+	vs->vs_status = (uint8_t)val;
+	(void) nvlist_lookup_uint64(nvl, "vi.isr", &val);
+	vs->vs_isr = (uint8_t)val;
+	(void) nvlist_lookup_uint64(nvl, "vi.msix_cfg_idx", &val);
+	vs->vs_msix_cfg_idx = (uint16_t)val;
+	(void) nvlist_lookup_uint64(nvl, "vi.curq", &val);
+	vs->vs_curq = (int)val;
+	(void) nvlist_lookup_uint64(nvl, "vi.flags", &val);
+	vs->vs_flags = (virtio_flags_t)val;
+	(void) nvlist_lookup_uint64(nvl, "vi.mode", &val);
+	vs->vs_mode = (virtio_mode_t)val;
+
+	(void) nvlist_lookup_uint64(nvl, "vi.nvq", &val);
+	int nvq = (int)val;
 	if (nvq > vc->vc_max_nvq)
 		nvq = vc->vc_max_nvq;
 
@@ -2180,25 +2194,35 @@ vi_restore_common(struct virtio_softc *vs, nvlist_t *nvl)
 		char name[32];
 
 		(void) snprintf(name, sizeof (name), "vq.%d.qsize", i);
-		vq->vq_qsize = (uint16_t)nvlist_get_number(nvl, name);
+		(void) nvlist_lookup_uint64(nvl, name, &val);
+		vq->vq_qsize = (uint16_t)val;
 		(void) snprintf(name, sizeof (name), "vq.%d.pfn", i);
-		vq->vq_pfn = (uint32_t)nvlist_get_number(nvl, name);
+		(void) nvlist_lookup_uint64(nvl, name, &val);
+		vq->vq_pfn = (uint32_t)val;
 		(void) snprintf(name, sizeof (name), "vq.%d.flags", i);
-		vq->vq_flags = (uint16_t)nvlist_get_number(nvl, name);
+		(void) nvlist_lookup_uint64(nvl, name, &val);
+		vq->vq_flags = (uint16_t)val;
 		(void) snprintf(name, sizeof (name), "vq.%d.last_avail", i);
-		vq->vq_last_avail = (uint16_t)nvlist_get_number(nvl, name);
+		(void) nvlist_lookup_uint64(nvl, name, &val);
+		vq->vq_last_avail = (uint16_t)val;
 		(void) snprintf(name, sizeof (name), "vq.%d.next_used", i);
-		vq->vq_next_used = (uint16_t)nvlist_get_number(nvl, name);
+		(void) nvlist_lookup_uint64(nvl, name, &val);
+		vq->vq_next_used = (uint16_t)val;
 		(void) snprintf(name, sizeof (name), "vq.%d.save_used", i);
-		vq->vq_save_used = (uint16_t)nvlist_get_number(nvl, name);
+		(void) nvlist_lookup_uint64(nvl, name, &val);
+		vq->vq_save_used = (uint16_t)val;
 		(void) snprintf(name, sizeof (name), "vq.%d.msix_idx", i);
-		vq->vq_msix_idx = (uint16_t)nvlist_get_number(nvl, name);
+		(void) nvlist_lookup_uint64(nvl, name, &val);
+		vq->vq_msix_idx = (uint16_t)val;
 		(void) snprintf(name, sizeof (name), "vq.%d.desc_gpa", i);
-		vq->vq_desc_gpa = nvlist_get_number(nvl, name);
+		(void) nvlist_lookup_uint64(nvl, name, &val);
+		vq->vq_desc_gpa = val;
 		(void) snprintf(name, sizeof (name), "vq.%d.avail_gpa", i);
-		vq->vq_avail_gpa = nvlist_get_number(nvl, name);
+		(void) nvlist_lookup_uint64(nvl, name, &val);
+		vq->vq_avail_gpa = val;
 		(void) snprintf(name, sizeof (name), "vq.%d.used_gpa", i);
-		vq->vq_used_gpa = nvlist_get_number(nvl, name);
+		(void) nvlist_lookup_uint64(nvl, name, &val);
+		vq->vq_used_gpa = val;
 
 		/*
 		 * Re-map the queue rings into host virtual addresses if the

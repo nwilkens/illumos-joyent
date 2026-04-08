@@ -2460,35 +2460,40 @@ INOUT_PORT(pci_cfgdata, CONF1_DATA_PORT+3, IOPORT_F_INOUT, pci_emul_cfgdata);
 static int
 pci_save_cfgspace(struct pci_devinst *pi, nvlist_t *nvl)
 {
-	nvlist_add_byte_array(nvl, "cfgdata", pi->pi_cfgdata,
-	    sizeof (pi->pi_cfgdata));
+	nvlist_add_byte_array(nvl, "cfgdata", (uchar_t *)pi->pi_cfgdata,
+	    (uint_t)sizeof (pi->pi_cfgdata));
 
 	/* Save MSI state */
-	nvlist_add_bool(nvl, "msi.enabled", pi->pi_msi.enabled != 0);
-	nvlist_add_number(nvl, "msi.addr", pi->pi_msi.addr);
-	nvlist_add_number(nvl, "msi.msg_data", pi->pi_msi.msg_data);
-	nvlist_add_number(nvl, "msi.maxmsgnum", pi->pi_msi.maxmsgnum);
+	nvlist_add_boolean_value(nvl, "msi.enabled",
+	    pi->pi_msi.enabled != 0 ? B_TRUE : B_FALSE);
+	nvlist_add_uint64(nvl, "msi.addr", (uint64_t)pi->pi_msi.addr);
+	nvlist_add_uint64(nvl, "msi.msg_data", (uint64_t)pi->pi_msi.msg_data);
+	nvlist_add_uint64(nvl, "msi.maxmsgnum",
+	    (uint64_t)pi->pi_msi.maxmsgnum);
 
 	/* Save MSI-X state */
-	nvlist_add_bool(nvl, "msix.enabled", pi->pi_msix.enabled != 0);
-	nvlist_add_number(nvl, "msix.table_bar", pi->pi_msix.table_bar);
-	nvlist_add_number(nvl, "msix.table_count", pi->pi_msix.table_count);
-	nvlist_add_number(nvl, "msix.function_mask",
-	    pi->pi_msix.function_mask);
+	nvlist_add_boolean_value(nvl, "msix.enabled",
+	    pi->pi_msix.enabled != 0 ? B_TRUE : B_FALSE);
+	nvlist_add_uint64(nvl, "msix.table_bar",
+	    (uint64_t)pi->pi_msix.table_bar);
+	nvlist_add_uint64(nvl, "msix.table_count",
+	    (uint64_t)pi->pi_msix.table_count);
+	nvlist_add_uint64(nvl, "msix.function_mask",
+	    (uint64_t)pi->pi_msix.function_mask);
 	if (pi->pi_msix.table != NULL && pi->pi_msix.table_count > 0) {
 		nvlist_add_byte_array(nvl, "msix.table",
-		    (const uint8_t *)pi->pi_msix.table,
-		    pi->pi_msix.table_count *
-		    sizeof (struct msix_table_entry));
+		    (uchar_t *)pi->pi_msix.table,
+		    (uint_t)(pi->pi_msix.table_count *
+		    sizeof (struct msix_table_entry)));
 	}
 
 	/* Save BAR configuration */
 	for (int i = 0; i < PCI_BARMAX_WITH_ROM + 1; i++) {
 		char name[32];
 		(void) snprintf(name, sizeof (name), "bar.%d.type", i);
-		nvlist_add_number(nvl, name, pi->pi_bar[i].type);
+		nvlist_add_uint64(nvl, name, (uint64_t)pi->pi_bar[i].type);
 		(void) snprintf(name, sizeof (name), "bar.%d.addr", i);
-		nvlist_add_number(nvl, name, pi->pi_bar[i].addr);
+		nvlist_add_uint64(nvl, name, (uint64_t)pi->pi_bar[i].addr);
 	}
 
 	return (0);
@@ -2497,29 +2502,36 @@ pci_save_cfgspace(struct pci_devinst *pi, nvlist_t *nvl)
 static int
 pci_restore_cfgspace(struct pci_devinst *pi, nvlist_t *nvl)
 {
-	const uint8_t *cfgdata;
-	size_t len;
+	uchar_t *cfgdata;
+	uint_t len;
+	boolean_t bval;
+	uint64_t val;
 
-	cfgdata = nvlist_get_byte_array(nvl, "cfgdata", &len);
-	if (cfgdata == NULL || len != sizeof (pi->pi_cfgdata))
+	if (nvlist_lookup_byte_array(nvl, "cfgdata", &cfgdata, &len) != 0 ||
+	    len != sizeof (pi->pi_cfgdata))
 		return (-1);
 	memcpy(pi->pi_cfgdata, cfgdata, sizeof (pi->pi_cfgdata));
 
 	/* Restore MSI state */
-	pi->pi_msi.enabled = nvlist_get_bool(nvl, "msi.enabled") ? 1 : 0;
-	pi->pi_msi.addr = nvlist_get_number(nvl, "msi.addr");
-	pi->pi_msi.msg_data = nvlist_get_number(nvl, "msi.msg_data");
-	pi->pi_msi.maxmsgnum = nvlist_get_number(nvl, "msi.maxmsgnum");
+	if (nvlist_lookup_boolean_value(nvl, "msi.enabled", &bval) == 0)
+		pi->pi_msi.enabled = (bval == B_TRUE) ? 1 : 0;
+	if (nvlist_lookup_uint64(nvl, "msi.addr", &val) == 0)
+		pi->pi_msi.addr = val;
+	if (nvlist_lookup_uint64(nvl, "msi.msg_data", &val) == 0)
+		pi->pi_msi.msg_data = val;
+	if (nvlist_lookup_uint64(nvl, "msi.maxmsgnum", &val) == 0)
+		pi->pi_msi.maxmsgnum = val;
 
 	/* Restore MSI-X state */
-	pi->pi_msix.enabled = nvlist_get_bool(nvl, "msix.enabled") ? 1 : 0;
-	pi->pi_msix.function_mask =
-	    nvlist_get_number(nvl, "msix.function_mask");
+	if (nvlist_lookup_boolean_value(nvl, "msix.enabled", &bval) == 0)
+		pi->pi_msix.enabled = (bval == B_TRUE) ? 1 : 0;
+	if (nvlist_lookup_uint64(nvl, "msix.function_mask", &val) == 0)
+		pi->pi_msix.function_mask = val;
 	if (pi->pi_msix.table != NULL) {
-		const uint8_t *tbl;
-		size_t tbllen;
-		tbl = nvlist_get_byte_array(nvl, "msix.table", &tbllen);
-		if (tbl != NULL) {
+		uchar_t *tbl;
+		uint_t tbllen;
+		if (nvlist_lookup_byte_array(nvl, "msix.table",
+		    &tbl, &tbllen) == 0) {
 			size_t expected = pi->pi_msix.table_count *
 			    sizeof (struct msix_table_entry);
 			if (tbllen == expected)
@@ -2568,7 +2580,7 @@ pci_save_all(nvlist_t *nvl)
 				/* Save PCI config space */
 				error = pci_save_cfgspace(pi, dev_nvl);
 				if (error != 0) {
-					nvlist_destroy(dev_nvl);
+					nvlist_free(dev_nvl);
 					return (error);
 				}
 
@@ -2576,13 +2588,13 @@ pci_save_all(nvlist_t *nvl)
 				if (pe->pe_save != NULL) {
 					error = pe->pe_save(pi, dev_nvl);
 					if (error != 0) {
-						nvlist_destroy(dev_nvl);
+						nvlist_free(dev_nvl);
 						return (error);
 					}
 				}
 
 				nvlist_add_nvlist(nvl, key, dev_nvl);
-				nvlist_destroy(dev_nvl);
+				nvlist_free(dev_nvl);
 			}
 		}
 	}
@@ -2621,27 +2633,22 @@ pci_restore_all(nvlist_t *nvl)
 				if (!nvlist_exists_nvlist(nvl, key))
 					continue;
 
-				nvlist_t *dev_nvl = nvlist_take_nvlist(nvl, key);
-				if (dev_nvl == NULL)
+				nvlist_t *dev_nvl;
+				if (nvlist_lookup_nvlist(nvl, key,
+				    &dev_nvl) != 0)
 					continue;
 
 				/* Restore PCI config space */
 				error = pci_restore_cfgspace(pi, dev_nvl);
-				if (error != 0) {
-					nvlist_destroy(dev_nvl);
+				if (error != 0)
 					return (error);
-				}
 
 				/* Restore device-specific state */
 				if (pe->pe_restore != NULL) {
 					error = pe->pe_restore(pi, dev_nvl);
-					if (error != 0) {
-						nvlist_destroy(dev_nvl);
+					if (error != 0)
 						return (error);
-					}
 				}
-
-				nvlist_destroy(dev_nvl);
 			}
 		}
 	}
