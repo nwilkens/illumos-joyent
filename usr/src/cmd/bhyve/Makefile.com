@@ -27,6 +27,7 @@ COMMON_OBJS = \
 	acpi_device.o		\
 	basl.o			\
 	bhyvegc.o		\
+	bhyve_migrate.o		\
 	bhyverun.o		\
 	block_if.o		\
 	bootrom.o		\

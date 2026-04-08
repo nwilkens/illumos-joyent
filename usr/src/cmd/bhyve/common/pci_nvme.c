@@ -3433,11 +3433,166 @@ pci_nvme_legacy_config(nvlist_t *nvl, const char *opts)
 		return (blockif_legacy_config(nvl, opts));
 }
 
+#ifndef __FreeBSD__
+/*
+ * Migration save/restore for NVMe controller.
+ *
+ * Saves controller registers, per-SQ and per-CQ state (head, tail, size,
+ * associations), and feature settings. Queue base addresses are guest
+ * physical addresses — the actual queue memory lives in guest RAM which
+ * is transferred separately.
+ *
+ * Note on CQ tail/phase: Linux NVMe driver uses a generation counter in
+ * the CID field, so stale CQEs after migration produce a warning but not
+ * a crash. Safe to preserve CQ tail as-is.
+ */
+static int
+pci_nvme_save(struct pci_devinst *pi, nvlist_t *nvl)
+{
+	struct pci_nvme_softc *sc = pi->pi_arg;
+
+	/* Controller registers */
+	nvlist_add_byte_array(nvl, "nvme.regs",
+	    (uchar_t *)&sc->regs, (uint_t)sizeof (sc->regs));
+
+	/* Queue counts */
+	nvlist_add_uint64(nvl, "nvme.max_queues", (uint64_t)sc->max_queues);
+	nvlist_add_uint64(nvl, "nvme.num_squeues", (uint64_t)sc->num_squeues);
+	nvlist_add_uint64(nvl, "nvme.num_cqueues", (uint64_t)sc->num_cqueues);
+	nvlist_add_boolean_value(nvl, "nvme.num_q_is_set",
+	    sc->num_q_is_set ? B_TRUE : B_FALSE);
+
+	/* Submission queues */
+	for (uint32_t i = 0; i <= sc->num_squeues; i++) {
+		struct nvme_submission_queue *sq = &sc->submit_queues[i];
+		char name[48];
+
+		(void) snprintf(name, sizeof (name), "nvme.sq.%u.size", i);
+		nvlist_add_uint64(nvl, name, (uint64_t)sq->size);
+		(void) snprintf(name, sizeof (name), "nvme.sq.%u.head", i);
+		nvlist_add_uint64(nvl, name, (uint64_t)sq->head);
+		(void) snprintf(name, sizeof (name), "nvme.sq.%u.tail", i);
+		nvlist_add_uint64(nvl, name, (uint64_t)sq->tail);
+		(void) snprintf(name, sizeof (name), "nvme.sq.%u.cqid", i);
+		nvlist_add_uint64(nvl, name, (uint64_t)sq->cqid);
+		(void) snprintf(name, sizeof (name), "nvme.sq.%u.qpriority", i);
+		nvlist_add_uint64(nvl, name, (uint64_t)sq->qpriority);
+	}
+
+	/* Completion queues */
+	for (uint32_t i = 0; i <= sc->num_cqueues; i++) {
+		struct nvme_completion_queue *cq = &sc->compl_queues[i];
+		char name[48];
+
+		(void) snprintf(name, sizeof (name), "nvme.cq.%u.size", i);
+		nvlist_add_uint64(nvl, name, (uint64_t)cq->size);
+		(void) snprintf(name, sizeof (name), "nvme.cq.%u.head", i);
+		nvlist_add_uint64(nvl, name, (uint64_t)cq->head);
+		(void) snprintf(name, sizeof (name), "nvme.cq.%u.tail", i);
+		nvlist_add_uint64(nvl, name, (uint64_t)cq->tail);
+		(void) snprintf(name, sizeof (name), "nvme.cq.%u.intr_vec", i);
+		nvlist_add_uint64(nvl, name, (uint64_t)cq->intr_vec);
+		(void) snprintf(name, sizeof (name), "nvme.cq.%u.intr_en", i);
+		nvlist_add_uint64(nvl, name, (uint64_t)cq->intr_en);
+	}
+
+	/* Feature CDW11 values */
+	for (uint32_t i = 0; i < NVME_FID_MAX; i++) {
+		char name[48];
+		(void) snprintf(name, sizeof (name), "nvme.feat.%u", i);
+		nvlist_add_uint64(nvl, name, (uint64_t)sc->feat[i].cdw11);
+	}
+
+	return (0);
+}
+
+static int
+pci_nvme_restore(struct pci_devinst *pi, nvlist_t *nvl)
+{
+	struct pci_nvme_softc *sc = pi->pi_arg;
+	uint64_t val;
+	boolean_t bval;
+
+	/* Restore controller registers */
+	uchar_t *regs;
+	uint_t len;
+	if (nvlist_lookup_byte_array(nvl, "nvme.regs", &regs, &len) == 0 &&
+	    len == sizeof (sc->regs))
+		memcpy(&sc->regs, regs, sizeof (sc->regs));
+
+	/* Restore queue counts */
+	if (nvlist_lookup_uint64(nvl, "nvme.num_squeues", &val) == 0)
+		sc->num_squeues = (uint32_t)val;
+	if (nvlist_lookup_uint64(nvl, "nvme.num_cqueues", &val) == 0)
+		sc->num_cqueues = (uint32_t)val;
+	if (nvlist_lookup_boolean_value(nvl, "nvme.num_q_is_set", &bval) == 0)
+		sc->num_q_is_set = (bval == B_TRUE);
+
+	/* Restore submission queues */
+	for (uint32_t i = 0; i <= sc->num_squeues; i++) {
+		struct nvme_submission_queue *sq = &sc->submit_queues[i];
+		char name[48];
+
+		(void) snprintf(name, sizeof (name), "nvme.sq.%u.size", i);
+		if (nvlist_lookup_uint64(nvl, name, &val) == 0)
+			sq->size = (uint32_t)val;
+		(void) snprintf(name, sizeof (name), "nvme.sq.%u.head", i);
+		if (nvlist_lookup_uint64(nvl, name, &val) == 0)
+			sq->head = (uint16_t)val;
+		(void) snprintf(name, sizeof (name), "nvme.sq.%u.tail", i);
+		if (nvlist_lookup_uint64(nvl, name, &val) == 0)
+			sq->tail = (uint16_t)val;
+		(void) snprintf(name, sizeof (name), "nvme.sq.%u.cqid", i);
+		if (nvlist_lookup_uint64(nvl, name, &val) == 0)
+			sq->cqid = (uint16_t)val;
+		(void) snprintf(name, sizeof (name), "nvme.sq.%u.qpriority", i);
+		if (nvlist_lookup_uint64(nvl, name, &val) == 0)
+			sq->qpriority = (int)val;
+	}
+
+	/* Restore completion queues */
+	for (uint32_t i = 0; i <= sc->num_cqueues; i++) {
+		struct nvme_completion_queue *cq = &sc->compl_queues[i];
+		char name[48];
+
+		(void) snprintf(name, sizeof (name), "nvme.cq.%u.size", i);
+		if (nvlist_lookup_uint64(nvl, name, &val) == 0)
+			cq->size = (uint32_t)val;
+		(void) snprintf(name, sizeof (name), "nvme.cq.%u.head", i);
+		if (nvlist_lookup_uint64(nvl, name, &val) == 0)
+			cq->head = (uint16_t)val;
+		(void) snprintf(name, sizeof (name), "nvme.cq.%u.tail", i);
+		if (nvlist_lookup_uint64(nvl, name, &val) == 0)
+			cq->tail = (uint16_t)val;
+		(void) snprintf(name, sizeof (name), "nvme.cq.%u.intr_vec", i);
+		if (nvlist_lookup_uint64(nvl, name, &val) == 0)
+			cq->intr_vec = (uint16_t)val;
+		(void) snprintf(name, sizeof (name), "nvme.cq.%u.intr_en", i);
+		if (nvlist_lookup_uint64(nvl, name, &val) == 0)
+			cq->intr_en = (uint32_t)val;
+	}
+
+	/* Restore feature CDW11 values */
+	for (uint32_t i = 0; i < NVME_FID_MAX; i++) {
+		char name[48];
+		(void) snprintf(name, sizeof (name), "nvme.feat.%u", i);
+		if (nvlist_lookup_uint64(nvl, name, &val) == 0)
+			sc->feat[i].cdw11 = (uint32_t)val;
+	}
+
+	return (0);
+}
+#endif /* !__FreeBSD__ */
+
 static const struct pci_devemu pci_de_nvme = {
 	.pe_emu =	"nvme",
 	.pe_init =	pci_nvme_init,
 	.pe_legacy_config = pci_nvme_legacy_config,
 	.pe_barwrite =	pci_nvme_write,
-	.pe_barread =	pci_nvme_read
+	.pe_barread =	pci_nvme_read,
+#ifndef __FreeBSD__
+	.pe_save =	pci_nvme_save,
+	.pe_restore =	pci_nvme_restore,
+#endif
 };
 PCI_EMUL_SET(pci_de_nvme);

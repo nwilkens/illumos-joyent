@@ -1322,6 +1322,161 @@ pci_viona_set_hv_features(void *vsc, uint64_t *value)
 	}
 }
 
+#ifndef __FreeBSD__
+/*
+ * Migration save/restore for viona (kernel-accelerated virtio-net).
+ *
+ * The key challenge is that viona ring state is managed in the kernel.
+ * We must:
+ *   Save:  Pause rings → VNA_IOC_RING_GET_STATE per ring → save indices
+ *   Restore: VNA_IOC_RING_SET_STATE per ring → VNA_IOC_RING_SET_MSI →
+ *            VNA_IOC_RING_KICK to restart ring workers
+ *
+ * Critical lesson from Rust impl: viona rings MUST be paused BEFORE
+ * vCPUs are paused. If vCPUs pause first, the kernel ring worker thread
+ * can still consume avail ring entries while the guest is frozen, causing
+ * descriptor ID reuse crashes on the destination.
+ */
+static int
+pci_viona_save(struct pci_devinst *pi, nvlist_t *nvl)
+{
+	struct pci_viona_softc *sc = pi->pi_arg;
+	int nrings = VIONA_NRINGS(sc);
+
+	/* Save virtio common state */
+	vi_save_common(&sc->vsc_vs, nvl);
+
+	/* Save viona-specific config */
+	nvlist_add_byte_array(nvl, "viona.config",
+	    (uchar_t *)&sc->vsc_config, (uint_t)sizeof (sc->vsc_config));
+	nvlist_add_uint64(nvl, "viona.promisc", (uint64_t)sc->vsc_promisc);
+	nvlist_add_boolean_value(nvl, "viona.msix_active",
+	    sc->vsc_msix_active ? B_TRUE : B_FALSE);
+	nvlist_add_uint64(nvl, "viona.vq_usepairs",
+	    (uint64_t)sc->vsc_vq_usepairs);
+
+	/*
+	 * Save kernel ring state for each viona ring (RX + TX pairs).
+	 * The control queue is userspace-only and handled by vi_save_common.
+	 *
+	 * We MUST pause rings before reading state to get a consistent
+	 * snapshot of vr_cur_aidx/vr_cur_uidx.
+	 */
+	for (int i = 0; i < nrings; i++) {
+		vioc_ring_state_t vrs;
+		char name[32];
+
+		/* Pause this ring */
+		if (ioctl(sc->vsc_vnafd, VNA_IOC_RING_PAUSE, i) != 0) {
+			WPRINTF("viona save: ring %d pause failed: %d",
+			    i, errno);
+			/* Continue anyway — state may be stale */
+		}
+
+		/* Get kernel ring state */
+		memset(&vrs, 0, sizeof (vrs));
+		vrs.vrs_index = i;
+		if (ioctl(sc->vsc_vnafd, VNA_IOC_RING_GET_STATE, &vrs) != 0) {
+			WPRINTF("viona save: ring %d get_state failed: %d",
+			    i, errno);
+			continue;
+		}
+
+		(void) snprintf(name, sizeof (name), "viona.ring.%d.avail", i);
+		nvlist_add_uint64(nvl, name, (uint64_t)vrs.vrs_avail_idx);
+		(void) snprintf(name, sizeof (name), "viona.ring.%d.used", i);
+		nvlist_add_uint64(nvl, name, (uint64_t)vrs.vrs_used_idx);
+	}
+
+	return (0);
+}
+
+static int
+pci_viona_restore(struct pci_devinst *pi, nvlist_t *nvl)
+{
+	struct pci_viona_softc *sc = pi->pi_arg;
+	int nrings = VIONA_NRINGS(sc);
+	uint64_t val;
+	boolean_t bval;
+
+	/* Restore virtio common state (includes feature flag propagation) */
+	vi_restore_common(&sc->vsc_vs, nvl);
+
+	/* Restore viona-specific config */
+	uchar_t *cfg;
+	uint_t len;
+	if (nvlist_lookup_byte_array(nvl, "viona.config", &cfg, &len) == 0 &&
+	    len == sizeof (sc->vsc_config))
+		memcpy(&sc->vsc_config, cfg, sizeof (sc->vsc_config));
+
+	if (nvlist_lookup_uint64(nvl, "viona.promisc", &val) == 0)
+		sc->vsc_promisc = (viona_promisc_t)val;
+	if (nvlist_lookup_boolean_value(nvl, "viona.msix_active", &bval) == 0)
+		sc->vsc_msix_active = (bval == B_TRUE);
+	if (nvlist_lookup_uint64(nvl, "viona.vq_usepairs", &val) == 0)
+		sc->vsc_vq_usepairs = (uint16_t)val;
+
+	/* Push negotiated features to kernel */
+	uint64_t features = sc->vsc_vs.vs_negotiated_caps;
+	(void) ioctl(sc->vsc_vnafd, VNA_IOC_SET_FEATURES, features);
+
+	/* Set promiscuous mode */
+	(void) ioctl(sc->vsc_vnafd, VNA_IOC_SET_PROMISC,
+	    (int)sc->vsc_promisc);
+
+	/* Set MTU */
+	(void) ioctl(sc->vsc_vnafd, VNA_IOC_SET_MTU,
+	    (int)sc->vsc_config.vnc_mtu);
+
+	/*
+	 * Restore kernel ring state for each viona ring.
+	 *
+	 * Sequence per ring:
+	 * 1. VNA_IOC_RING_SET_STATE - set addresses + indices
+	 * 2. VNA_IOC_RING_SET_MSI  - program MSI-X interrupt delivery
+	 * 3. VNA_IOC_RING_KICK     - start kernel ring workers
+	 */
+	for (int i = 0; i < nrings; i++) {
+		struct vqueue_info *vq = &sc->vsc_queues[i];
+		vioc_ring_state_t vrs;
+		char name[32];
+		uint64_t avail_idx = 0, used_idx = 0;
+
+		/* Read saved kernel indices */
+		(void) snprintf(name, sizeof (name), "viona.ring.%d.avail", i);
+		(void) nvlist_lookup_uint64(nvl, name, &avail_idx);
+		(void) snprintf(name, sizeof (name), "viona.ring.%d.used", i);
+		(void) nvlist_lookup_uint64(nvl, name, &used_idx);
+
+		if (!(vq->vq_flags & VQ_ALLOC))
+			continue;
+
+		/* Set ring state in kernel */
+		memset(&vrs, 0, sizeof (vrs));
+		vrs.vrs_index = i;
+		vrs.vrs_avail_idx = (uint16_t)avail_idx;
+		vrs.vrs_used_idx = (uint16_t)used_idx;
+		vrs.vrs_qsize = vq->vq_qsize;
+		vrs.vrs_qaddr_desc = vq->vq_desc_gpa;
+		vrs.vrs_qaddr_avail = vq->vq_avail_gpa;
+		vrs.vrs_qaddr_used = vq->vq_used_gpa;
+
+		if (ioctl(sc->vsc_vnafd, VNA_IOC_RING_SET_STATE, &vrs) != 0) {
+			WPRINTF("viona restore: ring %d set_state failed: %d",
+			    i, errno);
+		}
+
+		/* Program MSI-X vector for this ring */
+		pci_viona_ring_set_msix(sc, i);
+
+		/* Kick to start the ring worker */
+		(void) ioctl(sc->vsc_vnafd, VNA_IOC_RING_KICK, i);
+	}
+
+	return (0);
+}
+#endif /* !__FreeBSD__ */
+
 struct pci_devemu pci_de_viona = {
 	.pe_emu =		"virtio-net-viona",
 	.pe_init =		pci_viona_init,
@@ -1331,6 +1486,10 @@ struct pci_devemu pci_de_viona = {
 	.pe_barwrite =		vi_pci_write,
 	.pe_barread =		vi_pci_read,
 	.pe_baraddr =		pci_viona_baraddr,
-	.pe_lintrupdate =	pci_viona_lintrupdate
+	.pe_lintrupdate =	pci_viona_lintrupdate,
+#ifndef __FreeBSD__
+	.pe_save =		pci_viona_save,
+	.pe_restore =		pci_viona_restore,
+#endif
 };
 PCI_EMUL_SET(pci_de_viona);
