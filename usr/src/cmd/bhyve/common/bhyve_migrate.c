@@ -336,7 +336,105 @@ bhyve_migrate_export(struct vmctx *ctx, int ncpus, int fd)
 	}
 
 	free(packed);
-	fprintf(stderr, "mig: exported %zu bytes of VM state\n", packed_len);
+	fprintf(stderr, "mig: exported %zu bytes of device state\n", packed_len);
+
+	/*
+	 * 4. Guest RAM.
+	 *
+	 * Write memory regions as: [count:u64] then per region
+	 * [gpa:u64][len:u64][data]. Guest memory is directly accessible
+	 * via vm_map_gpa() (mmap'd from the VMM device).
+	 */
+	{
+		size_t lowmem = vm_get_lowmem_size(ctx);
+		size_t highmem = vm_get_highmem_size(ctx);
+		uint64_t nregions = (lowmem > 0 ? 1 : 0) +
+		    (highmem > 0 ? 1 : 0);
+
+		if (write(fd, &nregions, sizeof (nregions)) !=
+		    sizeof (nregions)) {
+			fprintf(stderr, "mig: write region count failed\n");
+			return (-1);
+		}
+
+		/* Lowmem: GPA 0 to lowmem */
+		if (lowmem > 0) {
+			void *ptr = vm_map_gpa(ctx, 0, lowmem);
+			uint64_t gpa = 0;
+			uint64_t len = lowmem;
+
+			if (ptr == NULL) {
+				fprintf(stderr, "mig: vm_map_gpa lowmem "
+				    "failed\n");
+				return (-1);
+			}
+
+			if (write(fd, &gpa, 8) != 8 ||
+			    write(fd, &len, 8) != 8) {
+				fprintf(stderr, "mig: write lowmem hdr "
+				    "failed\n");
+				return (-1);
+			}
+
+			/* Write in 4MB chunks to avoid partial writes */
+			size_t chunk = 4 * 1024 * 1024;
+			uint8_t *p = (uint8_t *)ptr;
+			size_t remaining = lowmem;
+			while (remaining > 0) {
+				size_t n = remaining < chunk ? remaining : chunk;
+				ssize_t w = write(fd, p, n);
+				if (w <= 0) {
+					fprintf(stderr,
+					    "mig: write lowmem failed\n");
+					return (-1);
+				}
+				p += w;
+				remaining -= w;
+			}
+			fprintf(stderr, "mig: lowmem exported %zu MB\n",
+			    lowmem / (1024 * 1024));
+		}
+
+		/* Highmem: GPA 4GB to 4GB+highmem */
+		if (highmem > 0) {
+			uint64_t base = vm_get_highmem_base(ctx);
+			void *ptr = vm_map_gpa(ctx, base, highmem);
+			uint64_t gpa = base;
+			uint64_t len = highmem;
+
+			if (ptr == NULL) {
+				fprintf(stderr, "mig: vm_map_gpa highmem "
+				    "failed\n");
+				return (-1);
+			}
+
+			if (write(fd, &gpa, 8) != 8 ||
+			    write(fd, &len, 8) != 8) {
+				fprintf(stderr, "mig: write highmem hdr "
+				    "failed\n");
+				return (-1);
+			}
+
+			size_t chunk = 4 * 1024 * 1024;
+			uint8_t *p = (uint8_t *)ptr;
+			size_t remaining = highmem;
+			while (remaining > 0) {
+				size_t n = remaining < chunk ? remaining : chunk;
+				ssize_t w = write(fd, p, n);
+				if (w <= 0) {
+					fprintf(stderr,
+					    "mig: write highmem failed\n");
+					return (-1);
+				}
+				p += w;
+				remaining -= w;
+			}
+			fprintf(stderr, "mig: highmem exported %zu MB\n",
+			    highmem / (1024 * 1024));
+		}
+	}
+
+	fprintf(stderr, "mig: export complete\n");
 	return (0);
 }
 
@@ -547,6 +645,101 @@ bhyve_migrate_import(struct vmctx *ctx, int ncpus, int fd)
 	}
 
 	nvlist_free(nvl);
+
+	/*
+	 * 4. Import guest RAM.
+	 *
+	 * Read memory regions written after the nvlist:
+	 * [count:u64] then per region [gpa:u64][len:u64][data].
+	 */
+	{
+		uint64_t nregions = 0;
+		if (read(fd, &nregions, sizeof (nregions)) !=
+		    sizeof (nregions)) {
+			fprintf(stderr, "mig: read region count failed "
+			    "(no RAM data?)\n");
+			/* Non-fatal: old checkpoint without RAM */
+			goto done;
+		}
+
+		fprintf(stderr, "mig: importing %llu memory regions\n",
+		    (unsigned long long)nregions);
+
+		/* Sanity: max 2 regions (lowmem + highmem) */
+		if (nregions > 16) {
+			fprintf(stderr, "mig: too many regions: %llu\n",
+			    (unsigned long long)nregions);
+			return (-1);
+		}
+
+		for (uint64_t r = 0; r < nregions; r++) {
+			uint64_t gpa, len;
+
+			if (read(fd, &gpa, 8) != 8 ||
+			    read(fd, &len, 8) != 8) {
+				fprintf(stderr,
+				    "mig: read region %llu hdr failed\n",
+				    (unsigned long long)r);
+				return (-1);
+			}
+
+			/* Validate region size (max 256GB per region) */
+			if (len > 256ULL * 1024 * 1024 * 1024) {
+				fprintf(stderr,
+				    "mig: region %llu too large: %llu\n",
+				    (unsigned long long)r,
+				    (unsigned long long)len);
+				return (-1);
+			}
+
+			void *ptr = vm_map_gpa(ctx, gpa, len);
+			if (ptr == NULL) {
+				fprintf(stderr,
+				    "mig: vm_map_gpa(0x%llx, %llu) "
+				    "failed\n",
+				    (unsigned long long)gpa,
+				    (unsigned long long)len);
+				/* Skip this region's data */
+				for (uint64_t skip = 0; skip < len; ) {
+					char buf[65536];
+					size_t n = len - skip;
+					if (n > sizeof (buf))
+						n = sizeof (buf);
+					(void) read(fd, buf, n);
+					skip += n;
+				}
+				continue;
+			}
+
+			/* Read in chunks */
+			size_t chunk = 4 * 1024 * 1024;
+			uint8_t *p = (uint8_t *)ptr;
+			size_t remaining = len;
+			while (remaining > 0) {
+				size_t n = remaining < chunk ?
+				    remaining : chunk;
+				ssize_t rd = read(fd, p, n);
+				if (rd <= 0) {
+					fprintf(stderr,
+					    "mig: read RAM failed at "
+					    "offset %zu\n",
+					    len - remaining);
+					return (-1);
+				}
+				p += rd;
+				remaining -= rd;
+			}
+
+			fprintf(stderr,
+			    "mig: region %llu: GPA 0x%llx, "
+			    "%llu MB imported\n",
+			    (unsigned long long)r,
+			    (unsigned long long)gpa,
+			    (unsigned long long)(len / (1024 * 1024)));
+		}
+	}
+
+done:
 	fprintf(stderr, "mig: import complete\n");
 	return (0);
 }

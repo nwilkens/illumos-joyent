@@ -761,8 +761,12 @@ checkpoint_thread(void *arg)
 			continue;
 		}
 
-		/* Export state to checkpoint file */
-		int ckpt_fd = open("/checkpoints/vm.checkpoint",
+		/*
+		 * Export state to checkpoint file.
+		 * /tmp inside the zone is tmpfs (memory-backed), so it
+		 * can hold the RAM dump without using zone disk quota.
+		 */
+		int ckpt_fd = open("/tmp/vm.checkpoint",
 		    O_WRONLY | O_CREAT | O_TRUNC, 0600);
 		if (ckpt_fd < 0) {
 			fprintf(stderr, "checkpoint: open failed: %s\n",
@@ -777,7 +781,7 @@ checkpoint_thread(void *arg)
 
 		if (rv == 0) {
 			fprintf(stderr, "checkpoint: saved to "
-			    "/checkpoints/vm.checkpoint — "
+			    "/tmp/vm.checkpoint — "
 			    "VM PAUSED for migration\n");
 			/*
 			 * VM stays paused. The GZ migration script will:
@@ -1015,8 +1019,8 @@ main(int argc, char *argv[])
 		const char *restore_path = get_config_value("migrate.restore");
 		if (restore_path == NULL) {
 			/* Auto-detect: check standard checkpoint location */
-			if (access("/checkpoints/vm.checkpoint", R_OK) == 0)
-				restore_path = "/checkpoints/vm.checkpoint";
+			if (access("/tmp/vm.checkpoint", R_OK) == 0)
+				restore_path = "/tmp/vm.checkpoint";
 		}
 		if (restore_path != NULL) {
 			int rfd = open(restore_path, O_RDONLY);
