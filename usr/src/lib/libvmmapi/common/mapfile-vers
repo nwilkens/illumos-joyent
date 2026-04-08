@@ -131,6 +131,18 @@ SYMBOL_VERSION ILLUMOSprivate {
 		vm_vcpu_open;
 		vm_wrlock_cycle;
 
+		# Migration APIs
+		vm_data_read;
+		vm_data_write;
+		vm_get_fpu;
+		vm_set_fpu;
+		vm_npt_disable_dirty_tracking;
+		vm_npt_enable_dirty_tracking;
+		vm_npt_get_dirty_tracking;
+		vm_npt_reset_dirty;
+		vm_pause_instance;
+		vm_resume_instance;
+
 	local:
 		*;
 };

@@ -104,6 +104,8 @@
 #ifndef __FreeBSD__
 #include "smbiostbl.h"
 #include "privileges.h"
+#include "bhyve_migrate.h"
+#include <signal.h>
 #endif
 
 #define MB		(1024UL * 1024)
@@ -477,8 +479,19 @@ vm_loop(struct vmctx *ctx, struct vcpu *vcpu)
 
 	while (1) {
 		error = vm_run(vcpu, ventry, &vme);
-		if (error != 0)
+		if (error != 0) {
+#ifndef __FreeBSD__
+			/*
+			 * EBUSY means the VM is paused (e.g., for checkpoint
+			 * or migration). Wait and retry.
+			 */
+			if (errno == EBUSY) {
+				usleep(10000); /* 10ms */
+				continue;
+			}
+#endif
 			break;
+		}
 
 		if (ventry->cmd != VEC_DEFAULT) {
 			/*
@@ -706,6 +719,75 @@ mark_provisioned(void)
 
 #endif
 
+#ifndef __FreeBSD__
+/*
+ * Checkpoint thread: blocks on SIGUSR1, then performs a live checkpoint.
+ *
+ * On SIGUSR1:
+ * 1. Pause the VM (VM_PAUSE — pauses all vCPUs + kernel timer devices)
+ * 2. Export all state to /tmp/vm.checkpoint
+ * 3. Resume the VM (VM_RESUME)
+ *
+ * The VM pauses briefly (~10-100ms) for the checkpoint, then continues
+ * running. Pair with "zfs snapshot" for a full point-in-time restore
+ * that captures both VM state AND disk state.
+ */
+static void *
+checkpoint_thread(void *arg)
+{
+	struct vmctx *ctx = (struct vmctx *)arg;
+	sigset_t set;
+	int sig;
+
+	sigemptyset(&set);
+	sigaddset(&set, SIGUSR1);
+
+	for (;;) {
+		sig = sigwaitinfo(&set, NULL);
+		if (sig != SIGUSR1)
+			continue;
+
+		fprintf(stderr, "checkpoint: SIGUSR1 received, "
+		    "checkpointing VM...\n");
+
+		/* Pause the VM (vCPUs + kernel devices) */
+		if (vm_pause_instance(ctx) != 0) {
+			fprintf(stderr, "checkpoint: VM_PAUSE failed: %s\n",
+			    strerror(errno));
+			continue;
+		}
+
+		/* Export state to the pre-opened checkpoint fd */
+		int ckpt_fd = open("/checkpoints/vm.checkpoint",
+		    O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		if (ckpt_fd < 0) {
+			fprintf(stderr, "checkpoint: open failed: %s\n",
+			    strerror(errno));
+		}
+		int rv = -1;
+		if (ckpt_fd >= 0) {
+			rv = bhyve_migrate_export(ctx, guest_ncpus, ckpt_fd);
+			(void) close(ckpt_fd);
+		}
+
+		/* Resume the VM */
+		if (vm_resume_instance(ctx) != 0) {
+			fprintf(stderr, "checkpoint: VM_RESUME failed: %s\n",
+			    strerror(errno));
+		}
+
+		if (rv == 0) {
+			fprintf(stderr, "checkpoint: saved to "
+			    "/checkpoints/vm.checkpoint\n");
+		} else {
+			fprintf(stderr, "checkpoint: export failed\n");
+		}
+	}
+
+	return (NULL);
+}
+#endif /* !__FreeBSD__ */
+
 int
 main(int argc, char *argv[])
 {
@@ -715,6 +797,20 @@ main(int argc, char *argv[])
 	struct vmctx *ctx;
 	size_t memsize;
 	const char *value, *vmname;
+
+#ifndef __FreeBSD__
+	/*
+	 * Block SIGUSR1 early, before any threads are created.
+	 * The checkpoint thread will unblock it via sigwaitinfo().
+	 * All child threads inherit this mask.
+	 */
+	{
+		sigset_t set;
+		sigemptyset(&set);
+		sigaddset(&set, SIGUSR1);
+		(void) pthread_sigmask(SIG_BLOCK, &set, NULL);
+	}
+#endif
 
 	bhyve_init_config();
 
@@ -739,6 +835,8 @@ main(int argc, char *argv[])
 
 #ifndef __FreeBSD__
 	illumos_priv_init();
+	/* Retain file_write privilege for VM state checkpoint/migration */
+	illumos_priv_add_min(PRIV_FILE_WRITE, "migrate");
 #endif
 
 	calc_topology();
@@ -914,6 +1012,23 @@ main(int argc, char *argv[])
          * to drop here.
          */
 	illumos_priv_lock();
+#endif
+
+#ifndef __FreeBSD__
+	/*
+	 * Start the checkpoint thread. SIGUSR1 triggers a live checkpoint:
+	 * pause VM, export state to /tmp/vm.checkpoint, resume VM.
+	 * SIGUSR1 was blocked early in main() before any threads were
+	 * created, so all threads inherit the mask.
+	 */
+	{
+		pthread_t ckpt_tid;
+
+		if (pthread_create(&ckpt_tid, NULL, checkpoint_thread,
+		    ctx) == 0) {
+			pthread_set_name_np(ckpt_tid, "checkpoint");
+		}
+	}
 #endif
 
 	/*
