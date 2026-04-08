@@ -1451,7 +1451,29 @@ pci_viona_restore(struct pci_devinst *pi, nvlist_t *nvl)
 		if (!(vq->vq_flags & VQ_ALLOC))
 			continue;
 
-		/* Set ring state in kernel */
+		/*
+		 * Initialize the ring in the kernel first. This maps
+		 * guest memory into the kernel ring structures.
+		 * Without this, viona ring pointers are NULL and
+		 * incoming packets cause a kernel panic (NULL deref
+		 * in viona_ring_num_avail).
+		 */
+		vioc_ring_init_modern_t vrim;
+		memset(&vrim, 0, sizeof (vrim));
+		vrim.rim_index = i;
+		vrim.rim_qsize = vq->vq_qsize;
+		vrim.rim_qaddr_desc = vq->vq_desc_gpa;
+		vrim.rim_qaddr_avail = vq->vq_avail_gpa;
+		vrim.rim_qaddr_used = vq->vq_used_gpa;
+
+		if (ioctl(sc->vsc_vnafd, VNA_IOC_RING_INIT_MODERN,
+		    &vrim) != 0) {
+			WPRINTF("viona restore: ring %d init failed: %d",
+			    i, errno);
+			continue;
+		}
+
+		/* Now set the kernel's consumed/returned indices */
 		memset(&vrs, 0, sizeof (vrs));
 		vrs.vrs_index = i;
 		vrs.vrs_avail_idx = (uint16_t)avail_idx;
