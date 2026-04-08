@@ -2103,3 +2103,145 @@ done:
 	if (vs->vs_mtx)
 		pthread_mutex_unlock(vs->vs_mtx);
 }
+
+#ifndef __FreeBSD__
+/*
+ * Save/restore helpers for virtio common state (migration).
+ *
+ * vi_save_common() saves the virtio softc and per-queue state into the
+ * provided nvlist.  vi_restore_common() restores it, including calling
+ * vc_apply_features() to propagate negotiated feature flags to queues.
+ * Without this, features like INDIRECT_DESC and EVENT_IDX would not be
+ * set on the restored queues, causing silent I/O failures.
+ */
+int
+vi_save_common(struct virtio_softc *vs, nvlist_t *nvl)
+{
+	struct virtio_consts *vc = vs->vs_vc;
+
+	nvlist_add_number(nvl, "vi.negotiated_caps", vs->vs_negotiated_caps);
+	nvlist_add_number(nvl, "vi.status", vs->vs_status);
+	nvlist_add_number(nvl, "vi.isr", vs->vs_isr);
+	nvlist_add_number(nvl, "vi.msix_cfg_idx", vs->vs_msix_cfg_idx);
+	nvlist_add_number(nvl, "vi.curq", vs->vs_curq);
+	nvlist_add_number(nvl, "vi.flags", (uint64_t)vs->vs_flags);
+	nvlist_add_number(nvl, "vi.mode", (uint64_t)vs->vs_mode);
+	nvlist_add_number(nvl, "vi.nvq", vc->vc_nvq);
+
+	for (int i = 0; i < vc->vc_nvq; i++) {
+		struct vqueue_info *vq = &vs->vs_queues[i];
+		char name[32];
+
+		(void) snprintf(name, sizeof (name), "vq.%d.qsize", i);
+		nvlist_add_number(nvl, name, vq->vq_qsize);
+		(void) snprintf(name, sizeof (name), "vq.%d.pfn", i);
+		nvlist_add_number(nvl, name, vq->vq_pfn);
+		(void) snprintf(name, sizeof (name), "vq.%d.flags", i);
+		nvlist_add_number(nvl, name, vq->vq_flags);
+		(void) snprintf(name, sizeof (name), "vq.%d.last_avail", i);
+		nvlist_add_number(nvl, name, vq->vq_last_avail);
+		(void) snprintf(name, sizeof (name), "vq.%d.next_used", i);
+		nvlist_add_number(nvl, name, vq->vq_next_used);
+		(void) snprintf(name, sizeof (name), "vq.%d.save_used", i);
+		nvlist_add_number(nvl, name, vq->vq_save_used);
+		(void) snprintf(name, sizeof (name), "vq.%d.msix_idx", i);
+		nvlist_add_number(nvl, name, vq->vq_msix_idx);
+		(void) snprintf(name, sizeof (name), "vq.%d.desc_gpa", i);
+		nvlist_add_number(nvl, name, vq->vq_desc_gpa);
+		(void) snprintf(name, sizeof (name), "vq.%d.avail_gpa", i);
+		nvlist_add_number(nvl, name, vq->vq_avail_gpa);
+		(void) snprintf(name, sizeof (name), "vq.%d.used_gpa", i);
+		nvlist_add_number(nvl, name, vq->vq_used_gpa);
+	}
+
+	return (0);
+}
+
+int
+vi_restore_common(struct virtio_softc *vs, nvlist_t *nvl)
+{
+	struct virtio_consts *vc = vs->vs_vc;
+
+	vs->vs_negotiated_caps = nvlist_get_number(nvl, "vi.negotiated_caps");
+	vs->vs_status = (uint8_t)nvlist_get_number(nvl, "vi.status");
+	vs->vs_isr = (uint8_t)nvlist_get_number(nvl, "vi.isr");
+	vs->vs_msix_cfg_idx = (uint16_t)nvlist_get_number(nvl,
+	    "vi.msix_cfg_idx");
+	vs->vs_curq = (int)nvlist_get_number(nvl, "vi.curq");
+	vs->vs_flags = (virtio_flags_t)nvlist_get_number(nvl, "vi.flags");
+	vs->vs_mode = (virtio_mode_t)nvlist_get_number(nvl, "vi.mode");
+
+	int nvq = (int)nvlist_get_number(nvl, "vi.nvq");
+	if (nvq > vc->vc_max_nvq)
+		nvq = vc->vc_max_nvq;
+
+	for (int i = 0; i < nvq; i++) {
+		struct vqueue_info *vq = &vs->vs_queues[i];
+		char name[32];
+
+		(void) snprintf(name, sizeof (name), "vq.%d.qsize", i);
+		vq->vq_qsize = (uint16_t)nvlist_get_number(nvl, name);
+		(void) snprintf(name, sizeof (name), "vq.%d.pfn", i);
+		vq->vq_pfn = (uint32_t)nvlist_get_number(nvl, name);
+		(void) snprintf(name, sizeof (name), "vq.%d.flags", i);
+		vq->vq_flags = (uint16_t)nvlist_get_number(nvl, name);
+		(void) snprintf(name, sizeof (name), "vq.%d.last_avail", i);
+		vq->vq_last_avail = (uint16_t)nvlist_get_number(nvl, name);
+		(void) snprintf(name, sizeof (name), "vq.%d.next_used", i);
+		vq->vq_next_used = (uint16_t)nvlist_get_number(nvl, name);
+		(void) snprintf(name, sizeof (name), "vq.%d.save_used", i);
+		vq->vq_save_used = (uint16_t)nvlist_get_number(nvl, name);
+		(void) snprintf(name, sizeof (name), "vq.%d.msix_idx", i);
+		vq->vq_msix_idx = (uint16_t)nvlist_get_number(nvl, name);
+		(void) snprintf(name, sizeof (name), "vq.%d.desc_gpa", i);
+		vq->vq_desc_gpa = nvlist_get_number(nvl, name);
+		(void) snprintf(name, sizeof (name), "vq.%d.avail_gpa", i);
+		vq->vq_avail_gpa = nvlist_get_number(nvl, name);
+		(void) snprintf(name, sizeof (name), "vq.%d.used_gpa", i);
+		vq->vq_used_gpa = nvlist_get_number(nvl, name);
+
+		/*
+		 * Re-map the queue rings into host virtual addresses if the
+		 * queue was allocated (has a valid PFN or GPA).
+		 */
+		if (vq->vq_flags & VQ_ALLOC) {
+			struct vmctx *ctx = vs->vs_pi->pi_vmctx;
+
+			if (vq->vq_desc_gpa != 0) {
+				/* Modern: individual GPAs */
+				vq->vq_desc = vm_map_gpa(ctx,
+				    vq->vq_desc_gpa,
+				    vq->vq_qsize *
+				    sizeof (struct vring_desc));
+				vq->vq_avail = vm_map_gpa(ctx,
+				    vq->vq_avail_gpa,
+				    sizeof (uint16_t) * (3 + vq->vq_qsize));
+				vq->vq_used = vm_map_gpa(ctx,
+				    vq->vq_used_gpa,
+				    sizeof (uint16_t) * 3 +
+				    sizeof (struct vring_used_elem) *
+				    vq->vq_qsize);
+			} else if (vq->vq_pfn != 0) {
+				/* Legacy: compute from PFN */
+				int saved_curq = vs->vs_curq;
+				vs->vs_curq = i;
+				vi_legacy_vq_init(vs, vq->vq_pfn);
+				vs->vs_curq = saved_curq;
+			}
+		}
+	}
+
+	/*
+	 * Critical: propagate negotiated feature flags to queues.
+	 * Without this, features like INDIRECT_DESC stay disabled on
+	 * restore, causing silent I/O stalls (virtio-blk) or broken
+	 * networking (viona).
+	 */
+	if (vc->vc_apply_features != NULL) {
+		(*vc->vc_apply_features)(DEV_SOFTC(vs),
+		    &vs->vs_negotiated_caps);
+	}
+
+	return (0);
+}
+#endif /* !__FreeBSD__ */

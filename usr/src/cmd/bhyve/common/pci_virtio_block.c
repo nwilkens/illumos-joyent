@@ -648,6 +648,44 @@ pci_vtblk_apply_feats(void *vsc, uint64_t *caps)
 }
 #endif /* __FreeBSD__ */
 
+#ifndef __FreeBSD__
+static int
+pci_vtblk_save(struct pci_devinst *pi, nvlist_t *nvl)
+{
+	struct pci_vtblk_softc *sc = pi->pi_arg;
+
+	/* Save virtio common state (queues, features, status) */
+	vi_save_common(&sc->vbsc_vs, nvl);
+
+	/* Save block-specific config */
+	nvlist_add_byte_array(nvl, "vtblk.cfg", (const uint8_t *)&sc->vbsc_cfg,
+	    sizeof (sc->vbsc_cfg));
+	nvlist_add_number(nvl, "vtblk.wce", sc->vbsc_wce);
+
+	return (0);
+}
+
+static int
+pci_vtblk_restore(struct pci_devinst *pi, nvlist_t *nvl)
+{
+	struct pci_vtblk_softc *sc = pi->pi_arg;
+
+	/* Restore virtio common state (includes feature flag propagation) */
+	vi_restore_common(&sc->vbsc_vs, nvl);
+
+	/* Restore block-specific config */
+	const uint8_t *cfg;
+	size_t len;
+	cfg = nvlist_get_byte_array(nvl, "vtblk.cfg", &len);
+	if (cfg != NULL && len == sizeof (sc->vbsc_cfg))
+		memcpy(&sc->vbsc_cfg, cfg, sizeof (sc->vbsc_cfg));
+
+	sc->vbsc_wce = (int)nvlist_get_number(nvl, "vtblk.wce");
+
+	return (0);
+}
+#endif /* !__FreeBSD__ */
+
 static const struct pci_devemu pci_de_vblk = {
 	.pe_emu =	"virtio-blk",
 	.pe_init =	pci_vtblk_init,
@@ -656,5 +694,9 @@ static const struct pci_devemu pci_de_vblk = {
 	.pe_cfgread =	vi_pci_cfgread,
 	.pe_barwrite =	vi_pci_write,
 	.pe_barread =	vi_pci_read,
+#ifndef __FreeBSD__
+	.pe_save =	pci_vtblk_save,
+	.pe_restore =	pci_vtblk_restore,
+#endif
 };
 PCI_EMUL_SET(pci_de_vblk);

@@ -45,4 +45,10 @@ void	uart_ns16550_write(struct uart_ns16550_softc *sc, int offset,
 int	uart_ns16550_tty_open(struct uart_ns16550_softc *sc,
 	    const char *device);
 
+#ifndef __FreeBSD__
+#include <sys/nv.h>
+int	uart_ns16550_save(struct uart_ns16550_softc *sc, nvlist_t *nvl);
+int	uart_ns16550_restore(struct uart_ns16550_softc *sc, nvlist_t *nvl);
+#endif
+
 #endif /* _UART_EMUL_H_ */

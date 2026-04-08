@@ -350,6 +350,28 @@ int vm_get_run_state(struct vcpu *vcpu, enum vcpu_run_state *state,
 int vm_set_run_state(struct vcpu *vcpu, enum vcpu_run_state state,
     uint8_t sipi_vector);
 int vm_vcpu_barrier(struct vcpu *vcpu);
+
+/* VM pause/resume (for migration) */
+int	vm_pause_instance(struct vmctx *ctx);
+int	vm_resume_instance(struct vmctx *ctx);
+
+/* VM data read/write (kernel device state for migration) */
+int	vm_data_read(struct vmctx *ctx, int vcpuid, uint16_t class,
+	    uint16_t version, uint32_t flags, void *data, uint32_t len,
+	    uint32_t *result_len);
+int	vm_data_write(struct vmctx *ctx, int vcpuid, uint16_t class,
+	    uint16_t version, uint32_t flags, const void *data, uint32_t len);
+
+/* FPU state (for migration) */
+int	vm_get_fpu(struct vcpu *vcpu, void *buf, size_t len);
+int	vm_set_fpu(struct vcpu *vcpu, const void *buf, size_t len);
+
+/* Dirty page tracking via NPT operations (for migration) */
+int	vm_npt_enable_dirty_tracking(struct vmctx *ctx);
+int	vm_npt_disable_dirty_tracking(struct vmctx *ctx);
+int	vm_npt_get_dirty_tracking(struct vmctx *ctx, int *enabled);
+int	vm_npt_reset_dirty(struct vmctx *ctx, uint64_t gpa, uint64_t len,
+	    uint8_t *bitmap);
 #endif	/* __FreeBSD__ */
 
 #ifdef	__FreeBSD__

@@ -2250,6 +2250,170 @@ vm_vcpu_barrier(struct vcpu *vcpu)
 
 	return (0);
 }
+
+int
+vm_pause_instance(struct vmctx *ctx)
+{
+	if (ioctl(ctx->fd, VM_PAUSE, 0) != 0) {
+		return (-1);
+	}
+	return (0);
+}
+
+int
+vm_resume_instance(struct vmctx *ctx)
+{
+	if (ioctl(ctx->fd, VM_RESUME, 0) != 0) {
+		return (-1);
+	}
+	return (0);
+}
+
+int
+vm_data_read(struct vmctx *ctx, int vcpuid, uint16_t class, uint16_t version,
+    uint32_t flags, void *data, uint32_t len, uint32_t *result_len)
+{
+	struct vm_data_xfer vdx;
+
+	bzero(&vdx, sizeof(vdx));
+	vdx.vdx_vcpuid = vcpuid;
+	vdx.vdx_class = class;
+	vdx.vdx_version = version;
+	vdx.vdx_flags = flags;
+	vdx.vdx_len = len;
+	vdx.vdx_data = data;
+
+	if (ioctl(ctx->fd, VM_DATA_READ, &vdx) != 0) {
+		return (-1);
+	}
+
+	if (result_len != NULL)
+		*result_len = vdx.vdx_result_len;
+
+	return (0);
+}
+
+int
+vm_data_write(struct vmctx *ctx, int vcpuid, uint16_t class, uint16_t version,
+    uint32_t flags, const void *data, uint32_t len)
+{
+	struct vm_data_xfer vdx;
+
+	bzero(&vdx, sizeof(vdx));
+	vdx.vdx_vcpuid = vcpuid;
+	vdx.vdx_class = class;
+	vdx.vdx_version = version;
+	vdx.vdx_flags = flags;
+	vdx.vdx_len = len;
+	vdx.vdx_data = (void *)(uintptr_t)data;
+
+	if (ioctl(ctx->fd, VM_DATA_WRITE, &vdx) != 0) {
+		return (-1);
+	}
+
+	return (0);
+}
+
+int
+vm_get_fpu(struct vcpu *vcpu, void *buf, size_t len)
+{
+	struct vm_fpu_state vfs;
+
+	bzero(&vfs, sizeof(vfs));
+	vfs.vcpuid = vcpu->vcpuid;
+	vfs.buf = buf;
+	vfs.len = len;
+
+	if (vcpu_ioctl(vcpu, VM_GET_FPU, &vfs) != 0) {
+		return (-1);
+	}
+
+	return (0);
+}
+
+int
+vm_set_fpu(struct vcpu *vcpu, const void *buf, size_t len)
+{
+	struct vm_fpu_state vfs;
+
+	bzero(&vfs, sizeof(vfs));
+	vfs.vcpuid = vcpu->vcpuid;
+	vfs.buf = (void *)(uintptr_t)buf;
+	vfs.len = len;
+
+	if (vcpu_ioctl(vcpu, VM_SET_FPU, &vfs) != 0) {
+		return (-1);
+	}
+
+	return (0);
+}
+
+int
+vm_npt_enable_dirty_tracking(struct vmctx *ctx)
+{
+	struct vm_npt_operation vno;
+
+	bzero(&vno, sizeof(vno));
+	vno.vno_operation = VNO_OP_EN_TRACK_DIRTY;
+
+	if (ioctl(ctx->fd, VM_NPT_OPERATION, &vno) != 0) {
+		return (-1);
+	}
+
+	return (0);
+}
+
+int
+vm_npt_disable_dirty_tracking(struct vmctx *ctx)
+{
+	struct vm_npt_operation vno;
+
+	bzero(&vno, sizeof(vno));
+	vno.vno_operation = VNO_OP_DIS_TRACK_DIRTY;
+
+	if (ioctl(ctx->fd, VM_NPT_OPERATION, &vno) != 0) {
+		return (-1);
+	}
+
+	return (0);
+}
+
+int
+vm_npt_get_dirty_tracking(struct vmctx *ctx, int *enabled)
+{
+	struct vm_npt_operation vno;
+	int rv;
+
+	bzero(&vno, sizeof(vno));
+	vno.vno_operation = VNO_OP_GET_TRACK_DIRTY;
+
+	rv = ioctl(ctx->fd, VM_NPT_OPERATION, &vno);
+	if (rv < 0) {
+		return (-1);
+	}
+
+	*enabled = rv;
+	return (0);
+}
+
+int
+vm_npt_reset_dirty(struct vmctx *ctx, uint64_t gpa, uint64_t len,
+    uint8_t *bitmap)
+{
+	struct vm_npt_operation vno;
+
+	bzero(&vno, sizeof(vno));
+	vno.vno_gpa = gpa;
+	vno.vno_len = len;
+	vno.vno_bitmap = bitmap;
+	vno.vno_operation = VNO_OP_RESET_DIRTY | VNO_FLAG_BITMAP_OUT;
+
+	if (ioctl(ctx->fd, VM_NPT_OPERATION, &vno) != 0) {
+		return (-1);
+	}
+
+	return (0);
+}
 #endif /* __FreeBSD__ */
 
 #ifdef __FreeBSD__

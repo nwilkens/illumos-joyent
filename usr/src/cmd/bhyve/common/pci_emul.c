@@ -2445,6 +2445,211 @@ INOUT_PORT(pci_cfgdata, CONF1_DATA_PORT+1, IOPORT_F_INOUT, pci_emul_cfgdata);
 INOUT_PORT(pci_cfgdata, CONF1_DATA_PORT+2, IOPORT_F_INOUT, pci_emul_cfgdata);
 INOUT_PORT(pci_cfgdata, CONF1_DATA_PORT+3, IOPORT_F_INOUT, pci_emul_cfgdata);
 
+#ifndef __FreeBSD__
+/*
+ * Migration save/restore framework.
+ *
+ * pci_save_all() iterates all instantiated PCI devices and saves their
+ * PCI config space and device-specific state (via pe_save callback) into
+ * the provided nvlist, keyed by "bus.slot.func".
+ *
+ * pci_restore_all() is the inverse: it extracts per-device sub-nvlists
+ * and restores PCI config space and device state (via pe_restore callback).
+ */
+
+static int
+pci_save_cfgspace(struct pci_devinst *pi, nvlist_t *nvl)
+{
+	nvlist_add_byte_array(nvl, "cfgdata", pi->pi_cfgdata,
+	    sizeof (pi->pi_cfgdata));
+
+	/* Save MSI state */
+	nvlist_add_bool(nvl, "msi.enabled", pi->pi_msi.enabled != 0);
+	nvlist_add_number(nvl, "msi.addr", pi->pi_msi.addr);
+	nvlist_add_number(nvl, "msi.msg_data", pi->pi_msi.msg_data);
+	nvlist_add_number(nvl, "msi.maxmsgnum", pi->pi_msi.maxmsgnum);
+
+	/* Save MSI-X state */
+	nvlist_add_bool(nvl, "msix.enabled", pi->pi_msix.enabled != 0);
+	nvlist_add_number(nvl, "msix.table_bar", pi->pi_msix.table_bar);
+	nvlist_add_number(nvl, "msix.table_count", pi->pi_msix.table_count);
+	nvlist_add_number(nvl, "msix.function_mask",
+	    pi->pi_msix.function_mask);
+	if (pi->pi_msix.table != NULL && pi->pi_msix.table_count > 0) {
+		nvlist_add_byte_array(nvl, "msix.table",
+		    (const uint8_t *)pi->pi_msix.table,
+		    pi->pi_msix.table_count *
+		    sizeof (struct msix_table_entry));
+	}
+
+	/* Save BAR configuration */
+	for (int i = 0; i < PCI_BARMAX_WITH_ROM + 1; i++) {
+		char name[32];
+		(void) snprintf(name, sizeof (name), "bar.%d.type", i);
+		nvlist_add_number(nvl, name, pi->pi_bar[i].type);
+		(void) snprintf(name, sizeof (name), "bar.%d.addr", i);
+		nvlist_add_number(nvl, name, pi->pi_bar[i].addr);
+	}
+
+	return (0);
+}
+
+static int
+pci_restore_cfgspace(struct pci_devinst *pi, nvlist_t *nvl)
+{
+	const uint8_t *cfgdata;
+	size_t len;
+
+	cfgdata = nvlist_get_byte_array(nvl, "cfgdata", &len);
+	if (cfgdata == NULL || len != sizeof (pi->pi_cfgdata))
+		return (-1);
+	memcpy(pi->pi_cfgdata, cfgdata, sizeof (pi->pi_cfgdata));
+
+	/* Restore MSI state */
+	pi->pi_msi.enabled = nvlist_get_bool(nvl, "msi.enabled") ? 1 : 0;
+	pi->pi_msi.addr = nvlist_get_number(nvl, "msi.addr");
+	pi->pi_msi.msg_data = nvlist_get_number(nvl, "msi.msg_data");
+	pi->pi_msi.maxmsgnum = nvlist_get_number(nvl, "msi.maxmsgnum");
+
+	/* Restore MSI-X state */
+	pi->pi_msix.enabled = nvlist_get_bool(nvl, "msix.enabled") ? 1 : 0;
+	pi->pi_msix.function_mask =
+	    nvlist_get_number(nvl, "msix.function_mask");
+	if (pi->pi_msix.table != NULL) {
+		const uint8_t *tbl;
+		size_t tbllen;
+		tbl = nvlist_get_byte_array(nvl, "msix.table", &tbllen);
+		if (tbl != NULL) {
+			size_t expected = pi->pi_msix.table_count *
+			    sizeof (struct msix_table_entry);
+			if (tbllen == expected)
+				memcpy(pi->pi_msix.table, tbl, expected);
+		}
+	}
+
+	return (0);
+}
+
+int
+pci_save_all(nvlist_t *nvl)
+{
+	struct businfo *bi;
+	struct slotinfo *si;
+	struct funcinfo *fi;
+	struct pci_devinst *pi;
+	struct pci_devemu *pe;
+	char key[32];
+	int bus, slot, func;
+	int error = 0;
+
+	for (bus = 0; bus < MAXBUSES; bus++) {
+		if ((bi = pci_businfo[bus]) == NULL)
+			continue;
+
+		for (slot = 0; slot < MAXSLOTS; slot++) {
+			si = &bi->slotinfo[slot];
+			for (func = 0; func < MAXFUNCS; func++) {
+				fi = &si->si_funcs[func];
+				pi = fi->fi_devi;
+				if (pi == NULL)
+					continue;
+				pe = pi->pi_d;
+
+				(void) snprintf(key, sizeof (key),
+				    "%d.%d.%d", bus, slot, func);
+
+				nvlist_t *dev_nvl = nvlist_create(0);
+				if (dev_nvl == NULL)
+					return (-1);
+
+				nvlist_add_string(dev_nvl, "device",
+				    pe->pe_emu);
+
+				/* Save PCI config space */
+				error = pci_save_cfgspace(pi, dev_nvl);
+				if (error != 0) {
+					nvlist_destroy(dev_nvl);
+					return (error);
+				}
+
+				/* Save device-specific state */
+				if (pe->pe_save != NULL) {
+					error = pe->pe_save(pi, dev_nvl);
+					if (error != 0) {
+						nvlist_destroy(dev_nvl);
+						return (error);
+					}
+				}
+
+				nvlist_add_nvlist(nvl, key, dev_nvl);
+				nvlist_destroy(dev_nvl);
+			}
+		}
+	}
+
+	return (0);
+}
+
+int
+pci_restore_all(nvlist_t *nvl)
+{
+	struct businfo *bi;
+	struct slotinfo *si;
+	struct funcinfo *fi;
+	struct pci_devinst *pi;
+	struct pci_devemu *pe;
+	char key[32];
+	int bus, slot, func;
+	int error = 0;
+
+	for (bus = 0; bus < MAXBUSES; bus++) {
+		if ((bi = pci_businfo[bus]) == NULL)
+			continue;
+
+		for (slot = 0; slot < MAXSLOTS; slot++) {
+			si = &bi->slotinfo[slot];
+			for (func = 0; func < MAXFUNCS; func++) {
+				fi = &si->si_funcs[func];
+				pi = fi->fi_devi;
+				if (pi == NULL)
+					continue;
+				pe = pi->pi_d;
+
+				(void) snprintf(key, sizeof (key),
+				    "%d.%d.%d", bus, slot, func);
+
+				if (!nvlist_exists_nvlist(nvl, key))
+					continue;
+
+				nvlist_t *dev_nvl = nvlist_take_nvlist(nvl, key);
+				if (dev_nvl == NULL)
+					continue;
+
+				/* Restore PCI config space */
+				error = pci_restore_cfgspace(pi, dev_nvl);
+				if (error != 0) {
+					nvlist_destroy(dev_nvl);
+					return (error);
+				}
+
+				/* Restore device-specific state */
+				if (pe->pe_restore != NULL) {
+					error = pe->pe_restore(pi, dev_nvl);
+					if (error != 0) {
+						nvlist_destroy(dev_nvl);
+						return (error);
+					}
+				}
+
+				nvlist_destroy(dev_nvl);
+			}
+		}
+	}
+
+	return (0);
+}
+#endif /* !__FreeBSD__ */
+
 #define PCI_EMUL_TEST
 #ifdef PCI_EMUL_TEST
 /*

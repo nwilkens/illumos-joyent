@@ -487,6 +487,46 @@ uart_ns16550_init(uart_intr_func_t intr_assert, uart_intr_func_t intr_deassert,
 	return (sc);
 }
 
+#ifndef __FreeBSD__
+#include <sys/nv.h>
+
+int
+uart_ns16550_save(struct uart_ns16550_softc *sc, nvlist_t *nvl)
+{
+	nvlist_add_number(nvl, "uart.data", sc->data);
+	nvlist_add_number(nvl, "uart.ier", sc->ier);
+	nvlist_add_number(nvl, "uart.lcr", sc->lcr);
+	nvlist_add_number(nvl, "uart.mcr", sc->mcr);
+	nvlist_add_number(nvl, "uart.lsr", sc->lsr);
+	nvlist_add_number(nvl, "uart.msr", sc->msr);
+	nvlist_add_number(nvl, "uart.fcr", sc->fcr);
+	nvlist_add_number(nvl, "uart.scr", sc->scr);
+	nvlist_add_number(nvl, "uart.dll", sc->dll);
+	nvlist_add_number(nvl, "uart.dlh", sc->dlh);
+	nvlist_add_bool(nvl, "uart.thre_int_pending", sc->thre_int_pending);
+
+	return (0);
+}
+
+int
+uart_ns16550_restore(struct uart_ns16550_softc *sc, nvlist_t *nvl)
+{
+	sc->data = (uint8_t)nvlist_get_number(nvl, "uart.data");
+	sc->ier = (uint8_t)nvlist_get_number(nvl, "uart.ier");
+	sc->lcr = (uint8_t)nvlist_get_number(nvl, "uart.lcr");
+	sc->mcr = (uint8_t)nvlist_get_number(nvl, "uart.mcr");
+	sc->lsr = (uint8_t)nvlist_get_number(nvl, "uart.lsr");
+	sc->msr = (uint8_t)nvlist_get_number(nvl, "uart.msr");
+	sc->fcr = (uint8_t)nvlist_get_number(nvl, "uart.fcr");
+	sc->scr = (uint8_t)nvlist_get_number(nvl, "uart.scr");
+	sc->dll = (uint8_t)nvlist_get_number(nvl, "uart.dll");
+	sc->dlh = (uint8_t)nvlist_get_number(nvl, "uart.dlh");
+	sc->thre_int_pending = nvlist_get_bool(nvl, "uart.thre_int_pending");
+
+	return (0);
+}
+#endif /* !__FreeBSD__ */
+
 int
 uart_ns16550_tty_open(struct uart_ns16550_softc *sc, const char *device)
 {

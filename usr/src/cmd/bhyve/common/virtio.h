@@ -531,4 +531,10 @@ void	vi_pci_write(struct pci_devinst *pi, int baridx, uint64_t offset,
 void	vi_vq_init(struct virtio_softc *);
 void	vi_legacy_vq_init(struct virtio_softc *, uint32_t);
 
+#ifndef __FreeBSD__
+/* Migration save/restore helpers for virtio devices */
+int	vi_save_common(struct virtio_softc *vs, nvlist_t *nvl);
+int	vi_restore_common(struct virtio_softc *vs, nvlist_t *nvl);
+#endif
+
 #endif	/* _BHYVE_VIRTIO_H_ */
