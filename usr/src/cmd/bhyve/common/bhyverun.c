@@ -988,6 +988,37 @@ main(int argc, char *argv[])
 		err(EX_OSERR, "vmentry_init() failed");
 #endif
 
+#ifndef __FreeBSD__
+	/*
+	 * If migrate.restore is set, import VM state from checkpoint file
+	 * before starting vCPUs. This restores all kernel device state,
+	 * vCPU registers, FPU, and userspace device state.
+	 *
+	 * Usage: bhyve ... -o migrate.restore=/checkpoints/vm.checkpoint
+	 */
+	{
+		const char *restore_path = get_config_value("migrate.restore");
+		if (restore_path != NULL) {
+			int rfd = open(restore_path, O_RDONLY);
+			if (rfd < 0) {
+				fprintf(stderr,
+				    "migrate: open %s: %s\n",
+				    restore_path, strerror(errno));
+				exit(4);
+			}
+			fprintf(stderr,
+			    "migrate: restoring from %s\n", restore_path);
+			if (bhyve_migrate_import(ctx, guest_ncpus, rfd) != 0) {
+				fprintf(stderr, "migrate: import failed\n");
+				(void) close(rfd);
+				exit(4);
+			}
+			(void) close(rfd);
+			fprintf(stderr, "migrate: restore complete\n");
+		}
+	}
+#endif
+
 	/*
 	 * Add all vCPUs.
 	 */
