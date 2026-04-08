@@ -428,8 +428,25 @@ bhyve_migrate_import(struct vmctx *ctx, int ncpus, int fd)
 			if (nvlist_lookup_byte_array(cpu_nvl, "registers",
 			    &regdata, &reglen) == 0 &&
 			    reglen == sizeof (uint64_t) * N_VCPU_REGS) {
-				(void) vm_set_register_set(vcpu, N_VCPU_REGS,
+				int rr = vm_set_register_set(vcpu, N_VCPU_REGS,
 				    vcpu_regs, (uint64_t *)regdata);
+				if (rr != 0) {
+					fprintf(stderr,
+					    "mig: vm_set_register_set "
+					    "vcpu%d failed: %s\n",
+					    cpu, strerror(errno));
+				} else {
+					fprintf(stderr,
+					    "mig: vcpu%d registers "
+					    "restored (%u regs)\n",
+					    cpu, (uint_t)N_VCPU_REGS);
+				}
+			} else {
+				fprintf(stderr,
+				    "mig: vcpu%d no register data "
+				    "(len=%u expected=%zu)\n",
+				    cpu, reglen,
+				    sizeof (uint64_t) * N_VCPU_REGS);
 			}
 		}
 
@@ -474,7 +491,11 @@ bhyve_migrate_import(struct vmctx *ctx, int ncpus, int fd)
 			if (nvlist_lookup_byte_array(cpu_nvl, "fpu",
 			    &fpudata, &fpulen) == 0 &&
 			    fpulen <= FPU_BUF_SIZE) {
-				(void) vm_set_fpu(vcpu, fpudata, fpulen);
+				int fr = vm_set_fpu(vcpu, fpudata, fpulen);
+				fprintf(stderr, "mig: vcpu%d FPU %s "
+				    "(%u bytes)\n", cpu,
+				    fr == 0 ? "restored" : "FAILED",
+				    fpulen);
 			}
 		}
 

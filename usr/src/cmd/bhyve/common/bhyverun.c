@@ -1044,6 +1044,19 @@ main(int argc, char *argv[])
 			/* Remove checkpoint after successful import */
 			(void) unlink(restore_path);
 
+			/*
+			 * Verify register state was applied by reading
+			 * back RIP for the BSP.
+			 */
+			{
+				uint64_t rip_val = 0;
+				(void) vm_get_register(bsp, VM_REG_GUEST_RIP,
+				    &rip_val);
+				fprintf(stderr,
+				    "migrate: BSP RIP after restore: 0x%llx\n",
+				    (unsigned long long)rip_val);
+			}
+
 			/* Resume so vCPU threads can start */
 			(void) vm_resume_instance(ctx);
 			fprintf(stderr, "migrate: restore complete\n");
