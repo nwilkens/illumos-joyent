@@ -1008,7 +1008,16 @@ main(int argc, char *argv[])
 			assert(error == 0);
 		}
 	} else {
-		fprintf(stderr, "migrate-listen: skipping bootrom\n");
+		/*
+		 * In migrate-listen mode, skip bootrom but DO reset the BSP
+		 * to initialize VMCS host-state fields.  Without this,
+		 * VM_RUN fails because the VMCS is not properly initialized.
+		 * The guest-state fields will be overwritten by import-state.
+		 */
+		fprintf(stderr, "migrate-listen: skipping bootrom, "
+		    "resetting BSP\n");
+		error = vcpu_reset(bsp);
+		assert(error == 0);
 	}
 
 	if (bhyve_init_platform_late(ctx, bsp) != 0)
