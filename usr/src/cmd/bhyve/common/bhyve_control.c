@@ -815,6 +815,20 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 		}
 	}
 
+	/* Reset all vCPUs before import (matching vmmnew pattern).
+	 * This initializes VMCS host-state fields, CR/shadow registers,
+	 * activity state, and interruptibility. The subsequent imports
+	 * overwrite guest-state. Without this, VMCS fields like CR0/CR4
+	 * shadows and activity state cause VMENTRY triple fault. */
+	for (int cpu = 0; cpu < ctl_ncpus; cpu++) {
+		struct vcpu *v = vm_vcpu_open(ctl_ctx, cpu);
+		if (v != NULL) {
+			(void) vcpu_reset(v);
+			if (cpu != 0)
+				vm_vcpu_close(v);
+		}
+	}
+
 	/* Import per-vCPU state */
 	static const struct {
 		uint16_t class;
