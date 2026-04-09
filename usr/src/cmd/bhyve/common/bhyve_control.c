@@ -606,11 +606,13 @@ cmd_resume_devices(int fd)
  *   vcpu.N.run_state, vcpu.N.sipi_vector — uint64
  */
 static void
-cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len)
+cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
+    uint64_t time_len)
 {
 	int rv;
 
-	if (kern_len > 256 * 1024 || dev_len > 64 * 1024 * 1024) {
+	if (kern_len > 256 * 1024 || dev_len > 64 * 1024 * 1024 ||
+	    time_len > 1024) {
 		send_error(fd, "payload too large");
 		return;
 	}
@@ -630,6 +632,17 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len)
 		free(dev_packed);
 		send_error(fd, "read dev state failed");
 		return;
+	}
+
+	/* Read pre-captured destination time snapshot */
+	uint8_t dst_time_buf[sizeof (struct vdi_time_info_v1)];
+	if (time_len > 0 && time_len <= sizeof (dst_time_buf)) {
+		if (read_all(fd, dst_time_buf, time_len) != 0) {
+			free(kern_packed);
+			free(dev_packed);
+			send_error(fd, "read dst_time failed");
+			return;
+		}
 	}
 
 	/* Unpack both nvlists */
@@ -652,11 +665,28 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len)
 
 	/*
 	 * VM should already be paused via the earlier pause-vm command.
-	 * Do NOT call vm_pause_instance here — it acquires LOCK_WRITE_HOLD
-	 * which races with vCPU threads in the EBUSY/usleep loop.
-	 * Just proceed directly to state import.
+	 * Force a write-lock cycle to synchronize all vCPU threads.
+	 * After VM_WRLOCK_CYCLE returns, all vCPUs are in IDLE state
+	 * and subsequent vm_data_write calls can acquire the write lock
+	 * without contention.
 	 */
-	fprintf(stderr, "import-state: starting (VM should be paused)\n");
+	/*
+	 * Pause viona rings (they may not have been paused yet if
+	 * the source's pause-devices command was on a different VM).
+	 * Then reset them — this releases vmm_drv leases that block
+	 * vmm_write_lock.  Without this, vm_data_write deadlocks on
+	 * vmm_lease_block because viona ring workers hold leases.
+	 */
+	fprintf(stderr, "import-state: pausing/resetting viona rings\n");
+	(void) pci_pause_devices();
+
+	fprintf(stderr, "import-state: syncing vCPU threads\n");
+	if (ioctl(vm_get_device_fd(ctl_ctx), 0x766cff /* VM_WRLOCK_CYCLE */,
+	    0) != 0) {
+		fprintf(stderr, "import-state: wrlock_cycle: %s\n",
+		    strerror(errno));
+	}
+	fprintf(stderr, "import-state: vCPUs synced, starting writes\n");
 
 	/* Import VMM_TIME first (timers depend on boot_hrtime).
 	 * Must adjust for destination host's TSC frequency and
@@ -670,12 +700,13 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len)
 			struct vdi_time_info_v1 src;
 			memcpy(&src, data, sizeof (src));
 
-			/* Read destination's current time */
+			/* Use the pre-read destination time snapshot */
 			struct vdi_time_info_v1 dst;
-			uint32_t dst_len = 0;
-			if (vm_data_read(ctl_ctx, -1, 13, 1,
-			    VDX_FLAG_WRITE_COPYOUT, &dst,
-			    sizeof (dst), &dst_len) == 0) {
+			memset(&dst, 0, sizeof (dst));
+			if (time_len >= sizeof (dst)) {
+				memcpy(&dst, dst_time_buf, sizeof (dst));
+			}
+			if (dst.vt_guest_freq != 0) {
 				/* Adjust boot_hrtime */
 				int64_t uptime = src.vt_hrtime -
 				    src.vt_boot_hrtime;
@@ -725,6 +756,7 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len)
 				    (unsigned long long)src.vt_guest_freq);
 			}
 
+			fprintf(stderr, "import-state: writing vmm_time\n");
 			if (vm_data_write(ctl_ctx, -1, 13, 1,
 			    VDX_FLAG_READ_COPYIN, &src,
 			    sizeof (src)) != 0) {
@@ -734,6 +766,8 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len)
 			}
 		}
 	}
+
+	fprintf(stderr, "import-state: vmm_time done, importing sys devices\n");
 
 	/* Import system device classes */
 	static const struct {
@@ -896,29 +930,32 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len)
 
 	nvlist_free(kern_nvl);
 
-	/* Restore bhyve userspace device state */
-	fprintf(stderr, "import-state: restoring PCI devices\n");
-	rv = pci_restore_all(dev_nvl);
-	nvlist_free(dev_nvl);
-	if (rv != 0) {
-		fprintf(stderr, "import-state: pci_restore_all: %d\n", rv);
-	}
-
-	/* Wait briefly for vCPU threads to cycle through VM_RUN
-	 * and return to the EBUSY/usleep loop. After the data_write
-	 * calls above, vCPUs may have re-entered VM_RUN and be stuck
-	 * in hardware VM execution until the next vmexit.  A 50ms
-	 * wait covers the LAPIC timer period. */
-	(void) usleep(50000);
-
-	/* Resume VM — all state is in place */
+	/* Resume VM BEFORE restoring PCI devices.
+	 *
+	 * VM_RESUME requires vmm_write_lock which calls vmm_lease_block.
+	 * pci_restore_all kicks viona rings which creates vmm_drv leases.
+	 * If we restore devices first, the leases block vmm_lease_block
+	 * and resume deadlocks.
+	 *
+	 * Resume first, then restore devices. vCPUs will run briefly
+	 * without device state, but the kernel has already been
+	 * initialized (registers, LAPIC, etc.) so they won't crash.
+	 * They may get EBUSY on virtio-net until rings are kicked.
+	 */
 	fprintf(stderr, "import-state: resuming VM\n");
 	rv = vm_resume_instance(ctl_ctx);
 	if (rv != 0) {
 		fprintf(stderr, "import-state: vm_resume: %s\n",
 		    strerror(errno));
-		send_error(fd, "vm_resume failed");
-		return;
+		/* Continue with device restore even if resume fails */
+	}
+
+	/* Now restore PCI devices (including viona ring kick) */
+	fprintf(stderr, "import-state: restoring PCI devices\n");
+	rv = pci_restore_all(dev_nvl);
+	nvlist_free(dev_nvl);
+	if (rv != 0) {
+		fprintf(stderr, "import-state: pci_restore_all: %d\n", rv);
 	}
 
 	fprintf(stderr, "import-state: complete\n");
@@ -986,12 +1023,13 @@ handle_client(int cfd)
 		} else if (strcmp(cmd, "export-state") == 0) {
 			cmd_export_state(cfd);
 		} else if (strcmp(cmd, "import-state") == 0) {
-			uint64_t kl = 0, dl = 0;
+			uint64_t kl = 0, dl = 0, tl = 0;
 			if (json_get_uint64(line, "kern_len", &kl) != 0 ||
 			    json_get_uint64(line, "dev_len", &dl) != 0) {
 				send_error(cfd, "missing kern_len/dev_len");
 			} else {
-				cmd_import_state(cfd, kl, dl);
+				(void) json_get_uint64(line, "time_len", &tl);
+				cmd_import_state(cfd, kl, dl, tl);
 			}
 		} else {
 			send_error(cfd, "unknown command");
