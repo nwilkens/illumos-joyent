@@ -52,6 +52,24 @@
 #include "bhyve_control.h"
 #include "pci_emul.h"
 
+/*
+ * Register list for VM_SET_REGISTER_SET — must match the agent's
+ * VCPU_REGS list in vmm_dev.rs exactly.
+ */
+static const int ctl_vcpu_regs[] = {
+	VM_REG_GUEST_RAX, VM_REG_GUEST_RBX, VM_REG_GUEST_RCX,
+	VM_REG_GUEST_RDX, VM_REG_GUEST_RSI, VM_REG_GUEST_RDI,
+	VM_REG_GUEST_RBP, VM_REG_GUEST_RSP, VM_REG_GUEST_R8,
+	VM_REG_GUEST_R9,  VM_REG_GUEST_R10, VM_REG_GUEST_R11,
+	VM_REG_GUEST_R12, VM_REG_GUEST_R13, VM_REG_GUEST_R14,
+	VM_REG_GUEST_R15, VM_REG_GUEST_RIP, VM_REG_GUEST_RFLAGS,
+	VM_REG_GUEST_CR0, VM_REG_GUEST_CR3, VM_REG_GUEST_CR2,
+	VM_REG_GUEST_CR4, VM_REG_GUEST_DR7, VM_REG_GUEST_EFER,
+	VM_REG_GUEST_XCR0,
+};
+#define	CTL_N_VCPU_REGS \
+	(sizeof (ctl_vcpu_regs) / sizeof (ctl_vcpu_regs[0]))
+
 static struct vmctx	*ctl_ctx;
 static int		ctl_ncpus;
 static char		*ctl_path;
@@ -61,6 +79,9 @@ static volatile int	ctl_running;
 
 /* Max JSON line length */
 #define	CTL_MAXLINE	4096
+
+/* Buffer for VM_DATA_READ — matches VM_DATA_XFER_LIMIT */
+#define	MIG_DATA_BUFSZ	8192
 
 /*
  * Simple JSON field extraction.  Finds "key":"value" and returns a
@@ -282,6 +303,229 @@ cmd_export_devices(int fd)
 }
 
 /*
+ * Handle "export-state" — export ALL state (kernel + devices).
+ *
+ * Exports kernel state (VMM_TIME, system devices, per-vCPU registers,
+ * MSRs, LAPIC, FPU, segment descriptors, run state) and device state
+ * (PCI config, virtio queues, viona rings) as two packed nvlists.
+ *
+ * This must be called AFTER viona rings are paused (pause-devices)
+ * and vCPUs are paused (pause-vm).
+ *
+ * Response:
+ *   {"success":true,"kern_len":NNN,"dev_len":NNN}\n
+ *   <kern_len bytes><dev_len bytes>
+ */
+static void
+cmd_export_state(int fd)
+{
+	nvlist_t *kern_nvl, *dev_nvl;
+	char *kern_packed = NULL, *dev_packed = NULL;
+	size_t kern_len = 0, dev_len = 0;
+	int rv;
+	uint8_t buf[MIG_DATA_BUFSZ];
+
+	/* Kernel state nvlist */
+	rv = nvlist_alloc(&kern_nvl, NV_UNIQUE_NAME, 0);
+	if (rv != 0) {
+		send_error(fd, "nvlist_alloc kern failed");
+		return;
+	}
+
+	/* System device classes */
+	static const struct {
+		uint16_t class;
+		uint16_t version;
+		const char *name;
+	} kern_classes[] = {
+		{ 13, 1, "vmm_time" },
+		{ 7, 1, "ioapic" },
+		{ 8, 1, "atpit" },
+		{ 9, 1, "atpic" },
+		{ 10, 1, "hpet" },
+		{ 11, 1, "pm_timer" },
+		{ 12, 2, "rtc" },
+	};
+	for (uint_t i = 0;
+	    i < sizeof (kern_classes) / sizeof (kern_classes[0]); i++) {
+		uint32_t result_len = 0;
+		char key[32];
+		if (vm_data_read(ctl_ctx, -1, kern_classes[i].class,
+		    kern_classes[i].version, VDX_FLAG_WRITE_COPYOUT,
+		    buf, sizeof (buf), &result_len) == 0) {
+			(void) snprintf(key, sizeof (key), "kern.%s",
+			    kern_classes[i].name);
+			nvlist_add_byte_array(kern_nvl, key,
+			    (uchar_t *)buf, (uint_t)result_len);
+		}
+	}
+
+	/* Per-vCPU state */
+	static const struct {
+		uint16_t class;
+		uint16_t version;
+		const char *name;
+	} vcpu_dc[] = {
+		{ 3, 1, "msrs" },
+		{ 5, 1, "lapic" },
+		{ 6, 1, "vmm_arch" },
+	};
+
+	for (int cpu = 0; cpu < ctl_ncpus; cpu++) {
+		struct vcpu *vcpu = vm_vcpu_open(ctl_ctx, cpu);
+		if (vcpu == NULL)
+			continue;
+
+		/* VM_DATA_READ classes */
+		for (uint_t i = 0;
+		    i < sizeof (vcpu_dc) / sizeof (vcpu_dc[0]); i++) {
+			uint32_t result_len = 0;
+			char key[32];
+			if (vm_data_read(ctl_ctx, cpu,
+			    vcpu_dc[i].class, vcpu_dc[i].version,
+			    VDX_FLAG_WRITE_COPYOUT,
+			    buf, sizeof (buf), &result_len) == 0) {
+				(void) snprintf(key, sizeof (key),
+				    "vcpu.%d.%s", cpu, vcpu_dc[i].name);
+				nvlist_add_byte_array(kern_nvl, key,
+				    (uchar_t *)buf, (uint_t)result_len);
+			}
+		}
+
+		/* Registers */
+		{
+			uint64_t regvals[CTL_N_VCPU_REGS];
+			char key[32];
+			if (vm_get_register_set(vcpu, CTL_N_VCPU_REGS,
+			    ctl_vcpu_regs, regvals) == 0) {
+				(void) snprintf(key, sizeof (key),
+				    "vcpu.%d.regs", cpu);
+				nvlist_add_byte_array(kern_nvl, key,
+				    (uchar_t *)regvals,
+				    (uint_t)sizeof (regvals));
+			}
+		}
+
+		/* Segment descriptors — packed as [regid:4, base:8, limit:4, access:4] */
+		{
+			static const int seg_regs[] = {
+				VM_REG_GUEST_CS, VM_REG_GUEST_DS,
+				VM_REG_GUEST_ES, VM_REG_GUEST_FS,
+				VM_REG_GUEST_GS, VM_REG_GUEST_SS,
+				VM_REG_GUEST_TR, VM_REG_GUEST_LDTR,
+				VM_REG_GUEST_GDTR, VM_REG_GUEST_IDTR,
+			};
+			uint_t nsegs = sizeof (seg_regs) / sizeof (seg_regs[0]);
+			uint8_t segbuf[nsegs * 20];
+			uint8_t *p = segbuf;
+			char key[32];
+			int ok = 1;
+			for (uint_t i = 0; i < nsegs; i++) {
+				uint64_t base;
+				uint32_t limit, access;
+				if (vm_get_desc(vcpu, seg_regs[i],
+				    &base, &limit, &access) != 0) {
+					ok = 0;
+					break;
+				}
+				int32_t regid = seg_regs[i];
+				memcpy(p, &regid, 4); p += 4;
+				memcpy(p, &base, 8); p += 8;
+				memcpy(p, &limit, 4); p += 4;
+				memcpy(p, &access, 4); p += 4;
+			}
+			if (ok) {
+				(void) snprintf(key, sizeof (key),
+				    "vcpu.%d.segs", cpu);
+				nvlist_add_byte_array(kern_nvl, key,
+				    segbuf, (uint_t)sizeof (segbuf));
+			}
+		}
+
+		/* FPU */
+		{
+			uint8_t fpubuf[8192];
+			char key[32];
+			if (vm_get_fpu(vcpu, fpubuf, sizeof (fpubuf)) == 0) {
+				(void) snprintf(key, sizeof (key),
+				    "vcpu.%d.fpu", cpu);
+				nvlist_add_byte_array(kern_nvl, key,
+				    fpubuf, (uint_t)sizeof (fpubuf));
+			}
+		}
+
+		/* Run state */
+		{
+			enum vcpu_run_state rstate;
+			uint8_t sipi_vec;
+			char key[32];
+			if (vm_get_run_state(vcpu, &rstate, &sipi_vec) == 0) {
+				(void) snprintf(key, sizeof (key),
+				    "vcpu.%d.run_state", cpu);
+				nvlist_add_uint64(kern_nvl, key,
+				    (uint64_t)rstate);
+				(void) snprintf(key, sizeof (key),
+				    "vcpu.%d.sipi_vector", cpu);
+				nvlist_add_uint64(kern_nvl, key,
+				    (uint64_t)sipi_vec);
+			}
+		}
+
+		if (cpu != 0)
+			vm_vcpu_close(vcpu);
+	}
+
+	/* Pack kernel nvlist */
+	rv = nvlist_pack(kern_nvl, &kern_packed, &kern_len,
+	    NV_ENCODE_NATIVE, 0);
+	nvlist_free(kern_nvl);
+	if (rv != 0) {
+		send_error(fd, "kern nvlist_pack failed");
+		return;
+	}
+
+	/* Device state nvlist */
+	rv = nvlist_alloc(&dev_nvl, NV_UNIQUE_NAME, 0);
+	if (rv != 0) {
+		free(kern_packed);
+		send_error(fd, "nvlist_alloc dev failed");
+		return;
+	}
+
+	rv = pci_save_all(dev_nvl);
+	if (rv != 0) {
+		free(kern_packed);
+		nvlist_free(dev_nvl);
+		send_error(fd, "pci_save_all failed");
+		return;
+	}
+
+	rv = nvlist_pack(dev_nvl, &dev_packed, &dev_len,
+	    NV_ENCODE_NATIVE, 0);
+	nvlist_free(dev_nvl);
+	if (rv != 0) {
+		free(kern_packed);
+		send_error(fd, "dev nvlist_pack failed");
+		return;
+	}
+
+	/* Send header + two blobs */
+	char hdr[128];
+	(void) snprintf(hdr, sizeof (hdr),
+	    "{\"success\":true,\"kern_len\":%zu,\"dev_len\":%zu}\n",
+	    kern_len, dev_len);
+	if (write_all(fd, hdr, strlen(hdr)) != 0 ||
+	    write_all(fd, kern_packed, kern_len) != 0 ||
+	    write_all(fd, dev_packed, dev_len) != 0) {
+		fprintf(stderr, "ctl: export-state write failed\n");
+	}
+
+	free(kern_packed);
+	free(dev_packed);
+	fprintf(stderr, "export-state: kern=%zu dev=%zu\n", kern_len, dev_len);
+}
+
+/*
  * Handle "import-devices" — restore userspace device state.
  *
  * Reads len bytes of packed nvlist from the socket, unpacks it,
@@ -328,11 +572,6 @@ cmd_import_devices(int fd, uint64_t len)
 
 /*
  * Handle "resume-devices" — kick viona rings after import.
- *
- * Called after the GZ agent has written kernel state and is about
- * to VM_RESUME.  This is a no-op for now since pci_restore_all
- * already kicks rings and injects interrupts.  Kept as a command
- * for future use if we split the kick from restore.
  */
 static void
 cmd_resume_devices(int fd)
@@ -341,25 +580,376 @@ cmd_resume_devices(int fd)
 }
 
 /*
+ * Handle "import-state" — full state import, pause through resume.
+ *
+ * This is the primary migration import command.  The GZ agent sends
+ * two packed nvlists: kernel state (VMM_TIME, system devices, per-vCPU
+ * registers/MSRs/LAPIC/FPU/run_state) and bhyve device state (PCI
+ * config, virtio queues, viona rings).
+ *
+ * bhyve does the entire sequence in-process to avoid the cross-process
+ * write-lock deadlock that occurs when the GZ agent calls VM_DATA_WRITE
+ * while bhyve's vCPU threads are in VM_RUN.
+ *
+ * Protocol:
+ *   {"command":"import-state","kern_len":NNN,"dev_len":NNN}\n
+ *   <kern_len bytes of packed kernel state nvlist>
+ *   <dev_len bytes of packed device state nvlist>
+ *
+ * The kernel state nvlist keys:
+ *   kern.vmm_time, kern.ioapic, kern.atpit, kern.atpic, kern.hpet,
+ *   kern.pm_timer, kern.rtc — raw bytes for VM_DATA_WRITE
+ *   vcpu.N.msrs, vcpu.N.lapic, vcpu.N.vmm_arch — raw bytes
+ *   vcpu.N.regs — uint64 array for VM_SET_REGISTER_SET
+ *   vcpu.N.segs — packed [regid:i32, base:u64, limit:u32, access:u32]
+ *   vcpu.N.fpu — raw bytes for VM_SET_FPU
+ *   vcpu.N.run_state, vcpu.N.sipi_vector — uint64
+ */
+static void
+cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len)
+{
+	int rv;
+
+	if (kern_len > 256 * 1024 || dev_len > 64 * 1024 * 1024) {
+		send_error(fd, "payload too large");
+		return;
+	}
+
+	/* Read kernel state blob */
+	char *kern_packed = malloc(kern_len);
+	if (kern_packed == NULL || read_all(fd, kern_packed, kern_len) != 0) {
+		free(kern_packed);
+		send_error(fd, "read kern state failed");
+		return;
+	}
+
+	/* Read device state blob */
+	char *dev_packed = malloc(dev_len);
+	if (dev_packed == NULL || read_all(fd, dev_packed, dev_len) != 0) {
+		free(kern_packed);
+		free(dev_packed);
+		send_error(fd, "read dev state failed");
+		return;
+	}
+
+	/* Unpack both nvlists */
+	nvlist_t *kern_nvl = NULL, *dev_nvl = NULL;
+	rv = nvlist_unpack(kern_packed, kern_len, &kern_nvl, 0);
+	free(kern_packed);
+	if (rv != 0) {
+		free(dev_packed);
+		send_error(fd, "kern nvlist_unpack failed");
+		return;
+	}
+
+	rv = nvlist_unpack(dev_packed, dev_len, &dev_nvl, 0);
+	free(dev_packed);
+	if (rv != 0) {
+		nvlist_free(kern_nvl);
+		send_error(fd, "dev nvlist_unpack failed");
+		return;
+	}
+
+	/*
+	 * VM should already be paused via the earlier pause-vm command.
+	 * Do NOT call vm_pause_instance here — it acquires LOCK_WRITE_HOLD
+	 * which races with vCPU threads in the EBUSY/usleep loop.
+	 * Just proceed directly to state import.
+	 */
+	fprintf(stderr, "import-state: starting (VM should be paused)\n");
+
+	/* Import VMM_TIME first (timers depend on boot_hrtime).
+	 * Must adjust for destination host's TSC frequency and
+	 * wall clock to avoid EPERM from kernel TSC scaling check. */
+	{
+		uchar_t *data;
+		uint_t len;
+		if (nvlist_lookup_byte_array(kern_nvl, "kern.vmm_time",
+		    &data, &len) == 0 &&
+		    len >= sizeof (struct vdi_time_info_v1)) {
+			struct vdi_time_info_v1 src;
+			memcpy(&src, data, sizeof (src));
+
+			/* Read destination's current time */
+			struct vdi_time_info_v1 dst;
+			uint32_t dst_len = 0;
+			if (vm_data_read(ctl_ctx, -1, 13, 1,
+			    VDX_FLAG_WRITE_COPYOUT, &dst,
+			    sizeof (dst), &dst_len) == 0) {
+				/* Adjust boot_hrtime */
+				int64_t uptime = src.vt_hrtime -
+				    src.vt_boot_hrtime;
+				uint64_t swc = src.vt_hres_sec * 1000000000ULL +
+				    src.vt_hres_ns;
+				uint64_t dwc = dst.vt_hres_sec * 1000000000ULL +
+				    dst.vt_hres_ns;
+				int64_t delta = (dwc > swc) ?
+				    (int64_t)(dwc - swc) : 0;
+
+				src.vt_boot_hrtime = dst.vt_hrtime -
+				    (uptime + delta);
+				src.vt_hrtime = dst.vt_hrtime;
+				src.vt_hres_sec = dst.vt_hres_sec;
+				src.vt_hres_ns = dst.vt_hres_ns;
+
+				/* TSC frequency scaling */
+				if (src.vt_guest_freq != dst.vt_guest_freq &&
+				    src.vt_guest_freq != 0) {
+					uint64_t q = src.vt_guest_tsc /
+					    src.vt_guest_freq;
+					uint64_t r = src.vt_guest_tsc %
+					    src.vt_guest_freq;
+					src.vt_guest_tsc =
+					    q * dst.vt_guest_freq +
+					    r * dst.vt_guest_freq /
+					    src.vt_guest_freq;
+					src.vt_guest_freq = dst.vt_guest_freq;
+				}
+
+				/* Add migration delta to TSC */
+				if (delta > 0 && src.vt_guest_freq > 0) {
+					uint64_t ns = (uint64_t)delta;
+					src.vt_guest_tsc +=
+					    (ns / 1000000000ULL) *
+					    src.vt_guest_freq +
+					    (ns % 1000000000ULL) *
+					    src.vt_guest_freq / 1000000000ULL;
+				}
+
+				fprintf(stderr,
+				    "import-state: vmm_time adjusted "
+				    "freq=%llu->%llu\n",
+				    (unsigned long long)
+				    ((struct vdi_time_info_v1 *)data)->
+				    vt_guest_freq,
+				    (unsigned long long)src.vt_guest_freq);
+			}
+
+			if (vm_data_write(ctl_ctx, -1, 13, 1,
+			    VDX_FLAG_READ_COPYIN, &src,
+			    sizeof (src)) != 0) {
+				fprintf(stderr,
+				    "import-state: vmm_time write: %s\n",
+				    strerror(errno));
+			}
+		}
+	}
+
+	/* Import system device classes */
+	static const struct {
+		uint16_t class;
+		uint16_t version;
+		const char *name;
+	} sys_classes[] = {
+		{ 7, 1, "ioapic" },
+		{ 8, 1, "atpit" },
+		{ 9, 1, "atpic" },
+		{ 10, 1, "hpet" },
+		{ 11, 1, "pm_timer" },
+		{ 12, 2, "rtc" },
+	};
+	for (uint_t i = 0;
+	    i < sizeof (sys_classes) / sizeof (sys_classes[0]); i++) {
+		char key[32];
+		uchar_t *data;
+		uint_t len;
+		(void) snprintf(key, sizeof (key), "kern.%s",
+		    sys_classes[i].name);
+		if (nvlist_lookup_byte_array(kern_nvl, key,
+		    &data, &len) == 0) {
+			if (vm_data_write(ctl_ctx, -1,
+			    sys_classes[i].class,
+			    sys_classes[i].version,
+			    VDX_FLAG_READ_COPYIN, data, len) != 0) {
+				fprintf(stderr,
+				    "import-state: %s write: %s\n",
+				    sys_classes[i].name, strerror(errno));
+			}
+		}
+	}
+
+	/* Import per-vCPU state */
+	static const struct {
+		uint16_t class;
+		uint16_t version;
+		const char *name;
+	} vcpu_classes[] = {
+		{ 3, 1, "msrs" },
+		{ 5, 1, "lapic" },
+		{ 6, 1, "vmm_arch" },
+	};
+
+	for (int cpu = 0; cpu < ctl_ncpus; cpu++) {
+		struct vcpu *vcpu = vm_vcpu_open(ctl_ctx, cpu);
+		if (vcpu == NULL)
+			continue;
+
+		/* VM_DATA_WRITE classes (MSRs, LAPIC, VMM_ARCH) */
+		for (uint_t i = 0;
+		    i < sizeof (vcpu_classes) / sizeof (vcpu_classes[0]);
+		    i++) {
+			char key[32];
+			uchar_t *data;
+			uint_t len;
+			(void) snprintf(key, sizeof (key), "vcpu.%d.%s",
+			    cpu, vcpu_classes[i].name);
+			if (nvlist_lookup_byte_array(kern_nvl, key,
+			    &data, &len) == 0) {
+				if (vm_data_write(ctl_ctx, cpu,
+				    vcpu_classes[i].class,
+				    vcpu_classes[i].version,
+				    VDX_FLAG_READ_COPYIN, data, len) != 0) {
+					fprintf(stderr,
+					    "import-state: vcpu%d %s: %s\n",
+					    cpu, vcpu_classes[i].name,
+					    strerror(errno));
+				}
+			}
+		}
+
+		/* Registers via VM_SET_REGISTER_SET */
+		{
+			char key[32];
+			uchar_t *data;
+			uint_t len;
+			(void) snprintf(key, sizeof (key),
+			    "vcpu.%d.regs", cpu);
+			if (nvlist_lookup_byte_array(kern_nvl, key,
+			    &data, &len) == 0) {
+				/* Data is array of uint64_t register values */
+				uint_t nregs = len / sizeof (uint64_t);
+				rv = vm_set_register_set(vcpu, nregs,
+				    ctl_vcpu_regs, (uint64_t *)data);
+				if (rv != 0) {
+					fprintf(stderr,
+					    "import-state: vcpu%d regs: %s\n",
+					    cpu, strerror(errno));
+				}
+			}
+		}
+
+		/* Segment descriptors */
+		{
+			char key[32];
+			uchar_t *data;
+			uint_t len;
+			(void) snprintf(key, sizeof (key),
+			    "vcpu.%d.segs", cpu);
+			if (nvlist_lookup_byte_array(kern_nvl, key,
+			    &data, &len) == 0) {
+				/* Packed: [regid:4, base:8, limit:4, access:4] */
+				uint8_t *p = data;
+				uint_t nsegs = len / 20;
+				for (uint_t i = 0; i < nsegs; i++) {
+					int32_t regid;
+					uint64_t base;
+					uint32_t limit, access;
+					memcpy(&regid, p, 4); p += 4;
+					memcpy(&base, p, 8); p += 8;
+					memcpy(&limit, p, 4); p += 4;
+					memcpy(&access, p, 4); p += 4;
+					(void) vm_set_desc(vcpu, regid,
+					    base, limit, access);
+				}
+			}
+		}
+
+		/* FPU state */
+		{
+			char key[32];
+			uchar_t *data;
+			uint_t len;
+			(void) snprintf(key, sizeof (key),
+			    "vcpu.%d.fpu", cpu);
+			if (nvlist_lookup_byte_array(kern_nvl, key,
+			    &data, &len) == 0) {
+				if (vm_set_fpu(vcpu, data, len) != 0) {
+					fprintf(stderr,
+					    "import-state: vcpu%d fpu: %s\n",
+					    cpu, strerror(errno));
+				}
+			}
+		}
+
+		/* Run state */
+		{
+			char key[32];
+			uint64_t state_val = 0, sipi_val = 0;
+			(void) snprintf(key, sizeof (key),
+			    "vcpu.%d.run_state", cpu);
+			(void) nvlist_lookup_uint64(kern_nvl, key, &state_val);
+			(void) snprintf(key, sizeof (key),
+			    "vcpu.%d.sipi_vector", cpu);
+			(void) nvlist_lookup_uint64(kern_nvl, key, &sipi_val);
+			if (state_val != 0) {
+				(void) vm_set_run_state(vcpu,
+				    (enum vcpu_run_state)state_val,
+				    (uint8_t)sipi_val);
+			}
+		}
+
+		if (cpu != 0)
+			vm_vcpu_close(vcpu);
+
+		fprintf(stderr, "import-state: vcpu%d imported\n", cpu);
+	}
+
+	nvlist_free(kern_nvl);
+
+	/* Restore bhyve userspace device state */
+	fprintf(stderr, "import-state: restoring PCI devices\n");
+	rv = pci_restore_all(dev_nvl);
+	nvlist_free(dev_nvl);
+	if (rv != 0) {
+		fprintf(stderr, "import-state: pci_restore_all: %d\n", rv);
+	}
+
+	/* Resume VM — all state is in place */
+	fprintf(stderr, "import-state: resuming VM\n");
+	rv = vm_resume_instance(ctl_ctx);
+	if (rv != 0) {
+		fprintf(stderr, "import-state: vm_resume: %s\n",
+		    strerror(errno));
+		send_error(fd, "vm_resume failed");
+		return;
+	}
+
+	fprintf(stderr, "import-state: complete\n");
+	send_ok(fd);
+}
+
+/*
+ * Read a line from fd byte-by-byte.
+ * Must NOT use stdio buffering because import-devices sends a binary
+ * blob after the JSON line — stdio would consume blob bytes into
+ * its read-ahead buffer, corrupting the subsequent read_all().
+ */
+static ssize_t
+read_line(int fd, char *buf, size_t bufsz)
+{
+	size_t pos = 0;
+	while (pos < bufsz - 1) {
+		char c;
+		ssize_t n = read(fd, &c, 1);
+		if (n <= 0)
+			return (-1);
+		if (c == '\n')
+			break;
+		buf[pos++] = c;
+	}
+	buf[pos] = '\0';
+	return ((ssize_t)pos);
+}
+
+/*
  * Handle a single client connection.
  */
 static void
 handle_client(int cfd)
 {
-	FILE *fp;
 	char line[CTL_MAXLINE];
 
-	fp = fdopen(cfd, "r");
-	if (fp == NULL) {
-		(void) close(cfd);
-		return;
-	}
-
-	while (fgets(line, sizeof (line), fp) != NULL) {
-		/* Strip trailing newline */
-		size_t len = strlen(line);
-		if (len > 0 && line[len - 1] == '\n')
-			line[len - 1] = '\0';
+	while (read_line(cfd, line, sizeof (line)) >= 0) {
 
 		char *cmd = json_get_string(line, "command");
 		if (cmd == NULL) {
@@ -386,6 +976,16 @@ handle_client(int cfd)
 			cmd_pause_vm(cfd);
 		} else if (strcmp(cmd, "resume-vm") == 0) {
 			cmd_resume_vm(cfd);
+		} else if (strcmp(cmd, "export-state") == 0) {
+			cmd_export_state(cfd);
+		} else if (strcmp(cmd, "import-state") == 0) {
+			uint64_t kl = 0, dl = 0;
+			if (json_get_uint64(line, "kern_len", &kl) != 0 ||
+			    json_get_uint64(line, "dev_len", &dl) != 0) {
+				send_error(cfd, "missing kern_len/dev_len");
+			} else {
+				cmd_import_state(cfd, kl, dl);
+			}
 		} else {
 			send_error(cfd, "unknown command");
 		}
@@ -393,7 +993,7 @@ handle_client(int cfd)
 		free(cmd);
 	}
 
-	fclose(fp);
+	(void) close(cfd);
 }
 
 /*
