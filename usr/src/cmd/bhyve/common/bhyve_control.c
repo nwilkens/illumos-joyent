@@ -904,6 +904,13 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len)
 		fprintf(stderr, "import-state: pci_restore_all: %d\n", rv);
 	}
 
+	/* Wait briefly for vCPU threads to cycle through VM_RUN
+	 * and return to the EBUSY/usleep loop. After the data_write
+	 * calls above, vCPUs may have re-entered VM_RUN and be stuck
+	 * in hardware VM execution until the next vmexit.  A 50ms
+	 * wait covers the LAPIC timer period. */
+	(void) usleep(50000);
+
 	/* Resume VM — all state is in place */
 	fprintf(stderr, "import-state: resuming VM\n");
 	rv = vm_resume_instance(ctl_ctx);
