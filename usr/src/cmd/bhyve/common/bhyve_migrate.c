@@ -587,15 +587,18 @@ bhyve_migrate_import(struct vmctx *ctx, int ncpus, int fd)
 				/*
 				 * Scale guest TSC:
 				 *   new_tsc = old_tsc * dst_freq / src_freq
-				 * Use 128-bit math to avoid overflow.
+				 * Split into quotient + remainder to avoid
+				 * needing __udivti3 (128-bit division).
 				 */
 				if (src.vt_guest_freq != 0) {
-					__uint128_t tsc128 =
-					    (__uint128_t)src.vt_guest_tsc *
-					    dst.vt_guest_freq;
+					uint64_t q = src.vt_guest_tsc /
+					    src.vt_guest_freq;
+					uint64_t r = src.vt_guest_tsc %
+					    src.vt_guest_freq;
 					src.vt_guest_tsc =
-					    (uint64_t)(tsc128 /
-					    src.vt_guest_freq);
+					    q * dst.vt_guest_freq +
+					    r * dst.vt_guest_freq /
+					    src.vt_guest_freq;
 				}
 				src.vt_guest_freq = dst.vt_guest_freq;
 			}
@@ -605,9 +608,12 @@ bhyve_migrate_import(struct vmctx *ctx, int ncpus, int fd)
 			 * the guest clock doesn't appear to jump backward.
 			 */
 			if (migrate_delta_ns > 0 && src.vt_guest_freq > 0) {
+				uint64_t ns = (uint64_t)migrate_delta_ns;
+				uint64_t q = ns / 1000000000ULL;
+				uint64_t r = ns % 1000000000ULL;
 				uint64_t tsc_delta =
-				    (uint64_t)((__uint128_t)migrate_delta_ns *
-				    src.vt_guest_freq / 1000000000ULL);
+				    q * src.vt_guest_freq +
+				    r * src.vt_guest_freq / 1000000000ULL;
 				src.vt_guest_tsc += tsc_delta;
 			}
 

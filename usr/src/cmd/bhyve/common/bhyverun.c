@@ -947,14 +947,16 @@ main(int argc, char *argv[])
 #ifndef __FreeBSD__
 	/*
 	 * Start control socket for GZ migration agent.
-	 * Path set via -o control.socket=/tmp/<vmname>.sock
+	 * Always enabled at /tmp/bhyve.sock (accessible from GZ at
+	 * /zones/<uuid>/root/tmp/bhyve.sock).
+	 * Override via -o control.socket=<path>.
 	 */
 	{
 		const char *ctl_path = get_config_value("control.socket");
-		if (ctl_path != NULL) {
-			bhyve_control_init(ctx, guest_ncpus, ctl_path);
-			atexit(bhyve_control_fini);
-		}
+		if (ctl_path == NULL)
+			ctl_path = "/tmp/bhyve.sock";
+		bhyve_control_init(ctx, guest_ncpus, ctl_path);
+		atexit(bhyve_control_fini);
 	}
 #endif
 
