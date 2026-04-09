@@ -66,19 +66,9 @@ static const int ctl_vcpu_regs[] = {
 	VM_REG_GUEST_CR0, VM_REG_GUEST_CR2, VM_REG_GUEST_CR3,
 	VM_REG_GUEST_CR4, VM_REG_GUEST_DR7, VM_REG_GUEST_EFER,
 	VM_REG_GUEST_XCR0,
-	/* Segment SELECTORS — VM_SET_SEGMENT_DESCRIPTOR only writes
-	 * base/limit/access, NOT the selector.  Without these, the CPU
-	 * has wrong CS/SS/TR/LDTR selectors → immediate triple fault. */
-	VM_REG_GUEST_CS, VM_REG_GUEST_DS, VM_REG_GUEST_ES,
-	VM_REG_GUEST_FS, VM_REG_GUEST_GS, VM_REG_GUEST_SS,
-	VM_REG_GUEST_TR, VM_REG_GUEST_LDTR,
-	/* Additional registers needed for migration */
-	VM_REG_GUEST_PDPTE0, VM_REG_GUEST_PDPTE1,
-	VM_REG_GUEST_PDPTE2, VM_REG_GUEST_PDPTE3,
-	VM_REG_GUEST_DR0, VM_REG_GUEST_DR1,
-	VM_REG_GUEST_DR2, VM_REG_GUEST_DR3,
-	VM_REG_GUEST_DR6,
-	VM_REG_GUEST_ENTRY_INST_LENGTH,
+	/* Match the file-based bhyve_migrate.c register list exactly.
+	 * Extra registers (PDPTEs, DRx, ENTRY_INST_LENGTH) may have
+	 * side effects that cause VMENTRY triple fault. */
 };
 #define	CTL_N_VCPU_REGS \
 	(sizeof (ctl_vcpu_regs) / sizeof (ctl_vcpu_regs[0]))
@@ -89,6 +79,12 @@ static char		*ctl_path;
 static int		ctl_listen_fd = -1;
 static pthread_t	ctl_thread;
 static volatile int	ctl_running;
+
+/* Condition variable for migrate-listen: main thread waits until
+ * import-state completes before starting vCPU threads. */
+static pthread_mutex_t	ctl_import_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t	ctl_import_cv = PTHREAD_COND_INITIALIZER;
+static volatile int	ctl_import_done;
 
 /* Max JSON line length */
 #define	CTL_MAXLINE	4096
@@ -690,16 +686,11 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 	 * vmm_write_lock.  Without this, vm_data_write deadlocks on
 	 * vmm_lease_block because viona ring workers hold leases.
 	 */
-	fprintf(stderr, "import-state: pausing/resetting viona rings\n");
-	(void) pci_pause_devices();
-
-	fprintf(stderr, "import-state: syncing vCPU threads\n");
-	if (ioctl(vm_get_device_fd(ctl_ctx), 0x766cff /* VM_WRLOCK_CYCLE */,
-	    0) != 0) {
-		fprintf(stderr, "import-state: wrlock_cycle: %s\n",
-		    strerror(errno));
-	}
-	fprintf(stderr, "import-state: vCPUs synced, starting writes\n");
+	/* In migrate-listen mode, no vCPU threads are running, so no
+	 * viona leases exist and no write lock contention. Skip the
+	 * pci_pause_devices() and wrlock_cycle. */
+	fprintf(stderr, "import-state: starting writes "
+	    "(no vCPU threads yet)\n");
 
 	/* Import VMM_TIME first (timers depend on boot_hrtime).
 	 * Must adjust for destination host's TSC frequency and
@@ -1007,19 +998,22 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 		fprintf(stderr, "import-state: pci_restore_all: %d\n", rv);
 	}
 
-	/* Pause viona rings again to release leases created by restore.
-	 * VM_RESUME needs vmm_write_lock which blocks on vmm_lease_block
-	 * if viona holds active leases. */
-	(void) pci_pause_devices();
-
-	fprintf(stderr, "import-state: resuming VM\n");
-	rv = vm_resume_instance(ctl_ctx);
-	if (rv != 0) {
-		fprintf(stderr, "import-state: vm_resume: %s\n",
-		    strerror(errno));
-	}
+	/* In migrate-listen mode, vCPU threads haven't started yet.
+	 * No VM_RESUME needed — the main thread is blocked in
+	 * bhyve_control_wait_import() and will start vCPU threads
+	 * after we signal completion. This matches the file-based
+	 * restore path where import happens before vCPU startup. */
 
 	fprintf(stderr, "import-state: complete\n");
+
+	/* Signal the main thread that import is done.
+	 * In migrate-listen mode, vCPU threads haven't started yet.
+	 * The main thread is blocked in bhyve_control_wait_import(). */
+	pthread_mutex_lock(&ctl_import_mtx);
+	ctl_import_done = 1;
+	pthread_cond_signal(&ctl_import_cv);
+	pthread_mutex_unlock(&ctl_import_mtx);
+
 	send_ok(fd);
 }
 
@@ -1191,6 +1185,23 @@ bhyve_control_init(struct vmctx *ctx, int ncpus, const char *path)
 	}
 
 	fprintf(stderr, "ctl: listening on %s\n", path);
+}
+
+/*
+ * Block until import-state completes.
+ * Called from main thread in migrate-listen mode to ensure
+ * state is imported BEFORE vCPU threads start.
+ */
+void
+bhyve_control_wait_import(void)
+{
+	pthread_mutex_lock(&ctl_import_mtx);
+	while (!ctl_import_done) {
+		pthread_cond_wait(&ctl_import_cv, &ctl_import_mtx);
+	}
+	pthread_mutex_unlock(&ctl_import_mtx);
+	fprintf(stderr, "migrate-listen: import-state received, "
+	    "starting vCPU threads\n");
 }
 
 void

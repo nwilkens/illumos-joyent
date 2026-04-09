@@ -31,5 +31,6 @@
 
 void	bhyve_control_init(struct vmctx *ctx, int ncpus, const char *path);
 void	bhyve_control_fini(void);
+void	bhyve_control_wait_import(void);
 
 #endif	/* _BHYVE_CONTROL_H_ */

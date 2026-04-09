@@ -1165,9 +1165,15 @@ main(int argc, char *argv[])
 	 * vm_resume_instance.
 	 */
 	if (get_config_bool_default("migrate.listen", false)) {
-		fprintf(stderr, "migrate-listen: pausing VM, "
-		    "waiting for import-state\n");
-		(void) vm_pause_instance(ctx);
+		/*
+		 * Block until the GZ agent sends import-state via the
+		 * control socket.  State is imported BEFORE vCPU threads
+		 * start, matching the file-based restore path.  This
+		 * avoids races between vCPU VM_RUN and register writes.
+		 */
+		fprintf(stderr, "migrate-listen: waiting for import-state "
+		    "(vCPU threads not yet started)\n");
+		bhyve_control_wait_import();
 		set_config_bool("migrate.restored", true);
 	}
 
