@@ -980,18 +980,35 @@ main(int argc, char *argv[])
 	}
 #endif
 
-	if (bootrom_boot()) {
+	/*
+	 * In migrate-listen mode, skip bootrom loading entirely.
+	 * The guest state (including RIP, CR0, etc.) will be imported
+	 * via the import-state control socket command.  Loading the
+	 * bootrom would initialize UEFI firmware code in guest memory,
+	 * conflicting with the migrated RAM contents.
+	 *
+	 * Triggered by -o migrate.listen=true or /tmp/migrate.listen file.
+	 */
+	if (access("/tmp/migrate.listen", F_OK) == 0) {
+		set_config_bool("migrate.listen", true);
+		(void) unlink("/tmp/migrate.listen");
+	}
+	if (!get_config_bool_default("migrate.listen", false)) {
+		if (bootrom_boot()) {
 #ifdef __FreeBSD__
-		if (vm_set_capability(bsp, VM_CAP_UNRESTRICTED_GUEST, 1)) {
-			fprintf(stderr, "ROM boot failed: unrestricted guest "
-			    "capability not available\n");
-			exit(4);
-		}
+			if (vm_set_capability(bsp, VM_CAP_UNRESTRICTED_GUEST, 1)) {
+				fprintf(stderr, "ROM boot failed: unrestricted guest "
+				    "capability not available\n");
+				exit(4);
+			}
 #else
-		/* Unrestricted Guest is always enabled on illumos */
+			/* Unrestricted Guest is always enabled on illumos */
 #endif
-		error = vcpu_reset(bsp);
-		assert(error == 0);
+			error = vcpu_reset(bsp);
+			assert(error == 0);
+		}
+	} else {
+		fprintf(stderr, "migrate-listen: skipping bootrom\n");
 	}
 
 	if (bhyve_init_platform_late(ctx, bsp) != 0)
@@ -1099,6 +1116,20 @@ main(int argc, char *argv[])
 		}
 	}
 #endif
+
+	/*
+	 * In migrate-listen mode, pause the VM before starting vCPU
+	 * threads. This ensures no guest code runs until the GZ agent
+	 * sends import-state.  vCPU threads will see is_paused=true
+	 * and loop on EBUSY/usleep until import-state calls
+	 * vm_resume_instance.
+	 */
+	if (get_config_bool_default("migrate.listen", false)) {
+		fprintf(stderr, "migrate-listen: pausing VM, "
+		    "waiting for import-state\n");
+		(void) vm_pause_instance(ctx);
+		set_config_bool("migrate.restored", true);
+	}
 
 	/*
 	 * Add all vCPUs.
