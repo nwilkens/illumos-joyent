@@ -1444,7 +1444,7 @@ pci_viona_restore(struct pci_devinst *pi, nvlist_t *nvl)
 
 	/* Push negotiated features to kernel */
 	uint64_t features = sc->vsc_vs.vs_negotiated_caps;
-	(void) ioctl(sc->vsc_vnafd, VNA_IOC_SET_FEATURES, features);
+	(void) ioctl(sc->vsc_vnafd, VNA_IOC_SET_FEATURES, &features);
 
 	/* Set promiscuous mode */
 	(void) ioctl(sc->vsc_vnafd, VNA_IOC_SET_PROMISC,
