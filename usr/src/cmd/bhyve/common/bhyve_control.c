@@ -955,20 +955,54 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 	 * initialized (registers, LAPIC, etc.) so they won't crash.
 	 * They may get EBUSY on virtio-net until rings are kicked.
 	 */
-	fprintf(stderr, "import-state: resuming VM\n");
-	rv = vm_resume_instance(ctl_ctx);
-	if (rv != 0) {
-		fprintf(stderr, "import-state: vm_resume: %s\n",
-		    strerror(errno));
-		/* Continue with device restore even if resume fails */
+	/* Verify key register values after import */
+	{
+		struct vcpu *v0 = vm_vcpu_open(ctl_ctx, 0);
+		if (v0 != NULL) {
+			uint64_t rip, cr3, rfl, cs_sel;
+			uint64_t idtr_base;
+			uint32_t idtr_limit, idtr_acc;
+			(void) vm_get_register(v0, VM_REG_GUEST_RIP, &rip);
+			(void) vm_get_register(v0, VM_REG_GUEST_CR3, &cr3);
+			(void) vm_get_register(v0, VM_REG_GUEST_RFLAGS, &rfl);
+			(void) vm_get_register(v0, VM_REG_GUEST_CS, &cs_sel);
+			(void) vm_get_desc(v0, VM_REG_GUEST_IDTR,
+			    &idtr_base, &idtr_limit, &idtr_acc);
+			fprintf(stderr,
+			    "import-state: vcpu0 verify: "
+			    "RIP=0x%llx CR3=0x%llx RFLAGS=0x%llx "
+			    "CS=0x%llx IDTR=0x%llx/%x\n",
+			    (unsigned long long)rip,
+			    (unsigned long long)cr3,
+			    (unsigned long long)rfl,
+			    (unsigned long long)cs_sel,
+			    (unsigned long long)idtr_base, idtr_limit);
+			vm_vcpu_close(v0);
+		}
 	}
 
-	/* Now restore PCI devices (including viona ring kick) */
+	/* Restore PCI devices WITHOUT kicking viona rings first.
+	 * This sets up virtio-blk and other device state so the guest
+	 * can access them after resume. viona rings are restored
+	 * but NOT kicked — they'll be kicked after resume.
+	 */
 	fprintf(stderr, "import-state: restoring PCI devices\n");
 	rv = pci_restore_all(dev_nvl);
 	nvlist_free(dev_nvl);
 	if (rv != 0) {
 		fprintf(stderr, "import-state: pci_restore_all: %d\n", rv);
+	}
+
+	/* Pause viona rings again to release leases created by restore.
+	 * VM_RESUME needs vmm_write_lock which blocks on vmm_lease_block
+	 * if viona holds active leases. */
+	(void) pci_pause_devices();
+
+	fprintf(stderr, "import-state: resuming VM\n");
+	rv = vm_resume_instance(ctl_ctx);
+	if (rv != 0) {
+		fprintf(stderr, "import-state: vm_resume: %s\n",
+		    strerror(errno));
 	}
 
 	fprintf(stderr, "import-state: complete\n");
