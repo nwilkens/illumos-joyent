@@ -156,6 +156,7 @@ struct pci_viona_softc {
 
 	bool		vsc_resetting;
 	bool		vsc_msix_active;
+	bool		vsc_rings_paused;	/* set by pe_pause */
 
 	viona_promisc_t	vsc_promisc;		/* Current promisc mode */
 	bool		vsc_promisc_promisc;	/* PROMISC enabled */
@@ -1355,6 +1356,7 @@ pci_viona_pause(struct pci_devinst *pi)
 			WPRINTF("viona pause: ring %d failed: %d", i, errno);
 		}
 	}
+	sc->vsc_rings_paused = true;
 	return (0);
 }
 
@@ -1380,18 +1382,21 @@ pci_viona_save(struct pci_devinst *pi, nvlist_t *nvl)
 	 * Save kernel ring state for each viona ring (RX + TX pairs).
 	 * The control queue is userspace-only and handled by vi_save_common.
 	 *
-	 * We MUST pause rings before reading state to get a consistent
-	 * snapshot of vr_cur_aidx/vr_cur_uidx.
+	 * If pe_pause was called first (GZ migration agent path), rings
+	 * are already paused and vCPUs may be paused too — calling
+	 * RING_PAUSE here would deadlock because the ring worker can't
+	 * transition while paused.  Skip if already paused.
 	 */
 	for (int i = 0; i < nrings; i++) {
 		vioc_ring_state_t vrs;
 		char name[32];
 
-		/* Pause this ring */
-		if (ioctl(sc->vsc_vnafd, VNA_IOC_RING_PAUSE, i) != 0) {
-			WPRINTF("viona save: ring %d pause failed: %d",
-			    i, errno);
-			/* Continue anyway — state may be stale */
+		/* Pause this ring (skip if already done by pe_pause) */
+		if (!sc->vsc_rings_paused) {
+			if (ioctl(sc->vsc_vnafd, VNA_IOC_RING_PAUSE, i) != 0) {
+				WPRINTF("viona save: ring %d pause failed: %d",
+				    i, errno);
+			}
 		}
 
 		/* Get kernel ring state */
