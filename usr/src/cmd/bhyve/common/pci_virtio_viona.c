@@ -1337,6 +1337,27 @@ pci_viona_set_hv_features(void *vsc, uint64_t *value)
  * can still consume avail ring entries while the guest is frozen, causing
  * descriptor ID reuse crashes on the destination.
  */
+
+/*
+ * Pause viona rings only (no state export).  Called by the GZ
+ * migration agent before VM_PAUSE to freeze ring processing.
+ * Safe to call multiple times — pausing an already-paused ring
+ * is a no-op in the kernel.
+ */
+static int
+pci_viona_pause(struct pci_devinst *pi)
+{
+	struct pci_viona_softc *sc = pi->pi_arg;
+	int nrings = VIONA_NRINGS(sc);
+
+	for (int i = 0; i < nrings; i++) {
+		if (ioctl(sc->vsc_vnafd, VNA_IOC_RING_PAUSE, i) != 0) {
+			WPRINTF("viona pause: ring %d failed: %d", i, errno);
+		}
+	}
+	return (0);
+}
+
 static int
 pci_viona_save(struct pci_devinst *pi, nvlist_t *nvl)
 {
@@ -1431,8 +1452,12 @@ pci_viona_restore(struct pci_devinst *pi, nvlist_t *nvl)
 	/*
 	 * Restore kernel ring state for each viona ring.
 	 *
-	 * Sequence per ring:
-	 * 1. VNA_IOC_RING_SET_STATE - set addresses + indices
+	 * Sequence per ring (matches vmmnew/propolis pattern):
+	 * 1. VNA_IOC_RING_SET_STATE - init ring with addresses, sizes, AND
+	 *    saved indices in one call.  This calls viona_ring_init() which
+	 *    requires VRS_RESET — a fresh VM starts there, so no separate
+	 *    RING_INIT_MODERN is needed.  Using both would fail: INIT_MODERN
+	 *    transitions to VRS_SETUP, then SET_STATE returns EBUSY.
 	 * 2. VNA_IOC_RING_SET_MSI  - program MSI-X interrupt delivery
 	 * 3. VNA_IOC_RING_KICK     - start kernel ring workers
 	 */
@@ -1452,28 +1477,10 @@ pci_viona_restore(struct pci_devinst *pi, nvlist_t *nvl)
 			continue;
 
 		/*
-		 * Initialize the ring in the kernel first. This maps
-		 * guest memory into the kernel ring structures.
-		 * Without this, viona ring pointers are NULL and
-		 * incoming packets cause a kernel panic (NULL deref
-		 * in viona_ring_num_avail).
+		 * RING_SET_STATE passes addresses, sizes, and indices through
+		 * viona_ring_init() in one shot — this maps guest memory,
+		 * creates the worker thread, and sets vr_cur_aidx/vr_cur_uidx.
 		 */
-		vioc_ring_init_modern_t vrim;
-		memset(&vrim, 0, sizeof (vrim));
-		vrim.rim_index = i;
-		vrim.rim_qsize = vq->vq_qsize;
-		vrim.rim_qaddr_desc = vq->vq_desc_gpa;
-		vrim.rim_qaddr_avail = vq->vq_avail_gpa;
-		vrim.rim_qaddr_used = vq->vq_used_gpa;
-
-		if (ioctl(sc->vsc_vnafd, VNA_IOC_RING_INIT_MODERN,
-		    &vrim) != 0) {
-			WPRINTF("viona restore: ring %d init failed: %d",
-			    i, errno);
-			continue;
-		}
-
-		/* Now set the kernel's consumed/returned indices */
 		memset(&vrs, 0, sizeof (vrs));
 		vrs.vrs_index = i;
 		vrs.vrs_avail_idx = (uint16_t)avail_idx;
@@ -1486,13 +1493,32 @@ pci_viona_restore(struct pci_devinst *pi, nvlist_t *nvl)
 		if (ioctl(sc->vsc_vnafd, VNA_IOC_RING_SET_STATE, &vrs) != 0) {
 			WPRINTF("viona restore: ring %d set_state failed: %d",
 			    i, errno);
+			continue;
 		}
 
 		/* Program MSI-X vector for this ring */
 		pci_viona_ring_set_msix(sc, i);
 
 		/* Kick to start the ring worker */
-		(void) ioctl(sc->vsc_vnafd, VNA_IOC_RING_KICK, i);
+		if (ioctl(sc->vsc_vnafd, VNA_IOC_RING_KICK, i) != 0) {
+			WPRINTF("viona restore: ring %d kick failed: %d",
+			    i, errno);
+		}
+	}
+
+	/*
+	 * Post-restore interrupt injection (matches vmmnew pattern).
+	 *
+	 * After ring workers are started, inject an MSI-X interrupt on
+	 * each enabled queue to wake the guest's virtio-net driver.
+	 * Without this, the guest network stack stays asleep until the
+	 * next packet arrives from the network — which may never happen
+	 * if the guest needs to initiate communication (e.g., ARP).
+	 */
+	for (int i = 0; i < nrings; i++) {
+		struct vqueue_info *vq = &sc->vsc_queues[i];
+		if (vq->vq_flags & VQ_ALLOC)
+			vq_interrupt(&sc->vsc_vs, vq);
 	}
 
 	return (0);
@@ -1510,6 +1536,7 @@ struct pci_devemu pci_de_viona = {
 	.pe_baraddr =		pci_viona_baraddr,
 	.pe_lintrupdate =	pci_viona_lintrupdate,
 #ifndef __FreeBSD__
+	.pe_pause =		pci_viona_pause,
 	.pe_save =		pci_viona_save,
 	.pe_restore =		pci_viona_restore,
 #endif

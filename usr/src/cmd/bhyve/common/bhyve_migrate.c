@@ -483,12 +483,172 @@ bhyve_migrate_import(struct vmctx *ctx, int ncpus, int fd)
 
 	/*
 	 * 1. Restore kernel device state (system-wide).
-	 *    VMM time is first — timers depend on correct boot_hrtime.
+	 *    VMM time must be adjusted and imported FIRST — all device
+	 *    timers depend on correct boot_hrtime.
 	 */
+
+	/*
+	 * 1a. VMM_TIME adjustment for cross-host migration.
+	 *
+	 * The source checkpoint contains the source host's TSC frequency,
+	 * hrtime, and wall clock.  On the destination these values differ.
+	 * We must:
+	 *   - Read the destination's current time snapshot
+	 *   - Compute the wall-clock delta (migration transit time)
+	 *   - Adjust boot_hrtime so device timers stay consistent
+	 *   - Use the destination's host frequency as guest_freq when TSC
+	 *     scaling is not supported (avoids EPERM from the kernel)
+	 *   - Scale guest_tsc from source to destination frequency
+	 *
+	 * This follows the same algorithm as vmmnew and propolis.
+	 */
+	{
+		uchar_t *time_data;
+		uint_t time_len;
+
+		if (nvlist_lookup_byte_array(nvl, "kern.vmm_time",
+		    &time_data, &time_len) == 0 &&
+		    time_len >= sizeof (struct vdi_time_info_v1)) {
+			struct vdi_time_info_v1 src;
+			memcpy(&src, time_data, sizeof (src));
+
+			/*
+			 * Read destination's current VMM_TIME to get the
+			 * host's hrtime, wall clock, and TSC frequency.
+			 */
+			struct vdi_time_info_v1 dst;
+			uint32_t dst_len = 0;
+			if (vm_data_read(ctx, -1, 13 /* VDC_VMM_TIME */, 1,
+			    VDX_FLAG_WRITE_COPYOUT, &dst, sizeof (dst),
+			    &dst_len) != 0) {
+				fprintf(stderr, "mig: cannot read dest "
+				    "VMM_TIME: %s\n", strerror(errno));
+				goto time_write_raw;
+			}
+
+			fprintf(stderr, "mig: time adjust: src_freq=%llu "
+			    "dst_freq=%llu src_hrtime=%lld "
+			    "dst_hrtime=%lld\n",
+			    (unsigned long long)src.vt_guest_freq,
+			    (unsigned long long)dst.vt_guest_freq,
+			    (long long)src.vt_hrtime,
+			    (long long)dst.vt_hrtime);
+
+			/*
+			 * Compute guest uptime on the source and the
+			 * wall-clock delta that elapsed during migration.
+			 */
+			int64_t guest_uptime = src.vt_hrtime -
+			    src.vt_boot_hrtime;
+
+			uint64_t src_wc_ns = src.vt_hres_sec * 1000000000ULL +
+			    src.vt_hres_ns;
+			uint64_t dst_wc_ns = dst.vt_hres_sec * 1000000000ULL +
+			    dst.vt_hres_ns;
+
+			/*
+			 * Wall clock delta — clamp to 0 if destination
+			 * clock is behind (NTP skew).
+			 */
+			int64_t migrate_delta_ns = 0;
+			if (dst_wc_ns > src_wc_ns)
+				migrate_delta_ns = (int64_t)(dst_wc_ns -
+				    src_wc_ns);
+
+			/*
+			 * Adjust boot_hrtime so that:
+			 *   dst_hrtime - new_boot_hrtime ==
+			 *       guest_uptime + migrate_delta
+			 */
+			src.vt_boot_hrtime = dst.vt_hrtime -
+			    (guest_uptime + migrate_delta_ns);
+
+			/*
+			 * Use the destination's current hrtime as the
+			 * reference point for the kernel's delta calc.
+			 */
+			src.vt_hrtime = dst.vt_hrtime;
+			src.vt_hres_sec = dst.vt_hres_sec;
+			src.vt_hres_ns = dst.vt_hres_ns;
+
+			/*
+			 * Handle TSC frequency mismatch.  If the source
+			 * and destination have different frequencies, set
+			 * guest_freq to the destination's host frequency
+			 * (avoids EPERM when TSC scaling is unsupported)
+			 * and scale the guest TSC proportionally.
+			 */
+			if (src.vt_guest_freq != dst.vt_guest_freq) {
+				fprintf(stderr, "mig: TSC freq mismatch: "
+				    "scaling %llu -> %llu Hz\n",
+				    (unsigned long long)src.vt_guest_freq,
+				    (unsigned long long)dst.vt_guest_freq);
+
+				/*
+				 * Scale guest TSC:
+				 *   new_tsc = old_tsc * dst_freq / src_freq
+				 * Use 128-bit math to avoid overflow.
+				 */
+				if (src.vt_guest_freq != 0) {
+					__uint128_t tsc128 =
+					    (__uint128_t)src.vt_guest_tsc *
+					    dst.vt_guest_freq;
+					src.vt_guest_tsc =
+					    (uint64_t)(tsc128 /
+					    src.vt_guest_freq);
+				}
+				src.vt_guest_freq = dst.vt_guest_freq;
+			}
+
+			/*
+			 * Add migration transit time to guest TSC so
+			 * the guest clock doesn't appear to jump backward.
+			 */
+			if (migrate_delta_ns > 0 && src.vt_guest_freq > 0) {
+				uint64_t tsc_delta =
+				    (uint64_t)((__uint128_t)migrate_delta_ns *
+				    src.vt_guest_freq / 1000000000ULL);
+				src.vt_guest_tsc += tsc_delta;
+			}
+
+			fprintf(stderr, "mig: adjusted: boot_hrtime=%lld "
+			    "guest_tsc=%llu guest_freq=%llu "
+			    "migrate_delta=%lld ms\n",
+			    (long long)src.vt_boot_hrtime,
+			    (unsigned long long)src.vt_guest_tsc,
+			    (unsigned long long)src.vt_guest_freq,
+			    (long long)(migrate_delta_ns / 1000000));
+
+			if (vm_data_write(ctx, -1, 13 /* VDC_VMM_TIME */, 1,
+			    VDX_FLAG_READ_COPYIN, &src, sizeof (src)) != 0) {
+				fprintf(stderr,
+				    "mig: VM_DATA_WRITE vmm_time "
+				    "failed: %s\n", strerror(errno));
+			}
+			goto time_done;
+		}
+time_write_raw:
+		/* Fallback: write raw (same-host checkpoint restore) */
+		if (nvlist_lookup_byte_array(nvl, "kern.vmm_time",
+		    &time_data, &time_len) == 0) {
+			if (vm_data_write(ctx, -1, 13, 1,
+			    VDX_FLAG_READ_COPYIN, time_data, time_len) != 0) {
+				fprintf(stderr, "mig: VM_DATA_WRITE vmm_time "
+				    "(raw) failed: %s\n", strerror(errno));
+			}
+		}
+	}
+time_done:
+
+	/* 1b. Remaining kernel device classes (skip vmm_time, already done) */
 	for (uint_t i = 0; i < N_KERN_DEV_CLASSES; i++) {
 		char key[64];
 		uchar_t *data;
 		uint_t len;
+
+		/* vmm_time handled above */
+		if (kern_dev_classes[i].class == 13)
+			continue;
 
 		(void) snprintf(key, sizeof (key), "kern.%s",
 		    kern_dev_classes[i].name);

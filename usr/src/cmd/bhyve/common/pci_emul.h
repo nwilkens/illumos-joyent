@@ -83,6 +83,13 @@ struct pci_devemu {
 	/* Migration save/restore callbacks (optional, NULL if no state) */
 	int	(*pe_save)(struct pci_devinst *pi, nvlist_t *nvl);
 	int	(*pe_restore)(struct pci_devinst *pi, nvlist_t *nvl);
+
+	/*
+	 * Pre-pause callback for migration — pause device rings before
+	 * vCPU pause.  Only needed for devices with kernel-managed rings
+	 * (viona).  Called by pci_pause_devices().
+	 */
+	int	(*pe_pause)(struct pci_devinst *pi);
 #endif /* __FreeBSD__ */
 };
 #define PCI_EMUL_SET(x)   DATA_SET(pci_devemu_set, x)
@@ -286,6 +293,7 @@ int	pci_bus_configured(int bus);
 /* Migration save/restore framework */
 int	pci_save_all(nvlist_t *nvl);
 int	pci_restore_all(nvlist_t *nvl);
+int	pci_pause_devices(void);
 #endif
 
 static __inline void

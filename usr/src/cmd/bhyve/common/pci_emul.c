@@ -2602,6 +2602,43 @@ pci_save_all(nvlist_t *nvl)
 	return (0);
 }
 
+/*
+ * Pause device rings before vCPU pause (for migration).
+ * Iterates all PCI devices and calls pe_pause on those that
+ * support it (only viona).  Must be called BEFORE VM_PAUSE.
+ */
+int
+pci_pause_devices(void)
+{
+	struct businfo *bi;
+	struct slotinfo *si;
+	struct funcinfo *fi;
+	struct pci_devinst *pi;
+	struct pci_devemu *pe;
+	int bus, slot, func;
+
+	for (bus = 0; bus < MAXBUSES; bus++) {
+		if ((bi = pci_businfo[bus]) == NULL)
+			continue;
+		for (slot = 0; slot < MAXSLOTS; slot++) {
+			si = &bi->slotinfo[slot];
+			for (func = 0; func < MAXFUNCS; func++) {
+				fi = &si->si_funcs[func];
+				pi = fi->fi_devi;
+				if (pi == NULL)
+					continue;
+				pe = pi->pi_d;
+				if (pe->pe_pause != NULL) {
+					int rv = pe->pe_pause(pi);
+					if (rv != 0)
+						return (rv);
+				}
+			}
+		}
+	}
+	return (0);
+}
+
 int
 pci_restore_all(nvlist_t *nvl)
 {

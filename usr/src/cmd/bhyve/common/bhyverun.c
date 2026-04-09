@@ -104,6 +104,7 @@
 #ifndef __FreeBSD__
 #include "smbiostbl.h"
 #include "privileges.h"
+#include "bhyve_control.h"
 #include "bhyve_migrate.h"
 #include <signal.h>
 #endif
@@ -942,6 +943,20 @@ main(int argc, char *argv[])
 		EPRINTLN("Failed to init TPM device");
 		exit(4);
 	}
+
+#ifndef __FreeBSD__
+	/*
+	 * Start control socket for GZ migration agent.
+	 * Path set via -o control.socket=/tmp/<vmname>.sock
+	 */
+	{
+		const char *ctl_path = get_config_value("control.socket");
+		if (ctl_path != NULL) {
+			bhyve_control_init(ctx, guest_ncpus, ctl_path);
+			atexit(bhyve_control_fini);
+		}
+	}
+#endif
 
 	/*
 	 * Initialize after PCI, to allow a bootrom file to reserve the high
