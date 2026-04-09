@@ -503,10 +503,36 @@ vm_loop(struct vmctx *ctx, struct vcpu *vcpu)
 		}
 
 		exitcode = vme.exitcode;
+
+		/*
+		 * Migration debug: log first few vmexits after restore
+		 * to diagnose guest exit issues.
+		 */
+		if (get_config_bool_default("migrate.restored", false)) {
+			static int vmexit_count[64];
+			int vid = vcpu_id(vcpu);
+			if (vid >= 0 && vid < 64 &&
+			    vmexit_count[vid]++ < 20) {
+				fprintf(stderr,
+				    "migrate-debug: vcpu%d exit #%d: "
+				    "code=%d rip=0x%llx",
+				    vid, vmexit_count[vid],
+				    exitcode,
+				    (unsigned long long)vme.rip);
+				if (exitcode == 14) /* SUSPENDED */
+					fprintf(stderr, " how=%d",
+					    vme.u.suspended.how);
+				fprintf(stderr, "\n");
+			}
+		}
+
 		if (exitcode >= VM_EXITCODE_MAX ||
 		    vmexit_handlers[exitcode] == NULL) {
-			fprintf(stderr, "vm_loop: unexpected exitcode 0x%x\n",
-			    exitcode);
+			fprintf(stderr, "vm_loop: unexpected exitcode 0x%x "
+			    "rip=0x%llx inst_len=%d\n",
+			    exitcode,
+			    (unsigned long long)vme.rip,
+			    vme.inst_length);
 			exit(4);
 		}
 
@@ -516,8 +542,14 @@ vm_loop(struct vmctx *ctx, struct vcpu *vcpu)
 		case VMEXIT_CONTINUE:
 			break;
 		case VMEXIT_ABORT:
+			fprintf(stderr, "vm_loop: VMEXIT_ABORT exitcode=%d "
+			    "rip=0x%llx\n", exitcode,
+			    (unsigned long long)vme.rip);
 			abort();
 		default:
+			fprintf(stderr, "vm_loop: exit(4) rc=%d exitcode=%d "
+			    "rip=0x%llx\n", rc, exitcode,
+			    (unsigned long long)vme.rip);
 			exit(4);
 		}
 	}
@@ -1009,15 +1041,14 @@ main(int argc, char *argv[])
 		}
 	} else {
 		/*
-		 * In migrate-listen mode, skip bootrom but DO reset the BSP
-		 * to initialize VMCS host-state fields.  Without this,
-		 * VM_RUN fails because the VMCS is not properly initialized.
-		 * The guest-state fields will be overwritten by import-state.
+		 * In migrate-listen mode, skip bootrom entirely.
+		 * Do NOT call vcpu_reset — leave vCPUs uninitialized.
+		 * The import-state command will write all guest state
+		 * (registers, MSRs, LAPIC, etc.) before VM_RUN.
+		 * The kernel initializes VMCS host-state on first VM_RUN.
 		 */
-		fprintf(stderr, "migrate-listen: skipping bootrom, "
-		    "resetting BSP\n");
-		error = vcpu_reset(bsp);
-		assert(error == 0);
+		fprintf(stderr, "migrate-listen: skipping bootrom "
+		    "(no vcpu_reset)\n");
 	}
 
 	if (bhyve_init_platform_late(ctx, bsp) != 0)
