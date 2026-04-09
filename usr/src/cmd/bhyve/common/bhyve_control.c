@@ -188,10 +188,8 @@ cmd_status(int fd)
 /*
  * Handle "pause-devices" — pause viona rings before vCPU pause.
  *
- * This must be called BEFORE the GZ agent does VM_PAUSE so that
- * kernel ring workers stop consuming avail entries while the guest
- * is frozen.  Uses pci_pause_devices() which iterates PCI slots
- * and calls pe_pause on devices that support it (only viona).
+ * This must be called BEFORE VM pause so that kernel ring workers
+ * stop consuming avail entries while the guest is frozen.
  */
 static void
 cmd_pause_devices(int fd)
@@ -201,6 +199,38 @@ cmd_pause_devices(int fd)
 		send_ok(fd);
 	else
 		send_error(fd, "pci_pause_devices failed");
+}
+
+/*
+ * Handle "pause-vm" — pause vCPUs and device timers.
+ *
+ * Must be called from inside bhyve (not from GZ) so that the
+ * vCPU threads properly coordinate their exit from VM_RUN.
+ * The GZ agent's VM_PAUSE ioctl can deadlock with subsequent
+ * VM_DATA_WRITE because vcpu_lock_one blocks on vCPUs still
+ * stuck in VM_RUN.
+ */
+static void
+cmd_pause_vm(int fd)
+{
+	if (vm_pause_instance(ctl_ctx) != 0) {
+		send_error(fd, strerror(errno));
+		return;
+	}
+	send_ok(fd);
+}
+
+/*
+ * Handle "resume-vm" — resume vCPUs and device timers.
+ */
+static void
+cmd_resume_vm(int fd)
+{
+	if (vm_resume_instance(ctl_ctx) != 0) {
+		send_error(fd, strerror(errno));
+		return;
+	}
+	send_ok(fd);
 }
 
 /*
@@ -352,6 +382,10 @@ handle_client(int cfd)
 			}
 		} else if (strcmp(cmd, "resume-devices") == 0) {
 			cmd_resume_devices(cfd);
+		} else if (strcmp(cmd, "pause-vm") == 0) {
+			cmd_pause_vm(cfd);
+		} else if (strcmp(cmd, "resume-vm") == 0) {
+			cmd_resume_vm(cfd);
 		} else {
 			send_error(cfd, "unknown command");
 		}
@@ -396,7 +430,7 @@ control_thread(void *arg __unused)
 void
 bhyve_control_init(struct vmctx *ctx, int ncpus, const char *path)
 {
-	struct sockaddr_un sun;
+	struct sockaddr_un saddr;
 	mode_t old_umask;
 	int fd;
 
@@ -416,13 +450,13 @@ bhyve_control_init(struct vmctx *ctx, int ncpus, const char *path)
 		return;
 	}
 
-	memset(&sun, 0, sizeof (sun));
-	sun.sun_family = AF_UNIX;
-	(void) strlcpy(sun.sun_path, path, sizeof (sun.sun_path));
+	memset(&saddr, 0, sizeof (saddr));
+	saddr.sun_family = AF_UNIX;
+	(void) strlcpy(saddr.sun_path, path, sizeof (saddr.sun_path));
 
 	/* Restrict to owner-only access */
 	old_umask = umask(0177);
-	if (bind(fd, (struct sockaddr *)&sun, sizeof (sun)) != 0) {
+	if (bind(fd, (struct sockaddr *)&saddr, sizeof (saddr)) != 0) {
 		fprintf(stderr, "ctl: bind %s failed: %s\n",
 		    path, strerror(errno));
 		umask(old_umask);
