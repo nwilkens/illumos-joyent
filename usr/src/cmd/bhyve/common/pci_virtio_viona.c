@@ -1458,13 +1458,12 @@ pci_viona_restore(struct pci_devinst *pi, nvlist_t *nvl)
 	 * Restore kernel ring state for each viona ring.
 	 *
 	 * Sequence per ring (matches vmmnew/propolis pattern):
-	 * 1. VNA_IOC_RING_SET_STATE - init ring with addresses, sizes, AND
-	 *    saved indices in one call.  This calls viona_ring_init() which
-	 *    requires VRS_RESET — a fresh VM starts there, so no separate
-	 *    RING_INIT_MODERN is needed.  Using both would fail: INIT_MODERN
-	 *    transitions to VRS_SETUP, then SET_STATE returns EBUSY.
-	 * 2. VNA_IOC_RING_SET_MSI  - program MSI-X interrupt delivery
-	 * 3. VNA_IOC_RING_KICK     - start kernel ring workers
+	 * 1. VNA_IOC_RING_PAUSE + VNA_IOC_RING_RESET - return ring to
+	 *    VRS_RESET (required because the destination bhyve already
+	 *    initialized rings during normal startup)
+	 * 2. VNA_IOC_RING_SET_STATE - init with addresses, sizes, indices
+	 * 3. VNA_IOC_RING_SET_MSI  - program MSI-X interrupt delivery
+	 * 4. VNA_IOC_RING_KICK     - start kernel ring workers
 	 */
 	for (int i = 0; i < nrings; i++) {
 		struct vqueue_info *vq = &sc->vsc_queues[i];
@@ -1480,6 +1479,15 @@ pci_viona_restore(struct pci_devinst *pi, nvlist_t *nvl)
 
 		if (!(vq->vq_flags & VQ_ALLOC))
 			continue;
+
+		/*
+		 * Reset the ring to VRS_RESET before setting state.
+		 * On the destination, the normal bhyve startup has already
+		 * initialized rings (VRS_SETUP/VRS_RUN). RING_SET_STATE
+		 * calls ring_init() which requires VRS_RESET.
+		 */
+		(void) ioctl(sc->vsc_vnafd, VNA_IOC_RING_PAUSE, i);
+		(void) ioctl(sc->vsc_vnafd, VNA_IOC_RING_RESET, i);
 
 		/*
 		 * RING_SET_STATE passes addresses, sizes, and indices through
