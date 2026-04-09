@@ -66,9 +66,9 @@ static const int ctl_vcpu_regs[] = {
 	VM_REG_GUEST_CR0, VM_REG_GUEST_CR2, VM_REG_GUEST_CR3,
 	VM_REG_GUEST_CR4, VM_REG_GUEST_DR7, VM_REG_GUEST_EFER,
 	VM_REG_GUEST_XCR0,
-	/* Match the file-based bhyve_migrate.c register list exactly.
-	 * Extra registers (PDPTEs, DRx, ENTRY_INST_LENGTH) may have
-	 * side effects that cause VMENTRY triple fault. */
+	/* NOTE: Segment selectors and PDPTEs/DRx removed — they cause
+	 * triple fault. The 25-register list matching bhyve_migrate.c
+	 * is the only configuration that produces code=2 vmexits. */
 };
 #define	CTL_N_VCPU_REGS \
 	(sizeof (ctl_vcpu_regs) / sizeof (ctl_vcpu_regs[0]))
@@ -689,8 +689,15 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 	/* In migrate-listen mode, no vCPU threads are running, so no
 	 * viona leases exist and no write lock contention. Skip the
 	 * pci_pause_devices() and wrlock_cycle. */
-	fprintf(stderr, "import-state: starting writes "
-	    "(no vCPU threads yet)\n");
+	/* Pause VM before writing state — CRITICAL.
+	 * vlapic_data_write checks vm_is_paused() and defers timer
+	 * callout scheduling to VM_RESUME. Without pause, LAPIC timer
+	 * import arms callouts with wrong time base → triple fault.
+	 * In migrate-listen mode (no vCPU threads, no viona leases),
+	 * the write lock succeeds immediately. */
+	fprintf(stderr, "import-state: pausing VM\n");
+	(void) vm_pause_instance(ctl_ctx);
+	fprintf(stderr, "import-state: starting writes\n");
 
 	/* Import VMM_TIME first (timers depend on boot_hrtime).
 	 * Must adjust for destination host's TSC frequency and
@@ -803,20 +810,6 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 				    "import-state: %s write: %s\n",
 				    sys_classes[i].name, strerror(errno));
 			}
-		}
-	}
-
-	/* Reset all vCPUs before import (matching vmmnew pattern).
-	 * This initializes VMCS host-state fields, CR/shadow registers,
-	 * activity state, and interruptibility. The subsequent imports
-	 * overwrite guest-state. Without this, VMCS fields like CR0/CR4
-	 * shadows and activity state cause VMENTRY triple fault. */
-	for (int cpu = 0; cpu < ctl_ncpus; cpu++) {
-		struct vcpu *v = vm_vcpu_open(ctl_ctx, cpu);
-		if (v != NULL) {
-			(void) vcpu_reset(v);
-			if (cpu != 0)
-				vm_vcpu_close(v);
 		}
 	}
 
@@ -986,7 +979,13 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 		}
 	}
 
-	/* Restore PCI devices WITHOUT kicking viona rings first.
+	/* Resume VM — re-arms LAPIC/HPET/PIT/RTC timers with correct
+	 * time bases. Must happen after all state writes, before PCI
+	 * restore (which creates viona leases that block write lock). */
+	fprintf(stderr, "import-state: resuming VM (re-arm timers)\n");
+	(void) vm_resume_instance(ctl_ctx);
+
+	/* Restore PCI devices.
 	 * This sets up virtio-blk and other device state so the guest
 	 * can access them after resume. viona rings are restored
 	 * but NOT kicked — they'll be kicked after resume.
@@ -997,12 +996,6 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 	if (rv != 0) {
 		fprintf(stderr, "import-state: pci_restore_all: %d\n", rv);
 	}
-
-	/* In migrate-listen mode, vCPU threads haven't started yet.
-	 * No VM_RESUME needed — the main thread is blocked in
-	 * bhyve_control_wait_import() and will start vCPU threads
-	 * after we signal completion. This matches the file-based
-	 * restore path where import happens before vCPU startup. */
 
 	fprintf(stderr, "import-state: complete\n");
 
