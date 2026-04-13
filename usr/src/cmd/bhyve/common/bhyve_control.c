@@ -415,7 +415,17 @@ cmd_export_state(int fd)
 			}
 		}
 
-		/* Segment descriptors — packed as [regid:4, base:8, limit:4, access:4] */
+		/*
+		 * Segment descriptors + selectors.
+		 * Packed as [regid:4, base:8, limit:4, access:4, sel:8]
+		 * = 28 bytes per segment.
+		 *
+		 * vm_set_desc only writes base/limit/access to the VMCS.
+		 * The selector is a SEPARATE VMCS field that must be set
+		 * via vm_set_register. Without the selector, VMX entry
+		 * fails with inst_error=7 (invalid control fields)
+		 * because CS.sel=0 is invalid in long mode.
+		 */
 		{
 			static const int seg_regs[] = {
 				VM_REG_GUEST_CS, VM_REG_GUEST_DS,
@@ -425,23 +435,27 @@ cmd_export_state(int fd)
 				VM_REG_GUEST_GDTR, VM_REG_GUEST_IDTR,
 			};
 			uint_t nsegs = sizeof (seg_regs) / sizeof (seg_regs[0]);
-			uint8_t segbuf[nsegs * 20];
+			uint8_t segbuf[nsegs * 28];
 			uint8_t *p = segbuf;
 			char key[32];
 			int ok = 1;
 			for (uint_t i = 0; i < nsegs; i++) {
-				uint64_t base;
+				uint64_t base, sel = 0;
 				uint32_t limit, access;
 				if (vm_get_desc(vcpu, seg_regs[i],
 				    &base, &limit, &access) != 0) {
 					ok = 0;
 					break;
 				}
+				/* Read selector via vm_get_register */
+				(void) vm_get_register(vcpu,
+				    seg_regs[i], &sel);
 				int32_t regid = seg_regs[i];
 				memcpy(p, &regid, 4); p += 4;
 				memcpy(p, &base, 8); p += 8;
 				memcpy(p, &limit, 4); p += 4;
 				memcpy(p, &access, 4); p += 4;
+				memcpy(p, &sel, 8); p += 8;
 			}
 			if (ok) {
 				(void) snprintf(key, sizeof (key),
@@ -589,16 +603,22 @@ cmd_resume_devices(int fd)
 }
 
 /*
- * Handle "import-state" — full state import, pause through resume.
+ * Handle "import-state" — full state import for migrate-listen mode.
  *
  * This is the primary migration import command.  The GZ agent sends
  * two packed nvlists: kernel state (VMM_TIME, system devices, per-vCPU
  * registers/MSRs/LAPIC/FPU/run_state) and bhyve device state (PCI
  * config, virtio queues, viona rings).
  *
- * bhyve does the entire sequence in-process to avoid the cross-process
- * write-lock deadlock that occurs when the GZ agent calls VM_DATA_WRITE
- * while bhyve's vCPU threads are in VM_RUN.
+ * In migrate-listen mode, no vCPU threads are running and no viona
+ * leases exist, so we write state directly without pause/resume.
+ * This matches the working bhyve_migrate_import() path exactly.
+ *
+ * Import order (must match bhyve_migrate_import):
+ *   1. VMM_TIME (adjusted for cross-host TSC/wall clock)
+ *   2. System devices (IOAPIC, timers, RTC)
+ *   3. Per-vCPU: registers → segments → FPU → MSRs/LAPIC/VMM_ARCH → run_state
+ *   4. PCI devices (viona rings, virtio-blk, etc.)
  *
  * Protocol:
  *   {"command":"import-state","kern_len":NNN,"dev_len":NNN}\n
@@ -614,14 +634,26 @@ cmd_resume_devices(int fd)
  *   vcpu.N.fpu — raw bytes for VM_SET_FPU
  *   vcpu.N.run_state, vcpu.N.sipi_vector — uint64
  */
+
+/* Segment descriptor register list — must match export order */
+static const int ctl_seg_descs[] = {
+	VM_REG_GUEST_CS,  VM_REG_GUEST_DS,  VM_REG_GUEST_ES,
+	VM_REG_GUEST_FS,  VM_REG_GUEST_GS,  VM_REG_GUEST_SS,
+	VM_REG_GUEST_TR,  VM_REG_GUEST_LDTR,
+	VM_REG_GUEST_GDTR, VM_REG_GUEST_IDTR,
+};
+#define	CTL_N_SEG_DESCS \
+	(sizeof (ctl_seg_descs) / sizeof (ctl_seg_descs[0]))
+
+/* FPU buffer size limit */
+#define	CTL_FPU_BUF_SIZE	8192
+
 static void
-cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
-    uint64_t time_len)
+cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len)
 {
 	int rv;
 
-	if (kern_len > 256 * 1024 || dev_len > 64 * 1024 * 1024 ||
-	    time_len > 1024) {
+	if (kern_len > 256 * 1024 || dev_len > 64 * 1024 * 1024) {
 		send_error(fd, "payload too large");
 		return;
 	}
@@ -643,17 +675,6 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 		return;
 	}
 
-	/* Read pre-captured destination time snapshot */
-	uint8_t dst_time_buf[sizeof (struct vdi_time_info_v1)];
-	if (time_len > 0 && time_len <= sizeof (dst_time_buf)) {
-		if (read_all(fd, dst_time_buf, time_len) != 0) {
-			free(kern_packed);
-			free(dev_packed);
-			send_error(fd, "read dst_time failed");
-			return;
-		}
-	}
-
 	/* Unpack both nvlists */
 	nvlist_t *kern_nvl = NULL, *dev_nvl = NULL;
 	rv = nvlist_unpack(kern_packed, kern_len, &kern_nvl, 0);
@@ -673,35 +694,27 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 	}
 
 	/*
-	 * VM should already be paused via the earlier pause-vm command.
-	 * Force a write-lock cycle to synchronize all vCPU threads.
-	 * After VM_WRLOCK_CYCLE returns, all vCPUs are in IDLE state
-	 * and subsequent vm_data_write calls can acquire the write lock
-	 * without contention.
-	 */
-	/*
-	 * Pause viona rings (they may not have been paused yet if
-	 * the source's pause-devices command was on a different VM).
-	 * Then reset them — this releases vmm_drv leases that block
-	 * vmm_write_lock.  Without this, vm_data_write deadlocks on
-	 * vmm_lease_block because viona ring workers hold leases.
-	 */
-	/* In migrate-listen mode, no vCPU threads are running, so no
-	 * viona leases exist and no write lock contention. Skip the
-	 * pci_pause_devices() and wrlock_cycle. */
-	/* Pause VM before writing state — CRITICAL.
-	 * vlapic_data_write checks vm_is_paused() and defers timer
-	 * callout scheduling to VM_RESUME. Without pause, LAPIC timer
-	 * import arms callouts with wrong time base → triple fault.
+	 * Pause VM before writing state — matches the file-based
+	 * bhyve_migrate_import() path which calls vm_pause_instance()
+	 * before any state writes.  The kernel's vlapic_data_write()
+	 * checks vm_is_paused() to defer LAPIC timer callout scheduling
+	 * to vm_resume_instance().  Without pause, VMM_TIME/LAPIC writes
+	 * may produce inconsistent VMCS state → VMX entry failure.
+	 *
 	 * In migrate-listen mode (no vCPU threads, no viona leases),
-	 * the write lock succeeds immediately. */
+	 * the write lock succeeds immediately.
+	 */
 	fprintf(stderr, "import-state: pausing VM\n");
 	(void) vm_pause_instance(ctl_ctx);
 	fprintf(stderr, "import-state: starting writes\n");
 
-	/* Import VMM_TIME first (timers depend on boot_hrtime).
-	 * Must adjust for destination host's TSC frequency and
-	 * wall clock to avoid EPERM from kernel TSC scaling check. */
+	/*
+	 * 1. Import VMM_TIME first (timers depend on boot_hrtime).
+	 *
+	 * Read destination's CURRENT VMM_TIME live from the kernel —
+	 * this must be fresh, not pre-captured.  Pre-captured time
+	 * sent over the network can be stale by seconds.
+	 */
 	{
 		uchar_t *data;
 		uint_t len;
@@ -711,63 +724,83 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 			struct vdi_time_info_v1 src;
 			memcpy(&src, data, sizeof (src));
 
-			/* Use the pre-read destination time snapshot */
+			/* Read destination time live from kernel */
 			struct vdi_time_info_v1 dst;
-			memset(&dst, 0, sizeof (dst));
-			if (time_len >= sizeof (dst)) {
-				memcpy(&dst, dst_time_buf, sizeof (dst));
-			}
-			if (dst.vt_guest_freq != 0) {
-				/* Adjust boot_hrtime */
-				int64_t uptime = src.vt_hrtime -
-				    src.vt_boot_hrtime;
-				uint64_t swc = src.vt_hres_sec * 1000000000ULL +
-				    src.vt_hres_ns;
-				uint64_t dwc = dst.vt_hres_sec * 1000000000ULL +
-				    dst.vt_hres_ns;
-				int64_t delta = (dwc > swc) ?
-				    (int64_t)(dwc - swc) : 0;
-
-				src.vt_boot_hrtime = dst.vt_hrtime -
-				    (uptime + delta);
-				src.vt_hrtime = dst.vt_hrtime;
-				src.vt_hres_sec = dst.vt_hres_sec;
-				src.vt_hres_ns = dst.vt_hres_ns;
-
-				/* TSC frequency scaling */
-				if (src.vt_guest_freq != dst.vt_guest_freq &&
-				    src.vt_guest_freq != 0) {
-					uint64_t q = src.vt_guest_tsc /
-					    src.vt_guest_freq;
-					uint64_t r = src.vt_guest_tsc %
-					    src.vt_guest_freq;
-					src.vt_guest_tsc =
-					    q * dst.vt_guest_freq +
-					    r * dst.vt_guest_freq /
-					    src.vt_guest_freq;
-					src.vt_guest_freq = dst.vt_guest_freq;
-				}
-
-				/* Add migration delta to TSC */
-				if (delta > 0 && src.vt_guest_freq > 0) {
-					uint64_t ns = (uint64_t)delta;
-					src.vt_guest_tsc +=
-					    (ns / 1000000000ULL) *
-					    src.vt_guest_freq +
-					    (ns % 1000000000ULL) *
-					    src.vt_guest_freq / 1000000000ULL;
-				}
-
+			uint32_t dst_len = 0;
+			if (vm_data_read(ctl_ctx, -1, 13 /* VDC_VMM_TIME */,
+			    1, VDX_FLAG_WRITE_COPYOUT, &dst, sizeof (dst),
+			    &dst_len) != 0) {
 				fprintf(stderr,
-				    "import-state: vmm_time adjusted "
-				    "freq=%llu->%llu\n",
-				    (unsigned long long)
-				    ((struct vdi_time_info_v1 *)data)->
-				    vt_guest_freq,
-				    (unsigned long long)src.vt_guest_freq);
+				    "import-state: cannot read dest "
+				    "VMM_TIME: %s — writing raw\n",
+				    strerror(errno));
+				/* Fallback: write raw (same-host) */
+				(void) vm_data_write(ctl_ctx, -1, 13, 1,
+				    VDX_FLAG_READ_COPYIN, data, len);
+				goto time_done;
 			}
 
-			fprintf(stderr, "import-state: writing vmm_time\n");
+			fprintf(stderr,
+			    "import-state: time adjust: "
+			    "src_freq=%llu dst_freq=%llu "
+			    "src_hrtime=%lld dst_hrtime=%lld\n",
+			    (unsigned long long)src.vt_guest_freq,
+			    (unsigned long long)dst.vt_guest_freq,
+			    (long long)src.vt_hrtime,
+			    (long long)dst.vt_hrtime);
+
+			/* Guest uptime and migration wall-clock delta */
+			int64_t guest_uptime = src.vt_hrtime -
+			    src.vt_boot_hrtime;
+			uint64_t src_wc_ns =
+			    src.vt_hres_sec * 1000000000ULL + src.vt_hres_ns;
+			uint64_t dst_wc_ns =
+			    dst.vt_hres_sec * 1000000000ULL + dst.vt_hres_ns;
+			int64_t migrate_delta_ns = 0;
+			if (dst_wc_ns > src_wc_ns)
+				migrate_delta_ns =
+				    (int64_t)(dst_wc_ns - src_wc_ns);
+
+			/* Adjust boot_hrtime */
+			src.vt_boot_hrtime = dst.vt_hrtime -
+			    (guest_uptime + migrate_delta_ns);
+			src.vt_hrtime = dst.vt_hrtime;
+			src.vt_hres_sec = dst.vt_hres_sec;
+			src.vt_hres_ns = dst.vt_hres_ns;
+
+			/* TSC frequency scaling */
+			if (src.vt_guest_freq != dst.vt_guest_freq &&
+			    src.vt_guest_freq != 0) {
+				uint64_t q = src.vt_guest_tsc /
+				    src.vt_guest_freq;
+				uint64_t r = src.vt_guest_tsc %
+				    src.vt_guest_freq;
+				src.vt_guest_tsc =
+				    q * dst.vt_guest_freq +
+				    r * dst.vt_guest_freq /
+				    src.vt_guest_freq;
+				src.vt_guest_freq = dst.vt_guest_freq;
+			}
+
+			/* Add migration transit time to guest TSC */
+			if (migrate_delta_ns > 0 && src.vt_guest_freq > 0) {
+				uint64_t ns = (uint64_t)migrate_delta_ns;
+				uint64_t q = ns / 1000000000ULL;
+				uint64_t r = ns % 1000000000ULL;
+				src.vt_guest_tsc +=
+				    q * src.vt_guest_freq +
+				    r * src.vt_guest_freq / 1000000000ULL;
+			}
+
+			fprintf(stderr,
+			    "import-state: adjusted: "
+			    "boot_hrtime=%lld guest_tsc=%llu "
+			    "guest_freq=%llu migrate_delta=%lld ms\n",
+			    (long long)src.vt_boot_hrtime,
+			    (unsigned long long)src.vt_guest_tsc,
+			    (unsigned long long)src.vt_guest_freq,
+			    (long long)(migrate_delta_ns / 1000000));
+
 			if (vm_data_write(ctl_ctx, -1, 13, 1,
 			    VDX_FLAG_READ_COPYIN, &src,
 			    sizeof (src)) != 0) {
@@ -777,10 +810,11 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 			}
 		}
 	}
+time_done:
 
 	fprintf(stderr, "import-state: vmm_time done, importing sys devices\n");
 
-	/* Import system device classes */
+	/* 2. Import system device classes */
 	static const struct {
 		uint16_t class;
 		uint16_t version;
@@ -813,7 +847,12 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 		}
 	}
 
-	/* Import per-vCPU state */
+	/*
+	 * 3. Import per-vCPU state.
+	 *
+	 * Order matches bhyve_migrate_import exactly:
+	 *   registers → segments → FPU → MSRs/LAPIC/VMM_ARCH → run_state
+	 */
 	static const struct {
 		uint16_t class;
 		uint16_t version;
@@ -829,7 +868,133 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 		if (vcpu == NULL)
 			continue;
 
-		/* VM_DATA_WRITE classes (MSRs, LAPIC, VMM_ARCH) */
+		/* 3a. Registers via VM_SET_REGISTER_SET */
+		{
+			char key[32];
+			uchar_t *data;
+			uint_t len;
+			(void) snprintf(key, sizeof (key),
+			    "vcpu.%d.regs", cpu);
+			if (nvlist_lookup_byte_array(kern_nvl, key,
+			    &data, &len) == 0) {
+				/* Validate exact register count */
+				if (len != sizeof (uint64_t) * CTL_N_VCPU_REGS) {
+					fprintf(stderr,
+					    "import-state: vcpu%d regs: "
+					    "bad size %u (expected %zu)\n",
+					    cpu, len,
+					    sizeof (uint64_t) * CTL_N_VCPU_REGS);
+				} else {
+					rv = vm_set_register_set(vcpu,
+					    CTL_N_VCPU_REGS, ctl_vcpu_regs,
+					    (uint64_t *)data);
+					if (rv != 0) {
+						fprintf(stderr,
+						    "import-state: vcpu%d "
+						    "regs: %s\n",
+						    cpu, strerror(errno));
+					}
+				}
+			}
+		}
+
+		/*
+		 * 3b. Segment descriptors + selectors.
+		 *
+		 * Format: [regid:4, base:8, limit:4, access:4, sel:8]
+		 * = 28 bytes per segment.
+		 *
+		 * vm_set_desc sets base/limit/access in the VMCS.
+		 * vm_set_register sets the selector (separate VMCS field).
+		 * Both are required for correct VMX entry.
+		 */
+		{
+			char key[32];
+			uchar_t *data;
+			uint_t len;
+			(void) snprintf(key, sizeof (key),
+			    "vcpu.%d.segs", cpu);
+			if (nvlist_lookup_byte_array(kern_nvl, key,
+			    &data, &len) == 0) {
+				int has_sel;
+				if (len == CTL_N_SEG_DESCS * 28) {
+					has_sel = 1;
+				} else if (len == CTL_N_SEG_DESCS * 20) {
+					has_sel = 0;
+				} else {
+					fprintf(stderr,
+					    "import-state: vcpu%d segs "
+					    "bad size %u\n", cpu, len);
+					goto seg_done;
+				}
+				uint8_t *p = data;
+				for (uint_t i = 0; i < CTL_N_SEG_DESCS; i++) {
+					int32_t regid;
+					uint64_t base, sel = 0;
+					uint32_t limit, access;
+					memcpy(&regid, p, 4); p += 4;
+					memcpy(&base, p, 8); p += 8;
+					memcpy(&limit, p, 4); p += 4;
+					memcpy(&access, p, 4); p += 4;
+					if (has_sel) {
+						memcpy(&sel, p, 8); p += 8;
+					}
+					if (regid != ctl_seg_descs[i]) {
+						fprintf(stderr,
+						    "import-state: vcpu%d "
+						    "bad seg regid %d at "
+						    "index %u\n",
+						    cpu, regid, i);
+						break;
+					}
+					(void) vm_set_desc(vcpu, regid,
+					    base, limit, access);
+					/* Set selector via vm_set_register.
+					 * GDTR and IDTR have no selector. */
+					if (has_sel &&
+					    regid != VM_REG_GUEST_GDTR &&
+					    regid != VM_REG_GUEST_IDTR) {
+						(void) vm_set_register(vcpu,
+						    regid, sel);
+					}
+					if (i < 6) {
+						fprintf(stderr,
+						    "import-state: vcpu%d "
+						    "seg[%u]: regid=%d "
+						    "sel=0x%llx base=0x%llx "
+						    "lim=0x%x acc=0x%x\n",
+						    cpu, i, regid,
+						    (unsigned long long)sel,
+						    (unsigned long long)base,
+						    limit, access);
+					}
+				}
+			}
+		}
+seg_done:
+
+		/* 3c. FPU state with size validation */
+		{
+			char key[32];
+			uchar_t *data;
+			uint_t len;
+			(void) snprintf(key, sizeof (key),
+			    "vcpu.%d.fpu", cpu);
+			if (nvlist_lookup_byte_array(kern_nvl, key,
+			    &data, &len) == 0) {
+				if (len > CTL_FPU_BUF_SIZE) {
+					fprintf(stderr,
+					    "import-state: vcpu%d fpu "
+					    "too large: %u\n", cpu, len);
+				} else if (vm_set_fpu(vcpu, data, len) != 0) {
+					fprintf(stderr,
+					    "import-state: vcpu%d fpu: %s\n",
+					    cpu, strerror(errno));
+				}
+			}
+		}
+
+		/* 3d. VM_DATA_WRITE classes (MSRs, LAPIC, VMM_ARCH) */
 		for (uint_t i = 0;
 		    i < sizeof (vcpu_classes) / sizeof (vcpu_classes[0]);
 		    i++) {
@@ -840,97 +1005,44 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 			    cpu, vcpu_classes[i].name);
 			if (nvlist_lookup_byte_array(kern_nvl, key,
 			    &data, &len) == 0) {
+				fprintf(stderr,
+				    "import-state: vcpu%d writing %s "
+				    "(%u bytes, class=%u)\n",
+				    cpu, vcpu_classes[i].name, len,
+				    vcpu_classes[i].class);
 				if (vm_data_write(ctl_ctx, cpu,
 				    vcpu_classes[i].class,
 				    vcpu_classes[i].version,
 				    VDX_FLAG_READ_COPYIN, data, len) != 0) {
 					fprintf(stderr,
-					    "import-state: vcpu%d %s: %s\n",
+					    "import-state: vcpu%d %s "
+					    "FAILED: %s\n",
 					    cpu, vcpu_classes[i].name,
 					    strerror(errno));
 				}
 			}
 		}
 
-		/* Registers via VM_SET_REGISTER_SET */
+		/* 3e. Run state — always set (default VRS_HALT) */
 		{
 			char key[32];
-			uchar_t *data;
-			uint_t len;
-			(void) snprintf(key, sizeof (key),
-			    "vcpu.%d.regs", cpu);
-			if (nvlist_lookup_byte_array(kern_nvl, key,
-			    &data, &len) == 0) {
-				/* Data is array of uint64_t register values */
-				uint_t nregs = len / sizeof (uint64_t);
-				rv = vm_set_register_set(vcpu, nregs,
-				    ctl_vcpu_regs, (uint64_t *)data);
-				if (rv != 0) {
-					fprintf(stderr,
-					    "import-state: vcpu%d regs: %s\n",
-					    cpu, strerror(errno));
-				}
-			}
-		}
+			uint64_t state_val, sipi_val;
+			enum vcpu_run_state rstate = VRS_HALT;
+			uint8_t sipi_vec = 0;
 
-		/* Segment descriptors */
-		{
-			char key[32];
-			uchar_t *data;
-			uint_t len;
-			(void) snprintf(key, sizeof (key),
-			    "vcpu.%d.segs", cpu);
-			if (nvlist_lookup_byte_array(kern_nvl, key,
-			    &data, &len) == 0) {
-				/* Packed: [regid:4, base:8, limit:4, access:4] */
-				uint8_t *p = data;
-				uint_t nsegs = len / 20;
-				for (uint_t i = 0; i < nsegs; i++) {
-					int32_t regid;
-					uint64_t base;
-					uint32_t limit, access;
-					memcpy(&regid, p, 4); p += 4;
-					memcpy(&base, p, 8); p += 8;
-					memcpy(&limit, p, 4); p += 4;
-					memcpy(&access, p, 4); p += 4;
-					(void) vm_set_desc(vcpu, regid,
-					    base, limit, access);
-				}
-			}
-		}
-
-		/* FPU state */
-		{
-			char key[32];
-			uchar_t *data;
-			uint_t len;
-			(void) snprintf(key, sizeof (key),
-			    "vcpu.%d.fpu", cpu);
-			if (nvlist_lookup_byte_array(kern_nvl, key,
-			    &data, &len) == 0) {
-				if (vm_set_fpu(vcpu, data, len) != 0) {
-					fprintf(stderr,
-					    "import-state: vcpu%d fpu: %s\n",
-					    cpu, strerror(errno));
-				}
-			}
-		}
-
-		/* Run state */
-		{
-			char key[32];
-			uint64_t state_val = 0, sipi_val = 0;
 			(void) snprintf(key, sizeof (key),
 			    "vcpu.%d.run_state", cpu);
-			(void) nvlist_lookup_uint64(kern_nvl, key, &state_val);
+			if (nvlist_lookup_uint64(kern_nvl, key,
+			    &state_val) == 0)
+				rstate = (enum vcpu_run_state)state_val;
+
 			(void) snprintf(key, sizeof (key),
 			    "vcpu.%d.sipi_vector", cpu);
-			(void) nvlist_lookup_uint64(kern_nvl, key, &sipi_val);
-			if (state_val != 0) {
-				(void) vm_set_run_state(vcpu,
-				    (enum vcpu_run_state)state_val,
-				    (uint8_t)sipi_val);
-			}
+			if (nvlist_lookup_uint64(kern_nvl, key,
+			    &sipi_val) == 0)
+				sipi_vec = (uint8_t)sipi_val;
+
+			(void) vm_set_run_state(vcpu, rstate, sipi_vec);
 		}
 
 		if (cpu != 0)
@@ -941,54 +1053,83 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 
 	nvlist_free(kern_nvl);
 
-	/* Resume VM BEFORE restoring PCI devices.
-	 *
-	 * VM_RESUME requires vmm_write_lock which calls vmm_lease_block.
-	 * pci_restore_all kicks viona rings which creates vmm_drv leases.
-	 * If we restore devices first, the leases block vmm_lease_block
-	 * and resume deadlocks.
-	 *
-	 * Resume first, then restore devices. vCPUs will run briefly
-	 * without device state, but the kernel has already been
-	 * initialized (registers, LAPIC, etc.) so they won't crash.
-	 * They may get EBUSY on virtio-net until rings are kicked.
-	 */
-	/* Verify key register values after import */
-	{
-		struct vcpu *v0 = vm_vcpu_open(ctl_ctx, 0);
-		if (v0 != NULL) {
-			uint64_t rip, cr3, rfl, cs_sel;
-			uint64_t idtr_base;
-			uint32_t idtr_limit, idtr_acc;
-			(void) vm_get_register(v0, VM_REG_GUEST_RIP, &rip);
-			(void) vm_get_register(v0, VM_REG_GUEST_CR3, &cr3);
-			(void) vm_get_register(v0, VM_REG_GUEST_RFLAGS, &rfl);
-			(void) vm_get_register(v0, VM_REG_GUEST_CS, &cs_sel);
-			(void) vm_get_desc(v0, VM_REG_GUEST_IDTR,
-			    &idtr_base, &idtr_limit, &idtr_acc);
-			fprintf(stderr,
-			    "import-state: vcpu0 verify: "
-			    "RIP=0x%llx CR3=0x%llx RFLAGS=0x%llx "
-			    "CS=0x%llx IDTR=0x%llx/%x\n",
-			    (unsigned long long)rip,
-			    (unsigned long long)cr3,
-			    (unsigned long long)rfl,
-			    (unsigned long long)cs_sel,
-			    (unsigned long long)idtr_base, idtr_limit);
-			vm_vcpu_close(v0);
-		}
+	/* Verify key register values after import — ALL vCPUs */
+	for (int vcpu_id = 0; vcpu_id < ctl_ncpus; vcpu_id++) {
+		struct vcpu *v = vm_vcpu_open(ctl_ctx, vcpu_id);
+		if (v == NULL)
+			continue;
+		uint64_t rip, cr0, cr3, cr4, rfl, efer;
+		uint64_t cs_sel, ss_sel, ds_sel, es_sel;
+		uint64_t cs_base, ss_base;
+		uint32_t cs_limit, cs_acc, ss_limit, ss_acc;
+		uint64_t idtr_base, gdtr_base;
+		uint32_t idtr_limit, idtr_acc, gdtr_limit, gdtr_acc;
+		enum vcpu_run_state rstate;
+		uint8_t sipi_vec;
+
+		(void) vm_get_register(v, VM_REG_GUEST_RIP, &rip);
+		(void) vm_get_register(v, VM_REG_GUEST_CR0, &cr0);
+		(void) vm_get_register(v, VM_REG_GUEST_CR3, &cr3);
+		(void) vm_get_register(v, VM_REG_GUEST_CR4, &cr4);
+		(void) vm_get_register(v, VM_REG_GUEST_RFLAGS, &rfl);
+		(void) vm_get_register(v, VM_REG_GUEST_EFER, &efer);
+		(void) vm_get_register(v, VM_REG_GUEST_CS, &cs_sel);
+		(void) vm_get_register(v, VM_REG_GUEST_SS, &ss_sel);
+		(void) vm_get_register(v, VM_REG_GUEST_DS, &ds_sel);
+		(void) vm_get_register(v, VM_REG_GUEST_ES, &es_sel);
+		(void) vm_get_desc(v, VM_REG_GUEST_CS,
+		    &cs_base, &cs_limit, &cs_acc);
+		(void) vm_get_desc(v, VM_REG_GUEST_SS,
+		    &ss_base, &ss_limit, &ss_acc);
+		(void) vm_get_desc(v, VM_REG_GUEST_IDTR,
+		    &idtr_base, &idtr_limit, &idtr_acc);
+		(void) vm_get_desc(v, VM_REG_GUEST_GDTR,
+		    &gdtr_base, &gdtr_limit, &gdtr_acc);
+		(void) vm_get_run_state(v, &rstate, &sipi_vec);
+
+		fprintf(stderr,
+		    "import-state: vcpu%d verify:\n"
+		    "  RIP=0x%llx RFLAGS=0x%llx\n"
+		    "  CR0=0x%llx CR3=0x%llx CR4=0x%llx EFER=0x%llx\n"
+		    "  CS: sel=0x%llx base=0x%llx lim=0x%x acc=0x%x\n"
+		    "  SS: sel=0x%llx base=0x%llx lim=0x%x acc=0x%x\n"
+		    "  DS=0x%llx ES=0x%llx\n"
+		    "  IDTR=0x%llx/%x GDTR=0x%llx/%x\n"
+		    "  run_state=%u sipi=0x%x\n",
+		    vcpu_id,
+		    (unsigned long long)rip,
+		    (unsigned long long)rfl,
+		    (unsigned long long)cr0, (unsigned long long)cr3,
+		    (unsigned long long)cr4, (unsigned long long)efer,
+		    (unsigned long long)cs_sel, (unsigned long long)cs_base,
+		    cs_limit, cs_acc,
+		    (unsigned long long)ss_sel, (unsigned long long)ss_base,
+		    ss_limit, ss_acc,
+		    (unsigned long long)ds_sel, (unsigned long long)es_sel,
+		    (unsigned long long)idtr_base, idtr_limit,
+		    (unsigned long long)gdtr_base, gdtr_limit,
+		    (uint_t)rstate, (uint_t)sipi_vec);
+
+		if (vcpu_id != 0)
+			vm_vcpu_close(v);
 	}
 
-	/* Resume VM — re-arms LAPIC/HPET/PIT/RTC timers with correct
-	 * time bases. Must happen after all state writes, before PCI
-	 * restore (which creates viona leases that block write lock). */
-	fprintf(stderr, "import-state: resuming VM (re-arm timers)\n");
-	(void) vm_resume_instance(ctl_ctx);
-
-	/* Restore PCI devices.
-	 * This sets up virtio-blk and other device state so the guest
-	 * can access them after resume. viona rings are restored
-	 * but NOT kicked — they'll be kicked after resume.
+	/*
+	 * 4. Restore PCI devices BEFORE resume.
+	 *
+	 * This matches the file-based bhyve_migrate_import() path where
+	 * pci_restore_all() runs BEFORE vm_resume_instance().
+	 *
+	 * If we resume first, the VNA_IOC_SET_NOTIFY_MMIO ioctl (called
+	 * from pci_viona_baraddr during viona restore) modifies VM-level
+	 * MMIO hook state via vm_mmio_hook().  If vCPU threads enter VMX
+	 * while this is happening, they see inconsistent MMIO config →
+	 * VMX entry failure (inst_error=7).
+	 *
+	 * In migrate-listen mode, no vCPU threads are running yet (they
+	 * start after the condvar signal), so pci_restore_all's
+	 * RING_KICK won't create leases that block vmm_lease_block.
+	 * Resume after PCI restore is safe here.
 	 */
 	fprintf(stderr, "import-state: restoring PCI devices\n");
 	rv = pci_restore_all(dev_nvl);
@@ -996,6 +1137,13 @@ cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len,
 	if (rv != 0) {
 		fprintf(stderr, "import-state: pci_restore_all: %d\n", rv);
 	}
+
+	/*
+	 * Resume VM AFTER PCI restore — re-arms LAPIC/HPET/PIT/RTC
+	 * timers with correct time bases (deferred by vm_pause_instance).
+	 */
+	fprintf(stderr, "import-state: resuming VM\n");
+	(void) vm_resume_instance(ctl_ctx);
 
 	fprintf(stderr, "import-state: complete\n");
 
@@ -1071,13 +1219,12 @@ handle_client(int cfd)
 		} else if (strcmp(cmd, "export-state") == 0) {
 			cmd_export_state(cfd);
 		} else if (strcmp(cmd, "import-state") == 0) {
-			uint64_t kl = 0, dl = 0, tl = 0;
+			uint64_t kl = 0, dl = 0;
 			if (json_get_uint64(line, "kern_len", &kl) != 0 ||
 			    json_get_uint64(line, "dev_len", &dl) != 0) {
 				send_error(cfd, "missing kern_len/dev_len");
 			} else {
-				(void) json_get_uint64(line, "time_len", &tl);
-				cmd_import_state(cfd, kl, dl, tl);
+				cmd_import_state(cfd, kl, dl);
 			}
 		} else {
 			send_error(cfd, "unknown command");

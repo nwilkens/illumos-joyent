@@ -1229,20 +1229,38 @@ pci_viona_baraddr(struct pci_devinst *pi, int baridx, int enabled,
 		}
 
 		cfg = vi_pci_cfg_bytype(&sc->vsc_vs, VIRTIO_PCI_CAP_NOTIFY_CFG);
-		if (cfg == NULL)
+		if (cfg == NULL) {
+			fprintf(stderr,
+			    "viona baraddr: NOTIFY_CFG capability NOT FOUND "
+			    "in vs_caps[] (ncaps=%u)\n",
+			    sc->vsc_vs.vs_ncaps);
 			break;
+		}
 
 		vim.vim_address = address + cfg->c_baroff;
 		vim.vim_size = cfg->c_barlen;
 
-		DPRINTF("MODERN BAR NOTIFY address 0x%" PRIx64 " size 0x%x",
-		    vim.vim_address, vim.vim_size);
+		fprintf(stderr,
+		    "viona baraddr: MODERN BAR NOTIFY bar_addr=0x%llx "
+		    "c_baroff=0x%x c_barlen=0x%x -> vim.addr=0x%llx "
+		    "vim.size=0x%x\n",
+		    (unsigned long long)address,
+		    cfg->c_baroff, cfg->c_barlen,
+		    (unsigned long long)vim.vim_address, vim.vim_size);
 
 		err = ioctl(sc->vsc_vnafd, VNA_IOC_SET_NOTIFY_MMIO, &vim);
 		if (err != 0) {
-			WPRINTF(
-			    "Install MMIO hook at 0x%" PRIx64 "+0x%x failed %d",
-			    vim.vim_address, vim.vim_size, errno);
+			fprintf(stderr,
+			    "viona baraddr: VNA_IOC_SET_NOTIFY_MMIO FAILED "
+			    "addr=0x%llx size=0x%x errno=%d (%s)\n",
+			    (unsigned long long)vim.vim_address,
+			    vim.vim_size, errno, strerror(errno));
+		} else {
+			fprintf(stderr,
+			    "viona baraddr: VNA_IOC_SET_NOTIFY_MMIO OK "
+			    "addr=0x%llx size=0x%x\n",
+			    (unsigned long long)vim.vim_address,
+			    vim.vim_size);
 		}
 		break;
 	}
@@ -1516,6 +1534,60 @@ pci_viona_restore(struct pci_devinst *pi, nvlist_t *nvl)
 		if (ioctl(sc->vsc_vnafd, VNA_IOC_RING_KICK, i) != 0) {
 			WPRINTF("viona restore: ring %d kick failed: %d",
 			    i, errno);
+		}
+	}
+
+	/*
+	 * Re-program notification addresses.
+	 *
+	 * During normal bhyve operation, notification addresses
+	 * (SET_NOTIFY_IOP / SET_NOTIFY_MMIO) are programmed when
+	 * the guest writes PCI BAR config, triggering baraddr callbacks.
+	 * After migration restore, BARs are restored from PCI config
+	 * but the notification hooks are not re-installed because
+	 * pci_restore doesn't trigger baraddr callbacks.
+	 *
+	 * Without notification addresses, the guest can't notify viona
+	 * of new TX buffers, so networking is dead post-migration.
+	 */
+	{
+		int baridx;
+		uint64_t baraddr;
+
+		/* Try modern MMIO notification first (64-bit BAR) */
+		baridx = VIRTIO_MODERN_BAR;
+		baraddr = (uint64_t)pci_get_cfgdata32(pi, PCIR_BAR(baridx)) |
+		    ((uint64_t)pci_get_cfgdata32(pi,
+		    PCIR_BAR(baridx) + 4) << 32);
+		baraddr &= ~0xfULL;  /* mask type bits */
+		fprintf(stderr,
+		    "viona restore: modern BAR%d raw=0x%llx\n",
+		    baridx, (unsigned long long)baraddr);
+		if (baraddr != 0) {
+			fprintf(stderr,
+			    "viona restore: programming MMIO notify "
+			    "via baraddr(BAR%d, 0x%llx)\n",
+			    baridx, (unsigned long long)baraddr);
+			pci_viona_baraddr(pi, baridx, 1, baraddr);
+		} else {
+			/* Try legacy IO port notification */
+			baridx = VIRTIO_LEGACY_BAR;
+			baraddr = pci_get_cfgdata32(pi, PCIR_BAR(baridx));
+			baraddr &= ~0x3ULL;  /* mask type bits */
+			fprintf(stderr,
+			    "viona restore: legacy BAR%d raw=0x%llx\n",
+			    baridx, (unsigned long long)baraddr);
+			if (baraddr != 0) {
+				fprintf(stderr,
+				    "viona restore: programming IOP notify "
+				    "via baraddr(BAR%d, 0x%llx)\n",
+				    baridx, (unsigned long long)baraddr);
+				pci_viona_baraddr(pi, baridx, 1, baraddr);
+			} else {
+				fprintf(stderr,
+				    "viona restore: NO BAR address found "
+				    "for notification hook!\n");
+			}
 		}
 	}
 

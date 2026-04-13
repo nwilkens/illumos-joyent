@@ -44,11 +44,11 @@ PID=$(ps -ef | grep "bhyve.rust.*$UUID" | grep -v grep | awk '{print $2}' | head
 
 # Get VM RAM size and increase zone quota to fit checkpoint
 RAM_MB=$(vmadm get "$UUID" | json ram)
-ORIG_QUOTA=$(zfs get -Ho value quota "${ZONE_DS}")
-NEW_QUOTA=$(( ${RAM_MB} + 2048 ))  # RAM + 2GB headroom
+ORIG_QUOTA=$(vmadm get "$UUID" | json quota)
+NEW_QUOTA=$(( ${RAM_MB} / 1024 + ORIG_QUOTA + 2 ))  # RAM(GB) + original + 2GB headroom
 echo "=== vmm-migrate $UUID → $DEST (PID $PID, ${RAM_MB}MB RAM) ==="
-echo "  Increasing zone quota: ${ORIG_QUOTA} → ${NEW_QUOTA}M"
-zfs set quota=${NEW_QUOTA}M "${ZONE_DS}"
+echo "  Increasing zone quota: ${ORIG_QUOTA}G → ${NEW_QUOTA}G"
+vmadm update "$UUID" quota=$NEW_QUOTA 2>/dev/null
 
 # --- Phase 1: ZFS base send (VM running) ---
 echo "[1/6] ZFS base snapshot..."
@@ -77,7 +77,7 @@ zfs send -i "${DISK_DS}@mig-base" "${DISK_DS}@mig-final" | \
 # --- Phase 4: Transfer checkpoint ---
 echo "[4/6] Transferring checkpoint..."
 # Increase dest zone quota to receive checkpoint
-$SSH "root@${DEST}" "zfs set quota=${NEW_QUOTA}M ${ZONE_DS}" 2>/dev/null
+$SSH "root@${DEST}" "vmadm update $UUID quota=$NEW_QUOTA" 2>/dev/null
 $SCP -q "$CKPT" "root@${DEST}:${CKPT}" || die "checkpoint transfer failed"
 
 # --- Phase 5: Start destination ---
@@ -99,8 +99,8 @@ vmadm stop "$UUID" -F 2>/dev/null
 zfs destroy "${DISK_DS}@mig-base" 2>/dev/null
 zfs destroy "${DISK_DS}@mig-final" 2>/dev/null
 # Restore zone quotas
-zfs set quota="${ORIG_QUOTA}" "${ZONE_DS}" 2>/dev/null
-$SSH "root@${DEST}" "zfs set quota=${ORIG_QUOTA} ${ZONE_DS}" 2>/dev/null
+vmadm update "$UUID" quota=$ORIG_QUOTA 2>/dev/null
+$SSH "root@${DEST}" "vmadm update $UUID quota=$ORIG_QUOTA" 2>/dev/null
 # Remove checkpoint files
 rm -f "$CKPT"
 $SSH "root@${DEST}" "rm -f ${CKPT}" 2>/dev/null
