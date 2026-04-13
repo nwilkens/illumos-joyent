@@ -2639,6 +2639,49 @@ pci_pause_devices(void)
 	return (0);
 }
 
+/*
+ * Drain any in-flight device I/O AFTER vCPUs are paused.
+ *
+ * pci_pause_devices() runs BEFORE vm_pause_instance and can race with
+ * vCPU threads still processing MMIO exits (e.g. a vCPU thread calls
+ * pci_vtblk_proc -> blockif_write while the control thread is in
+ * pci_vtblk_pause's drain).  This function runs AFTER vm pause so
+ * no new submissions can race in, and waits for every device's
+ * in-flight queue to drain.  Callers should invoke this between
+ * vm_pause_instance() and state export.
+ */
+int
+pci_drain_devices(void)
+{
+	struct businfo *bi;
+	struct slotinfo *si;
+	struct funcinfo *fi;
+	struct pci_devinst *pi;
+	struct pci_devemu *pe;
+	int bus, slot, func;
+
+	for (bus = 0; bus < MAXBUSES; bus++) {
+		if ((bi = pci_businfo[bus]) == NULL)
+			continue;
+		for (slot = 0; slot < MAXSLOTS; slot++) {
+			si = &bi->slotinfo[slot];
+			for (func = 0; func < MAXFUNCS; func++) {
+				fi = &si->si_funcs[func];
+				pi = fi->fi_devi;
+				if (pi == NULL)
+					continue;
+				pe = pi->pi_d;
+				if (pe->pe_drain != NULL) {
+					int rv = pe->pe_drain(pi);
+					if (rv != 0)
+						return (rv);
+				}
+			}
+		}
+	}
+	return (0);
+}
+
 int
 pci_restore_all(nvlist_t *nvl)
 {
@@ -2675,7 +2718,7 @@ pci_restore_all(nvlist_t *nvl)
 				    &dev_nvl) != 0)
 					continue;
 
-				/* Restore PCI config space */
+				/* Restore PCI config space (memcpy + MSI/MSI-X) */
 				error = pci_restore_cfgspace(pi, dev_nvl);
 				if (error != 0)
 					return (error);
@@ -2685,6 +2728,143 @@ pci_restore_all(nvlist_t *nvl)
 					error = pe->pe_restore(pi, dev_nvl);
 					if (error != 0)
 						return (error);
+				}
+			}
+		}
+	}
+
+	/*
+	 * Re-program BAR addresses from the just-restored cfgdata.
+	 *
+	 * pci_restore_cfgspace() above copies raw PCI config bytes
+	 * (including BAR registers) but does NOT touch pi->pi_bar[].addr
+	 * or the VMM's MMIO/IO interception tables.  Without this replay,
+	 * guest MMIO writes to BAR-backed devices (e.g. virtio-blk
+	 * notification register) hit the wrong address (dest's startup
+	 * BAR) and the guest hangs on disk I/O after migration.
+	 *
+	 * We replay BAR programming in TWO passes to avoid transient
+	 * BAR overlaps when source and destination chose different
+	 * initial BAR allocations:
+	 *   Pass A: unregister every BAR that's currently registered
+	 *           (using the dest's startup pi_bar[].addr values).
+	 *   Pass B: write the new pi_bar[].addr from cfgdata and
+	 *           re-register at the new address (which invokes the
+	 *           device's pe_baraddr callback as a side effect).
+	 *
+	 * Without the two-pass split, the first device to be re-registered
+	 * at an address that's still claimed by a not-yet-moved second
+	 * device fails the BAR overlap assertion in modify_bar_registration().
+	 */
+
+	/* Pass A: unregister all BARs at their CURRENT (dest-init) addresses */
+	for (bus = 0; bus < MAXBUSES; bus++) {
+		if ((bi = pci_businfo[bus]) == NULL)
+			continue;
+		for (slot = 0; slot < MAXSLOTS; slot++) {
+			si = &bi->slotinfo[slot];
+			for (func = 0; func < MAXFUNCS; func++) {
+				fi = &si->si_funcs[func];
+				pi = fi->fi_devi;
+				if (pi == NULL)
+					continue;
+
+				int decode = memen(pi) || porten(pi);
+				if (!decode)
+					continue;
+
+				for (int i = 0; i <= PCI_BARMAX; i++) {
+					if (pi->pi_bar[i].type == PCIBAR_NONE)
+						continue;
+					if (pi->pi_bar[i].type ==
+					    PCIBAR_MEMHI64)
+						continue;
+					if (pi->pi_bar[i].addr == 0)
+						continue;
+					int u_decode =
+					    (pi->pi_bar[i].type == PCIBAR_IO)
+					    ? porten(pi) : memen(pi);
+					if (u_decode)
+						unregister_bar(pi, i);
+				}
+			}
+		}
+	}
+
+	/* Pass B: update pi_bar[].addr from restored cfgdata + re-register */
+	for (bus = 0; bus < MAXBUSES; bus++) {
+		if ((bi = pci_businfo[bus]) == NULL)
+			continue;
+		for (slot = 0; slot < MAXSLOTS; slot++) {
+			si = &bi->slotinfo[slot];
+			for (func = 0; func < MAXFUNCS; func++) {
+				fi = &si->si_funcs[func];
+				pi = fi->fi_devi;
+				if (pi == NULL)
+					continue;
+
+				for (int i = 0; i <= PCI_BARMAX; i++) {
+					enum pcibar_type type =
+					    pi->pi_bar[i].type;
+					uint64_t mask;
+					uint32_t bar_val;
+					uint64_t addr;
+
+					if (type == PCIBAR_NONE ||
+					    type == PCIBAR_MEMHI64)
+						continue;
+
+					mask = ~(pi->pi_bar[i].size - 1);
+					bar_val = pci_get_cfgdata32(pi,
+					    PCIR_BAR(i));
+
+					switch (type) {
+					case PCIBAR_IO:
+						addr = (bar_val & mask)
+						    & 0xffff;
+						pi->pi_bar[i].addr = addr;
+						break;
+					case PCIBAR_MEM32:
+						addr = bar_val & mask;
+						pi->pi_bar[i].addr = addr;
+						break;
+					case PCIBAR_MEM64: {
+						uint64_t lo = bar_val & mask;
+						uint64_t hi = (i + 1 <=
+						    PCI_BARMAX)
+						    ? pci_get_cfgdata32(pi,
+						        PCIR_BAR(i + 1))
+						    : 0;
+						addr = (hi << 32) | lo;
+						pi->pi_bar[i].addr = addr;
+						break;
+					}
+					case PCIBAR_ROM:
+						/* handled by ROM-specific path */
+						break;
+					default:
+						break;
+					}
+				}
+
+				/* Now register all BARs at their new addrs */
+				int decode = memen(pi) || porten(pi);
+				if (!decode)
+					continue;
+
+				for (int i = 0; i <= PCI_BARMAX; i++) {
+					if (pi->pi_bar[i].type == PCIBAR_NONE)
+						continue;
+					if (pi->pi_bar[i].type ==
+					    PCIBAR_MEMHI64)
+						continue;
+					if (pi->pi_bar[i].addr == 0)
+						continue;
+					int r_decode =
+					    (pi->pi_bar[i].type == PCIBAR_IO)
+					    ? porten(pi) : memen(pi);
+					if (r_decode)
+						register_bar(pi, i);
 				}
 			}
 		}

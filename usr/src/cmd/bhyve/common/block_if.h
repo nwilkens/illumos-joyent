@@ -84,5 +84,16 @@ int	blockif_flush(struct blockif_ctxt *bc, struct blockif_req *breq);
 int	blockif_delete(struct blockif_ctxt *bc, struct blockif_req *breq);
 int	blockif_cancel(struct blockif_ctxt *bc, struct blockif_req *breq);
 int	blockif_close(struct blockif_ctxt *bc);
+#ifndef __FreeBSD__
+/*
+ * Wait for all pending and in-flight block I/O to complete.
+ * Used during live migration pause to ensure no outstanding I/O
+ * is lost when the VM is suspended for state capture.  The caller
+ * must guarantee no new requests are being submitted (e.g. the
+ * device's ring processing is already paused) before calling this,
+ * otherwise it may loop indefinitely.
+ */
+void	blockif_drain(struct blockif_ctxt *bc);
+#endif
 
 #endif /* _BLOCK_IF_H_ */

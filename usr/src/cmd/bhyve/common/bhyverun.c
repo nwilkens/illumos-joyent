@@ -1196,6 +1196,20 @@ main(int argc, char *argv[])
 	}
 
 #ifndef __FreeBSD__
+	/*
+	 * In migrate-listen mode, cmd_import_state() leaves the VM
+	 * paused after writing all state.  We must resume AFTER every
+	 * vCPU has been activated via vm_activate_cpu() above, because
+	 * vm_resume_instance() calls vlapic_resume() only on CPUs in
+	 * active_cpus — resuming before activation leaves AP LAPIC
+	 * timer callouts unarmed and causes RCU stalls on cpu>=1.
+	 */
+	if (get_config_bool_default("migrate.listen", false)) {
+		fprintf(stderr,
+		    "migrate-listen: resuming VM now that vCPUs are active\n");
+		(void) vm_resume_instance(ctx);
+	}
+
 	mark_provisioned();
         /*
          * XXX SmartOS:  The mark_provisioned() call above required file-access

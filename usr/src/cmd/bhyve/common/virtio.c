@@ -2186,8 +2186,17 @@ vi_restore_common(struct virtio_softc *vs, nvlist_t *nvl)
 
 	(void) nvlist_lookup_uint64(nvl, "vi.nvq", &val);
 	int nvq = (int)val;
-	if (nvq > vc->vc_max_nvq)
-		nvq = vc->vc_max_nvq;
+	/*
+	 * Clamp to the device's actual queue capacity.  Some devices
+	 * (e.g. virtio-blk) don't initialize vc_max_nvq because they
+	 * are single-queue and use only vc_nvq; clamping naively to
+	 * vc_max_nvq would zero out nvq and skip queue restoration
+	 * entirely, leaving the dest with NULL ring pointers and
+	 * total disk I/O hang post-migration.
+	 */
+	int cap = vc->vc_max_nvq > vc->vc_nvq ? vc->vc_max_nvq : vc->vc_nvq;
+	if (nvq > cap)
+		nvq = cap;
 
 	for (int i = 0; i < nvq; i++) {
 		struct vqueue_info *vq = &vs->vs_queues[i];

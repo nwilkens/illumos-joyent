@@ -979,6 +979,30 @@ blockif_delete(struct blockif_ctxt *bc, struct blockif_req *breq)
 	return (blockif_request(bc, breq, BOP_DELETE));
 }
 
+#ifndef __FreeBSD__
+/*
+ * Wait for all pending and in-flight I/O to drain.  Used during live
+ * migration to quiesce block devices before the VM is suspended.
+ *
+ * Poll-and-sleep is sufficient here: migration pause is rare and the
+ * per-drain wait is O(100ms) worst case for a busy queue.  Using a
+ * condition variable would require plumbing a new "drain complete"
+ * broadcast into the completion path; not worth it for a rare path.
+ */
+void
+blockif_drain(struct blockif_ctxt *bc)
+{
+	assert(bc->bc_magic == BLOCKIF_SIG);
+	pthread_mutex_lock(&bc->bc_mtx);
+	while (!blockif_empty(bc)) {
+		pthread_mutex_unlock(&bc->bc_mtx);
+		(void) usleep(1000);		/* 1ms */
+		pthread_mutex_lock(&bc->bc_mtx);
+	}
+	pthread_mutex_unlock(&bc->bc_mtx);
+}
+#endif /* !__FreeBSD__ */
+
 int
 blockif_cancel(struct blockif_ctxt *bc, struct blockif_req *breq)
 {

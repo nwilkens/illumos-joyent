@@ -90,6 +90,15 @@ struct pci_devemu {
 	 * (viona).  Called by pci_pause_devices().
 	 */
 	int	(*pe_pause)(struct pci_devinst *pi);
+
+	/*
+	 * Post-vm-pause drain callback for migration — drain any in-flight
+	 * I/O AFTER vCPUs are paused so no new submissions can race.
+	 * Called by pci_drain_devices().  Used by virtio-blk (drains
+	 * blockif pendq/busyq) so migration state capture sees a
+	 * fully-settled view (no "in-flight on source, lost on dest").
+	 */
+	int	(*pe_drain)(struct pci_devinst *pi);
 #endif /* __FreeBSD__ */
 };
 #define PCI_EMUL_SET(x)   DATA_SET(pci_devemu_set, x)
@@ -294,6 +303,7 @@ int	pci_bus_configured(int bus);
 int	pci_save_all(nvlist_t *nvl);
 int	pci_restore_all(nvlist_t *nvl);
 int	pci_pause_devices(void);
+int	pci_drain_devices(void);
 #endif
 
 static __inline void

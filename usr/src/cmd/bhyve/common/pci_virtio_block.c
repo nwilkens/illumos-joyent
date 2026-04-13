@@ -649,6 +649,35 @@ pci_vtblk_apply_feats(void *vsc, uint64_t *caps)
 #endif /* __FreeBSD__ */
 
 #ifndef __FreeBSD__
+/*
+ * Drain hook invoked by pci_drain_devices() during migration.
+ *
+ * Runs AFTER vCPUs are paused (which prevents the guest from
+ * submitting new I/O via MMIO), so the only outstanding work
+ * is what's already in the blockif pendq/busyq.  Wait for all
+ * of it to complete so the migrated state captures every
+ * completion (used-ring index, status byte, etc.) consistently.
+ *
+ * Without this drain, descriptors that were "in flight" on the
+ * source at pause time would be lost on the dest — the guest
+ * would see vq_last_avail advanced (consumed) but never see the
+ * matching used-ring entries, causing ext4/jbd2 journal commits
+ * to hang indefinitely post-migration.
+ *
+ * Must be a *drain* hook (post-vm-pause), not a *pause* hook
+ * (pre-vm-pause): a pause-time drain races with vCPU threads
+ * still calling pci_vtblk_proc -> blockif_write.
+ */
+static int
+pci_vtblk_drain(struct pci_devinst *pi)
+{
+	struct pci_vtblk_softc *sc = pi->pi_arg;
+
+	if (sc->bc != NULL)
+		blockif_drain(sc->bc);
+	return (0);
+}
+
 static int
 pci_vtblk_save(struct pci_devinst *pi, nvlist_t *nvl)
 {
@@ -684,6 +713,21 @@ pci_vtblk_restore(struct pci_devinst *pi, nvlist_t *nvl)
 	if (nvlist_lookup_uint64(nvl, "vtblk.wce", &val) == 0)
 		sc->vbsc_wce = (int)val;
 
+	/*
+	 * Kickstart: process any descriptors the guest already placed
+	 * in the avail ring before migration but virtio-blk hadn't yet
+	 * consumed.  After restore the guest considers those requests
+	 * submitted; if we don't process them here, virtio-blk will
+	 * only wake on a NEW notification — and the guest won't issue
+	 * one because, from its view, the work was already handed off.
+	 * Without this, jbd2 / kworker hang on completions that never
+	 * come.  virtio-blk has a single queue (vc_nvq = 1).
+	 */
+	if (sc->vbsc_vq.vq_desc != NULL && sc->vbsc_vq.vq_avail != NULL) {
+		while (vq_has_descs(&sc->vbsc_vq))
+			pci_vtblk_proc(sc, &sc->vbsc_vq);
+	}
+
 	return (0);
 }
 #endif /* !__FreeBSD__ */
@@ -697,6 +741,7 @@ static const struct pci_devemu pci_de_vblk = {
 	.pe_barwrite =	vi_pci_write,
 	.pe_barread =	vi_pci_read,
 #ifndef __FreeBSD__
+	.pe_drain =	pci_vtblk_drain,
 	.pe_save =	pci_vtblk_save,
 	.pe_restore =	pci_vtblk_restore,
 #endif

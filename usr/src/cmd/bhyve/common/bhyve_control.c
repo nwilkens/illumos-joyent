@@ -232,6 +232,25 @@ cmd_pause_devices(int fd)
 }
 
 /*
+ * Handle "drain-devices" — drain in-flight device I/O AFTER vCPU pause.
+ *
+ * Must be called BETWEEN pause-vm and export-state so that all
+ * pending blockif I/O completes (used-ring entries written, status
+ * bytes set) before we capture device state.  If called before
+ * pause-vm, vCPU threads can race and submit new I/O during the
+ * drain, so the captured state would still be inconsistent.
+ */
+static void
+cmd_drain_devices(int fd)
+{
+	int rv = pci_drain_devices();
+	if (rv == 0)
+		send_ok(fd);
+	else
+		send_error(fd, "pci_drain_devices failed");
+}
+
+/*
  * Handle "pause-vm" — pause vCPUs and device timers.
  *
  * Must be called from inside bhyve (not from GZ) so that the
@@ -1139,13 +1158,21 @@ seg_done:
 	}
 
 	/*
-	 * Resume VM AFTER PCI restore — re-arms LAPIC/HPET/PIT/RTC
-	 * timers with correct time bases (deferred by vm_pause_instance).
+	 * Note: vm_resume_instance() is deliberately NOT called here.
+	 * It is called from bhyve_control_wait_import() AFTER the main
+	 * thread has activated every vCPU via vm_activate_cpu().
+	 *
+	 * vm_resume_instance() iterates vm->active_cpus and calls
+	 * vlapic_resume() to rearm each vCPU's LAPIC timer callout.
+	 * vlapic_data_write() defers its own callout_reset when
+	 * vm_is_paused is true, leaving timer_fire_when set but the
+	 * callout unarmed.  If we resume BEFORE vCPUs are in
+	 * active_cpus, the resume loop is a no-op and the APs never
+	 * get their LAPIC timer interrupts — causing RCU stalls on
+	 * cpu=1 and eventual OOM.
 	 */
-	fprintf(stderr, "import-state: resuming VM\n");
-	(void) vm_resume_instance(ctl_ctx);
-
-	fprintf(stderr, "import-state: complete\n");
+	fprintf(stderr, "import-state: complete (VM still paused; "
+	    "main thread will resume after activating vCPUs)\n");
 
 	/* Signal the main thread that import is done.
 	 * In migrate-listen mode, vCPU threads haven't started yet.
@@ -1201,6 +1228,8 @@ handle_client(int cfd)
 			cmd_status(cfd);
 		} else if (strcmp(cmd, "pause-devices") == 0) {
 			cmd_pause_devices(cfd);
+		} else if (strcmp(cmd, "drain-devices") == 0) {
+			cmd_drain_devices(cfd);
 		} else if (strcmp(cmd, "export-devices") == 0) {
 			cmd_export_devices(cfd);
 		} else if (strcmp(cmd, "import-devices") == 0) {
