@@ -2682,6 +2682,59 @@ pci_drain_devices(void)
 	return (0);
 }
 
+/*
+ * Validate that a BAR restored from a migration nvlist is safe to
+ * hand to register_bar().  Returns true on OK, false on out-of-range
+ * (migration data is corrupt or malicious — caller should fail the
+ * restore rather than proceed).
+ *
+ * Rationale: register_bar() -> modify_bar_registration() reaches
+ * register_inout() / register_mem() which assert on bad ranges via
+ * VERIFY_IOPORT and equivalents.  Those asserts abort the process,
+ * turning "malformed migration payload" into "dest bhyve SIGABRT"
+ * — a DoS from anyone who can reach the control socket on a
+ * migrate-listen bhyve.  Validate explicitly so we refuse the
+ * migration instead of aborting.
+ */
+static bool
+bar_restore_in_range(const struct pci_devinst *pi, int idx)
+{
+	uint64_t addr = pi->pi_bar[idx].addr;
+	uint64_t size = pi->pi_bar[idx].size;
+
+	if (size == 0)
+		return (false);
+	if (addr + size < addr)          /* u64 overflow */
+		return (false);
+
+	switch (pi->pi_bar[idx].type) {
+	case PCIBAR_IO:
+		/*
+		 * VERIFY_IOPORT requires port + size <= 0x10000 (MAX_IOPORTS).
+		 * A u32 cfgdata value can place addr anywhere in [0,
+		 * 0xffffffff]; the `& 0xffff` at addr-computation time
+		 * bounds addr to 16 bits, but addr + size can still
+		 * overflow that when the low 16 bits are near the top.
+		 */
+		return (addr <= 0xffff && addr + size <= 0x10000);
+	case PCIBAR_MEM32:
+		/* Must fit entirely in 32-bit MMIO space. */
+		return (addr <= 0xffffffffu &&
+		    addr + size <= 0x100000000ULL);
+	case PCIBAR_MEM64:
+		/*
+		 * Any 64-bit address is legal as far as the register
+		 * interface is concerned; we've already rejected u64
+		 * overflow above.  Further per-system bounds are the
+		 * VMM's problem.
+		 */
+		return (true);
+	case PCIBAR_ROM:
+	default:
+		return (true);
+	}
+}
+
 int
 pci_restore_all(nvlist_t *nvl)
 {
@@ -2863,8 +2916,33 @@ pci_restore_all(nvlist_t *nvl)
 					int r_decode =
 					    (pi->pi_bar[i].type == PCIBAR_IO)
 					    ? porten(pi) : memen(pi);
-					if (r_decode)
-						register_bar(pi, i);
+					if (!r_decode)
+						continue;
+
+					/*
+					 * Refuse to register a BAR whose
+					 * restored address is out of range
+					 * for its type.  Letting it through
+					 * trips VERIFY_IOPORT (for IO) or a
+					 * range assert (for MEM) inside
+					 * register_bar(), which SIGABRTs
+					 * the whole bhyve and denies service
+					 * to the migration attempt.
+					 */
+					if (!bar_restore_in_range(pi, i)) {
+						fprintf(stderr,
+						    "pci_restore_all: "
+						    "BAR %d out of range "
+						    "(type=%d addr=0x%lx "
+						    "size=0x%lx) — refusing "
+						    "migration\n",
+						    i,
+						    (int)pi->pi_bar[i].type,
+						    (unsigned long)pi->pi_bar[i].addr,
+						    (unsigned long)pi->pi_bar[i].size);
+						return (-1);
+					}
+					register_bar(pi, i);
 				}
 			}
 		}
