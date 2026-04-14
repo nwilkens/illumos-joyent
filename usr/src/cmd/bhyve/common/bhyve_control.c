@@ -49,6 +49,8 @@
 #include <vmmapi.h>
 #include <libnvpair.h>
 
+#include "config.h"
+
 #include "bhyve_control.h"
 #include "pci_emul.h"
 
@@ -671,6 +673,42 @@ static void
 cmd_import_state(int fd, uint64_t kern_len, uint64_t dev_len)
 {
 	int rv;
+
+	/*
+	 * Security gate: only accept import-state when this bhyve was
+	 * started in migrate-listen mode AND no prior import has
+	 * completed on this process.  Without these checks, anyone who
+	 * can reach the control socket (any process in the zone) can
+	 * re-invoke import-state on a running guest — which overwrites
+	 * vCPU registers / MSRs / LAPIC / FPU / device state with
+	 * attacker-chosen bytes and turns "migration destination" into
+	 * "unauthenticated VM hijack."
+	 *
+	 * migrate.listen is set via bhyverun command-line config when
+	 * the zone boots with /zones/<uuid>/root/tmp/migrate.listen
+	 * present.  A normal-boot bhyve has migrate.listen=false and
+	 * rejects import-state outright — import is meaningless on a
+	 * running guest since the write path in this function assumes
+	 * vCPU threads haven't started yet.
+	 *
+	 * ctl_import_done is a one-shot flag: set at the end of a
+	 * successful import, never reset.  The check + observation of
+	 * the flag happens under ctl_import_mtx so this is race-free
+	 * relative to bhyve_control_wait_import().
+	 */
+	if (!get_config_bool_default("migrate.listen", false)) {
+		send_error(fd,
+		    "import-state only valid in migrate-listen mode");
+		return;
+	}
+	(void) pthread_mutex_lock(&ctl_import_mtx);
+	if (ctl_import_done) {
+		(void) pthread_mutex_unlock(&ctl_import_mtx);
+		send_error(fd,
+		    "import-state already completed for this VM");
+		return;
+	}
+	(void) pthread_mutex_unlock(&ctl_import_mtx);
 
 	if (kern_len > 256 * 1024 || dev_len > 64 * 1024 * 1024) {
 		send_error(fd, "payload too large");
