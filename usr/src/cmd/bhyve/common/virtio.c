@@ -2184,6 +2184,28 @@ vi_restore_common(struct virtio_softc *vs, nvlist_t *nvl)
 	(void) nvlist_lookup_uint64(nvl, "vi.mode", &val);
 	vs->vs_mode = (virtio_mode_t)val;
 
+	/*
+	 * Apply the negotiated feature flags BEFORE restoring per-queue
+	 * state.  vc_apply_features has side effects that affect the
+	 * queue array: for viona with VIRTIO_NET_F_MQ negotiated, it
+	 * calls pci_viona_qalloc(sc, vnc_max_qpair) which grows
+	 * vs_queues via recallocarray and increases vc_nvq from 3 (the
+	 * fresh-boot value on migrate-dest) to 17 (8 pairs + ctlq).
+	 *
+	 * If we iterate queues first and THEN apply features, the loop
+	 * below writes to vs_queues[i] for i up to saved vi.nvq (17),
+	 * but vs_queues only has 3 slots allocated — buffer overflow
+	 * that corrupts adjacent heap, plus rings 2..N never get their
+	 * state restored at all (multiqueue TX queues appear dead to
+	 * the guest, which eventually prints:
+	 *   "virtio_net: TX timeout on queue: 1, sq: output.1, vq: 0x3"
+	 * because we only restored rings 0-1, leaving ring 3 stale).
+	 */
+	if (vc->vc_apply_features != NULL) {
+		(*vc->vc_apply_features)(DEV_SOFTC(vs),
+		    &vs->vs_negotiated_caps);
+	}
+
 	(void) nvlist_lookup_uint64(nvl, "vi.nvq", &val);
 	int nvq = (int)val;
 	/*
@@ -2193,6 +2215,10 @@ vi_restore_common(struct virtio_softc *vs, nvlist_t *nvl)
 	 * vc_max_nvq would zero out nvq and skip queue restoration
 	 * entirely, leaving the dest with NULL ring pointers and
 	 * total disk I/O hang post-migration.
+	 *
+	 * After vc_apply_features above, vc_nvq reflects the final
+	 * allocation (e.g. expanded to 17 for viona with MQ), so this
+	 * cap is safe against vs_queues out-of-bounds writes.
 	 */
 	int cap = vc->vc_max_nvq > vc->vc_nvq ? vc->vc_max_nvq : vc->vc_nvq;
 	if (nvq > cap)
@@ -2262,17 +2288,6 @@ vi_restore_common(struct virtio_softc *vs, nvlist_t *nvl)
 				vs->vs_curq = saved_curq;
 			}
 		}
-	}
-
-	/*
-	 * Critical: propagate negotiated feature flags to queues.
-	 * Without this, features like INDIRECT_DESC stay disabled on
-	 * restore, causing silent I/O stalls (virtio-blk) or broken
-	 * networking (viona).
-	 */
-	if (vc->vc_apply_features != NULL) {
-		(*vc->vc_apply_features)(DEV_SOFTC(vs),
-		    &vs->vs_negotiated_caps);
 	}
 
 	return (0);

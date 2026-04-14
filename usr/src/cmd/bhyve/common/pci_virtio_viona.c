@@ -1439,12 +1439,26 @@ static int
 pci_viona_restore(struct pci_devinst *pi, nvlist_t *nvl)
 {
 	struct pci_viona_softc *sc = pi->pi_arg;
-	int nrings = VIONA_NRINGS(sc);
 	uint64_t val;
 	boolean_t bval;
 
-	/* Restore virtio common state (includes feature flag propagation) */
+	/*
+	 * Restore virtio common state.  For viona, vi_restore_common's
+	 * vc_apply_features callback (pci_viona_set_hv_features) will
+	 * call pci_viona_qalloc(sc, vnc_max_qpair) if VIRTIO_NET_F_MQ
+	 * is in the negotiated set, growing vc_nvq from 3 to 17 (for
+	 * the default 8 pairs + ctlq).  Don't read VIONA_NRINGS until
+	 * AFTER this — the local value would otherwise capture the
+	 * pre-MQ "3" and leave rings 2..N unrestored.
+	 */
 	vi_restore_common(&sc->vsc_vs, nvl);
+	int nrings = VIONA_NRINGS(sc);
+	fprintf(stderr,
+	    "viona restore: vc_nvq=%d vc_max_nvq=%d nrings=%d "
+	    "usepairs=%u negotiated=0x%" PRIx64 "\n",
+	    sc->vsc_consts.vc_nvq, sc->vsc_consts.vc_max_nvq, nrings,
+	    sc->vsc_vq_usepairs,
+	    (uint64_t)sc->vsc_vs.vs_negotiated_caps);
 
 	/* Restore viona-specific config */
 	uchar_t *cfg;
@@ -1460,9 +1474,12 @@ pci_viona_restore(struct pci_devinst *pi, nvlist_t *nvl)
 	if (nvlist_lookup_uint64(nvl, "viona.vq_usepairs", &val) == 0)
 		sc->vsc_vq_usepairs = (uint16_t)val;
 
-	/* Push negotiated features to kernel */
-	uint64_t features = sc->vsc_vs.vs_negotiated_caps;
-	(void) ioctl(sc->vsc_vnafd, VNA_IOC_SET_FEATURES, &features);
+	/*
+	 * vi_restore_common already pushed negotiated features to the
+	 * kernel via vc_apply_features → pci_viona_set_hv_features.
+	 * Do not re-push here: a second SET_FEATURES call can confuse
+	 * viona's internal state transitions.
+	 */
 
 	/* Set promiscuous mode */
 	(void) ioctl(sc->vsc_vnafd, VNA_IOC_SET_PROMISC,
@@ -1521,19 +1538,34 @@ pci_viona_restore(struct pci_devinst *pi, nvlist_t *nvl)
 		vrs.vrs_qaddr_avail = vq->vq_avail_gpa;
 		vrs.vrs_qaddr_used = vq->vq_used_gpa;
 
+		fprintf(stderr,
+		    "viona restore: ring %d flags=0x%x qsize=%u desc=0x%"
+		    PRIx64 " avail=0x%" PRIx64 " used=0x%" PRIx64
+		    " avail_idx=%u used_idx=%u\n",
+		    i, vq->vq_flags, vq->vq_qsize,
+		    (uint64_t)vq->vq_desc_gpa,
+		    (uint64_t)vq->vq_avail_gpa,
+		    (uint64_t)vq->vq_used_gpa,
+		    (unsigned)avail_idx, (unsigned)used_idx);
+
 		if (ioctl(sc->vsc_vnafd, VNA_IOC_RING_SET_STATE, &vrs) != 0) {
-			WPRINTF("viona restore: ring %d set_state failed: %d",
+			fprintf(stderr,
+			    "viona restore: ring %d set_state FAILED errno=%d\n",
 			    i, errno);
 			continue;
 		}
+		fprintf(stderr, "viona restore: ring %d set_state OK\n", i);
 
 		/* Program MSI-X vector for this ring */
 		pci_viona_ring_set_msix(sc, i);
 
 		/* Kick to start the ring worker */
 		if (ioctl(sc->vsc_vnafd, VNA_IOC_RING_KICK, i) != 0) {
-			WPRINTF("viona restore: ring %d kick failed: %d",
+			fprintf(stderr,
+			    "viona restore: ring %d kick FAILED errno=%d\n",
 			    i, errno);
+		} else {
+			fprintf(stderr, "viona restore: ring %d kick OK\n", i);
 		}
 	}
 
