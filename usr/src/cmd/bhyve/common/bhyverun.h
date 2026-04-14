@@ -55,6 +55,9 @@ struct vmctx;
 struct vm_exit;
 
 extern void *paddr_guest2host(struct vmctx *ctx, uintptr_t addr, size_t len);
+#ifdef BHYVE_SNAPSHOT
+extern uintptr_t paddr_host2guest(struct vmctx *ctx, void *addr);
+#endif
 
 struct vcpu *fbsdrun_vcpu(int vcpuid);
 void fbsdrun_addcpu(int vcpuid, bool);
