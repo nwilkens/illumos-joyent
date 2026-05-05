@@ -53,16 +53,25 @@ static int failures;
 	}								\
 } while (0)
 
+/*
+ * vm_snapshot_buffer's buf_start and buf_size are declared const, so the
+ * struct must be brace-initialised rather than assigned post-hoc.  Build
+ * a fresh meta and copy it into the caller's storage.
+ */
 static void
-init_meta(struct vm_snapshot_meta *meta, void *buf, size_t sz,
+init_meta(struct vm_snapshot_meta *meta, uint8_t *buf, size_t sz,
     enum vm_snapshot_op op)
 {
-	(void) memset(meta, 0, sizeof (*meta));
-	meta->buffer.buf_start = buf;
-	meta->buffer.buf_size = sz;
-	meta->buffer.buf = buf;
-	meta->buffer.buf_rem = sz;
-	meta->op = op;
+	const struct vm_snapshot_meta tmpl = {
+		.buffer = {
+			.buf_start = buf,
+			.buf_size = sz,
+			.buf = buf,
+			.buf_rem = sz,
+		},
+		.op = op,
+	};
+	*meta = tmpl;
 }
 
 /*
