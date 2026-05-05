@@ -821,13 +821,25 @@ cmd_pause(int fd)
 static void
 cmd_resume(int fd)
 {
-	if (vm_resume_instance(ctl.ctx) != 0) {
-		send_error(fd, strerror(errno));
-		return;
-	}
+	/*
+	 * Mirror cmd_pause: resume devices first, then the VM.  If we
+	 * resume vCPUs first, a vCPU can issue a virtio queue-notify that
+	 * traps into bhyve, which calls blockif_request() and trips the
+	 * assert(!bc->bc_paused) in block_if.c against still-paused
+	 * blockif state.
+	 *
+	 * import_resume() is the listen-side analogue of this and uses the
+	 * other order on purpose: at that point vCPU threads have not yet
+	 * been spawned, so there is no guest code running between the two
+	 * calls and the race does not apply.
+	 */
 	int e = for_each_pci(pci_resume);
 	if (e != 0) {
 		send_error(fd, strerror(e));
+		return;
+	}
+	if (vm_resume_instance(ctl.ctx) != 0) {
+		send_error(fd, strerror(errno));
 		return;
 	}
 	send_ok(fd);
