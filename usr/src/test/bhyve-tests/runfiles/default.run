@@ -74,6 +74,11 @@ tests = [
 	'vcpu_barrier'
 	]
 
+[/opt/bhyve-tests/tests/migration]
+tests = [
+	'snapshot_buf_roundtrip'
+	]
+
 [/opt/bhyve-tests/tests/viona]
 user = root
 pre = setup

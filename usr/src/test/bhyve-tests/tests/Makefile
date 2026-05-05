@@ -15,6 +15,6 @@
 
 .PARALLEL: $(SUBDIRS)
 
-SUBDIRS = inst_emul kdev perf viona vmm
+SUBDIRS = inst_emul kdev migration perf viona vmm
 
 include $(SRC)/test/Makefile.com
