@@ -1429,6 +1429,24 @@ pci_viona_snapshot_inner(void *vsc, struct vm_snapshot_meta *meta)
 	nrings = VIONA_NRINGS(sc);
 	SNAPSHOT_VAR_OR_LEAVE(nrings, meta, ret, done);
 
+	if (meta->op == VM_SNAPSHOT_RESTORE) {
+		/*
+		 * nrings is restored from the wire and used as the loop
+		 * bound on vsc_queues[] below.  vsc_queues is allocated by
+		 * pci_viona_qalloc up to vc_max_nvq entries.  A negative
+		 * count or one larger than that allocation would index out
+		 * of bounds.
+		 */
+		const struct virtio_consts *vc = sc->vsc_vs.vs_vc;
+		if (nrings < 0 || nrings > vc->vc_max_nvq) {
+			(void) fprintf(stderr,
+			    "pci_viona_snapshot_inner: nrings=%d outside "
+			    "[0, vc_max_nvq=%d]\n", nrings, vc->vc_max_nvq);
+			ret = EINVAL;
+			goto done;
+		}
+	}
+
 	for (i = 0; i < nrings; i++) {
 		uint16_t avail_idx = 0, used_idx = 0;
 		struct vqueue_info *vq;

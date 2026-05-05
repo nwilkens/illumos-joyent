@@ -2500,7 +2500,30 @@ pci_snapshot_pci_dev(struct vm_snapshot_meta *meta)
 	SNAPSHOT_VAR_OR_LEAVE(pi->pi_msix.table_bar, meta, ret, done);
 	SNAPSHOT_VAR_OR_LEAVE(pi->pi_msix.pba_bar, meta, ret, done);
 	SNAPSHOT_VAR_OR_LEAVE(pi->pi_msix.table_offset, meta, ret, done);
-	SNAPSHOT_VAR_OR_LEAVE(pi->pi_msix.table_count, meta, ret, done);
+	{
+		/*
+		 * pi_msix.table is allocated at pci_emul_add_msixcap() time
+		 * with `table_count` entries.  SNAPSHOT_VAR_OR_LEAVE on
+		 * RESTORE overwrites that count with whatever the source
+		 * sent, but the destination's pi_msix.table is still sized
+		 * for the device's static MSI-X capability.  A larger source
+		 * value would let pci_msix_table_read/write() index past
+		 * the end of the destination's allocation.  Validate before
+		 * any further use.
+		 */
+		int local_table_count = pi->pi_msix.table_count;
+		SNAPSHOT_VAR_OR_LEAVE(pi->pi_msix.table_count, meta, ret, done);
+		if (meta->op == VM_SNAPSHOT_RESTORE &&
+		    pi->pi_msix.table_count != local_table_count) {
+			(void) fprintf(stderr,
+			    "pci_snapshot_pci_dev: %s msix.table_count "
+			    "mismatch source=%d dest=%d\n",
+			    pi->pi_name, pi->pi_msix.table_count,
+			    local_table_count);
+			ret = EINVAL;
+			goto done;
+		}
+	}
 	SNAPSHOT_VAR_OR_LEAVE(pi->pi_msix.pba_offset, meta, ret, done);
 	SNAPSHOT_VAR_OR_LEAVE(pi->pi_msix.pba_size, meta, ret, done);
 	SNAPSHOT_VAR_OR_LEAVE(pi->pi_msix.function_mask, meta, ret, done);

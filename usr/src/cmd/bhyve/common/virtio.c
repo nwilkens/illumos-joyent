@@ -2169,6 +2169,21 @@ vi_pci_snapshot_consts(struct virtio_consts *vc, struct vm_snapshot_meta *meta)
 	 * device-type config layout.
 	 */
 	SNAPSHOT_VAR_OR_LEAVE(vc->vc_nvq, meta, ret, done);
+	if (meta->op == VM_SNAPSHOT_RESTORE && vc->vc_nvq > vc->vc_max_nvq) {
+		/*
+		 * vc_nvq is restored from the wire and is used directly
+		 * as a loop bound on vs_queues[] in vi_pci_snapshot_queues
+		 * and elsewhere.  vs_queues is allocated up to vc_max_nvq
+		 * entries (set at device init from per-device max-queue
+		 * config); a larger source value would walk past the
+		 * destination allocation.
+		 */
+		(void) fprintf(stderr,
+		    "vi_pci_snapshot_consts: vc_nvq=%d > local vc_max_nvq=%d\n",
+		    vc->vc_nvq, vc->vc_max_nvq);
+		ret = EINVAL;
+		goto done;
+	}
 	SNAPSHOT_VAR_CMP_OR_LEAVE(vc->vc_cfgsize, meta, ret, done);
 	SNAPSHOT_VAR_OR_LEAVE(vc->vc_hv_caps_legacy, meta, ret, done);
 	SNAPSHOT_VAR_OR_LEAVE(vc->vc_hv_caps_modern, meta, ret, done);
