@@ -617,11 +617,7 @@ add_bhyve_extra_opts(int *argc, char **argv)
  *
  * The attribute is expected to be cleared by the migration agent
  * immediately after `zoneadm boot` returns so an incidental reboot
- * does not re-enter listen mode.  This path replaces the older
- * `/tmp/migrate.listen` sentinel file mechanism (which is still
- * honoured by bhyve as a fallback for hand-testing but should not be
- * used from production tooling — a zone-writable filesystem probe is
- * a weaker trust boundary than a zone-config attribute).
+ * does not re-enter listen mode.
  */
 static int
 add_migrate_listen(int *argc, char **argv)
@@ -631,6 +627,31 @@ add_migrate_listen(int *argc, char **argv)
 	}
 	if (add_arg(argc, argv, "-o") != 0 ||
 	    add_arg(argc, argv, "migrate.listen=true") != 0) {
+		return (-1);
+	}
+	return (0);
+}
+
+/*
+ * Live-migration source-side eligibility.  When the zone attribute
+ * `migrate_export=true` is set, append `-o migrate.export=true` to
+ * the bhyve argv so bhyve creates its private control socket on
+ * startup; the migration agent uses that socket to drive
+ * pause / export-state / resume on this source VM.
+ *
+ * Without this attribute (or `migrate_listen`) bhyve runs without a
+ * control socket and cannot be a migration participant.  The
+ * attribute is durable: source-eligibility is a property of the VM,
+ * not a one-shot like migrate_listen.
+ */
+static int
+add_migrate_export(int *argc, char **argv)
+{
+	if (!is_env_true("attr", "migrate_export", NULL)) {
+		return (0);
+	}
+	if (add_arg(argc, argv, "-o") != 0 ||
+	    add_arg(argc, argv, "migrate.export=true") != 0) {
 		return (-1);
 	}
 	return (0);
@@ -931,6 +952,7 @@ main(int argc, char **argv)
 	    add_virtio_opts(&zhargc, (char **)&zhargv) != 0 ||
 	    add_bhyve_extra_opts(&zhargc, (char **)&zhargv) != 0 ||
 	    add_migrate_listen(&zhargc, (char **)&zhargv) != 0 ||
+	    add_migrate_export(&zhargc, (char **)&zhargv) != 0 ||
 	    add_fbuf(&zhargc, (char **)&zhargv) != 0 ||
 	    add_vmname(&zhargc, (char **)&zhargv) != 0) {
 		return (1);
