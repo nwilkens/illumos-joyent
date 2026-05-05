@@ -581,8 +581,29 @@ build_save_stream(uint8_t **streamp, size_t *lenp)
 		ret = write_section(&stream, &cap, &used,
 		    CTL_SEC_DEV, 0, name, sec_save_dev, NULL, pdi);
 		if (ret == ENOTSUP) {
-			/* Device opted out of snapshot — skip silently. */
-			continue;
+			/*
+			 * The device emulator has no pe_snapshot callback.
+			 * Silently skipping was the prior behaviour; that
+			 * produced a clean-looking stream that omitted
+			 * controller / queue / register state for the
+			 * device entirely, and a destination guest that
+			 * could not survive the loss.  pci_nvme is the
+			 * concrete example: hibernate/wake exists, but
+			 * no pe_snapshot, so an NVMe-backed VM exported
+			 * just fine and resumed onto a fresh-init NVMe
+			 * controller.
+			 *
+			 * Refuse the export so the operator gets a
+			 * deterministic up-front error and the agent can
+			 * surface "this device is not migration-safe".
+			 */
+			(void) fprintf(stderr,
+			    "build_save_stream: dev '%s' (pe_emu=%s) has no "
+			    "pe_snapshot; refusing export\n",
+			    name,
+			    pdi->pi_d != NULL ? pdi->pi_d->pe_emu : "?");
+			free(stream);
+			return (ENOTSUP);
 		}
 		if (ret != 0) {
 			(void) fprintf(stderr,
@@ -668,8 +689,20 @@ apply_section(uint8_t kind, uint8_t kern_req, const char *name,
 	meta.dev_data = pdi;
 	int ret = pci_snapshot(&meta);
 	if (ret == ENOTSUP) {
-		/* Device has no pe_snapshot — fine, skip. */
-		return (0);
+		/*
+		 * Source wrote a section for this device but the
+		 * destination's emulator has no pe_snapshot.  Under the
+		 * tightened source-side gating this should not happen
+		 * with matching builds; if it does, source and dest
+		 * disagree on which devices are migration-safe and the
+		 * import cannot complete correctly.
+		 */
+		(void) fprintf(stderr,
+		    "import-state: dev '%s' (pe_emu=%s) has no pe_snapshot "
+		    "on destination; build/version mismatch with source\n",
+		    name,
+		    pdi->pi_d != NULL ? pdi->pi_d->pe_emu : "?");
+		return (EINVAL);
 	}
 	return (ret);
 }
