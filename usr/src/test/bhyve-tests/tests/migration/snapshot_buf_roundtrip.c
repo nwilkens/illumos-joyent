@@ -15,19 +15,16 @@
 
 /*
  * Unit tests for the vm_snapshot_buf primitives used by every
- * migration validation site.  The migration save/restore path
- * encodes scalar fields with SNAPSHOT_VAR_OR_LEAVE, which expands
- * to vm_snapshot_buf, and validates source-vs-destination matches
- * with SNAPSHOT_VAR_CMP_OR_LEAVE / vm_snapshot_buf_cmp.  All four
- * cross-host topology checks recently added to the import path
- * (ncpus mismatch, MSI-X table_count mismatch, virtio vc_nvq vs
- * vc_max_nvq, viona nrings vs vc_max_nvq) read a value through one
- * of those primitives before validating; a regression in the
- * primitives would let every one of those checks pass garbage.
+ * migration validation site.  Every cross-host topology check on
+ * the import path (ncpus mismatch, MSI-X table_count mismatch,
+ * virtio vc_nvq vs vc_max_nvq, viona nrings vs vc_max_nvq) reads a
+ * value through SNAPSHOT_VAR_OR_LEAVE before validating; a
+ * regression in the underlying primitives would let those checks
+ * pass garbage.
  *
- * These tests do not need a /dev/vmm instance: they construct
- * vm_snapshot_meta directly with a userspace buffer and exercise
- * save -> restore round-trip plus the bounds and CMP failure paths.
+ * struct vm_snapshot_buffer's buf_start and buf_size are declared
+ * const, so vm_snapshot_meta cannot be reassigned after creation
+ * and each test brace-initialises its own.
  */
 
 #include <stdio.h>
@@ -54,27 +51,6 @@ static int failures;
 } while (0)
 
 /*
- * vm_snapshot_buffer's buf_start and buf_size are declared const, so the
- * struct must be brace-initialised rather than assigned post-hoc.  Build
- * a fresh meta and copy it into the caller's storage.
- */
-static void
-init_meta(struct vm_snapshot_meta *meta, uint8_t *buf, size_t sz,
-    enum vm_snapshot_op op)
-{
-	const struct vm_snapshot_meta tmpl = {
-		.buffer = {
-			.buf_start = buf,
-			.buf_size = sz,
-			.buf = buf,
-			.buf_rem = sz,
-		},
-		.op = op,
-	};
-	*meta = tmpl;
-}
-
-/*
  * Save a uint32_t and a uint64_t, then restore them out of the same
  * buffer; values must round-trip byte-identically and the buffer
  * remainder must shrink by exactly the encoded size.
@@ -83,14 +59,21 @@ static void
 test_var_roundtrip(void)
 {
 	uint8_t buf[BUFSZ];
-	struct vm_snapshot_meta save, restore;
 	uint32_t src_u32 = 0xdeadbeef;
 	uint64_t src_u64 = 0x0123456789abcdefULL;
 	uint32_t dst_u32 = 0;
 	uint64_t dst_u64 = 0;
 	int ret = 0;
 
-	init_meta(&save, buf, sizeof (buf), VM_SNAPSHOT_SAVE);
+	struct vm_snapshot_meta save = {
+		.buffer = {
+			.buf_start = buf,
+			.buf_size = sizeof (buf),
+			.buf = buf,
+			.buf_rem = sizeof (buf),
+		},
+		.op = VM_SNAPSHOT_SAVE,
+	};
 	SNAPSHOT_VAR_OR_LEAVE(src_u32, &save, ret, save_done);
 	SNAPSHOT_VAR_OR_LEAVE(src_u64, &save, ret, save_done);
 save_done:
@@ -99,7 +82,15 @@ save_done:
 	REQUIRE(saved_bytes == sizeof (src_u32) + sizeof (src_u64),
 	    "saved bytes should equal sum of var sizes");
 
-	init_meta(&restore, buf, saved_bytes, VM_SNAPSHOT_RESTORE);
+	struct vm_snapshot_meta restore = {
+		.buffer = {
+			.buf_start = buf,
+			.buf_size = saved_bytes,
+			.buf = buf,
+			.buf_rem = saved_bytes,
+		},
+		.op = VM_SNAPSHOT_RESTORE,
+	};
 	ret = 0;
 	SNAPSHOT_VAR_OR_LEAVE(dst_u32, &restore, ret, restore_done);
 	SNAPSHOT_VAR_OR_LEAVE(dst_u64, &restore, ret, restore_done);
@@ -117,11 +108,18 @@ static void
 test_save_overflow(void)
 {
 	uint8_t buf[4];
-	struct vm_snapshot_meta save;
 	uint64_t v = 0xffffffffffffffffULL;
 	int ret = 0;
 
-	init_meta(&save, buf, sizeof (buf), VM_SNAPSHOT_SAVE);
+	struct vm_snapshot_meta save = {
+		.buffer = {
+			.buf_start = buf,
+			.buf_size = sizeof (buf),
+			.buf = buf,
+			.buf_rem = sizeof (buf),
+		},
+		.op = VM_SNAPSHOT_SAVE,
+	};
 	SNAPSHOT_VAR_OR_LEAVE(v, &save, ret, done);
 done:
 	REQUIRE(ret != 0, "save into too-small buffer must fail");
@@ -137,29 +135,51 @@ static void
 test_cmp_mismatch(void)
 {
 	uint8_t buf[BUFSZ];
-	struct vm_snapshot_meta save, restore;
 	uint32_t src = 0x11111111;
 	uint32_t dst_match = src;
 	uint32_t dst_mismatch = 0x22222222;
 	int ret;
 
-	init_meta(&save, buf, sizeof (buf), VM_SNAPSHOT_SAVE);
+	struct vm_snapshot_meta save = {
+		.buffer = {
+			.buf_start = buf,
+			.buf_size = sizeof (buf),
+			.buf = buf,
+			.buf_rem = sizeof (buf),
+		},
+		.op = VM_SNAPSHOT_SAVE,
+	};
 	ret = 0;
 	SNAPSHOT_VAR_OR_LEAVE(src, &save, ret, save_done);
 save_done:
 	REQUIRE(ret == 0, "save for CMP setup should succeed");
+	size_t saved = sizeof (buf) - save.buffer.buf_rem;
 
-	init_meta(&restore, buf, sizeof (buf) - save.buffer.buf_rem,
-	    VM_SNAPSHOT_RESTORE);
+	struct vm_snapshot_meta cmp_match = {
+		.buffer = {
+			.buf_start = buf,
+			.buf_size = saved,
+			.buf = buf,
+			.buf_rem = saved,
+		},
+		.op = VM_SNAPSHOT_RESTORE,
+	};
 	ret = 0;
-	SNAPSHOT_VAR_CMP_OR_LEAVE(dst_match, &restore, ret, cmp_match_done);
+	SNAPSHOT_VAR_CMP_OR_LEAVE(dst_match, &cmp_match, ret, cmp_match_done);
 cmp_match_done:
 	REQUIRE(ret == 0, "CMP with matching value should succeed");
 
-	init_meta(&restore, buf, sizeof (buf) - save.buffer.buf_rem,
-	    VM_SNAPSHOT_RESTORE);
+	struct vm_snapshot_meta cmp_mismatch = {
+		.buffer = {
+			.buf_start = buf,
+			.buf_size = saved,
+			.buf = buf,
+			.buf_rem = saved,
+		},
+		.op = VM_SNAPSHOT_RESTORE,
+	};
 	ret = 0;
-	SNAPSHOT_VAR_CMP_OR_LEAVE(dst_mismatch, &restore, ret,
+	SNAPSHOT_VAR_CMP_OR_LEAVE(dst_mismatch, &cmp_mismatch, ret,
 	    cmp_mismatch_done);
 cmp_mismatch_done:
 	REQUIRE(ret != 0, "CMP with mismatched value must fail");
