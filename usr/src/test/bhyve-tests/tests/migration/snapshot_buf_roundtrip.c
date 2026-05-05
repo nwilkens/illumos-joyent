@@ -143,14 +143,14 @@ save_done:
 	init_meta(&restore, buf, sizeof (buf) - save.buffer.buf_rem,
 	    VM_SNAPSHOT_RESTORE);
 	ret = 0;
-	SNAPSHOT_VAR_CMP_OR_LEAVE(&dst_match, &restore, ret, cmp_match_done);
+	SNAPSHOT_VAR_CMP_OR_LEAVE(dst_match, &restore, ret, cmp_match_done);
 cmp_match_done:
 	REQUIRE(ret == 0, "CMP with matching value should succeed");
 
 	init_meta(&restore, buf, sizeof (buf) - save.buffer.buf_rem,
 	    VM_SNAPSHOT_RESTORE);
 	ret = 0;
-	SNAPSHOT_VAR_CMP_OR_LEAVE(&dst_mismatch, &restore, ret,
+	SNAPSHOT_VAR_CMP_OR_LEAVE(dst_mismatch, &restore, ret,
 	    cmp_mismatch_done);
 cmp_mismatch_done:
 	REQUIRE(ret != 0, "CMP with mismatched value must fail");
