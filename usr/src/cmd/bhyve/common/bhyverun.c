@@ -949,16 +949,30 @@ main(int argc, char *argv[])
 	/*
 	 * Bring the migration control socket up after PCI is initialised
 	 * so cmd_export_state / cmd_import_state can iterate via
-	 * pci_next().  Path defaults to /tmp/bhyve.sock (visible from the
-	 * GZ at /zones/<uuid>/root/tmp/bhyve.sock); override with
-	 *   bhyve -o control.socket=<path>
+	 * pci_next().  The socket exposes pause / resume / export-state /
+	 * import-state on a privileged Unix-domain endpoint; it is created
+	 * only when this bhyve is participating in a migration:
+	 *
+	 *   migrate.listen = true   destination, blocking for import
+	 *   migrate.export = true   source, eligible to be migrated from
+	 *   control.socket = path   explicit override (testing / dev)
+	 *
+	 * The brand sets migrate.listen on listen-mode startup and is
+	 * expected to set migrate.export for source-eligible VMs; with
+	 * neither set the bhyve runs without a control socket and is not
+	 * a live-migration participant.  The socket file mode is 0600
+	 * (set in bhyve_control.c).
 	 */
 	{
+		bool migrate_export =
+		    get_config_bool_default("migrate.export", false);
 		const char *ctl_path = get_config_value("control.socket");
-		if (ctl_path == NULL)
-			ctl_path = "/tmp/bhyve.sock";
-		bhyve_control_init(ctx, guest_ncpus, ctl_path);
-		(void) atexit(bhyve_control_fini);
+		if (migrate_listen_mode || migrate_export || ctl_path != NULL) {
+			if (ctl_path == NULL)
+				ctl_path = "/tmp/bhyve.sock";
+			bhyve_control_init(ctx, guest_ncpus, ctl_path);
+			(void) atexit(bhyve_control_fini);
+		}
 	}
 #endif
 
