@@ -81,9 +81,28 @@ vm_snapshot_guest2host_addr(struct vmctx *ctx, void **addrp, size_t len,
 				ret = EFAULT;
 				goto done;
 			}
+			/*
+			 * Source recorded an intentional null pointer.  Do
+			 * not look it up; the destination's translation of
+			 * the sentinel is also NULL, but skipping the call
+			 * keeps paddr_guest2host's behaviour for invalid
+			 * GPAs unambiguous (real failures only).
+			 */
+			*addrp = NULL;
+		} else {
+			void *hva = paddr_guest2host(ctx, gaddr, len);
+			if (hva == NULL) {
+				/*
+				 * Restored GPA does not map to a valid host
+				 * region of `len` bytes.  Treat as EFAULT
+				 * rather than store NULL into a host pointer
+				 * a caller is about to dereference.
+				 */
+				ret = EFAULT;
+				goto done;
+			}
+			*addrp = hva;
 		}
-
-		*addrp = paddr_guest2host(ctx, gaddr, len);
 	} else {
 		ret = EINVAL;
 	}
