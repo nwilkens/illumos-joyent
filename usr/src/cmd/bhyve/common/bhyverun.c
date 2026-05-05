@@ -832,11 +832,15 @@ main(int argc, char *argv[])
 	/*
 	 * Resolve migrate-listen mode early and freeze into a static bool.
 	 * See docs/bhyve-snapshot-port.md#migrate-listen-resolution-timing.
+	 *
+	 * The sole entrypoint is the "-o migrate.listen=true" config value,
+	 * which the bhyve brand sets from the migrate_listen zone
+	 * attribute.  An earlier dev-only convenience checked
+	 * /tmp/migrate.listen and lifted the flag automatically; that
+	 * trigger let any in-zone process force the bhyve into listen
+	 * mode at next startup, which is a local DoS footgun and is no
+	 * longer needed now that the brand-attribute path is in place.
 	 */
-	if (access("/tmp/migrate.listen", F_OK) == 0) {
-		set_config_bool("migrate.listen", true);
-		(void) unlink("/tmp/migrate.listen");
-	}
 	migrate_listen_mode = get_config_bool_default("migrate.listen", false);
 #endif
 
