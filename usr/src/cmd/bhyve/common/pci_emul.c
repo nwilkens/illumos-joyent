@@ -2672,8 +2672,28 @@ bar_restore_in_range(const struct pci_devinst *pi, int idx)
 		 */
 		return (true);
 	case PCIBAR_ROM:
-	default:
 		return (true);
+	case PCIBAR_NONE:
+	case PCIBAR_MEMHI64:
+		/*
+		 * pci_restore_bars filters these out before calling us, so
+		 * arriving here means the type field was the enum value
+		 * but the caller's filter slipped — refuse to register.
+		 */
+		return (false);
+	default:
+		/*
+		 * The wire value did not name an enumerated pcibar_type.
+		 * Treat as out-of-range rather than fall through to
+		 * register_bar with an undefined type, which would either
+		 * assert in modify_bar_registration or silently route MMIO
+		 * for an unmapped class.
+		 */
+		(void) fprintf(stderr,
+		    "bar_restore_in_range: %s BAR[%d] type=%d not a "
+		    "known pcibar_type\n", pi->pi_name, idx,
+		    (int)pi->pi_bar[idx].type);
+		return (false);
 	}
 }
 
