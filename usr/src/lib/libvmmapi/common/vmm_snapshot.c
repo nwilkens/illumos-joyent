@@ -475,7 +475,17 @@ restore_vmcx_vcpu(struct vmctx *ctx, struct vcpu *vcpu, int vcpuid,
 	    vmcx_gpr_regs, gprs) != 0)
 		return (errno);
 
-	/* 2. Segment descriptors + selectors. */
+	/*
+	 * 2. Segment descriptors + selectors.
+	 *
+	 * Failures here are hard.  vm_set_desc / vm_set_register only
+	 * fail when the kernel rejects the value (architectural mismatch
+	 * or an unsupported VMM API on this host); a missed descriptor
+	 * leaves the destination's VMCS in an inconsistent state and
+	 * surfaces as VMX entry failure inst_error=7 on the next vCPU
+	 * resume.  An earlier revision logged-and-continued; that traded
+	 * a deterministic restore-time error for a noisy boot-time crash.
+	 */
 	for (i = 0; i < N_VMCX_SEG_DESCS; i++) {
 		struct vmcx_seg_entry ent;
 		int reg = vmcx_seg_descs[i];
@@ -486,27 +496,40 @@ restore_vmcx_vcpu(struct vmctx *ctx, struct vcpu *vcpu, int vcpuid,
 		    meta, ret, done);
 		if (vm_set_desc(vcpu, (int)ent.regid, ent.base, ent.limit,
 		    ent.access) != 0) {
-			/* Non-fatal; some segs can be uninitialised. */
+			int e = errno;
 			(void) fprintf(stderr,
 			    "vmcx: vcpu%d reg%u set_desc: %s\n",
-			    vcpuid, ent.regid, strerror(errno));
+			    vcpuid, ent.regid, strerror(e));
+			ret = e;
+			goto done;
 		}
 		if (!is_gx) {
 			if (vm_set_register(vcpu, (int)ent.regid,
 			    ent.sel) != 0) {
+				int e = errno;
 				(void) fprintf(stderr,
 				    "vmcx: vcpu%d reg%u set_sel: %s\n",
-				    vcpuid, ent.regid, strerror(errno));
+				    vcpuid, ent.regid, strerror(e));
+				ret = e;
+				goto done;
 			}
 		}
 	}
 
-	/* 3. FPU. */
+	/*
+	 * 3. FPU.
+	 *
+	 * FPU loss is guest-visible corruption — anything from incorrect
+	 * floating-point results to silent miscompares.  No "safe" errno
+	 * to swallow here; fail the import.
+	 */
 	SNAPSHOT_BUF_OR_LEAVE(fpubuf, sizeof (fpubuf), meta, ret, done);
 	if (vmcx_set_fpu(ctx, vcpuid, fpubuf, sizeof (fpubuf)) != 0) {
-		/* Not fatal for resume; log and continue. */
+		int e = errno;
 		(void) fprintf(stderr, "vmcx: vcpu%d set_fpu: %s\n",
-		    vcpuid, strerror(errno));
+		    vcpuid, strerror(e));
+		ret = e;
+		goto done;
 	}
 
 	/* 4. MSRs + 5. VMM_ARCH. */
@@ -515,14 +538,25 @@ restore_vmcx_vcpu(struct vmctx *ctx, struct vcpu *vcpu, int vcpuid,
 	if ((ret = snapshot_vmm_class(ctx, vcpuid, VDC_VMM_ARCH, 1, meta)) != 0)
 		return (ret);
 
-	/* 6. vCPU run state. */
+	/*
+	 * 6. vCPU run state.
+	 *
+	 * Run state and SIPI vector must reach the kernel together.  A
+	 * lost run state on an AP that received INIT but not yet SIPI
+	 * produces a vCPU that will never start; on the BSP it produces
+	 * one whose register file disagrees with its execution state.
+	 * Hard fail.
+	 */
 	SNAPSHOT_VAR_OR_LEAVE(rstate, meta, ret, done);
 	SNAPSHOT_VAR_OR_LEAVE(sipi_vector, meta, ret, done);
 	if (vm_set_run_state(vcpu, rstate, sipi_vector) != 0) {
+		int e = errno;
 		(void) fprintf(stderr,
 		    "vmcx: vcpu%d set_run_state(%u,%u): %s\n",
 		    vcpuid, (unsigned)rstate, (unsigned)sipi_vector,
-		    strerror(errno));
+		    strerror(e));
+		ret = e;
+		goto done;
 	}
 
 done:
