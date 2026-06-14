@@ -932,6 +932,23 @@ QLT_OBJS += 2400.o 2500.o 2700.o 8100.o 8300fc.o qlt.o qlt_dma.o
 
 SRPT_OBJS += srpt_mod.o srpt_ch.o srpt_cm.o srpt_ioc.o srpt_stp.o
 
+#
+# NVMe over Fabrics host (initiator) driver (drv/nvmf_host).  Presents fabric
+# namespaces as blkdev children; the FreeBSD CAM SIM (nvmf_sim.c) is dropped in
+# favour of blkdev integration.  Object names track the host/ sources ported
+# from FreeBSD sys/dev/nvmf/host.
+#
+NVMF_HOST_OBJS += nvmf_host.o nvmf_qpair.o nvmf_cmd.o nvmf_aer.o nvmf_ns.o \
+		nvmf_blkdev.o nvmf_mpath.o
+
+#
+# NVMe over Fabrics target: COMSTAR STMF port provider (drv/nvmft).  Object
+# names track the controller/ sources ported from FreeBSD sys/dev/nvmf, with
+# the CTL frontend replaced by an STMF port provider.
+#
+NVMFT_OBJS += nvmft.o nvmft_controller.o nvmft_qpair.o nvmft_subr.o \
+		nvmft_stmf.o nvmft_resv.o nvmft_ana.o
+
 FCOE_OBJS += fcoe.o fcoe_eth.o fcoe_fc.o
 
 FCOET_OBJS += fcoet.o fcoet_eth.o fcoet_fc.o
@@ -1978,6 +1995,19 @@ NVME_OBJS += nvme.o nvme_validate.o nvme_lock.o nvme_stat.o
 NVME_OBJS += nvme_feature.o nvme_field.o nvme_firmware.o nvme_format.o \
 		nvme_identify.o nvme_log.o nvme_nsmgmt.o nvme_version.o \
 		nvme_vuc.o
+
+#
+# NVMe over Fabrics transport core (misc/nvmf).  Transport-independent
+# dispatch core ported from FreeBSD sys/dev/nvmf.
+#
+NVMF_OBJS += nvmf_transport.o
+
+#
+# NVMe over Fabrics TCP transport (misc/nvmf_tcp).  Provider module ported
+# from FreeBSD sys/dev/nvmf/nvmf_tcp.c; registers the TCP transport vtable
+# with the misc/nvmf core and frames NVMe/TCP PDUs over a kernel TCP socket.
+#
+NVMF_TCP_OBJS += nvmf_tcp.o
 
 PVSCSI_OBJS = pvscsi.o
 
