@@ -1,0 +1,109 @@
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+
+#
+# Copyright 2026 Edgecast Cloud LLC.
+#
+
+#
+# MAPFILE HEADER START
+#
+# WARNING:  STOP NOW.  DO NOT MODIFY THIS FILE.
+# Object versioning must comply with the rules detailed in
+#
+#	usr/src/lib/README.mapfiles
+#
+# You should not be making modifications here until you've read the most current
+# copy of that file. If you need help, contact a gatekeeper for guidance.
+#
+# MAPFILE HEADER END
+#
+
+$mapfile_version 2
+
+SYMBOL_VERSION ILLUMOS_0.1 {
+    global:
+	#
+	# Transport-independent association/qpair/capsule API.
+	#
+	nvmf_allocate_association;
+	nvmf_update_association;
+	nvmf_free_association;
+	nvmf_association_error;
+	nvmf_allocate_qpair;
+	nvmf_free_qpair;
+	nvmf_allocate_command;
+	nvmf_allocate_response;
+	nvmf_free_capsule;
+	nvmf_capsule_append_data;
+	nvmf_transmit_capsule;
+	nvmf_receive_capsule;
+	nvmf_capsule_sqe;
+	nvmf_capsule_cqe;
+	nvmf_transport_type;
+	nvmf_nqn_valid;
+	nvmf_nqn_valid_strict;
+
+	#
+	# Controller-specific API.
+	#
+	nvmf_validate_command_capsule;
+	nvmf_capsule_data_len;
+	nvmf_receive_controller_data;
+	nvmf_send_controller_data;
+	nvmf_init_cqe;
+	nvmf_send_response;
+	nvmf_controller_receive_capsule;
+	nvmf_controller_transmit_response;
+	nvmf_send_error;
+	nvmf_send_generic_error;
+	nvmf_send_success;
+	nvmf_accept;
+	nvmf_connect_invalid_parameters;
+	nvmf_finish_accept;
+	nvmf_controller_cap;
+	nvmf_controller_serial;
+	nvmf_init_discovery_controller_data;
+	nvmf_init_io_controller_data;
+	nvmf_validate_cc;
+	nvmf_get_log_page_id;
+	nvmf_get_log_page_length;
+	nvmf_get_log_page_offset;
+	nvmf_handoff_controller_qpair;
+
+	#
+	# Host-specific API.
+	#
+	nvmf_connect;
+	nvmf_cntlid;
+	nvmf_host_transmit_command;
+	nvmf_host_receive_response;
+	nvmf_host_wait_for_response;
+	nvmf_keepalive;
+	nvmf_read_property;
+	nvmf_write_property;
+	nvmf_hostid_from_hostuuid;
+	nvmf_nqn_from_hostuuid;
+	nvmf_host_identify_controller;
+	nvmf_host_identify_namespace;
+	nvmf_host_fetch_discovery_log_page;
+	nvmf_init_dle_from_admin_qp;
+	nvmf_host_request_queues;
+	nvmf_handoff_host;
+	nvmf_disconnect_host;
+	nvmf_disconnect_all;
+	nvmf_reconnect_params;
+	nvmf_reconnect_host;
+	nvmf_connection_status;
+
+    local:
+	*;
+};

@@ -393,6 +393,8 @@ COMMON_SUBDIRS=		\
 	split		\
 	sqlite		\
 	srchtxt		\
+	nvmfadm		\
+	nvmfd		\
 	srptadm		\
 	srptsvc		\
 	stat		\
