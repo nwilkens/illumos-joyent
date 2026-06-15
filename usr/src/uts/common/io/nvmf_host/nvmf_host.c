@@ -669,6 +669,17 @@ nvmf_add_ns(nvmf_softc_t *sc, uint32_t nsid, const nvme_identify_nsid_t *data,
 {
 	_NOTE(ARGUNUSED(arg));
 
+	/*
+	 * sc->ns is sized cdata->id_nn and indexed by nsid - 1.  A target that
+	 * reports an out-of-range nsid must not be allowed to index past the
+	 * array; skip it with a warning rather than corrupting the heap.
+	 */
+	if (nsid < 1 || nsid > sc->cdata->id_nn) {
+		dev_err(sc->dip, CE_WARN,
+		    "!ignoring out-of-range namespace %u in active list", nsid);
+		return (B_TRUE);
+	}
+
 	if (sc->ns[nsid - 1] != NULL) {
 		dev_err(sc->dip, CE_WARN,
 		    "!duplicate namespace %u in active namespace list", nsid);
@@ -882,6 +893,21 @@ nvmf_rescan_ns_1(nvmf_softc_t *sc, uint32_t nsid,
 {
 	struct nvmf_namespace *ns;
 
+	ASSERT(RW_WRITE_HELD(&sc->connection_lock));
+
+	/*
+	 * A target-supplied nsid (changed-namespace log page or active-ns list)
+	 * indexes sc->ns, which is sized cdata->id_nn.  Drop anything out of
+	 * range or any rescan that raced a teardown freeing sc->ns.
+	 */
+	if (sc->detaching || sc->ns == NULL)
+		return;
+	if (nsid < 1 || nsid > sc->cdata->id_nn) {
+		dev_err(sc->dip, CE_WARN, "!ignoring out-of-range namespace %u",
+		    nsid);
+		return;
+	}
+
 	ns = sc->ns[nsid - 1];
 	if (data->id_nsize == 0) {
 		if (ns != NULL) {
@@ -926,7 +952,15 @@ nvmf_rescan_ns(nvmf_softc_t *sc, uint32_t nsid)
 		return;
 	}
 
+	/*
+	 * IDENTIFY is issued without connection_lock (it sleeps for the reply);
+	 * take the writer lock only across the sc->ns[] mutation, which is the
+	 * serialization the namespace objects require (see nvmf_ns.c).  The AER
+	 * taskq is the sole caller, so the lock is never already held here.
+	 */
+	rw_enter(&sc->connection_lock, RW_WRITER);
 	nvmf_rescan_ns_1(sc, nsid, data);
+	rw_exit(&sc->connection_lock);
 
 	kmem_free(data, sizeof (*data));
 }
@@ -943,6 +977,23 @@ nvmf_purge_namespaces(nvmf_softc_t *sc, uint32_t first_nsid,
 	struct nvmf_namespace *ns;
 	uint32_t nsid;
 
+	ASSERT(RW_WRITE_HELD(&sc->connection_lock));
+
+	if (sc->detaching || sc->ns == NULL)
+		return;
+
+	/*
+	 * next_valid_nsid is derived from the target's active-namespace list and
+	 * is otherwise untrusted; sc->ns is sized cdata->id_nn, so clamp the
+	 * range here -- this is the single choke point both purge call sites flow
+	 * through -- so a target reporting an out-of-range nsid cannot drive an
+	 * out-of-bounds sc->ns[] access.
+	 */
+	if (first_nsid < 1)
+		return;
+	if (next_valid_nsid > sc->cdata->id_nn + 1)
+		next_valid_nsid = sc->cdata->id_nn + 1;
+
 	for (nsid = first_nsid; nsid < next_valid_nsid; nsid++) {
 		ns = sc->ns[nsid - 1];
 		if (ns != NULL) {
@@ -953,32 +1004,79 @@ nvmf_purge_namespaces(nvmf_softc_t *sc, uint32_t first_nsid,
 	}
 }
 
+/*
+ * Context threaded through the active-namespace scan.  'locked' records whether
+ * the caller already holds connection_lock as a writer (the reconnect path) so
+ * the per-mutation sections do not recursively enter the non-recursive rwlock.
+ */
+typedef struct nvmf_rescan_ctx {
+	uint32_t	last_nsid;
+	boolean_t	locked;
+} nvmf_rescan_ctx_t;
+
 static boolean_t
 nvmf_rescan_ns_cb(nvmf_softc_t *sc, uint32_t nsid,
     const nvme_identify_nsid_t *data, void *arg)
 {
-	uint32_t *last_nsid = arg;
+	nvmf_rescan_ctx_t *ctx = arg;
+
+	/*
+	 * The scan issues IDENTIFY between callbacks, so the writer lock cannot
+	 * span the whole scan; take it only across the sc->ns[] mutations here
+	 * (unless the caller already holds it).
+	 */
+	if (!ctx->locked)
+		rw_enter(&sc->connection_lock, RW_WRITER);
 
 	/* Check for any gaps prior to this namespace. */
-	nvmf_purge_namespaces(sc, *last_nsid + 1, nsid);
-	*last_nsid = nsid;
+	nvmf_purge_namespaces(sc, ctx->last_nsid + 1, nsid);
+	ctx->last_nsid = nsid;
 
 	nvmf_rescan_ns_1(sc, nsid, data);
+
+	if (!ctx->locked)
+		rw_exit(&sc->connection_lock);
 	return (B_TRUE);
 }
 
-void
-nvmf_rescan_all_ns(nvmf_softc_t *sc)
+/*
+ * Reconcile the full namespace set against the target's active-namespace list.
+ * The scan issues IDENTIFY (which sleeps for its reply); 'locked' tells whether
+ * the caller already holds connection_lock as a writer.  Either way the
+ * sc->ns[] mutations run under the writer lock (see nvmf_ns.c).
+ */
+static void
+nvmf_rescan_all_ns_impl(nvmf_softc_t *sc, boolean_t locked)
 {
-	uint32_t last_nsid = 0;
+	nvmf_rescan_ctx_t ctx = { .last_nsid = 0, .locked = locked };
 
-	if (!nvmf_scan_active_namespaces(sc, nvmf_rescan_ns_cb, &last_nsid))
+	if (!nvmf_scan_active_namespaces(sc, nvmf_rescan_ns_cb, &ctx))
 		return;
 
 	/*
 	 * Check for any namespace devices after the last active namespace.
 	 */
-	nvmf_purge_namespaces(sc, last_nsid + 1, sc->cdata->id_nn + 1);
+	if (!locked)
+		rw_enter(&sc->connection_lock, RW_WRITER);
+	nvmf_purge_namespaces(sc, ctx.last_nsid + 1, sc->cdata->id_nn + 1);
+	if (!locked)
+		rw_exit(&sc->connection_lock);
+}
+
+/* AER taskq entry point: the caller does NOT hold connection_lock. */
+void
+nvmf_rescan_all_ns(nvmf_softc_t *sc)
+{
+	ASSERT(!RW_WRITE_HELD(&sc->connection_lock));
+	nvmf_rescan_all_ns_impl(sc, B_FALSE);
+}
+
+/* Reconnect entry point: the caller already holds connection_lock as writer. */
+static void
+nvmf_rescan_all_ns_locked(nvmf_softc_t *sc)
+{
+	ASSERT(RW_WRITE_HELD(&sc->connection_lock));
+	nvmf_rescan_all_ns_impl(sc, B_TRUE);
 }
 
 int
@@ -1035,6 +1133,11 @@ nvmf_passthrough_cmd(nvmf_softc_t *sc, nvme_ioctl_passthru_t *pt,
 		qp = sc->admin;
 	else
 		qp = nvmf_select_io_queue(sc);
+	if (qp == NULL) {
+		rw_exit(&sc->connection_lock);
+		error = ENXIO;
+		goto out;
+	}
 	nvmf_status_init(&status);
 	req = nvmf_allocate_request(qp, &cmd, nvmf_complete, &status, KM_SLEEP);
 	rw_exit(&sc->connection_lock);
@@ -1110,6 +1213,7 @@ nvmf_attach_association(nvmf_softc_t *sc, nvlist_t *nvl)
 	uint_t cdlen, num_io_queues, i;
 	uint64_t mpsmin, val, v64 = 0;
 	nvme_reg_cap_t cap;
+	boolean_t bd_inited = B_FALSE;
 	int error;
 
 	/*
@@ -1170,15 +1274,13 @@ nvmf_attach_association(nvmf_softc_t *sc, nvlist_t *nvl)
 	error = nvmf_init_bd(sc);
 	if (error != 0)
 		goto out;
+	bd_inited = B_TRUE;
 
 	error = nvmf_start_aer(sc);
-	if (error != 0) {
-		nvmf_destroy_bd(sc);
+	if (error != 0)
 		goto out;
-	}
 
 	if (!nvmf_add_namespaces(sc)) {
-		nvmf_destroy_bd(sc);
 		error = ENXIO;
 		goto out;
 	}
@@ -1186,6 +1288,13 @@ nvmf_attach_association(nvmf_softc_t *sc, nvlist_t *nvl)
 	sc->cdev_attached = B_TRUE;
 	return (0);
 out:
+	/*
+	 * Destroy the namespaces BEFORE the multipath/blkdev state: each
+	 * nvmf_destroy_ns() removes and frees its own path via
+	 * nvmf_mpath_remove_path(), so nvmf_destroy_bd() (which also walks
+	 * sc->paths and frees them) must run afterwards on an already-empty
+	 * list.  Doing it the other way around double-frees ns->path.
+	 */
 	if (sc->ns != NULL) {
 		for (i = 0; i < sc->cdata->id_nn; i++) {
 			if (sc->ns[i] != NULL)
@@ -1194,6 +1303,9 @@ out:
 		kmem_free(sc->ns, sc->cdata->id_nn * sizeof (*sc->ns));
 		sc->ns = NULL;
 	}
+
+	if (bd_inited)
+		nvmf_destroy_bd(sc);
 
 	rw_enter(&sc->connection_lock, RW_WRITER);
 	nvmf_disarm_ka_timers(sc);
@@ -1294,7 +1406,13 @@ nvmf_reconnect_host(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
 	}
 	nvmf_reconnect_bd(sc);
 
-	nvmf_rescan_all_ns(sc);
+	/*
+	 * The caller already holds connection_lock as a writer here, so the
+	 * rescan must run in its already-locked mode (it would otherwise
+	 * recursively enter the non-recursive rwlock).  The IDENTIFY commands
+	 * run on this thread under the lock, exactly as before this fix.
+	 */
+	nvmf_rescan_all_ns_locked(sc);
 
 	nvmf_cancel_timer(sc, &sc->reconnect_timer);
 	nvmf_cancel_timer(sc, &sc->loss_timer);
@@ -1449,9 +1567,13 @@ nvmf_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	sc->detaching = B_TRUE;
 	rw_exit(&sc->connection_lock);
 
-	/* Tear down the blkdev presentation and namespaces. */
+	/*
+	 * Tear down the namespaces BEFORE the blkdev/multipath state: each
+	 * nvmf_destroy_ns() frees its own path via nvmf_mpath_remove_path(), so
+	 * nvmf_destroy_bd() must run afterwards on an already-empty sc->paths
+	 * list to avoid double-freeing ns->path.
+	 */
 	if (sc->cdev_attached) {
-		nvmf_destroy_bd(sc);
 		if (sc->ns != NULL) {
 			for (i = 0; i < sc->cdata->id_nn; i++) {
 				if (sc->ns[i] != NULL)
@@ -1460,6 +1582,7 @@ nvmf_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 			kmem_free(sc->ns, sc->cdata->id_nn * sizeof (*sc->ns));
 			sc->ns = NULL;
 		}
+		nvmf_destroy_bd(sc);
 	}
 
 	rw_enter(&sc->connection_lock, RW_WRITER);

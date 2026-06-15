@@ -195,7 +195,17 @@ typedef struct nvmf_completion_status {
 static inline struct nvmf_host_qpair *
 nvmf_select_io_queue(nvmf_softc_t *sc)
 {
-	uint_t idx = (uint_t)(CPU->cpu_seqid) % sc->num_io_queues;
+	uint_t idx;
+
+	/*
+	 * nvmf_disconnect_task zeroes num_io_queues (and frees sc->io) under
+	 * connection_lock as a writer while the softc lives.  A caller racing
+	 * that teardown must see no queue rather than divide by zero or index a
+	 * freed array; return NULL and let the caller fail the I/O with ENXIO.
+	 */
+	if (sc->io == NULL || sc->num_io_queues == 0)
+		return (NULL);
+	idx = (uint_t)(CPU->cpu_seqid) % sc->num_io_queues;
 	return (sc->io[idx]);
 }
 
@@ -314,6 +324,7 @@ struct nvmf_path *nvmf_mpath_add_path(nvmf_softc_t *sc, uint32_t nsid,
 void nvmf_mpath_remove_path(struct nvmf_path *path);
 struct nvmf_ns_head *nvmf_mpath_find_head(const nvme_identify_nsid_t *data);
 struct nvmf_path *nvmf_mpath_select(struct nvmf_ns_head *head, bd_xfer_t *xfer);
+void nvmf_mpath_select_rele(struct nvmf_path *path);
 void nvmf_mpath_path_down(struct nvmf_path *path);
 void nvmf_mpath_path_up(struct nvmf_path *path);
 uint32_t nvmf_mpath_head_blksize(struct nvmf_ns_head *head);

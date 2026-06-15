@@ -287,6 +287,13 @@ nvmf_bd_finish(nvmf_bd_cmd_t *bc)
 	if (bc->bc_dsm != NULL)
 		kmem_free(bc->bc_dsm, bc->bc_dsm_len);
 
+	/*
+	 * Drop the in-flight path reference taken by nvmf_mpath_select() when
+	 * this command was submitted.  This is the last use of bc_path; once
+	 * released the path may be drained and freed by nvmf_mpath_remove_path.
+	 */
+	nvmf_mpath_select_rele(bc->bc_path);
+
 	kmem_free(bc, sizeof (*bc));
 	bd_xfer_done(xfer, error);
 }
@@ -393,8 +400,10 @@ nvmf_bd_rw(struct nvmf_ns_head *head, bd_xfer_t *xfer, boolean_t is_write)
 	how = (xfer->x_flags & BD_XFER_POLL) ? KM_NOSLEEP : KM_SLEEP;
 
 	bc = kmem_zalloc(sizeof (*bc), how);
-	if (bc == NULL)
+	if (bc == NULL) {
+		nvmf_mpath_select_rele(path);
 		return (ENOMEM);
+	}
 	bc->bc_xfer = xfer;
 	bc->bc_head = head;
 	bc->bc_path = path;
@@ -435,6 +444,7 @@ nvmf_bd_rw(struct nvmf_ns_head *head, bd_xfer_t *xfer, boolean_t is_write)
 	rw_enter(&sc->connection_lock, RW_READER);
 	if (sc->io == NULL || sc->num_io_queues == 0) {
 		rw_exit(&sc->connection_lock);
+		nvmf_mpath_select_rele(path);
 		kmem_free(bc, sizeof (*bc));
 		return (ENXIO);
 	}
@@ -443,6 +453,7 @@ nvmf_bd_rw(struct nvmf_ns_head *head, bd_xfer_t *xfer, boolean_t is_write)
 	req = nvmf_allocate_request(qp, &cmd, nvmf_bd_cqe_complete, bc, how);
 	if (req == NULL) {
 		rw_exit(&sc->connection_lock);
+		nvmf_mpath_select_rele(path);
 		kmem_free(bc, sizeof (*bc));
 		return (ENOMEM);
 	}
@@ -454,6 +465,7 @@ nvmf_bd_rw(struct nvmf_ns_head *head, bd_xfer_t *xfer, boolean_t is_write)
 	    nvmf_bd_io_complete, bc) != 0) {
 		rw_exit(&sc->connection_lock);
 		nvmf_free_request(req);
+		nvmf_mpath_select_rele(path);
 		kmem_free(bc, sizeof (*bc));
 		return (EIO);
 	}
@@ -497,6 +509,7 @@ nvmf_bd_sync_cache(void *arg, bd_xfer_t *xfer)
 	 * complete immediately rather than round-tripping (nvme(4D) nvme_bd_sync).
 	 */
 	if (sc->cdata != NULL && sc->cdata->id_vwc.vwc_present == 0) {
+		nvmf_mpath_select_rele(path);
 		bd_xfer_done(xfer, 0);
 		return (0);
 	}
@@ -504,8 +517,10 @@ nvmf_bd_sync_cache(void *arg, bd_xfer_t *xfer)
 	how = (xfer->x_flags & BD_XFER_POLL) ? KM_NOSLEEP : KM_SLEEP;
 
 	bc = kmem_zalloc(sizeof (*bc), how);
-	if (bc == NULL)
+	if (bc == NULL) {
+		nvmf_mpath_select_rele(path);
 		return (ENOMEM);
+	}
 	bc->bc_xfer = xfer;
 	bc->bc_head = head;
 	bc->bc_path = path;
@@ -522,6 +537,7 @@ nvmf_bd_sync_cache(void *arg, bd_xfer_t *xfer)
 	rw_enter(&sc->connection_lock, RW_READER);
 	if (sc->io == NULL || sc->num_io_queues == 0) {
 		rw_exit(&sc->connection_lock);
+		nvmf_mpath_select_rele(path);
 		kmem_free(bc, sizeof (*bc));
 		return (ENXIO);
 	}
@@ -530,6 +546,7 @@ nvmf_bd_sync_cache(void *arg, bd_xfer_t *xfer)
 	req = nvmf_allocate_request(qp, &cmd, nvmf_bd_cqe_complete, bc, how);
 	if (req == NULL) {
 		rw_exit(&sc->connection_lock);
+		nvmf_mpath_select_rele(path);
 		kmem_free(bc, sizeof (*bc));
 		return (ENOMEM);
 	}
@@ -581,24 +598,32 @@ nvmf_bd_free_space(void *arg, bd_xfer_t *xfer)
 		return (ENXIO);
 	sc = nvmf_mpath_path_sc(path);
 
-	if (sc->cdata == NULL || sc->cdata->id_oncs.on_dset_mgmt == 0)
+	if (sc->cdata == NULL || sc->cdata->id_oncs.on_dset_mgmt == 0) {
+		nvmf_mpath_select_rele(path);
 		return (ENOTSUP);
+	}
 
 	/*
 	 * The number of ranges is zero-based in CDW10; blkdev bounds the request
 	 * to d_max_free_seg (NVME_DSET_MGMT_MAX_RANGES) reported by drive_info.
 	 */
 	if (dfl->dfl_num_exts == 0 ||
-	    dfl->dfl_num_exts > NVME_DSET_MGMT_MAX_RANGES)
+	    dfl->dfl_num_exts > NVME_DSET_MGMT_MAX_RANGES) {
+		nvmf_mpath_select_rele(path);
 		return (EINVAL);
+	}
 
 	blksize = nvmf_mpath_head_blksize(head);
-	if (blksize == 0)
+	if (blksize == 0) {
+		nvmf_mpath_select_rele(path);
 		return (EIO);
+	}
 
 	bc = kmem_zalloc(sizeof (*bc), how);
-	if (bc == NULL)
+	if (bc == NULL) {
+		nvmf_mpath_select_rele(path);
 		return (ENOMEM);
+	}
 	bc->bc_xfer = xfer;
 	bc->bc_head = head;
 	bc->bc_path = path;
@@ -607,6 +632,7 @@ nvmf_bd_free_space(void *arg, bd_xfer_t *xfer)
 	ranges_len = dfl->dfl_num_exts * sizeof (nvme_range_t);
 	ranges = kmem_zalloc(ranges_len, how);
 	if (ranges == NULL) {
+		nvmf_mpath_select_rele(path);
 		kmem_free(bc, sizeof (*bc));
 		return (ENOMEM);
 	}
@@ -635,6 +661,7 @@ nvmf_bd_free_space(void *arg, bd_xfer_t *xfer)
 	rw_enter(&sc->connection_lock, RW_READER);
 	if (sc->io == NULL || sc->num_io_queues == 0) {
 		rw_exit(&sc->connection_lock);
+		nvmf_mpath_select_rele(path);
 		kmem_free(ranges, ranges_len);
 		kmem_free(bc, sizeof (*bc));
 		return (ENXIO);
@@ -644,6 +671,7 @@ nvmf_bd_free_space(void *arg, bd_xfer_t *xfer)
 	req = nvmf_allocate_request(qp, &cmd, nvmf_bd_cqe_complete, bc, how);
 	if (req == NULL) {
 		rw_exit(&sc->connection_lock);
+		nvmf_mpath_select_rele(path);
 		kmem_free(ranges, ranges_len);
 		kmem_free(bc, sizeof (*bc));
 		return (ENOMEM);
@@ -656,6 +684,7 @@ nvmf_bd_free_space(void *arg, bd_xfer_t *xfer)
 	    nvmf_bd_io_complete, bc) != 0) {
 		rw_exit(&sc->connection_lock);
 		nvmf_free_request(req);
+		nvmf_mpath_select_rele(path);
 		kmem_free(ranges, ranges_len);
 		kmem_free(bc, sizeof (*bc));
 		return (EIO);

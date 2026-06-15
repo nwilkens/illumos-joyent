@@ -97,6 +97,16 @@ nvmf_allocate_request(nvmf_host_qpair_t *qp, void *sqe,
 
 	ASSERT(how == KM_SLEEP || how == KM_NOSLEEP);
 
+	/*
+	 * The AER taskq work (nvmf_aer.c) can race a disconnect that NULLs
+	 * sc->admin: both run on the single-threaded nvmf_tq, so a queued AER
+	 * resubmit can execute after disconnect has set sc->admin = NULL.  Treat a
+	 * NULL qpair like an already-destroyed one (the qp->qp == NULL case below)
+	 * and fail cleanly; every caller already handles a NULL return.
+	 */
+	if (qp == NULL)
+		return (NULL);
+
 	req = kmem_zalloc(sizeof (*req), how);
 	if (req == NULL)
 		return (NULL);
@@ -228,7 +238,7 @@ nvmf_receive_capsule(void *arg, struct nvmf_capsule *nc)
 	 */
 	cid = cqe->cqe_cid;
 
-	if (cid > qp->num_commands) {
+	if (cid >= qp->num_commands) {
 		dev_err(sc->dip, CE_WARN,
 		    "!received invalid CID %u, disconnecting", cid);
 		nvmf_disconnect(sc);
