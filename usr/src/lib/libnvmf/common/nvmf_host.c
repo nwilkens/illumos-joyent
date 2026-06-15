@@ -36,13 +36,12 @@
  *   uuid_from_string / uuid_enc_le      raw 16-byte SMBIOS UUID; uuid_unparse()
  *                                       (libuuid) for the string NQN form
  *
- * PORT-TODO: the Fabrics *host* kernel driver (/dev/nvmf, /dev/nvmeX) ioctl
- * surface is still settling in the illumos tree (the kernel host lives under
- * io/nvmf_host and does not yet expose the FreeBSD NVMF_* host ioctls).  The
- * handoff / disconnect / reconnect / status wrappers below preserve the FreeBSD
- * call shape and ioctl ordinals (see internal.h) so they light up unchanged
- * once that ABI lands; until then they fail at open()/ioctl() like any missing
- * device.  The target daemon (nvmfd) does not use these host entry points.
+ * The Fabrics *host* kernel driver lives under io/nvmf_host and exposes the
+ * NVMF_HANDOFF_HOST / RECONNECT / CONNECTION_STATUS ioctls on its control minor
+ * (NVMF_HOST_DEV below); the handoff/reconnect/status wrappers drive them.
+ * NVMF_DISCONNECT_HOST/ALL are issued here but not yet handled by the kernel
+ * ioctl switch (they return ENOTTY until that case is wired).  The target
+ * daemon (nvmfd) does not use these host entry points.
  */
 
 #include <sys/types.h>
@@ -58,6 +57,15 @@
 
 #include "libnvmf.h"
 #include "internal.h"
+
+/*
+ * Control device for the Fabrics host (initiator) driver.  The kernel
+ * nvmf_host driver creates the minor "nvmf" on its single pseudo instance
+ * (nvmf_host@0); there is no /dev devlink, so the handoff/disconnect/reconnect
+ * wrappers open the /devices node directly, the same way nvmfadm reaches the
+ * target via /devices/pseudo/nvmft@0:admin.
+ */
+#define	NVMF_HOST_DEV	"/devices/pseudo/nvmf_host@0:nvmf"
 
 static void
 nvmf_init_sqe(void *sqe, uint8_t opcode)
@@ -976,7 +984,7 @@ nvmf_handoff_host(const nvmf_discovery_log_page_entry_t *dle,
 	u_int i;
 	int error, fd;
 
-	fd = open("/dev/nvmf", O_RDWR);
+	fd = open(NVMF_HOST_DEV, O_RDWR);
 	if (fd == -1) {
 		error = errno;
 		goto out;
@@ -1007,7 +1015,7 @@ nvmf_disconnect_host(const char *host)
 	int error, fd;
 
 	error = 0;
-	fd = open("/dev/nvmf", O_RDWR);
+	fd = open(NVMF_HOST_DEV, O_RDWR);
 	if (fd == -1) {
 		error = errno;
 		goto out;
@@ -1028,7 +1036,7 @@ nvmf_disconnect_all(void)
 	int error, fd;
 
 	error = 0;
-	fd = open("/dev/nvmf", O_RDWR);
+	fd = open(NVMF_HOST_DEV, O_RDWR);
 	if (fd == -1) {
 		error = errno;
 		goto out;
