@@ -146,6 +146,7 @@ typedef struct nvmf_tcp_qpair {
 	struct nvmf_qpair		qp;
 
 	ksocket_t			tq_so;
+	boolean_t			tq_krecv_set;	/* krecv cb installed */
 
 	volatile uint_t			tq_refs;	/* held by every capsule */
 	uint8_t				tq_txpda;
@@ -1571,6 +1572,19 @@ nvmf_tcp_so_tx(void *arg)
 		 */
 		rc = 0;
 		while (mp != NULL) {
+			/*
+			 * Bail out of the blocking send loop if teardown started,
+			 * so a flow-controlled send cannot re-park us after
+			 * tcp_free_qpair() has shut the socket down.  This is an
+			 * advisory racy read; ksocket_shutdown() is the authoritative
+			 * wakeup that makes the in-progress ksocket_sendmblk() return.
+			 */
+			if (qp->tq_tx_shutdown) {
+				freemsg(mp);
+				mp = NULL;
+				rc = 0;
+				break;
+			}
 			bzero(&msg, sizeof (msg));
 			rc = ksocket_sendmblk(qp->tq_so, &msg, 0, &mp, CRED());
 			if (rc != 0)
@@ -1728,14 +1742,21 @@ capsule_to_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_capsule_t *tc)
  * must set by hand for an adopted one.
  *
  * Reference counting (see ksocket_hold/ksocket_rele/ksocket_close):
- *   - a userland socket() starts at so_count == 1 (its VOP_OPEN reference);
+ *   - a userland socket() starts at so_count == 1 and its vnode at v_count == 1
+ *     (both held by the daemon's open fd);
  *   - ksocket_hold() bumps so_count so the sonode survives releasef() and the
  *     daemon's subsequent close(fd) (which only decrements so_count, not to 0);
+ *   - VN_HOLD() bumps the underlying vnode's v_count for the same reason: the
+ *     daemon's close(fd) does a vn_rele(), and without our hold v_count would
+ *     drop to 0, so the vn_rele() in ksocket_close() -> socket_destroy() would
+ *     underflow ("vp->v_count > 0" assertion panic).  A kernel-created socket
+ *     owns exactly this vnode reference; an adopted one must take it too;
  *   - tcp_free_qpair() calls ksocket_close(), which waits for so_count to drain
- *     to 1 (our hold) and then performs the single owning close.  We therefore
- *     do NOT also call ksocket_rele(): exactly one owning close is correct, and
- *     pairing rele()+close() would either panic (so_count < 2) or race the
- *     daemon's close.
+ *     to 1 (our hold), performs the single owning close, and releases our
+ *     VN_HOLD via socket_destroy() -> vn_rele().  We therefore do NOT also call
+ *     ksocket_rele(): exactly one owning close is correct, and pairing
+ *     rele()+close() would either panic (so_count < 2) or race the daemon's
+ *     close.
  */
 static int
 tcp_adopt_socket_fd(uint64_t fd, ksocket_t *ksp)
@@ -1769,10 +1790,11 @@ tcp_adopt_socket_fd(uint64_t fd, ksocket_t *ksp)
 	}
 
 	/*
-	 * Mark the sonode kernel-owned and take a reference that outlives the
-	 * userland fd, then drop the fd hold from getsonode().  Order matters:
-	 * the hold must be taken while the getf() reference still pins the
-	 * sonode, so a concurrent last close cannot free it underneath us.
+	 * Mark the sonode kernel-owned and take the sonode + vnode references
+	 * that outlive the userland fd, then drop the fd hold from getsonode().
+	 * Order matters: the holds must be taken while the getf() reference still
+	 * pins the sonode, so a concurrent last close cannot free it underneath
+	 * us.
 	 */
 	mutex_enter(&so->so_lock);
 	so->so_mode |= SM_KERNEL;
@@ -1780,6 +1802,7 @@ tcp_adopt_socket_fd(uint64_t fd, ksocket_t *ksp)
 
 	*ksp = (ksocket_t)(uintptr_t)so;
 	ksocket_hold(*ksp);
+	VN_HOLD(SOTOV(so));
 	releasef((int)fd);
 
 	return (0);
@@ -1905,6 +1928,7 @@ tcp_allocate_qpair(boolean_t controller, const nvlist_t *nvl)
 		tcp_free_qpair(&qp->qp);
 		return (NULL);
 	}
+	qp->tq_krecv_set = B_TRUE;
 
 	return (&qp->qp);
 }
@@ -1943,14 +1967,39 @@ tcp_free_qpair(struct nvmf_qpair *nq)
 	mblk_t *pmp;
 
 	/*
-	 * Quiesce RX first: clear the receive callback so no further krecv runs,
-	 * then mark shutdown and wake the rx worker so it exits before we touch
-	 * the state it consumes.  ksocket_krecv_unblock() defensively releases any
-	 * receive backpressure the socket may have asserted.
+	 * Quiesce RX, then mark shutdown and wake the rx worker so it exits
+	 * before we touch the state it consumes.  Order matters:
+	 * ksocket_krecv_unblock() releases any receive backpressure the socket
+	 * asserted, but so_krecv_unblock() VERIFYs the krecv callback is still
+	 * set, so it MUST run before ksocket_krecv_set(NULL) clears the callback.
+	 * Clearing first and then unblocking panics the kernel (so_krecv_cb ==
+	 * NULL, sockcommon_subr.c).  A krecv upcall racing between the two calls
+	 * is harmless: it only accumulates under tq_rx_lock and the worker is
+	 * shut down immediately below.
+	 *
+	 * Only unblock if the callback was actually installed: the allocate-qpair
+	 * error path frees a qpair whose ksocket_krecv_set() failed (e.g. ENOTSUP
+	 * on a fallback socket), leaving so_krecv_cb NULL -- unblocking that socket
+	 * would trip the same VERIFY.
 	 */
 	if (qp->tq_so != NULL) {
+		if (qp->tq_krecv_set)
+			ksocket_krecv_unblock(qp->tq_so);
 		(void) ksocket_krecv_set(qp->tq_so, NULL, NULL);
-		ksocket_krecv_unblock(qp->tq_so);
+
+		/*
+		 * Shut the socket down for both directions before waiting on the
+		 * workers.  The tx worker does a BLOCKING ksocket_sendmblk() and
+		 * only checks tq_tx_shutdown at its outer loop, so if the peer
+		 * vanished without a RST (e.g. keepalive timeout) it can be parked
+		 * indefinitely in so_snd_wait_qnotfull() with the send window
+		 * full; cv_signal(tq_tx_cv) does not reach it there.  socantsendmore
+		 * via shutdown broadcasts so_snd_cv, so the blocked send returns
+		 * EPIPE, the worker exits, and taskq_wait() below cannot hang the
+		 * (single-threaded) ns_taskq teardown thread.  ksocket_close() at
+		 * the end still does the owning close + vn_rele.
+		 */
+		(void) ksocket_shutdown(qp->tq_so, SHUT_RDWR, CRED());
 	}
 
 	mutex_enter(&qp->tq_rx_lock);

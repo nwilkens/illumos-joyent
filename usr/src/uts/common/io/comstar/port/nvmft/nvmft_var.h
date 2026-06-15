@@ -212,12 +212,22 @@ typedef struct nvmft_controller {
 	boolean_t		ctrlr_changed_ns_reported;
 
 	/*
-	 * Deferred shutdown/terminate work.  FreeBSD used a struct task plus a
-	 * timeout_task; illumos dispatches onto the shared nvmft taskq and uses
-	 * a timeout(9F) id for the delayed terminate.
+	 * Deferred shutdown/terminate work.  Like FreeBSD's separate struct task
+	 * and timeout_task, shutdown and terminate need INDEPENDENT taskq entries:
+	 * a single taskq_ent_t is the queue's list node, and re-dispatching one
+	 * that is still queued (e.g. a late error dispatching shutdown while the
+	 * delayed terminate is queued) corrupts the single-threaded ns_taskq list.
 	 */
 	taskq_ent_t		ctrlr_shutdown_task;
+	taskq_ent_t		ctrlr_terminate_task;
 	timeout_id_t		ctrlr_terminate_timer;
+	/*
+	 * Set under ctrlr_lock while a terminate is queued or running, so the
+	 * timeout trampoline never re-dispatches ctrlr_terminate_task while it is
+	 * still on the taskq (which would corrupt the queue): untimeout() cancels
+	 * the timer id but cannot recall an already-queued task.
+	 */
+	boolean_t		ctrlr_terminate_queued;
 } nvmft_controller_t;
 
 /*
@@ -320,6 +330,8 @@ void	nvmft_qpair_datamove(struct nvmft_qpair *qp, scsi_task_t *task);
 uint16_t nvmft_qpair_id(struct nvmft_qpair *qp);
 const char *nvmft_qpair_name(struct nvmft_qpair *qp);
 uint32_t nvmft_max_ioccsz(struct nvmft_qpair *qp);
+struct nvmf_qpair *nvmft_qpair_data_hold(struct nvmft_qpair *qp);
+void	nvmft_qpair_data_rele(struct nvmft_qpair *qp, struct nvmf_qpair *nq);
 void	nvmft_command_completed(struct nvmft_qpair *qp,
 	    struct nvmf_capsule *nc);
 int	nvmft_send_response(struct nvmft_qpair *qp, const void *cqe);

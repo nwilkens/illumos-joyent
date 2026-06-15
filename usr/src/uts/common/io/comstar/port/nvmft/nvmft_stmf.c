@@ -720,6 +720,24 @@ nvmft_translate_cmd(scsi_task_t *task, const nvme_sqe_t *cmd,
 }
 
 /*
+ * Whether nvmft_translate_cmd() can map this opcode to a SCSI CDB.  Must stay in
+ * sync with the switch above: it gates task allocation so we never create an
+ * STMF task we cannot post (see nvmft_dispatch_command).
+ */
+static boolean_t
+nvmft_cmd_translatable(uint8_t opc)
+{
+	switch (opc) {
+	case NVME_OPC_NVM_READ:
+	case NVME_OPC_NVM_WRITE:
+	case NVME_OPC_NVM_FLUSH:
+		return (B_TRUE);
+	default:
+		return (B_FALSE);
+	}
+}
+
+/*
  * Dispatch a received command capsule to the STMF LU.
  *
  * (FreeBSD: nvmft_dispatch_command -> ctl_alloc_io / ctl_run.)
@@ -754,6 +772,22 @@ nvmft_dispatch_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 	if (ctrlr->ctrlr_session == NULL) {
 		(void) nvmft_send_generic_error(qp, nc,
 		    NVME_CQE_SC_GEN_INTERNAL_ERR);
+		nvmf_free_capsule(nc);
+		return;
+	}
+
+	/*
+	 * Reject opcodes we cannot translate BEFORE allocating an STMF task.
+	 * stmf_task_alloc() links the task into the LU's ilu_tasks list and bumps
+	 * its task counters; an allocated task may only be disposed through STMF's
+	 * lifecycle (post -> complete/abort -> task_lu_free), never kmem_free'd.
+	 * Freeing a half-registered task corrupts ilu_tasks (use-after-free) and
+	 * leaks the counters so LU offline/deregister hangs.  (FreeBSD rejects
+	 * these inside CTL on a pooled io; STMF has no allocated-but-never-posted
+	 * free path.)
+	 */
+	if (!nvmft_cmd_translatable(cmd->sqe_opc)) {
+		(void) nvmft_send_generic_error(qp, nc, NVME_CQE_SC_GEN_INV_OPC);
 		nvmf_free_capsule(nc);
 		return;
 	}
@@ -815,26 +849,13 @@ nvmft_dispatch_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 	task->task_max_xfer_len = data_len;
 	task->task_1st_xfer_len = data_len;
 
-	if (!nvmft_translate_cmd(task, cmd, data_len)) {
-		/*
-		 * Unsupported opcode: fail the command cleanly rather than
-		 * posting an untranslated task.  task_port_private is cleared so
-		 * stmf_free() does not run our task_free path against a capsule
-		 * we free here.
-		 */
-		(void) nvmft_send_generic_error(qp, nc, NVME_CQE_SC_GEN_INV_OPC);
-		nvmf_free_capsule(nc);
-		task->task_port_private = NULL;
-		kmem_free(priv, sizeof (*priv));
-		stmf_free(task);
-		mutex_enter(&ctrlr->ctrlr_lock);
-		ASSERT3U(ctrlr->ctrlr_pending_commands, >, 0);
-		ctrlr->ctrlr_pending_commands--;
-		if (ctrlr->ctrlr_pending_commands == 0)
-			cv_signal(&ctrlr->ctrlr_pending_cv);
-		mutex_exit(&ctrlr->ctrlr_lock);
-		return;
-	}
+	/*
+	 * The opcode was already vetted by nvmft_cmd_translatable() above, so the
+	 * translation cannot fail here.  VERIFY the invariant rather than
+	 * kmem_free()'ing an allocated-and-linked STMF task (which would corrupt
+	 * the LU task list); a posted task is disposed only through STMF.
+	 */
+	VERIFY(nvmft_translate_cmd(task, cmd, data_len));
 
 	stmf_post_task(task, NULL);
 }
@@ -843,11 +864,17 @@ void
 nvmft_terminate_commands(nvmft_controller_t *ctrlr)
 {
 	/*
-	 * PORT-TODO (FreeBSD nvmft_terminate_commands): FreeBSD issues a
-	 * CTL_TASK_I_T_NEXUS_RESET ctl_io.  The STMF equivalent is to deregister
-	 * the scsi session for this controller (stmf_deregister_scsi_session),
-	 * which aborts that nexus's tasks, or to call stmf_abort() per task.
-	 * Wire this once sessions are created in the handoff path.
+	 * FreeBSD issues a CTL_TASK_I_T_NEXUS_RESET to proactively abort this
+	 * nexus's in-flight CTL commands so the drain below returns sooner.  STMF
+	 * has no single nexus-reset primitive (only per-task stmf_abort(), which
+	 * would need a per-controller task list we do not yet keep), so we rely on
+	 * the slower but correct path: nvmft_qpair_shutdown() has already freed
+	 * each I/O qpair, and freeing the transport qpair aborts any registered
+	 * H2C receive (tcp_free_qpair -> nvmf_complete_io_request -> the dbuf is
+	 * failed back to STMF), while nvmft_lport_xfer_data() fails fast once
+	 * qp_qp == NULL.  Both drive every in-flight task to completion, so
+	 * ctrlr_pending_commands drains without an explicit abort here.  Proactive
+	 * per-task abort remains a future optimization.
 	 */
 	mutex_enter(&ctrlr->ctrlr_lock);
 	if (ctrlr->ctrlr_pending_commands == 0)
@@ -1010,6 +1037,10 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 	nvmft_task_priv_t *priv = task->task_port_private;
 	struct nvmf_capsule *nc;
 	struct nvmft_qpair *qp;
+	struct nvmf_qpair *nq;
+	stmf_status_t ret;
+	boolean_t do_xfer_done = B_FALSE;
+	uint32_t xfer_iof = 0;
 
 	_NOTE(ARGUNUSED(ioflags));
 
@@ -1072,14 +1103,37 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 	nc = priv->ntp_nc;
 	qp = priv->ntp_qp;
 
+	/*
+	 * The send/receive below dereferences the transport qpair, which a racing
+	 * controller teardown frees (nvmft_qpair_shutdown -> nvmf_free_qpair).
+	 * Hold a reference across the transfer (nvmft_qpair_data_hold/rele, the
+	 * same handshake _nvmft_send_response() uses): if the qpair is already
+	 * shut down, fail the dbuf back to STMF (iof=0, as in the synchronous
+	 * failure path below) so STMF completes the task -- via abort or
+	 * lport_send_status(), which finds the qpair gone -- instead of touching a
+	 * freed qpair.  An H2C receive only needs the reference to span
+	 * registering the transfer: its async completion (nvmft_datamove_in_cb)
+	 * touches no qpair state, and freeing the qpair aborts any still-registered
+	 * receive (tcp_free_qpair -> nvmf_complete_io_request), which is what lets
+	 * the controller drain.
+	 */
+	nq = nvmft_qpair_data_hold(qp);
+	if (nq == NULL) {
+		dbuf->db_xfer_status = STMF_FAILURE;
+		stmf_data_xfer_done(task, dbuf, 0);
+		return (STMF_SUCCESS);
+	}
+
 	if (dbuf->db_flags & DB_DIRECTION_TO_RPORT) {
 		/* C2H: send controller data (READ). */
 		mblk_t *mp;
 		uint_t status;
 
 		mp = nvmft_dbuf_to_mblk(dbuf);
-		if (mp == NULL)
-			return (STMF_ALLOC_FAILURE);
+		if (mp == NULL) {
+			ret = STMF_ALLOC_FAILURE;
+			goto done;
+		}
 
 		status = nvmf_send_controller_data(nc,
 		    dbuf->db_relative_offset, mp, dbuf->db_data_size);
@@ -1101,9 +1155,10 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 			 * ITASK_KNOWN_TO_TGT_PORT before the LU finishes.
 			 */
 			if (dbuf->db_flags & DB_SEND_STATUS_GOOD) {
-				stmf_data_xfer_done(task, dbuf,
-				    STMF_IOF_LPORT_DONE);
-				return (STMF_SUCCESS);
+				xfer_iof = STMF_IOF_LPORT_DONE;
+				do_xfer_done = B_TRUE;
+				ret = STMF_SUCCESS;
+				goto done;
 			}
 			break;
 		case NVME_CQE_SC_GEN_SUCCESS:
@@ -1128,9 +1183,10 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 				cpl.cqe_sf.sf_sc = NVME_CQE_SC_GEN_SUCCESS;
 				priv->ntp_success_sent = B_TRUE;
 				(void) nvmft_send_response(qp, &cpl);
-				stmf_data_xfer_done(task, dbuf,
-				    STMF_IOF_LPORT_DONE);
-				return (STMF_SUCCESS);
+				xfer_iof = STMF_IOF_LPORT_DONE;
+				do_xfer_done = B_TRUE;
+				ret = STMF_SUCCESS;
+				goto done;
 			}
 			break;
 		case NVMF_MORE:
@@ -1144,8 +1200,9 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 		 * nvmf_send_controller_data() consumed the mblk chain.  The
 		 * transfer is complete synchronously for the send path.
 		 */
-		stmf_data_xfer_done(task, dbuf, 0);
-		return (STMF_SUCCESS);
+		do_xfer_done = B_TRUE;
+		ret = STMF_SUCCESS;
+		goto done;
 	} else {
 		/* H2C: receive controller data (WRITE). */
 		nvmft_xfer_t *nx;
@@ -1153,8 +1210,10 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 		mblk_t *mp;
 		int error;
 
-		if (!nvmft_dbuf_to_memdesc(dbuf, &mem, &mp))
-			return (STMF_ALLOC_FAILURE);
+		if (!nvmft_dbuf_to_memdesc(dbuf, &mem, &mp)) {
+			ret = STMF_ALLOC_FAILURE;
+			goto done;
+		}
 
 		nx = kmem_zalloc(sizeof (*nx), KM_SLEEP);
 		nx->nx_task = task;
@@ -1170,11 +1229,28 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 			kmem_free(nx, sizeof (*nx));
 			(void) nvmft_printf(nvmft_qpair_ctrlr(qp),
 			    "Failed to request capsule data: 0x%x\n", error);
-			return (STMF_FAILURE);
+			ret = STMF_FAILURE;
+			goto done;
 		}
 		/* Completion is asynchronous via nvmft_datamove_in_cb(). */
-		return (STMF_SUCCESS);
+		ret = STMF_SUCCESS;
+		goto done;
 	}
+
+done:
+	/*
+	 * Drop the qpair reference BEFORE completing the transfer: with
+	 * STMF_IOF_LPORT_DONE, stmf_data_xfer_done() can synchronously free the
+	 * task (stmf_task_free -> nvmft_lport_task_free), which drops
+	 * ctrlr_pending_commands and lets the controller-shutdown drain destroy
+	 * the qpair (struct nvmft_qpair).  nvmft_qpair_data_rele() touches that
+	 * struct, so it must run while the task is still pending and the qpair is
+	 * still alive.
+	 */
+	nvmft_qpair_data_rele(qp, nq);
+	if (do_xfer_done)
+		stmf_data_xfer_done(task, dbuf, xfer_iof);
+	return (ret);
 }
 
 /*

@@ -484,12 +484,32 @@ nvmft_controller_shutdown(void *arg)
 	 * re-dispatches the blocking work onto ns_taskq rather than running it
 	 * in callout context.
 	 */
+	mutex_enter(&ctrlr->ctrlr_lock);
 	if (ctrlr->ctrlr_admin_closed || csts.b.csts_cfs != 0) {
-		nvmft_controller_terminate(ctrlr);
+		/*
+		 * Terminate immediately, inline.  Claim ctrlr_terminate_queued
+		 * first so a graceful terminate timer that fires concurrently
+		 * cannot also dispatch the terminate task (double run on the same
+		 * controller); if a terminate is already queued/running, let it
+		 * proceed rather than running a second one here.
+		 */
+		boolean_t run = !ctrlr->ctrlr_terminate_queued;
+		ctrlr->ctrlr_terminate_queued = B_TRUE;
+		mutex_exit(&ctrlr->ctrlr_lock);
+		if (run)
+			nvmft_controller_terminate(ctrlr);
 	} else {
+		/*
+		 * Arm the 2-minute graceful terminate under ctrlr_lock so the
+		 * published timer id stays synchronized with the cancel paths
+		 * (nvmft_controller_error / terminate).  An unlocked store here
+		 * races those and can leave a second, uncancelled callout ->
+		 * double nvmft_controller_terminate -> controller double-free.
+		 */
 		ctrlr->ctrlr_terminate_timer = timeout(
 		    nvmft_controller_terminate_timeout, ctrlr,
 		    drv_usectohz(2 * 60 * 1000000));
+		mutex_exit(&ctrlr->ctrlr_lock);
 	}
 }
 
@@ -504,8 +524,18 @@ nvmft_controller_terminate_timeout(void *arg)
 {
 	nvmft_controller_t *ctrlr = arg;
 
+	mutex_enter(&ctrlr->ctrlr_lock);
+	ctrlr->ctrlr_terminate_timer = 0;	/* this timer has now fired */
+	if (ctrlr->ctrlr_terminate_queued) {
+		/* A terminate is already queued/running; do not re-dispatch. */
+		mutex_exit(&ctrlr->ctrlr_lock);
+		return;
+	}
+	ctrlr->ctrlr_terminate_queued = B_TRUE;
+	mutex_exit(&ctrlr->ctrlr_lock);
+
 	taskq_dispatch_ent(nvmft_global->ns_taskq, nvmft_controller_terminate,
-	    ctrlr, 0, &ctrlr->ctrlr_shutdown_task);
+	    ctrlr, 0, &ctrlr->ctrlr_terminate_task);
 }
 
 static void
@@ -522,10 +552,13 @@ nvmft_controller_terminate(void *arg)
 	cc.r = ctrlr->ctrlr_cc;
 	if (cc.b.cc_en != 0) {
 		/*
-		 * Re-arm the keep-alive timer under ctrlr_lock so the published
-		 * id is synchronized with nvmft_keep_alive_timer() and the
-		 * cancel paths.
+		 * Re-enabled: do not free.  Clear ctrlr_terminate_queued so a
+		 * later shutdown can schedule terminate again, and re-arm the
+		 * keep-alive timer under ctrlr_lock so the published id stays
+		 * synchronized with nvmft_keep_alive_timer() and the cancel
+		 * paths.
 		 */
+		ctrlr->ctrlr_terminate_queued = B_FALSE;
 		if (ctrlr->ctrlr_ka_ticks != 0)
 			ctrlr->ctrlr_ka_timer = timeout(nvmft_keep_alive_timer,
 			    ctrlr, ctrlr->ctrlr_ka_ticks);
@@ -612,8 +645,9 @@ nvmft_controller_error(nvmft_controller_t *ctrlr, struct nvmft_qpair *qp,
 		}
 
 		if (NVMFT_CC_EN(ctrlr->ctrlr_cc) == 0) {
+			timeout_id_t old;
+
 			ASSERT3U(ctrlr->ctrlr_num_io_queues, ==, 0);
-			mutex_exit(&ctrlr->ctrlr_lock);
 
 			/*
 			 * Safe to schedule terminate directly: no I/O queues to
@@ -622,13 +656,25 @@ nvmft_controller_error(nvmft_controller_t *ctrlr, struct nvmft_qpair *qp,
 			 * the admin qpair might deadlock.  Schedule via the
 			 * timeout trampoline so the blocking terminate work runs
 			 * on ns_taskq, not in callout context.
+			 *
+			 * Cancel any pending graceful-terminate timer and arm an
+			 * immediate one, keeping ctrlr_terminate_timer consistent
+			 * under ctrlr_lock so a still-armed callout is always
+			 * cancelled before a new one is published (else two live
+			 * callouts -> double terminate -> controller double-free).
+			 * untimeout() must run without the lock the callout may
+			 * block on, so snapshot-and-clear under the lock, drop it
+			 * to untimeout, then re-arm under the lock.
 			 */
-			if (ctrlr->ctrlr_terminate_timer != 0 &&
-			    untimeout(ctrlr->ctrlr_terminate_timer) >= 0)
-				ctrlr->ctrlr_terminate_timer = 0;
-			if (ctrlr->ctrlr_terminate_timer == 0)
-				ctrlr->ctrlr_terminate_timer = timeout(
-				    nvmft_controller_terminate_timeout, ctrlr, 0);
+			old = ctrlr->ctrlr_terminate_timer;
+			ctrlr->ctrlr_terminate_timer = 0;
+			mutex_exit(&ctrlr->ctrlr_lock);
+			if (old != 0)
+				(void) untimeout(old);
+			mutex_enter(&ctrlr->ctrlr_lock);
+			ctrlr->ctrlr_terminate_timer = timeout(
+			    nvmft_controller_terminate_timeout, ctrlr, 0);
+			mutex_exit(&ctrlr->ctrlr_lock);
 			return;
 		}
 
@@ -1170,18 +1216,27 @@ handle_property_set(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc,
 	(void) nvmft_send_success(ctrlr->ctrlr_admin, nc);
 	if (need_shutdown) {
 		timeout_id_t ka_timer;
+		timeout_id_t term_timer;
 
 		/*
 		 * update_cc() set ctrlr_shutdown under ctrlr_lock, so the
 		 * keep-alive timer routine will not re-arm.  Snapshot and clear
-		 * the id under the lock before cancelling it.
+		 * both timer ids under the lock before cancelling them.  The
+		 * terminate timer matters here too: a prior graceful shutdown may
+		 * have armed the 2-minute terminate and then the controller been
+		 * re-enabled; a fresh shutdown must cancel that stale callout so
+		 * it cannot fire (and re-dispatch terminate) after this shutdown.
 		 */
 		mutex_enter(&ctrlr->ctrlr_lock);
 		ka_timer = ctrlr->ctrlr_ka_timer;
 		ctrlr->ctrlr_ka_timer = 0;
+		term_timer = ctrlr->ctrlr_terminate_timer;
+		ctrlr->ctrlr_terminate_timer = 0;
 		mutex_exit(&ctrlr->ctrlr_lock);
 		if (ka_timer != 0)
 			(void) untimeout(ka_timer);
+		if (term_timer != 0)
+			(void) untimeout(term_timer);
 		taskq_dispatch_ent(nvmft_global->ns_taskq,
 		    nvmft_controller_shutdown, ctrlr, 0,
 		    &ctrlr->ctrlr_shutdown_task);

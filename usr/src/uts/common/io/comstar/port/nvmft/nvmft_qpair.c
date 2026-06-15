@@ -334,6 +334,41 @@ _nvmft_send_response(struct nvmft_qpair *qp, const void *cqe)
 	return (error);
 }
 
+/*
+ * Reference handshake for an STMF data transfer (nvmft_lport_xfer_data), which
+ * runs on an STMF worker thread and dereferences the transport qpair while a
+ * concurrent nvmft_qpair_shutdown() may free it.  _hold() returns the transport
+ * qpair to use, or NULL if the qpair has already been shut down (the caller
+ * must then fail the transfer); _rele() drops the reference once the transport
+ * send/receive has been issued, freeing the transport qpair if it was the last
+ * reference.  Same handshake as _nvmft_send_response(), exposed for nvmft_stmf.c
+ * because struct nvmft_qpair is opaque there.
+ */
+struct nvmf_qpair *
+nvmft_qpair_data_hold(struct nvmft_qpair *qp)
+{
+	struct nvmf_qpair *nq;
+
+	mutex_enter(&qp->qp_lock);
+	nq = qp->qp_qp;
+	if (nq != NULL)
+		qp->qp_refs++;
+	mutex_exit(&qp->qp_lock);
+	return (nq);
+}
+
+void
+nvmft_qpair_data_rele(struct nvmft_qpair *qp, struct nvmf_qpair *nq)
+{
+	boolean_t free_it;
+
+	mutex_enter(&qp->qp_lock);
+	free_it = (--qp->qp_refs == 0);
+	mutex_exit(&qp->qp_lock);
+	if (free_it)
+		nvmf_free_qpair(nq);
+}
+
 void
 nvmft_command_completed(struct nvmft_qpair *qp, struct nvmf_capsule *nc)
 {
