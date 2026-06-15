@@ -123,6 +123,7 @@ typedef struct nvmft_internal_io {
 	kcondvar_t	iio_cv;
 	boolean_t	iio_done;
 	uint8_t		iio_scsi_status;
+	uint8_t		iio_sense_key;
 	uint8_t		*iio_buf;
 	uint32_t	iio_buflen;
 	uint32_t	iio_xfered;
@@ -430,6 +431,13 @@ nvmft_ns_mapped(nvmft_controller_t *ctrlr, uint32_t nsid, uint8_t *guid)
 }
 
 /*
+ * How many times to reissue the internal READ CAPACITY when the LU reports a
+ * pending UNIT ATTENTION.  Each command clears one UA; a handful covers the
+ * power-on plus any reported-LUNs/capacity-changed UAs a new session may queue.
+ */
+#define	NVMFT_READ_CAPACITY_UA_RETRIES	5
+
+/*
  * Issue an internal READ CAPACITY(16) to the LU backing nsid and return its
  * block count and block size.  Blocks until the LU completes the command on an
  * STMF worker thread (independent of this thread), so it must run in thread
@@ -445,6 +453,7 @@ nvmft_lu_read_capacity(nvmft_controller_t *ctrlr, uint32_t nsid,
 	uint8_t capbuf[32];
 	uint8_t lun[8];
 	uint32_t lun_id = nsid - 1;
+	uint_t attempt;
 	int rc;
 
 	if (ctrlr->ctrlr_session == NULL)
@@ -454,51 +463,70 @@ nvmft_lu_read_capacity(nvmft_controller_t *ctrlr, uint32_t nsid,
 	lun[0] = (uint8_t)((lun_id >> 8) & 0x3f);
 	lun[1] = (uint8_t)(lun_id & 0xff);
 
-	task = stmf_task_alloc(ctrlr->ctrlr_np->np_lport, ctrlr->ctrlr_session,
-	    lun, 16, 0);
-	if (task == NULL)
-		return (ENOMEM);
+	/*
+	 * The first command on a freshly registered STMF session draws a
+	 * UNIT ATTENTION (29h/00h, power-on/reset occurred), failing with
+	 * CHECK CONDITION and no data.  A SCSI initiator clears a pending UA by
+	 * reissuing -- each command reports one UA -- so retry a bounded number
+	 * of times.  (Without this the host gets a zero-size namespace on
+	 * connect, since nvmf_host issues IDENTIFY only once.)
+	 */
+	for (attempt = 0; ; attempt++) {
+		task = stmf_task_alloc(ctrlr->ctrlr_np->np_lport,
+		    ctrlr->ctrlr_session, lun, 16, 0);
+		if (task == NULL)
+			return (ENOMEM);
 
-	(void) bzero(&iio, sizeof (iio));
-	mutex_init(&iio.iio_lock, NULL, MUTEX_DRIVER, NULL);
-	cv_init(&iio.iio_cv, NULL, CV_DRIVER, NULL);
-	iio.iio_buf = capbuf;
-	iio.iio_buflen = sizeof (capbuf);
+		(void) bzero(&iio, sizeof (iio));
+		mutex_init(&iio.iio_lock, NULL, MUTEX_DRIVER, NULL);
+		cv_init(&iio.iio_cv, NULL, CV_DRIVER, NULL);
+		iio.iio_buf = capbuf;
+		iio.iio_buflen = sizeof (capbuf);
 
-	priv = kmem_zalloc(sizeof (*priv), KM_SLEEP);
-	priv->ntp_iio = &iio;
-	task->task_port_private = priv;
-	task->task_flags |= TF_READ_DATA | TF_ATTR_SIMPLE_QUEUE;
+		priv = kmem_zalloc(sizeof (*priv), KM_SLEEP);
+		priv->ntp_iio = &iio;
+		task->task_port_private = priv;
+		task->task_flags |= TF_READ_DATA | TF_ATTR_SIMPLE_QUEUE;
 
-	(void) bzero(task->task_cdb, task->task_cdb_length);
-	task->task_cdb[0] = SCMD_SVC_ACTION_IN_G4;
-	task->task_cdb[1] = SSVC_ACTION_READ_CAPACITY_G4;
-	task->task_cdb[13] = sizeof (capbuf);	/* allocation length (bytes 10-13) */
-	task->task_expected_xfer_length = sizeof (capbuf);
-	task->task_cmd_xfer_length = sizeof (capbuf);
-	task->task_max_nbufs = 1;
-	task->task_max_xfer_len = sizeof (capbuf);
-	task->task_1st_xfer_len = sizeof (capbuf);
+		(void) bzero(task->task_cdb, task->task_cdb_length);
+		task->task_cdb[0] = SCMD_SVC_ACTION_IN_G4;
+		task->task_cdb[1] = SSVC_ACTION_READ_CAPACITY_G4;
+		/* allocation length (bytes 10-13) */
+		task->task_cdb[13] = sizeof (capbuf);
+		task->task_expected_xfer_length = sizeof (capbuf);
+		task->task_cmd_xfer_length = sizeof (capbuf);
+		task->task_max_nbufs = 1;
+		task->task_max_xfer_len = sizeof (capbuf);
+		task->task_1st_xfer_len = sizeof (capbuf);
 
-	stmf_post_task(task, NULL);
+		stmf_post_task(task, NULL);
 
-	mutex_enter(&iio.iio_lock);
-	while (!iio.iio_done)
-		cv_wait(&iio.iio_cv, &iio.iio_lock);
-	mutex_exit(&iio.iio_lock);
+		mutex_enter(&iio.iio_lock);
+		while (!iio.iio_done)
+			cv_wait(&iio.iio_cv, &iio.iio_lock);
+		mutex_exit(&iio.iio_lock);
 
-	/* READ CAPACITY(16): max LBA at bytes 0-7, block length at bytes 8-11. */
-	if (iio.iio_scsi_status != STATUS_GOOD || iio.iio_xfered < 12) {
-		rc = EIO;
-	} else {
-		*nblocksp = BE_IN64(&capbuf[0]) + 1;
-		*blksizep = BE_IN32(&capbuf[8]);
-		rc = 0;
+		/*
+		 * READ CAPACITY(16): max LBA at bytes 0-7, block length at 8-11.
+		 */
+		if (iio.iio_scsi_status == STATUS_GOOD && iio.iio_xfered >= 12) {
+			*nblocksp = BE_IN64(&capbuf[0]) + 1;
+			*blksizep = BE_IN32(&capbuf[8]);
+			rc = 0;
+		} else if (iio.iio_scsi_status == STATUS_CHECK &&
+		    iio.iio_sense_key == KEY_UNIT_ATTENTION &&
+		    attempt < NVMFT_READ_CAPACITY_UA_RETRIES) {
+			rc = EAGAIN;	/* UA cleared by this command; retry */
+		} else {
+			rc = EIO;
+		}
+
+		mutex_destroy(&iio.iio_lock);
+		cv_destroy(&iio.iio_cv);
+
+		if (rc != EAGAIN)
+			return (rc);
 	}
-
-	mutex_destroy(&iio.iio_lock);
-	cv_destroy(&iio.iio_cv);
-	return (rc);
 }
 
 /*
@@ -1426,6 +1454,11 @@ nvmft_lport_send_status(scsi_task_t *task, uint32_t ioflags)
 		mutex_enter(&iio->iio_lock);
 		if (!iio->iio_done) {
 			iio->iio_scsi_status = task->task_scsi_status;
+			if (task->task_scsi_status == STATUS_CHECK &&
+			    task->task_sense_data != NULL) {
+				iio->iio_sense_key =
+				    task->task_sense_data[2] & 0x0f;
+			}
 			iio->iio_done = B_TRUE;
 			cv_signal(&iio->iio_cv);
 		}
