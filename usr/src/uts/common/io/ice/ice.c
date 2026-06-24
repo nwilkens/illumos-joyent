@@ -152,7 +152,7 @@ _fini(void)
 }
 
 /*PRINTFLIKE2*/
-static void
+void
 ice_error(ice_t *ice, const char *fmt, ...)
 {
 	va_list ap;
@@ -168,7 +168,7 @@ ice_error(ice_t *ice, const char *fmt, ...)
 		cmn_err(CE_WARN, "ice: %s", buf);
 }
 
-static int
+int
 ice_check_acc_handle(ddi_acc_handle_t h)
 {
 	ddi_fm_error_t de;
@@ -383,18 +383,6 @@ ice_hw_init(ice_t *ice)
 	return (B_TRUE);
 }
 
-static uint_t
-ice_intr_msix(caddr_t arg1 __unused, caddr_t arg2 __unused)
-{
-	/*
-	 * Vectors are allocated and handlers installed during attach, but
-	 * interrupts are not enabled until the data path exists, so this is
-	 * never entered yet.  Queue and other-cause servicing is added with
-	 * the rings.
-	 */
-	return (DDI_INTR_CLAIMED);
-}
-
 static void
 ice_free_intrs(ice_t *ice)
 {
@@ -488,6 +476,19 @@ ice_alloc_intrs(ice_t *ice)
 		return (B_FALSE);
 	}
 
+	/*
+	 * ice_lock and ice_lse_lock are taken from the OICR interrupt and its
+	 * taskq, so they must be held at MSI-X priority.  ice_lock was created
+	 * earlier with a NULL cookie before the priority was known; recreate it
+	 * now that ddi_intr_get_pri() has run.
+	 */
+	mutex_destroy(&ice->ice_lock);
+	mutex_init(&ice->ice_lock, NULL, MUTEX_DRIVER,
+	    DDI_INTR_PRI(ice->ice_intr_pri));
+	mutex_init(&ice->ice_lse_lock, NULL, MUTEX_DRIVER,
+	    DDI_INTR_PRI(ice->ice_intr_pri));
+	cv_init(&ice->ice_lse_cv, NULL, CV_DRIVER, NULL);
+
 	return (B_TRUE);
 }
 
@@ -525,11 +526,36 @@ ice_add_intr_handlers(ice_t *ice)
 static void
 ice_unconfigure(ice_t *ice)
 {
+	/*
+	 * Quiesce interrupts before tearing down anything the OICR handler or
+	 * its taskq touch.  Masking only stops new deliveries; ddi_intr_remove_
+	 * handler() is what fences a handler already running on another CPU, so
+	 * removing the handlers must precede destroying the taskq they dispatch
+	 * onto and freeing the buffer they read.
+	 */
+	if (ice->ice_attach_progress & ICE_ATTACH_ENABLE_INTR) {
+		ice_intr_disable(ice);
+		ice_intr_oicr_disable(ice);
+		wr32(&ice->ice_hw, PFINT_OICR_ENA, 0);
+		ice_flush(&ice->ice_hw);
+	}
+
 	if (ice->ice_attach_progress & ICE_ATTACH_ADD_INTR)
 		ice_rem_intr_handlers(ice);
 
-	if (ice->ice_attach_progress & ICE_ATTACH_ALLOC_INTR)
+	if (ice->ice_attach_progress & ICE_ATTACH_OICR_TASKQ) {
+		/* No handler can dispatch now; drain then free. */
+		ddi_taskq_destroy(ice->ice_oicr_taskq);
+		ice->ice_oicr_taskq = NULL;
+		kmem_free(ice->ice_aqbuf, ICE_AQ_MAX_BUF_LEN);
+		ice->ice_aqbuf = NULL;
+	}
+
+	if (ice->ice_attach_progress & ICE_ATTACH_ALLOC_INTR) {
 		ice_free_intrs(ice);
+		cv_destroy(&ice->ice_lse_cv);
+		mutex_destroy(&ice->ice_lse_lock);
+	}
 
 	if (ice->ice_attach_progress & ICE_ATTACH_HW_INIT)
 		ice_deinit_hw(&ice->ice_hw);
@@ -626,10 +652,33 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	ice->ice_attach_progress |= ICE_ATTACH_ADD_INTR;
 
 	/*
-	 * MAC registration, interrupt enabling, and link bring-up are added in
-	 * a later milestone.  Enabling interrupts must be the final attach
-	 * step so no handler runs before the data path exists.
+	 * One worker thread by design: the single ice_aqbuf scratch buffer and
+	 * the ice_oicr_pending coalescing both assume one task runs at a time.
 	 */
+	ice->ice_oicr_taskq = ddi_taskq_create(dip, "ice_oicr", 1,
+	    TASKQ_DEFAULTPRI, 0);
+	if (ice->ice_oicr_taskq == NULL) {
+		ice_error(ice, "failed to create OICR taskq");
+		goto fail;
+	}
+	ice->ice_aqbuf = kmem_zalloc(ICE_AQ_MAX_BUF_LEN, KM_SLEEP);
+	ice->ice_attach_progress |= ICE_ATTACH_OICR_TASKQ;
+
+	ice_intr_oicr_setup(ice);
+
+	if (!ice_set_link_events(ice))
+		goto fail;
+
+	/*
+	 * Enabling interrupts is the final hardware step so no handler runs
+	 * before its state is ready.  MAC registration follows in a later
+	 * milestone; until then link state is cached but not reported.
+	 */
+	if (!ice_intr_enable(ice))
+		goto fail;
+	ice->ice_attach_progress |= ICE_ATTACH_ENABLE_INTR;
+
+	ice_link_status_update(ice);
 
 	mutex_enter(&ice_glock);
 	list_insert_tail(&ice_glist, ice);

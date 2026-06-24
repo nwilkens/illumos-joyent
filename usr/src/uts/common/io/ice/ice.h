@@ -66,8 +66,14 @@ extern "C" {
 #define	ICE_MAX_FUNCS		8
 
 typedef enum ice_state {
-	ICE_STATE_ATTACHED	= 1 << 0
+	ICE_STATE_ATTACHED	= 1 << 0,
+	ICE_STATE_RESET_PENDING	= 1 << 1,	/* GRST seen; recovery is M7 */
+	ICE_STATE_ERROR		= 1 << 2	/* acc-handle fault latched */
 } ice_state_t;
+
+/* ice_lse_flags bits (protected by ice_lse_lock). */
+#define	ICE_LSE_F_ENABLE	(1 << 0)	/* link status events wanted */
+#define	ICE_LSE_F_UPDATING	(1 << 1)	/* an update is in flight */
 
 /*
  * Attach progress.  Each completed attach step records its bit; teardown
@@ -79,7 +85,9 @@ typedef enum ice_attach_state {
 	ICE_ATTACH_REGS_MAP	= 1 << 2,
 	ICE_ATTACH_HW_INIT	= 1 << 3,
 	ICE_ATTACH_ALLOC_INTR	= 1 << 4,
-	ICE_ATTACH_ADD_INTR	= 1 << 5
+	ICE_ATTACH_ADD_INTR	= 1 << 5,
+	ICE_ATTACH_OICR_TASKQ	= 1 << 6,
+	ICE_ATTACH_ENABLE_INTR	= 1 << 7
 } ice_attach_state_t;
 
 typedef struct ice {
@@ -113,7 +121,45 @@ typedef struct ice {
 	int			ice_intr_count;
 	size_t			ice_intr_size;
 	ddi_intr_handle_t	*ice_intr_handles;
+
+	/* OICR deferred async work; thread context, serialized via ice_lock. */
+	ddi_taskq_t		*ice_oicr_taskq;
+	boolean_t		ice_oicr_pending;	/* ice_lock */
+	uint8_t			*ice_aqbuf;		/* ARQ scratch buffer */
+
+	/*
+	 * Link-state cache.  The authoritative state lives in
+	 * ice_hw.port_info->phy.link_info, refreshed by the common code; these
+	 * are the decoded values MAC will consume once mac_register lands.
+	 * Guarded by ice_lse_lock.
+	 */
+	kmutex_t		ice_lse_lock;
+	kcondvar_t		ice_lse_cv;
+	uint32_t		ice_lse_flags;
+	link_state_t		ice_link_state;
+	uint64_t		ice_link_speed;
+	link_duplex_t		ice_link_duplex;
+	link_flowctrl_t		ice_link_fctl;
+	mac_handle_t		ice_mac_hdl;		/* NULL until M6 */
 } ice_t;
+
+/*
+ * ice.c
+ */
+/*PRINTFLIKE2*/
+extern void ice_error(ice_t *, const char *, ...);
+extern int ice_check_acc_handle(ddi_acc_handle_t);
+
+/*
+ * ice_intr.c
+ */
+extern uint_t ice_intr_msix(caddr_t, caddr_t);
+extern boolean_t ice_intr_enable(ice_t *);
+extern void ice_intr_disable(ice_t *);
+extern void ice_intr_oicr_setup(ice_t *);
+extern void ice_intr_oicr_disable(ice_t *);
+extern boolean_t ice_set_link_events(ice_t *);
+extern void ice_link_status_update(ice_t *);
 
 #ifdef __cplusplus
 }
