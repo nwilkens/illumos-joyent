@@ -74,23 +74,6 @@
 #define	NVMF_BD_MIN_QSIZE	16
 
 /*
- * Head-identity accessors implemented in nvmf_mpath.c.  The namespace-head and
- * its identity (NGUID/EUI64/UUID) are private to the multipath layer; these
- * narrow helpers let the blkdev binding populate bd_drive_t and build the
- * path-independent devid without exposing the struct.
- *
- * PORT-TODO (integrator): move these prototypes into nvmf_var.h alongside the
- * other nvmf_mpath.c accessors.  They are declared here so this file compiles
- * without an implicit declaration before the header is updated.
- */
-extern struct nvmf_path *nvmf_mpath_head_path(struct nvmf_ns_head *head);
-extern boolean_t nvmf_mpath_head_eui64(struct nvmf_ns_head *head,
-    uint8_t *eui64);
-extern boolean_t nvmf_mpath_head_guid(struct nvmf_ns_head *head, uint8_t *guid);
-extern int nvmf_mpath_head_devid_init(struct nvmf_ns_head *head,
-    dev_info_t *dip, ddi_devid_t *devid);
-
-/*
  * Per-xfer state carried alongside a bd_xfer_t while a command is in flight.
  * FreeBSD abuses CCB spriv fields as a refcount (nvmf_sim.c ccb_refs); we keep
  * an explicit small object since blkdev gives us no private slot on bd_xfer_t.
@@ -138,6 +121,14 @@ nvmf_bd_drive_info(void *arg, bd_drive_t *drive)
 	bzero(drive, sizeof (*drive));
 
 	/*
+	 * blkdev pre-seeds d_free_align = 1 before calling o_drive_info, but the
+	 * bzero above wipes it.  Restore it: o_free_space is advertised, and
+	 * blkdev rejects the attach (DDI_FAILURE, "failed bringing node online")
+	 * if a free-space-capable driver reports d_free_align == 0.
+	 */
+	drive->d_free_align = 1;
+
+	/*
 	 * The head is reachable through any of its paths; use a representative
 	 * path's providing association for the controller-level Identify data and
 	 * this controller's NSID.  If no path exists the disk is between
@@ -162,7 +153,14 @@ nvmf_bd_drive_info(void *arg, bd_drive_t *drive)
 	 * queue before holding the rest in its waitq.
 	 */
 	drive->d_qcount = sc->num_io_queues;
-	drive->d_qsize = sc->max_pending_io / MAX(1, sc->num_io_queues);
+	/*
+	 * Reserve 1/4 of the negotiated SQ depth as headroom (FreeBSD
+	 * host/nvmf_sim.c sizes the CAM simq at max_pending_io * 3/4): blkdev
+	 * must not be able to fill the entire submission queue on every queue at
+	 * once -- that leaves no SQ slots for retries and lets a single host
+	 * flood the target with the full negotiated depth.
+	 */
+	drive->d_qsize = (sc->max_pending_io * 3 / 4) / MAX(1, sc->num_io_queues);
 	drive->d_qsize = MAX(drive->d_qsize, NVMF_BD_MIN_QSIZE);
 
 	/*
@@ -179,6 +177,17 @@ nvmf_bd_drive_info(void *arg, bd_drive_t *drive)
 
 	drive->d_removable = B_FALSE;
 	drive->d_hotpluggable = B_FALSE;
+
+	/*
+	 * SCSI INQUIRY vendor/product strings (what diskinfo(8) shows as
+	 * VID/PID).  The vendor is fixed "NVMf" to mark this as an NVMe-oF
+	 * fabric disk (local PCIe disks report "NVMe" via nvme(4D)); the product
+	 * carries the remote controller's model from Identify Controller, set
+	 * below once cdata is known.  nvme(4D) populates d_vendor/d_product the
+	 * same way -- d_model alone only feeds the kstats, not the inquiry props.
+	 */
+	drive->d_vendor = "NVMf";
+	drive->d_vendor_len = strlen("NVMf");
 
 	/*
 	 * Path-independent identity: EUI64/GUID come from the HEAD, not from
@@ -198,6 +207,8 @@ nvmf_bd_drive_info(void *arg, bd_drive_t *drive)
 	if (sc->cdata != NULL) {
 		drive->d_model = sc->cdata->id_model;
 		drive->d_model_len = sizeof (sc->cdata->id_model);
+		drive->d_product = sc->cdata->id_model;
+		drive->d_product_len = sizeof (sc->cdata->id_model);
 		drive->d_serial = sc->cdata->id_serial;
 		drive->d_serial_len = sizeof (sc->cdata->id_serial);
 		drive->d_revision = sc->cdata->id_fwrev;
@@ -785,9 +796,13 @@ nvmf_reconnect_bd(nvmf_softc_t *sc)
 void
 nvmf_shutdown_bd(nvmf_softc_t *sc)
 {
-	mutex_enter(&sc->mpath_mtx);
-	sc->mpath_shutdown = B_TRUE;
-	mutex_exit(&sc->mpath_mtx);
+	/*
+	 * Shutdown hook in the blkdev lifecycle API.  The only caller
+	 * (nvmf_controller_loss_task) has already destroyed every namespace,
+	 * which removed this association's paths, so there is nothing left to
+	 * quiesce here; the selector already refuses a head with no live path.
+	 */
+	_NOTE(ARGUNUSED(sc));
 }
 
 void

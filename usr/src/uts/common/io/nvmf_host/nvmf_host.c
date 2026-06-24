@@ -34,9 +34,8 @@
  *
  * The device-model glue is rebound rather than ported.  FreeBSD's newbus
  * (device_t, DRIVER_MODULE, make_dev, cdevsw, eventhandler) becomes illumos
- * DDI (dev_info_t, dev_ops/cb_ops, attach/detach/ioctl).  Those entry points
- * are scaffolded here with PORT-TODO (FreeBSD ref) markers; the protocol
- * routines they call are real.
+ * DDI (dev_info_t, dev_ops/cb_ops, attach/detach/ioctl); those entry points and
+ * the protocol routines they call are fully implemented here.
  *
  * OS-glue substitutions used throughout:
  *
@@ -44,7 +43,7 @@
  *   -------                 -------
  *   device_t / device_printf dev_info_t / dev_err
  *   struct sx               krwlock_t (connection_lock)
- *   struct callout          timeout(9F) id (keep-alive); see PORT-TODO
+ *   struct callout          timeout(9F) id (keep-alive)
  *   taskqueue / timeout_task ddi_taskq_t (nvmf_tq) + timeout(9F)
  *   mtx_pool_find/mtx_sleep  one kmutex + kcondvar on the completion status
  *   nvlist (sys/_nv.h)      nvlist (sys/nvpair.h), fnvlist_* helpers
@@ -57,6 +56,9 @@
 #include <sys/conf.h>
 #include <sys/ddi.h>
 #include <sys/sunddi.h>
+#include <sys/ddi_impldefs.h>
+#include <sys/autoconf.h>
+#include <sys/mkdev.h>
 #include <sys/modctl.h>
 #include <sys/cmn_err.h>
 #include <sys/ksynch.h>
@@ -769,13 +771,12 @@ nvmf_disconnect_task(void *arg)
 	}
 
 	if (sc->detaching) {
-		if (sc->admin != NULL) {
-			/*
-			 * This unsticks the detach process if a transport
-			 * error occurs during detach.
-			 */
-			nvmf_shutdown_qp(sc->admin);
-		}
+		/*
+		 * admin is non-NULL (checked above under this same writer lock).
+		 * This unsticks the detach process if a transport error occurs
+		 * during detach.
+		 */
+		nvmf_shutdown_qp(sc->admin);
 		rw_exit(&sc->connection_lock);
 		return;
 	}
@@ -1079,110 +1080,6 @@ nvmf_rescan_all_ns_locked(nvmf_softc_t *sc)
 	nvmf_rescan_all_ns_impl(sc, B_TRUE);
 }
 
-int
-nvmf_passthrough_cmd(nvmf_softc_t *sc, nvme_ioctl_passthru_t *pt,
-    boolean_t admin)
-{
-	nvmf_completion_status_t status;
-	nvme_sqe_t cmd;
-	nvmf_memdesc_t mem;
-	struct nvmf_host_qpair *qp;
-	nvmf_request_t *req;
-	void *buf;
-	int error;
-
-	if (pt->npc_buflen > sc->max_xfer_size)
-		return (EINVAL);
-
-	buf = NULL;
-	if (pt->npc_buflen != 0) {
-		buf = kmem_zalloc(pt->npc_buflen, KM_SLEEP);
-		/*
-		 * PORT-TODO (FreeBSD copyin/copyout of pt->buf): the illumos
-		 * nvme passthru ioctl carries a kernel-resident buffer set up
-		 * by the framework; wire that copyin/copyout here once the
-		 * /dev/nvmf cb_ops ioctl marshalling lands.
-		 */
-	}
-
-	/*
-	 * PORT-TODO (FreeBSD nvme_pt_command -> illumos nvme_ioctl_passthru_t):
-	 * the illumos passthru ioctl differs from FreeBSD's.  NSID lives in
-	 * npc_common; CDW10/CDW11 are not separate fields (they encode the
-	 * opcode-specific arguments the framework derives).  Map the remaining
-	 * dwords directly and finish the CDW10/CDW11 derivation when the
-	 * /dev/nvmf ioctl path lands.
-	 */
-	bzero(&cmd, sizeof (cmd));
-	cmd.sqe_opc = (uint8_t)pt->npc_opcode;
-	cmd.sqe_nsid = pt->npc_common.nioc_nsid;
-	cmd.sqe_cdw12 = pt->npc_cdw12;
-	cmd.sqe_cdw13 = pt->npc_cdw13;
-	cmd.sqe_cdw14 = pt->npc_cdw14;
-	cmd.sqe_cdw15 = pt->npc_cdw15;
-
-	rw_enter(&sc->connection_lock, RW_READER);
-	if (sc->admin == NULL || sc->detaching) {
-		dev_err(sc->dip, CE_WARN,
-		    "!failed to send passthrough command");
-		rw_exit(&sc->connection_lock);
-		error = ECONNABORTED;
-		goto out;
-	}
-	if (admin)
-		qp = sc->admin;
-	else
-		qp = nvmf_select_io_queue(sc);
-	if (qp == NULL) {
-		rw_exit(&sc->connection_lock);
-		error = ENXIO;
-		goto out;
-	}
-	nvmf_status_init(&status);
-	req = nvmf_allocate_request(qp, &cmd, nvmf_complete, &status, KM_SLEEP);
-	rw_exit(&sc->connection_lock);
-	if (req == NULL) {
-		dev_err(sc->dip, CE_WARN,
-		    "!failed to send passthrough command");
-		error = ECONNABORTED;
-		goto out;
-	}
-
-	if (pt->npc_buflen != 0) {
-		mem.nmd_type = NVMF_MEMDESC_VADDR;
-		mem.nmd_len = pt->npc_buflen;
-		mem.nmd_u.nmd_vaddr = buf;
-		/*
-		 * Only arm the I/O wait if the data was actually attached.
-		 * If append_data fails, no io_complete callback will ever
-		 * fire, so arming the wait would deadlock
-		 * nvmf_wait_for_reply().  Abort the request and return the
-		 * error instead.
-		 */
-		if (nvmf_capsule_append_data(req->nc, &mem, pt->npc_buflen,
-		    (pt->npc_flags & NVME_PASSTHRU_WRITE) != 0,
-		    nvmf_io_complete, &status) != 0) {
-			dev_err(sc->dip, CE_WARN,
-			    "!failed to append data to passthrough command");
-			nvmf_free_request(req);
-			error = ECONNABORTED;
-			goto out;
-		}
-		nvmf_status_wait_io(&status);
-	}
-
-	nvmf_submit_request(req);
-	nvmf_wait_for_reply(&status);
-
-	pt->npc_cdw0 = status.cqe.cqe_dw0;
-
-	error = status.io_error;
-out:
-	if (buf != NULL)
-		kmem_free(buf, pt->npc_buflen);
-	return (error);
-}
-
 /*
  * ----------------------------------------------------------------------------
  * DDI device-model glue (rebound from FreeBSD newbus).
@@ -1389,11 +1286,11 @@ nvmf_reconnect_host(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
 
 	error = nvmf_establish_connection(sc, nvl);
 	if (error != 0)
-		goto out;
+		goto fail;
 
 	error = nvmf_start_aer(sc);
 	if (error != 0)
-		goto out;
+		goto fail;
 
 	dev_err(sc->dip, CE_NOTE,
 	    "!established new association with %u I/O queues",
@@ -1416,6 +1313,55 @@ nvmf_reconnect_host(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
 
 	nvmf_cancel_timer(sc, &sc->reconnect_timer);
 	nvmf_cancel_timer(sc, &sc->loss_timer);
+	rw_exit(&sc->connection_lock);
+	nvlist_free(nvl);
+	return (0);
+fail:
+	/*
+	 * A partial reconnect leaves a half-built association: sc->admin set
+	 * with a possible NULL hole in sc->io[] (the failed nvmf_init_qp), and,
+	 * if nvmf_establish_connection() ran to completion before
+	 * nvmf_start_aer() failed, armed KeepAlive timers.  Unwind it back to
+	 * the clean disconnected state the disconnect task produces, so the
+	 * EBUSY guard above clears and a later reconnect can retry.  Reached
+	 * only after nvmf_establish_connection(), so sc->admin was set by this
+	 * call (it is NULL on entry past the EBUSY guard); the pre-build EBUSY/
+	 * EINVAL errors jump straight to out: and must not tear anything down.
+	 *
+	 * Mirror the disconnect-task teardown ordering: destroy the I/O qpairs
+	 * (skipping the hole), free sc->io, then destroy the admin qpair.  Leave
+	 * the namespaces in their already-disconnected state, leave the
+	 * persistent AER pool intact (freed only at attach failure or detach),
+	 * leave sc->rparams (valid reconnect params either way), and leave the
+	 * reconnect/loss timers running so userland keeps retrying.  Do not run
+	 * nvmf_shutdown_controller(): this is lost-association cleanup, not a
+	 * graceful controller shutdown.
+	 *
+	 * Unpublish sc->admin / sc->io before nvmf_disarm_ka_timers() drops the
+	 * lock to untimeout(), so a draining KeepAlive handler cannot reach a
+	 * qpair that is about to be destroyed.
+	 */
+	{
+		struct nvmf_host_qpair *admin = sc->admin;
+		struct nvmf_host_qpair **io = sc->io;
+		uint_t nio = sc->num_io_queues;
+
+		sc->admin = NULL;
+		sc->io = NULL;
+		sc->num_io_queues = 0;
+		sc->ka_traffic = B_FALSE;
+
+		nvmf_disarm_ka_timers(sc);
+
+		for (i = 0; i < nio; i++) {
+			if (io[i] != NULL)
+				nvmf_destroy_qp(io[i]);
+		}
+		if (io != NULL)
+			kmem_free(io, nio * sizeof (*io));
+		if (admin != NULL)
+			nvmf_destroy_qp(admin);
+	}
 out:
 	rw_exit(&sc->connection_lock);
 	nvlist_free(nvl);
@@ -1463,6 +1409,134 @@ nvmf_connection_status(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
 	fnvlist_add_nvlist(nvl, "last_disconnect", nvl_ts);
 	fnvlist_free(nvl_ts);
 
+	error = nvmf_pack_ioc_nvlist(nvl, nv);
+	fnvlist_free(nvl);
+	return (error);
+}
+
+/*
+ * Copy a fixed-width, space/NUL-padded controller string (an NVMe Identify field
+ * or a discovery-log-entry field) into the nvlist as a trimmed C string.
+ */
+static void
+nvmf_list_add_padded(nvlist_t *nvl, const char *key, const char *src,
+    size_t srclen)
+{
+	char buf[260];
+	size_t n = MIN(srclen, sizeof (buf) - 1);
+	size_t i;
+
+	for (i = 0; i < n && src[i] != '\0'; i++)
+		buf[i] = src[i];
+	while (i > 0 && buf[i - 1] == ' ')
+		i--;
+	buf[i] = '\0';
+	fnvlist_add_string(nvl, key, buf);
+}
+
+/*
+ * NVMF_LIST_CONTROLLER: return one nvlist describing this host controller --
+ * connection state, the target it is connected to (from the cached reconnect
+ * params), the controller identity (Identify Controller), and an array of its
+ * namespaces.  Userland (nvmf-connect list) formats it.
+ */
+static int
+nvmf_list_controller(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
+{
+	nvlist_t *nvl;
+	int error;
+
+	nvl = fnvlist_alloc();
+
+	rw_enter(&sc->connection_lock, RW_READER);
+
+	/*
+	 * While detaching, the namespace array and reconnect params are being
+	 * (or are about to be) freed by nvmf_teardown_association(); report a
+	 * bare disconnected controller rather than racing that teardown.  All
+	 * dynamic reads below are safe because setting sc->detaching takes the
+	 * lock as a writer, so it cannot start while we hold it as a reader.
+	 */
+	if (sc->detaching) {
+		fnvlist_add_boolean_value(nvl, "connected", B_FALSE);
+		rw_exit(&sc->connection_lock);
+		goto pack;
+	}
+
+	fnvlist_add_boolean_value(nvl, "connected", sc->admin != NULL);
+	fnvlist_add_uint32(nvl, "num_io_queues", sc->num_io_queues);
+
+	nvmf_list_add_padded(nvl, "model", sc->cdata->id_model,
+	    sizeof (sc->cdata->id_model));
+	nvmf_list_add_padded(nvl, "serial", sc->cdata->id_serial,
+	    sizeof (sc->cdata->id_serial));
+	nvmf_list_add_padded(nvl, "firmware", sc->cdata->id_fwrev,
+	    sizeof (sc->cdata->id_fwrev));
+
+	if (sc->rparams != NULL) {
+		uchar_t *dlebytes;
+		uint_t dlelen;
+		char *hostnqn;
+
+		if (nvlist_lookup_byte_array(sc->rparams, "dle", &dlebytes,
+		    &dlelen) == 0 &&
+		    dlelen >= sizeof (nvmf_discovery_log_page_entry_t)) {
+			const nvmf_discovery_log_page_entry_t *dle =
+			    (const nvmf_discovery_log_page_entry_t *)dlebytes;
+
+			nvmf_list_add_padded(nvl, "subnqn",
+			    (const char *)dle->ndle_subnqn,
+			    sizeof (dle->ndle_subnqn));
+			nvmf_list_add_padded(nvl, "traddr",
+			    (const char *)dle->ndle_traddr,
+			    sizeof (dle->ndle_traddr));
+			nvmf_list_add_padded(nvl, "trsvcid",
+			    (const char *)dle->ndle_trsvcid,
+			    sizeof (dle->ndle_trsvcid));
+			fnvlist_add_uint32(nvl, "trtype", dle->ndle_trtype);
+		}
+		if (nvlist_lookup_string(sc->rparams, "hostnqn", &hostnqn) == 0)
+			fnvlist_add_string(nvl, "hostnqn", hostnqn);
+	}
+
+	if (sc->ns != NULL && sc->cdata->id_nn > 0) {
+		nvlist_t **nsarr;
+		uint_t cap = sc->cdata->id_nn;
+		uint_t cnt = 0;
+		uint32_t i;
+
+		nsarr = kmem_zalloc(cap * sizeof (nvlist_t *), KM_SLEEP);
+		for (i = 0; i < cap; i++) {
+			nvlist_t *n;
+			uint32_t nsid, blksize;
+			uint64_t size;
+			uint8_t nguid[16], eui64[8];
+			boolean_t nsconn;
+
+			if (sc->ns[i] == NULL)
+				continue;
+			nvmf_ns_get_info(sc->ns[i], &nsid, &size, &blksize,
+			    nguid, eui64, &nsconn);
+			n = fnvlist_alloc();
+			fnvlist_add_uint32(n, "nsid", nsid);
+			fnvlist_add_uint64(n, "size", size);
+			fnvlist_add_uint32(n, "blksize", blksize);
+			fnvlist_add_boolean_value(n, "connected", nsconn);
+			fnvlist_add_byte_array(n, "nguid", nguid,
+			    sizeof (nguid));
+			fnvlist_add_byte_array(n, "eui64", eui64,
+			    sizeof (eui64));
+			nsarr[cnt++] = n;
+		}
+		if (cnt > 0)
+			fnvlist_add_nvlist_array(nvl, "namespaces", nsarr, cnt);
+		for (i = 0; i < cnt; i++)
+			fnvlist_free(nsarr[i]);
+		kmem_free(nsarr, cap * sizeof (nvlist_t *));
+	}
+	rw_exit(&sc->connection_lock);
+
+pack:
 	error = nvmf_pack_ioc_nvlist(nvl, nv);
 	fnvlist_free(nvl);
 	return (error);
@@ -1542,30 +1616,21 @@ nvmf_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	return (DDI_SUCCESS);
 }
 
-static int
-nvmf_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
+/*
+ * Tear down the live association on a softc: namespaces, blkdev disks, I/O and
+ * admin qpairs, AERs, and the reconnect/loss timers.  Shared by driver detach
+ * and the user-initiated disconnect ioctl.  On return sc holds no association
+ * (sc->admin/io/ns NULL, num_io_queues 0, rparams freed); the caller still owns
+ * sc->cdata, the control minor, and the softc.
+ *
+ * The caller must set sc->detaching before calling this so concurrent
+ * disconnect/rescan tasks quiesce, and is responsible for the post-teardown
+ * disposition (free for detach, reset-for-reuse for disconnect).
+ */
+static void
+nvmf_teardown_association(nvmf_softc_t *sc)
 {
-	nvmf_softc_t *sc;
-	int instance;
 	uint_t i;
-
-	switch (cmd) {
-	case DDI_DETACH:
-		break;
-	case DDI_SUSPEND:
-		return (DDI_SUCCESS);
-	default:
-		return (DDI_FAILURE);
-	}
-
-	instance = ddi_get_instance(dip);
-	sc = ddi_get_soft_state(nvmf_state, instance);
-	if (sc == NULL)
-		return (DDI_FAILURE);
-
-	rw_enter(&sc->connection_lock, RW_WRITER);
-	sc->detaching = B_TRUE;
-	rw_exit(&sc->connection_lock);
 
 	/*
 	 * Tear down the namespaces BEFORE the blkdev/multipath state: each
@@ -1596,8 +1661,11 @@ nvmf_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 		if (sc->io[i] != NULL)
 			nvmf_destroy_qp(sc->io[i]);
 	}
-	if (sc->io != NULL)
+	if (sc->io != NULL) {
 		kmem_free(sc->io, sc->num_io_queues * sizeof (*sc->io));
+		sc->io = NULL;
+	}
+	sc->num_io_queues = 0;
 
 	/*
 	 * Destroy the admin qpair BEFORE draining the taskq.  This stops all
@@ -1632,7 +1700,7 @@ nvmf_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 
 	/*
 	 * Cancel the reconnect and controller-loss timers.  Don't cancel the
-	 * loss timer if it is what triggered this detach (controller_timedout);
+	 * loss timer if it is what triggered this teardown (controller_timedout);
 	 * that handler has already cleared its own id.
 	 */
 	rw_enter(&sc->connection_lock, RW_WRITER);
@@ -1649,8 +1717,74 @@ nvmf_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	if (sc->cdev_attached)
 		nvmf_destroy_aer(sc);
 
-	ddi_remove_minor_node(dip, NULL);
 	nvlist_free(sc->rparams);
+	sc->rparams = NULL;
+}
+
+/*
+ * User-initiated disconnect (NVMF_DISCONNECT_HOST/ALL).  Tear the association
+ * down like detach, but keep the instance and its control minor so the same
+ * node can be reconnected with a fresh NVMF_HANDOFF_HOST.  Idempotent: a node
+ * with no association returns success.
+ */
+static int
+nvmf_disconnect_host_ioctl(nvmf_softc_t *sc)
+{
+	rw_enter(&sc->connection_lock, RW_WRITER);
+	if (!sc->cdev_attached && sc->admin == NULL) {
+		rw_exit(&sc->connection_lock);
+		return (0);
+	}
+	if (sc->detaching) {
+		rw_exit(&sc->connection_lock);
+		return (EBUSY);
+	}
+	/*
+	 * Reuse the detaching flag to quiesce disconnect/rescan tasks during
+	 * teardown; it is cleared again below so the instance stays usable.
+	 */
+	sc->detaching = B_TRUE;
+	rw_exit(&sc->connection_lock);
+
+	nvmf_teardown_association(sc);
+
+	rw_enter(&sc->connection_lock, RW_WRITER);
+	sc->cdev_attached = B_FALSE;
+	sc->controller_timedout = B_FALSE;
+	sc->detaching = B_FALSE;
+	bzero(sc->cdata, sizeof (*sc->cdata));
+	gethrestime(&sc->last_disconnect);
+	rw_exit(&sc->connection_lock);
+	return (0);
+}
+
+static int
+nvmf_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
+{
+	nvmf_softc_t *sc;
+	int instance;
+
+	switch (cmd) {
+	case DDI_DETACH:
+		break;
+	case DDI_SUSPEND:
+		return (DDI_SUCCESS);
+	default:
+		return (DDI_FAILURE);
+	}
+
+	instance = ddi_get_instance(dip);
+	sc = ddi_get_soft_state(nvmf_state, instance);
+	if (sc == NULL)
+		return (DDI_FAILURE);
+
+	rw_enter(&sc->connection_lock, RW_WRITER);
+	sc->detaching = B_TRUE;
+	rw_exit(&sc->connection_lock);
+
+	nvmf_teardown_association(sc);
+
+	ddi_remove_minor_node(dip, NULL);
 	kmem_free(sc->cdata, sizeof (*sc->cdata));
 	rw_destroy(&sc->connection_lock);
 	ddi_soft_state_free(nvmf_state, instance);
@@ -1703,6 +1837,14 @@ nvmf_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *credp,
 		if (ddi_copyin((void *)arg, &nv, sizeof (nv), mode) != 0)
 			return (EFAULT);
 		return (nvmf_handoff_host(sc, &nv));
+	case NVMF_DISCONNECT_HOST:
+	case NVMF_DISCONNECT_ALL:
+		/*
+		 * This control node owns exactly one association, so both the
+		 * per-host and disconnect-all forms tear down this instance.  The
+		 * FreeBSD subsystem-NQN argument is not needed and is ignored.
+		 */
+		return (nvmf_disconnect_host_ioctl(sc));
 	case NVMF_RECONNECT_PARAMS:
 		if (ddi_copyin((void *)arg, &nv, sizeof (nv), mode) != 0)
 			return (EFAULT);
@@ -1719,6 +1861,14 @@ nvmf_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *credp,
 		if (ddi_copyin((void *)arg, &nv, sizeof (nv), mode) != 0)
 			return (EFAULT);
 		error = nvmf_connection_status(sc, &nv);
+		if (error == 0 &&
+		    ddi_copyout(&nv, (void *)arg, sizeof (nv), mode) != 0)
+			error = EFAULT;
+		return (error);
+	case NVMF_LIST_CONTROLLER:
+		if (ddi_copyin((void *)arg, &nv, sizeof (nv), mode) != 0)
+			return (EFAULT);
+		error = nvmf_list_controller(sc, &nv);
 		if (error == 0 &&
 		    ddi_copyout(&nv, (void *)arg, sizeof (nv), mode) != 0)
 			error = EFAULT;
@@ -1789,6 +1939,76 @@ static struct dev_ops nvmf_dev_ops = {
 	.devo_quiesce = ddi_quiesce_not_needed
 };
 
+/*
+ * blkdev child-instance assignment for our pseudo nexus.
+ *
+ * nvmf_host is a pseudo device (nvmf_host.conf parent="pseudo"), so
+ * e_ddi_assign_instance() short-circuits for the blkdev disk children we create
+ * beneath us and returns their unassigned (-1) instance instead of allocating
+ * one from the instance tree (os/instance.c).  bd_attach()'s
+ * ddi_soft_state_zalloc() then fails ("unable to zalloc soft state").  A pseudo
+ * nexus is responsible for assigning instances to its own children: pseudonex
+ * and i2cnex do this in their INITCHILD; we must do the same for the blkdev
+ * children bd_attach_handle() creates under us.  bd_mod_init() installs blkdev's
+ * bus_ops (bd_bus_ctl as bus_ctl); we wrap it so INITCHILD also assigns a free
+ * instance.
+ *
+ * NB the proper home for this is blkdev's own bd_bus_ctl (it is a blkdev nexus
+ * bug exposed by a pseudo-rooted consumer), but blkdev is pinned at boot and
+ * cannot be hot-reloaded for testing, so the contained wrapper lives here.
+ */
+static struct bus_ops nvmf_bus_ops;
+static int (*nvmf_bd_bus_ctl)(dev_info_t *, dev_info_t *, ddi_ctl_enum_t,
+    void *, void *);
+
+/*
+ * Assign the lowest blkdev instance not already used by a live blkdev node.
+ * The number must be unique across ALL blkdev consumers (blkdev's soft state is
+ * global), so search the blkdev driver's per-major node list under its lock and
+ * set the instance while still holding it, mirroring pseudonex_auto_assign() and
+ * i2c_nex_assign_instance().  Returns the instance, or -1 if none is free.
+ */
+static int
+nvmf_blkdev_assign_instance(dev_info_t *child)
+{
+	major_t		maj = ddi_driver_major(child);
+	struct devnames	*dnp = &devnamesp[maj];
+	dev_info_t	*tdip;
+	int		inst;
+
+	LOCK_DEV_OPS(&dnp->dn_lock);
+	for (inst = 0; inst <= MAXMIN32; inst++) {
+		for (tdip = dnp->dn_head; tdip != NULL;
+		    tdip = ddi_get_next(tdip)) {
+			if (tdip != child && ddi_get_instance(tdip) == inst)
+				break;
+		}
+		if (tdip == NULL) {
+			DEVI(child)->devi_instance = inst;
+			UNLOCK_DEV_OPS(&dnp->dn_lock);
+			return (inst);
+		}
+	}
+	UNLOCK_DEV_OPS(&dnp->dn_lock);
+	return (-1);
+}
+
+static int
+nvmf_bus_ctl(dev_info_t *dip, dev_info_t *rdip, ddi_ctl_enum_t ctlop,
+    void *arg, void *result)
+{
+	int rv = nvmf_bd_bus_ctl(dip, rdip, ctlop, arg, result);
+
+	if (ctlop == DDI_CTLOPS_INITCHILD && rv == DDI_SUCCESS) {
+		dev_info_t *child = (dev_info_t *)arg;
+
+		if (ddi_get_instance(child) == -1 &&
+		    nvmf_blkdev_assign_instance(child) < 0)
+			return (DDI_FAILURE);
+	}
+	return (rv);
+}
+
 static struct modldrv nvmf_modldrv = {
 	.drv_modops = &mod_driverops,
 	.drv_linkinfo = "NVMe over Fabrics host",
@@ -1822,8 +2042,28 @@ _init(void)
 
 	nvmf_mpath_init();
 
+	/*
+	 * Register the blkdev bus_ops on our dev_ops so nvmf_host can act as the
+	 * nexus for the per-namespace blkdev child nodes (bd_attach_handle);
+	 * without this devo_bus_ops stays NULL and ndi_devi_online() of a
+	 * blkdev@N,0 child fails ("failed bringing node online").  Mirrors
+	 * nvme(4D).
+	 */
+	bd_mod_init(&nvmf_dev_ops);
+
+	/*
+	 * Wrap blkdev's bus_ops so our pseudo-nexus INITCHILD assigns an
+	 * instance to each blkdev child (see nvmf_bus_ctl); the framework will
+	 * not, because we are a pseudo device.
+	 */
+	nvmf_bus_ops = *nvmf_dev_ops.devo_bus_ops;
+	nvmf_bd_bus_ctl = nvmf_bus_ops.bus_ctl;
+	nvmf_bus_ops.bus_ctl = nvmf_bus_ctl;
+	nvmf_dev_ops.devo_bus_ops = &nvmf_bus_ops;
+
 	error = mod_install(&nvmf_modlinkage);
 	if (error != 0) {
+		bd_mod_fini(&nvmf_dev_ops);
 		nvmf_mpath_fini();
 		ddi_taskq_destroy(nvmf_tq);
 		cv_destroy(&nvmf_status_cv);
@@ -1848,6 +2088,7 @@ _fini(void)
 	if (error != 0)
 		return (error);
 
+	bd_mod_fini(&nvmf_dev_ops);
 	nvmf_mpath_fini();
 	ddi_taskq_destroy(nvmf_tq);
 	cv_destroy(&nvmf_status_cv);

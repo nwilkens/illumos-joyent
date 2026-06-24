@@ -91,51 +91,61 @@ typedef struct nvmf_namespace {
 } nvmf_namespace_t;
 
 /*
- * Validate Identify Namespace data and extract the LBA size.  Ports the
- * FreeBSD checks verbatim (no end-to-end data protection, valid LBA format
- * index, no metadata, non-zero LBA data size).  Returns the LBA size in bytes,
- * or 0 on rejection.
+ * Validate Identify Namespace data and derive block geometry: number of blocks
+ * and block size in bytes.  Ports the FreeBSD checks verbatim (no end-to-end
+ * data protection, valid LBA format index, no metadata, non-zero LBA data
+ * size).  Returns B_FALSE for a format we cannot present, leaving *nblksp /
+ * *blksizep untouched.
  *
- * The same validation (minus the warnings) is duplicated in nvmf_mpath.c
- * (nvmf_ns_geometry), which derives head geometry at add_path time; the two
- * must stay in lock-step or the disk size can desync from the I/O block size.
- * PORT-TODO: hoist this into a single shared helper once nvmf_var.h can export
- * it to both files (e.g. nvmf_ns_fmt() returning nblks/blksize/ok); until then
- * any change here (accepting metadata, honoring the NVMe 1.4 lba_fidxu upper
- * format-index bits, etc.) must be mirrored in nvmf_ns_geometry.
+ * Single source of truth for the geometry parse: nvmf_mpath.c calls it (dip ==
+ * NULL, no warnings) at add_path time to seed head geometry, and nvmf_ns.c
+ * calls it (dip set) for init/update so the disk size and I/O block size cannot
+ * desync.  Any change here (accepting metadata, honoring the NVMe 1.4 lba_fidxu
+ * upper format-index bits, etc.) therefore applies to both call sites.  The
+ * format index is taken from id_flbas.lba_format only, exactly as both callers
+ * did before this was hoisted.
  */
-static uint32_t
-nvmf_ns_lba_size(nvmf_namespace_t *ns, const nvme_identify_nsid_t *data)
+boolean_t
+nvmf_ns_fmt(const nvme_identify_nsid_t *data, uint64_t *nblksp,
+    uint32_t *blksizep, dev_info_t *dip, uint32_t nsid)
 {
 	uint8_t lbaf, lbads;
 
 	if (data->id_dps.dp_pinfo != 0) {
-		dev_err(ns->sc->dip, CE_WARN,
-		    "!ns%u: End-to-end data protection not supported", ns->id);
-		return (0);
+		if (dip != NULL)
+			dev_err(dip, CE_WARN,
+			    "!ns%u: End-to-end data protection not supported",
+			    nsid);
+		return (B_FALSE);
 	}
 
 	lbaf = data->id_flbas.lba_format;
 	if (lbaf > data->id_nlbaf) {
-		dev_err(ns->sc->dip, CE_WARN, "!ns%u: Invalid LBA format index",
-		    ns->id);
-		return (0);
+		if (dip != NULL)
+			dev_err(dip, CE_WARN,
+			    "!ns%u: Invalid LBA format index", nsid);
+		return (B_FALSE);
 	}
 
 	if (data->id_lbaf[lbaf].lbaf_ms != 0) {
-		dev_err(ns->sc->dip, CE_WARN,
-		    "!ns%u: Namespaces with metadata are not supported", ns->id);
-		return (0);
+		if (dip != NULL)
+			dev_err(dip, CE_WARN,
+			    "!ns%u: Namespaces with metadata are not supported",
+			    nsid);
+		return (B_FALSE);
 	}
 
 	lbads = data->id_lbaf[lbaf].lbaf_lbads;
 	if (lbads == 0) {
-		dev_err(ns->sc->dip, CE_WARN, "!ns%u: Invalid LBA format index",
-		    ns->id);
-		return (0);
+		if (dip != NULL)
+			dev_err(dip, CE_WARN,
+			    "!ns%u: Invalid LBA format index", nsid);
+		return (B_FALSE);
 	}
 
-	return (1U << lbads);
+	*blksizep = 1U << lbads;
+	*nblksp = data->id_nsize;
+	return (B_TRUE);
 }
 
 struct nvmf_namespace *
@@ -143,6 +153,7 @@ nvmf_init_ns(nvmf_softc_t *sc, uint32_t id, const nvme_identify_nsid_t *data)
 {
 	nvmf_namespace_t *ns;
 	struct nvmf_ns_head *head;
+	uint64_t nblks;
 	uint32_t lba_size;
 
 	ns = kmem_zalloc(sizeof (*ns), KM_SLEEP);
@@ -151,12 +162,11 @@ nvmf_init_ns(nvmf_softc_t *sc, uint32_t id, const nvme_identify_nsid_t *data)
 	ns->data = *data;
 	mutex_init(&ns->lock, NULL, MUTEX_DRIVER, NULL);
 
-	lba_size = nvmf_ns_lba_size(ns, data);
-	if (lba_size == 0)
+	if (!nvmf_ns_fmt(data, &nblks, &lba_size, sc->dip, id))
 		goto fail;
 
 	ns->lba_size = lba_size;
-	ns->size = data->id_nsize * ns->lba_size;
+	ns->size = nblks * lba_size;
 
 	/*
 	 * FreeBSD records per-namespace DEALLOCATE/FLUSH support here (from
@@ -266,16 +276,16 @@ boolean_t
 nvmf_update_ns(struct nvmf_namespace *ns, const nvme_identify_nsid_t *data)
 {
 	struct nvmf_ns_head *head;
+	uint64_t nblks;
 	uint32_t lba_size;
 
-	lba_size = nvmf_ns_lba_size(ns, data);
-	if (lba_size == 0)
+	if (!nvmf_ns_fmt(data, &nblks, &lba_size, ns->sc->dip, ns->id))
 		return (B_FALSE);
 
 	mutex_enter(&ns->lock);
 	ns->data = *data;
 	ns->lba_size = lba_size;
-	ns->size = data->id_nsize * ns->lba_size;
+	ns->size = nblks * lba_size;
 	mutex_exit(&ns->lock);
 
 	/*
@@ -294,4 +304,25 @@ nvmf_update_ns(struct nvmf_namespace *ns, const nvme_identify_nsid_t *data)
 	if (head != NULL)
 		nvmf_mpath_head_set_geometry(head, data->id_nsize, lba_size);
 	return (B_TRUE);
+}
+
+/*
+ * Read-only snapshot of a namespace for NVMF_LIST_CONTROLLER.  The struct is
+ * private to this file, so nvmf_host.c reads it through this accessor and builds
+ * the nvlist there.  ns->lock is intentionally not taken: the caller already
+ * holds sc->connection_lock (so the ns cannot be freed underneath us), and
+ * taking ns->lock under connection_lock would invert the lock order used by the
+ * I/O and AEN paths.  The geometry/identity fields are stable after init except
+ * across a rare resize/reformat AEN; a slightly stale display value is harmless.
+ */
+void
+nvmf_ns_get_info(struct nvmf_namespace *ns, uint32_t *nsidp, uint64_t *sizep,
+    uint32_t *blksizep, uint8_t *nguid, uint8_t *eui64, boolean_t *connectedp)
+{
+	*nsidp = ns->id;
+	*sizep = ns->size;
+	*blksizep = ns->lba_size;
+	(void) memcpy(nguid, ns->data.id_nguid, sizeof (ns->data.id_nguid));
+	(void) memcpy(eui64, ns->data.id_eui64, sizeof (ns->data.id_eui64));
+	*connectedp = !ns->disconnected;
 }

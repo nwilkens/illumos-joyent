@@ -98,13 +98,11 @@ typedef struct nvmf_softc {
 	/*
 	 * FreeBSD keeps cam_sim/cam_path/sim_mtx here.  illumos replaces them
 	 * with the head/path multipath layer (nvmf_mpath.c); this softc holds
-	 * the list of paths it currently provides plus the disconnect flags
-	 * the path selector consults.
+	 * the list of paths it currently provides.  The path selector consults
+	 * per-path state (nvmf_path_t path_down), not a softc-wide flag.
 	 */
 	kmutex_t		mpath_mtx;
 	list_t			paths;		/* nvmf_path_t by this assoc */
-	boolean_t		mpath_disconnected;
-	boolean_t		mpath_shutdown;
 
 	struct nvmf_namespace	**ns;
 
@@ -115,13 +113,10 @@ typedef struct nvmf_softc {
 	uint64_t		max_xfer_size;
 
 	/*
-	 * Keep Alive support.  See the FreeBSD comment: a tx timer sends
-	 * KeepAlive at half the timeout and an rx timer detects an actual
-	 * timeout.  ka_active_*_traffic are touched with atomics.
-	 *
-	 * PORT-TODO (FreeBSD nvmf_var.h ka_tx_timer/ka_rx_timer): the FreeBSD
-	 * callout becomes an illumos timeout(9F) id or a cyclic; for now the
-	 * scheduling is left to nvmf_host.c with TODO markers.
+	 * Keep Alive support.  A tx timer sends KeepAlive at half the timeout
+	 * and an rx timer detects an actual timeout; ka_active_*_traffic are
+	 * touched with atomics.  FreeBSD's callout becomes a timeout(9F) id
+	 * here; the scheduling lives in nvmf_host.c (nvmf_arm_ka_timers).
 	 */
 	boolean_t		ka_traffic;	/* Using TKAS? */
 	volatile uint_t		ka_active_tx_traffic;
@@ -247,8 +242,7 @@ extern int nvmf_copyin_handoff(const struct nvmf_ioc_nv *nv, nvlist_t **nvlp);
 extern void nvmf_disconnect(nvmf_softc_t *sc);
 extern void nvmf_rescan_ns(nvmf_softc_t *sc, uint32_t nsid);
 extern void nvmf_rescan_all_ns(nvmf_softc_t *sc);
-extern int nvmf_passthrough_cmd(nvmf_softc_t *sc, nvme_ioctl_passthru_t *pt,
-    boolean_t admin);
+extern ddi_taskq_t *nvmf_aer_taskq(nvmf_softc_t *sc);
 
 /* nvmf_aer.c */
 extern void nvmf_init_aer(nvmf_softc_t *sc);
@@ -276,6 +270,8 @@ extern boolean_t nvmf_cmd_get_log_page(nvmf_softc_t *sc, uint32_t nsid,
     nvmf_io_complete_t *io_cb, void *io_cb_arg, int how);
 
 /* nvmf_ns.c */
+extern boolean_t nvmf_ns_fmt(const nvme_identify_nsid_t *data, uint64_t *nblksp,
+    uint32_t *blksizep, dev_info_t *dip, uint32_t nsid);
 extern struct nvmf_namespace *nvmf_init_ns(nvmf_softc_t *sc, uint32_t id,
     const nvme_identify_nsid_t *data);
 extern void nvmf_disconnect_ns(struct nvmf_namespace *ns);
@@ -284,6 +280,9 @@ extern void nvmf_shutdown_ns(struct nvmf_namespace *ns);
 extern void nvmf_destroy_ns(struct nvmf_namespace *ns);
 extern boolean_t nvmf_update_ns(struct nvmf_namespace *ns,
     const nvme_identify_nsid_t *data);
+extern void nvmf_ns_get_info(struct nvmf_namespace *ns, uint32_t *nsidp,
+    uint64_t *sizep, uint32_t *blksizep, uint8_t *nguid, uint8_t *eui64,
+    boolean_t *connectedp);
 
 /* nvmf_qpair.c */
 extern struct nvmf_host_qpair *nvmf_init_qp(nvmf_softc_t *sc,
@@ -307,6 +306,15 @@ extern void nvmf_reconnect_bd(nvmf_softc_t *sc);
 extern void nvmf_shutdown_bd(nvmf_softc_t *sc);
 extern void nvmf_destroy_bd(nvmf_softc_t *sc);
 extern void nvmf_bd_rescan_ns(nvmf_softc_t *sc, uint32_t id);
+
+/*
+ * Head <-> blkdev handle translation, consumed by nvmf_mpath.c: the head
+ * carries the bd_ops "driver private" so the callbacks resolve geometry/NSID
+ * through it.
+ */
+extern bd_handle_t nvmf_blkdev_attach_head(struct nvmf_ns_head *head,
+    dev_info_t *dip);
+extern void nvmf_blkdev_detach_head(bd_handle_t bdh);
 
 /*
  * nvmf_mpath.c (NEW - the namespace-head / path / selector model of
@@ -333,6 +341,17 @@ void nvmf_mpath_head_set_geometry(struct nvmf_ns_head *head, uint64_t nblks,
     uint32_t blksize);
 uint32_t nvmf_mpath_path_nsid(struct nvmf_path *path);
 nvmf_softc_t *nvmf_mpath_path_sc(struct nvmf_path *path);
+
+/*
+ * Head identity/devid accessors consumed by nvmf_blkdev.c to populate
+ * bd_drive_t and build the path-independent devid without exposing the head
+ * struct.
+ */
+struct nvmf_path *nvmf_mpath_head_path(struct nvmf_ns_head *head);
+boolean_t nvmf_mpath_head_eui64(struct nvmf_ns_head *head, uint8_t *eui64);
+boolean_t nvmf_mpath_head_guid(struct nvmf_ns_head *head, uint8_t *guid);
+int nvmf_mpath_head_devid_init(struct nvmf_ns_head *head, dev_info_t *dip,
+    ddi_devid_t *devid);
 
 #ifdef __cplusplus
 }

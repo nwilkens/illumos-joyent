@@ -72,14 +72,8 @@
  * handle, or NULL on failure.  nvmf_blkdev_detach_head() bd_detach_handle()s
  * and bd_free_handle()s a handle.  The head retains ownership of the handle
  * storage; these helpers only translate between the head and blkdev's ops.
- *
- * PORT-TODO (integrator): move these prototypes into nvmf_var.h alongside the
- * other nvmf_blkdev.c entry points.  They are declared here so this file
- * compiles without an implicit declaration before the header is updated.
+ * Both are declared in nvmf_var.h.
  */
-extern bd_handle_t nvmf_blkdev_attach_head(struct nvmf_ns_head *head,
-    dev_info_t *dip);
-extern void nvmf_blkdev_detach_head(bd_handle_t bdh);
 
 /*
  * Path lifetime: nvmf_mpath_select() hands a path to the blkdev binding with an
@@ -216,8 +210,6 @@ nvmf_mpath_softc_init(nvmf_softc_t *sc)
 	mutex_init(&sc->mpath_mtx, NULL, MUTEX_DRIVER, NULL);
 	list_create(&sc->paths, sizeof (nvmf_path_t),
 	    offsetof(nvmf_path_t, sc_link));
-	sc->mpath_disconnected = B_FALSE;
-	sc->mpath_shutdown = B_FALSE;
 }
 
 void
@@ -234,7 +226,6 @@ nvmf_mpath_softc_down(nvmf_softc_t *sc)
 	nvmf_path_t *path;
 
 	mutex_enter(&sc->mpath_mtx);
-	sc->mpath_disconnected = B_TRUE;
 	for (path = list_head(&sc->paths); path != NULL;
 	    path = list_next(&sc->paths, path)) {
 		nvmf_mpath_path_down(path);
@@ -248,7 +239,6 @@ nvmf_mpath_softc_up(nvmf_softc_t *sc)
 	nvmf_path_t *path;
 
 	mutex_enter(&sc->mpath_mtx);
-	sc->mpath_disconnected = B_FALSE;
 	for (path = list_head(&sc->paths); path != NULL;
 	    path = list_next(&sc->paths, path)) {
 		nvmf_mpath_path_up(path);
@@ -310,38 +300,6 @@ nvmf_ns_id_from_data(nvmf_ns_id_t *id, const nvme_identify_nsid_t *data)
 		bcopy(data->id_eui64, id->nid_eui64, sizeof (id->nid_eui64));
 		id->nid_have_eui64 = B_TRUE;
 	}
-}
-
-/*
- * Derive block geometry (number of blocks, block size in bytes) from Identify
- * Namespace data, mirroring the validation in nvmf_ns.c::nvmf_ns_lba_size.
- * Returns B_FALSE if the namespace format is one we cannot present (data
- * protection, metadata, bad LBA format index, zero LBA data size), in which
- * case *nblksp / *blksizep are left untouched.
- */
-static boolean_t
-nvmf_ns_geometry(const nvme_identify_nsid_t *data, uint64_t *nblksp,
-    uint32_t *blksizep)
-{
-	uint8_t lbaf, lbads;
-
-	if (data->id_dps.dp_pinfo != 0)
-		return (B_FALSE);
-
-	lbaf = data->id_flbas.lba_format;
-	if (lbaf > data->id_nlbaf)
-		return (B_FALSE);
-
-	if (data->id_lbaf[lbaf].lbaf_ms != 0)
-		return (B_FALSE);
-
-	lbads = data->id_lbaf[lbaf].lbaf_lbads;
-	if (lbads == 0)
-		return (B_FALSE);
-
-	*blksizep = 1U << lbads;
-	*nblksp = data->id_nsize;
-	return (B_TRUE);
 }
 
 static boolean_t
@@ -414,7 +372,7 @@ nvmf_mpath_add_path(nvmf_softc_t *sc, uint32_t nsid,
 	bd_handle_t bdh;
 
 	nvmf_ns_id_from_data(&id, data);
-	(void) nvmf_ns_geometry(data, &nblks, &blksize);
+	(void) nvmf_ns_fmt(data, &nblks, &blksize, NULL, 0);
 
 	mutex_enter(&nvmf_heads_lock);
 	head = nvmf_mpath_find_head_locked(&id);
@@ -639,7 +597,7 @@ nvmf_mpath_path_up(struct nvmf_path *path)
 /*
  * Accessors so the blkdev binding (nvmf_blkdev.c) can read head geometry and
  * the path's NSID without the head/path structs being public.  Geometry is set
- * at head creation from the first path's Identify data (nvmf_ns_geometry) and
+ * at head creation from the first path's Identify data (nvmf_ns_fmt) and
  * refreshed via nvmf_mpath_head_set_geometry on a namespace-resize rescan.
  */
 uint32_t

@@ -160,6 +160,9 @@ extern "C" {
 #define	NVMF_RECONNECT_HOST	(NVMF_IOC | 204)
 #define	NVMF_CONNECTION_STATUS	(NVMF_IOC | 205)
 
+/* illumos extension: enumerate a host controller and its namespaces */
+#define	NVMF_LIST_CONTROLLER	(NVMF_IOC | 206)
+
 #ifdef __cplusplus
 }
 #endif

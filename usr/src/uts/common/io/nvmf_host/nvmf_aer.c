@@ -67,13 +67,6 @@ typedef struct nvmf_aer {
 
 #define	MAX_LOG_PAGE_SIZE	4096
 
-/*
- * PORT-TODO (FreeBSD nvmf_aer.c uses taskqueue_thread): nvmf_host.c owns a
- * ddi_taskq_t for the softc; this accessor returns it.  Declared here and
- * defined in nvmf_host.c.
- */
-extern ddi_taskq_t *nvmf_aer_taskq(nvmf_softc_t *sc);
-
 static void	nvmf_complete_aer(void *arg, const nvme_cqe_t *cqe);
 
 static void
