@@ -87,8 +87,36 @@ typedef enum ice_attach_state {
 	ICE_ATTACH_ALLOC_INTR	= 1 << 4,
 	ICE_ATTACH_ADD_INTR	= 1 << 5,
 	ICE_ATTACH_OICR_TASKQ	= 1 << 6,
-	ICE_ATTACH_ENABLE_INTR	= 1 << 7
+	ICE_ATTACH_ENABLE_INTR	= 1 << 7,
+	ICE_ATTACH_VSI		= 1 << 8
 } ice_attach_state_t;
+
+/* The driver-chosen software handle for the single PF data VSI. */
+#define	ICE_PF_VSI_HANDLE	0
+
+typedef struct ice_mac_filter {
+	list_node_t		imf_node;
+	uint8_t			imf_addr[ETHERADDRL];
+} ice_mac_filter_t;
+
+/*
+ * The PF data VSI.  vi_handle is the driver-chosen software index into
+ * hw->vsi_ctx[]; vi_hw_num is the firmware-assigned hardware VSI number,
+ * stored only after it is range-checked.  Rings and queue enable arrive with
+ * the data path; this milestone programs the control plane only.
+ */
+typedef struct ice_vsi {
+	boolean_t		vi_added;
+	uint16_t		vi_handle;
+	uint16_t		vi_hw_num;
+	uint16_t		vi_nrxq;
+	uint16_t		vi_ntxq;
+
+	kmutex_t		vi_mac_lock;
+	list_t			vi_macs;	/* for teardown */
+
+	boolean_t		vi_rss_set;
+} ice_vsi_t;
 
 typedef struct ice {
 	dev_info_t		*ice_dip;
@@ -140,6 +168,9 @@ typedef struct ice {
 	uint64_t		ice_link_speed;
 	link_duplex_t		ice_link_duplex;
 	link_flowctrl_t		ice_link_fctl;
+
+	ice_vsi_t		ice_pf_vsi;		/* control plane (M5) */
+
 	mac_handle_t		ice_mac_hdl;		/* NULL until M6 */
 } ice_t;
 
@@ -160,6 +191,12 @@ extern void ice_intr_oicr_setup(ice_t *);
 extern void ice_intr_oicr_disable(ice_t *);
 extern boolean_t ice_set_link_events(ice_t *);
 extern void ice_link_status_update(ice_t *);
+
+/*
+ * ice_vsi.c
+ */
+extern boolean_t ice_vsi_init(ice_t *);
+extern void ice_vsi_fini(ice_t *);
 
 #ifdef __cplusplus
 }

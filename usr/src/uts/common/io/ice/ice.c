@@ -527,6 +527,14 @@ static void
 ice_unconfigure(ice_t *ice)
 {
 	/*
+	 * Tear down the VSI first: ice_free_vsi() and ice_remove_mac() ride the
+	 * admin queue, which ice_deinit_hw() (a lower progress bit, undone
+	 * later) tears down.
+	 */
+	if (ice->ice_attach_progress & ICE_ATTACH_VSI)
+		ice_vsi_fini(ice);
+
+	/*
 	 * Quiesce interrupts before tearing down anything the OICR handler or
 	 * its taskq touch.  Masking only stops new deliveries; ddi_intr_remove_
 	 * handler() is what fences a handler already running on another CPU, so
@@ -679,6 +687,10 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	ice->ice_attach_progress |= ICE_ATTACH_ENABLE_INTR;
 
 	ice_link_status_update(ice);
+
+	if (!ice_vsi_init(ice))
+		goto fail;
+	ice->ice_attach_progress |= ICE_ATTACH_VSI;
 
 	mutex_enter(&ice_glock);
 	list_insert_tail(&ice_glist, ice);
