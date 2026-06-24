@@ -180,12 +180,21 @@ void
 ice_cfg_itr(ice_t *ice, uint32_t vector)
 {
 	struct ice_hw *hw = &ice->ice_hw;
+	uint32_t gran = hw->itr_gran != 0 ? hw->itr_gran : 2;
+	uint32_t interval = ICE_ITR_DEFAULT_US / gran;
 
+	/* Program ITR slot 0's interval; the queues' QINT_*CTL select it. */
 	wr32(hw, GLINT_ITR(ICE_ITR_IDX_0, vector),
-	    ICE_ITR_DEFAULT_INTERVAL & GLINT_ITR_INTERVAL_M);
+	    interval & GLINT_ITR_INTERVAL_M);
+
+	/*
+	 * Arm the vector with ITR_INDEX_NONE: a real ITR index here would
+	 * reload that slot's interval from this register's (zero) interval
+	 * field, undoing the throttle just programmed.
+	 */
 	wr32(hw, GLINT_DYN_CTL(vector),
 	    GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |
-	    ((ICE_ITR_IDX_0 << GLINT_DYN_CTL_ITR_INDX_S) &
+	    ((ICE_ITR_INDEX_NONE << GLINT_DYN_CTL_ITR_INDX_S) &
 	    GLINT_DYN_CTL_ITR_INDX_M));
 	ice_flush(hw);
 }
@@ -247,6 +256,14 @@ ice_rx_ring_program(ice_t *ice, ice_rx_ring_t *irr)
 	    QRXFLXP_CNTXT_RXDID_IDX_M;
 	reg |= (0x3 << QRXFLXP_CNTXT_RXDID_PRIO_S) & QRXFLXP_CNTXT_RXDID_PRIO_M;
 	wr32(hw, QRXFLXP_CNTXT(irr->irxr_index), reg);
+
+	/*
+	 * Zero the tail so head == tail == 0: the queue is enabled empty until
+	 * the data path posts buffers, regardless of any stale tail left by a
+	 * prior incarnation that did not core-reset the function.
+	 */
+	wr32(hw, QRX_TAIL(irr->irxr_index), 0);
+	ice_flush(hw);
 
 	/* Request the enable, then poll QENA_STAT for the queue to come up. */
 	reg = rd32(hw, QRX_CTRL(irr->irxr_index));
@@ -697,12 +714,18 @@ ice_rx_hcksum(ice_rx_ring_t *irr, mblk_t *mp, uint16_t status0, uint16_t ptype)
 	    (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_IPE_S)) == 0)
 		cksum |= HCK_IPV4_HDRCKSUM_OK;
 
+	/*
+	 * IPV6EXADD marks IPv6 extension headers that make the L4 checksum
+	 * coverage unreliable even when the L4-error bit is clear, so it must
+	 * also suppress the verified-good result (no-op for IPv4 frames).
+	 */
 	if (pinfo.outer_ip == ICE_RX_PTYPE_OUTER_IP &&
 	    pinfo.tunnel_type == ICE_RX_PTYPE_TUNNEL_NONE &&
 	    (pinfo.inner_prot == ICE_RX_PTYPE_INNER_PROT_TCP ||
 	    pinfo.inner_prot == ICE_RX_PTYPE_INNER_PROT_UDP ||
 	    pinfo.inner_prot == ICE_RX_PTYPE_INNER_PROT_SCTP) &&
-	    (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_L4E_S)) == 0)
+	    (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_L4E_S)) == 0 &&
+	    (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_IPV6EXADD_S)) == 0)
 		cksum |= HCK_FULLCKSUM_OK;
 
 	if (cksum != 0)
@@ -915,10 +938,10 @@ ice_ring_rx_intr_enable(mac_intr_handle_t intrh)
 	reg |= QINT_RQCTL_CAUSE_ENA_M;
 	wr32(hw, QINT_RQCTL(irr->irxr_index), reg);
 
-	/* Re-arm the vector so a pending cause fires immediately. */
+	/* Re-arm the vector (ITR_INDEX_NONE keeps the configured throttle). */
 	wr32(hw, GLINT_DYN_CTL(irr->irxr_vec),
 	    GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |
-	    ((ICE_ITR_IDX_0 << GLINT_DYN_CTL_ITR_INDX_S) &
+	    ((ICE_ITR_INDEX_NONE << GLINT_DYN_CTL_ITR_INDX_S) &
 	    GLINT_DYN_CTL_ITR_INDX_M));
 	ice_flush(hw);
 	mutex_exit(&irr->irxr_lock);

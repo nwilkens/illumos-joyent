@@ -28,12 +28,11 @@
 
 /*
  * OICR is always MSI-X vector 0; queue vectors start at 1.  The other cause
- * uses a dedicated ITR slot; ICE_ITR_INDEX_NONE is the "do not update the ITR"
- * encoding used when simply re-arming the vector.
+ * uses a dedicated ITR slot (ICE_ITR_INDEX_NONE, in ice.h, is the "do not
+ * update the ITR" encoding used when simply re-arming a vector).
  */
 #define	ICE_OICR_VECTOR		0
 #define	ICE_ITR_INDEX_OTHER	2
-#define	ICE_ITR_INDEX_NONE	3
 
 /*
  * Hard cap on a single ARQ drain pass so a wedged ring cannot spin forever.
@@ -330,7 +329,7 @@ ice_intr_queue(ice_t *ice, uint_t vector)
 
 	wr32(hw, GLINT_DYN_CTL(vector),
 	    GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |
-	    ((ICE_ITR_IDX_0 << GLINT_DYN_CTL_ITR_INDX_S) &
+	    ((ICE_ITR_INDEX_NONE << GLINT_DYN_CTL_ITR_INDX_S) &
 	    GLINT_DYN_CTL_ITR_INDX_M));
 	ice_flush(hw);
 
@@ -397,6 +396,43 @@ ice_intr_disable(ice_t *ice)
 }
 
 /*
+ * Bring the PHY up.  In strict link-management mode firmware does not enable
+ * the link on its own: the driver reads the active PHY caps, copies them into a
+ * set-phy-cfg request with the link-enable and auto-update bits added, and
+ * issues it.  With no media present firmware returns busy; it has saved the
+ * config and applies it when a module is later inserted, so that is benign.
+ */
+void
+ice_setup_link(ice_t *ice)
+{
+	struct ice_hw *hw = &ice->ice_hw;
+	struct ice_port_info *pi = hw->port_info;
+	struct ice_aqc_get_phy_caps_data pcaps;
+	struct ice_aqc_set_phy_cfg_data cfg;
+	int status;
+
+	if (pi == NULL)
+		return;
+
+	bzero(&pcaps, sizeof (pcaps));
+	status = ice_aq_get_phy_caps(pi, false, ICE_AQC_REPORT_ACTIVE_CFG,
+	    &pcaps, NULL);
+	if (status != ICE_SUCCESS) {
+		ice_error(ice, "failed to read PHY caps: %d", status);
+		return;
+	}
+
+	bzero(&cfg, sizeof (cfg));
+	ice_copy_phy_caps_to_cfg(pi, &pcaps, &cfg);
+	cfg.caps |= ICE_AQ_PHY_ENA_AUTO_LINK_UPDT | ICE_AQ_PHY_ENA_LINK;
+
+	status = ice_aq_set_phy_cfg(hw, pi, &cfg, NULL);
+	if (status != ICE_SUCCESS &&
+	    hw->adminq.sq_last_status != ICE_AQ_RC_EBUSY)
+		ice_error(ice, "failed to enable PHY: %d", status);
+}
+
+/*
  * Ask firmware to deliver link up/down events on the admin receive queue.  The
  * event mask is inverted: a clear bit means "deliver".  Only link up/down is
  * requested; all other link events are masked off because the driver does not
@@ -413,7 +449,13 @@ ice_set_link_events(ice_t *ice)
 	if (pi == NULL)
 		return (B_FALSE);
 
-	mask = (uint16_t)~ICE_AQ_LINK_EVENT_UPDOWN;
+	/*
+	 * Also wake on media insert/remove and unqualified-module plug so the
+	 * cached link/transceiver state stays current and a media-available
+	 * transition can re-drive the PHY enable.
+	 */
+	mask = (uint16_t)~(ICE_AQ_LINK_EVENT_UPDOWN |
+	    ICE_AQ_LINK_EVENT_MEDIA_NA | ICE_AQ_LINK_EVENT_MODULE_QUAL_FAIL);
 
 	mutex_enter(&ice->ice_lse_lock);
 	ice->ice_lse_flags |= ICE_LSE_F_ENABLE;

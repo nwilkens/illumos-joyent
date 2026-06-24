@@ -658,8 +658,15 @@ ice_unconfigure(ice_t *ice)
 		mutex_destroy(&ice->ice_lse_lock);
 	}
 
-	if (ice->ice_attach_progress & ICE_ATTACH_HW_INIT)
+	if (ice->ice_attach_progress & ICE_ATTACH_HW_INIT) {
 		ice_deinit_hw(&ice->ice_hw);
+		/*
+		 * Quiesce the function with a PF reset so a later re-attach
+		 * inherits clean hardware state (scheduler tree, queue and VSI
+		 * contexts, PHY config, in-flight DMA) not stale config.
+		 */
+		(void) ice_reset(&ice->ice_hw, ICE_RESET_PFR);
+	}
 
 	if (ice->ice_attach_progress & ICE_ATTACH_REGS_MAP) {
 		ddi_regs_map_free(&ice->ice_osdep.ios_reg_handle);
@@ -780,6 +787,9 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	ice->ice_attach_progress |= ICE_ATTACH_ENABLE_INTR;
 
 	ice_link_status_update(ice);
+
+	/* Enable the PHY; firmware will not bring the link up on its own. */
+	ice_setup_link(ice);
 
 	/*
 	 * Load the DDP package before the VSI: a missing or rejected package

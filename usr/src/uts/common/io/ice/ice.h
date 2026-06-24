@@ -82,7 +82,8 @@ extern "C" {
 #define	ICE_RX_BUF_SIZE		2048		/* posted rx data buffer */
 
 #define	ICE_ITR_IDX_0		0		/* ITR slot for queue vectors */
-#define	ICE_ITR_DEFAULT_INTERVAL 0x32		/* 50us in 2us units */
+#define	ICE_ITR_INDEX_NONE	3		/* "do not update the ITR" */
+#define	ICE_ITR_DEFAULT_US	50		/* rx interrupt throttle */
 #define	ICE_Q_ENA_MAX_WAIT	50		/* QENA_STAT poll, 20us each */
 
 typedef enum ice_state {
@@ -383,6 +384,7 @@ extern void ice_intr_oicr_setup(ice_t *);
 extern void ice_intr_oicr_disable(ice_t *);
 extern boolean_t ice_set_link_events(ice_t *);
 extern void ice_link_status_update(ice_t *);
+extern void ice_setup_link(ice_t *);
 
 /*
  * ice_vsi.c

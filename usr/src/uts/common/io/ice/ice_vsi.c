@@ -39,7 +39,9 @@ static const uint8_t ice_bcast_addr[ETHERADDRL] = {
 };
 
 /*
- * The flow types hashed for RSS: IPv4 and IPv6, each over TCP and UDP.
+ * The flow types hashed for RSS: TCP and UDP over IPv4 and IPv6, plus plain
+ * IPv4/IPv6 so non-TCP/UDP traffic still spreads across queues instead of all
+ * landing on queue 0.
  */
 static const struct {
 	uint64_t	irf_hash;
@@ -48,7 +50,9 @@ static const struct {
 	{ ICE_HASH_TCP_IPV4, ICE_FLOW_SEG_HDR_IPV4 | ICE_FLOW_SEG_HDR_TCP },
 	{ ICE_HASH_UDP_IPV4, ICE_FLOW_SEG_HDR_IPV4 | ICE_FLOW_SEG_HDR_UDP },
 	{ ICE_HASH_TCP_IPV6, ICE_FLOW_SEG_HDR_IPV6 | ICE_FLOW_SEG_HDR_TCP },
-	{ ICE_HASH_UDP_IPV6, ICE_FLOW_SEG_HDR_IPV6 | ICE_FLOW_SEG_HDR_UDP }
+	{ ICE_HASH_UDP_IPV6, ICE_FLOW_SEG_HDR_IPV6 | ICE_FLOW_SEG_HDR_UDP },
+	{ ICE_FLOW_HASH_IPV4, ICE_FLOW_SEG_HDR_IPV4 },
+	{ ICE_FLOW_HASH_IPV6, ICE_FLOW_SEG_HDR_IPV6 }
 };
 
 static void
@@ -154,16 +158,24 @@ ice_vsi_ctx_fill(ice_t *ice, struct ice_vsi_ctx *ctx)
 
 	/* switch ids are small; the field is a u8 */
 	ctx->info.sw_id = (u8)hw->port_info->sw_id;
-	ctx->info.sw_flags = ICE_AQ_VSI_SW_FLAG_ALLOW_LB;
+	/* Prune frames the VSI itself sourced; do not loop them back. */
+	ctx->info.sw_flags = ICE_AQ_VSI_SW_FLAG_SRC_PRUNE;
 	ctx->info.sw_flags2 = ICE_AQ_VSI_SW_FLAG_LAN_ENA;
 
+	/*
+	 * Contiguous rx-queue map: q_mapping[0] is the first absolute queue and
+	 * q_mapping[1] is the count.  Both are required; a zero count (the
+	 * bzero default) maps no queues to the VSI and receive never works.
+	 */
 	ctx->info.mapping_flags = CPU_TO_LE16(ICE_AQ_VSI_Q_MAP_CONTIG);
 	ctx->info.q_mapping[0] = CPU_TO_LE16(0);
+	ctx->info.q_mapping[1] = CPU_TO_LE16(nq);
 	ctx->info.tc_mapping[0] = CPU_TO_LE16(
 	    (0 << ICE_AQ_VSI_TC_Q_OFFSET_S) |
 	    ((uint16_t)ice_ilog2(nq) << ICE_AQ_VSI_TC_Q_NUM_S));
 
-	ctx->info.q_opt_rss = (ICE_AQ_VSI_Q_OPT_RSS_LUT_VSI &
+	/* A PF VSI uses the PF-wide RSS LUT instance. */
+	ctx->info.q_opt_rss = (ICE_AQ_VSI_Q_OPT_RSS_LUT_PF &
 	    ICE_AQ_VSI_Q_OPT_RSS_LUT_M) | ICE_AQ_VSI_Q_OPT_RSS_TPLZ;
 }
 
@@ -278,9 +290,16 @@ ice_rss_setup(ice_t *ice)
 	ice_vsi_t *vsi = &ice->ice_pf_vsi;
 	struct ice_aqc_get_set_rss_keys key;
 	struct ice_aq_get_set_rss_lut_params lp;
-	uint8_t lut[ICE_LUT_VSI_SIZE];
+	uint16_t lut_size = hw->func_caps.common_cap.rss_table_size;
+	uint8_t *lut;
 	uint_t i;
 	int status;
+
+	/* The PF LUT size is firmware-reported; reject an implausible value. */
+	if (lut_size == 0 || lut_size > ICE_LUT_PF_SIZE) {
+		ice_error(ice, "implausible RSS table size %u", lut_size);
+		return (ICE_ERR_CFG);
+	}
 
 	(void) random_get_pseudo_bytes((uint8_t *)&key, sizeof (key));
 	status = ice_aq_set_rss_key(hw, vsi->vi_handle, &key);
@@ -289,17 +308,19 @@ ice_rss_setup(ice_t *ice)
 		return (status);
 	}
 
-	/* Round-robin the redirection table over the planned rx queues. */
+	/* Round-robin the PF redirection table over the planned rx queues. */
 	ASSERT3U(vsi->vi_nrxq, >, 0);
-	for (i = 0; i < ICE_LUT_VSI_SIZE; i++)
+	lut = kmem_zalloc(lut_size, KM_SLEEP);
+	for (i = 0; i < lut_size; i++)
 		lut[i] = (uint8_t)(i % vsi->vi_nrxq);
 
 	bzero(&lp, sizeof (lp));
 	lp.vsi_handle = vsi->vi_handle;
-	lp.lut_type = ICE_LUT_VSI;
-	lp.lut_size = ICE_LUT_VSI_SIZE;
+	lp.lut_type = ICE_LUT_PF;
+	lp.lut_size = lut_size;
 	lp.lut = lut;
 	status = ice_aq_set_rss_lut(hw, &lp);
+	kmem_free(lut, lut_size);
 	if (status != ICE_SUCCESS) {
 		ice_error(ice, "failed to set RSS LUT: %d", status);
 		return (status);
