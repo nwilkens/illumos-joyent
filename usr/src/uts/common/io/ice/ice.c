@@ -191,10 +191,9 @@ ice_fm_init(ice_t *ice)
 	ddi_iblock_cookie_t iblk;
 
 	/*
-	 * DMACHK is intentionally not advertised yet: the only DMA at this
-	 * milestone is the common code's admin-queue memory, which the glue
-	 * does not drive and so cannot fault-check.  It is advertised with the
-	 * data path, whose DMA the driver owns and checks.
+	 * DMACHK is advertised with the data path (M6b), where the per-buffer
+	 * ddi_fm_dma_err_get checks that honor it live.  Advertising it here,
+	 * with no checker wired, would misrepresent the FMA posture.
 	 */
 	ice->ice_fm_caps = ddi_prop_get_int(DDI_DEV_T_ANY, ice->ice_dip,
 	    DDI_PROP_DONTPASS, "fm-capable",
@@ -523,11 +522,84 @@ ice_add_intr_handlers(ice_t *ice)
 	return (B_TRUE);
 }
 
+static int
+ice_queues_program(ice_t *ice)
+{
+	uint_t i;
+	int status;
+
+	for (i = 0; i < ice->ice_num_txr; i++) {
+		status = ice_tx_ring_program(ice, &ice->ice_txr[i]);
+		if (status != ICE_SUCCESS)
+			return (status);
+	}
+	for (i = 0; i < ice->ice_num_rxr; i++) {
+		status = ice_rx_ring_program(ice, &ice->ice_rxr[i]);
+		if (status != ICE_SUCCESS)
+			return (status);
+	}
+
+	return (ICE_SUCCESS);
+}
+
+static void
+ice_queues_disable(ice_t *ice)
+{
+	uint_t i;
+
+	for (i = 0; i < ice->ice_num_txr; i++)
+		ice_tx_ring_unprogram(ice, &ice->ice_txr[i]);
+	for (i = 0; i < ice->ice_num_rxr; i++)
+		ice_rx_ring_unprogram(ice, &ice->ice_rxr[i]);
+}
+
+static void
+ice_queues_intr_map(ice_t *ice)
+{
+	uint_t i;
+
+	for (i = 0; i < ice->ice_num_txr; i++)
+		ice_map_txq_vector(ice, &ice->ice_txr[i]);
+	for (i = 0; i < ice->ice_num_rxr; i++) {
+		ice_map_rxq_vector(ice, &ice->ice_rxr[i]);
+		ice_cfg_itr(ice, ice->ice_rxr[i].irxr_vec);
+	}
+}
+
+static void
+ice_queues_intr_unmap(ice_t *ice)
+{
+	struct ice_hw *hw = &ice->ice_hw;
+	uint_t i;
+
+	for (i = 0; i < ice->ice_num_txr; i++)
+		wr32(hw, QINT_TQCTL(ice->ice_txr[i].itxr_index), 0);
+	for (i = 0; i < ice->ice_num_rxr; i++)
+		wr32(hw, QINT_RQCTL(ice->ice_rxr[i].irxr_index), 0);
+	ice_flush(hw);
+}
+
 static void
 ice_unconfigure(ice_t *ice)
 {
 	/*
-	 * Tear down the VSI first: ice_free_vsi() and ice_remove_mac() ride the
+	 * Tear down the datapath before the VSI: the queues belong to the VSI
+	 * and the queue disables ride the admin queue, which a lower progress
+	 * bit (ice_deinit_hw) undoes later.
+	 */
+	if (ice->ice_attach_progress & ICE_ATTACH_QUEUE_INTR)
+		ice_queues_intr_unmap(ice);
+
+	if (ice->ice_attach_progress & ICE_ATTACH_QUEUES)
+		ice_queues_disable(ice);
+
+	if (ice->ice_attach_progress & ICE_ATTACH_RINGS) {
+		ice_tx_rings_free(ice);
+		ice_rx_rings_free(ice);
+	}
+
+	/*
+	 * Tear down the VSI: ice_free_vsi() and ice_remove_mac() ride the
 	 * admin queue, which ice_deinit_hw() (a lower progress bit, undone
 	 * later) tears down.
 	 */
@@ -691,6 +763,32 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	if (!ice_vsi_init(ice))
 		goto fail;
 	ice->ice_attach_progress |= ICE_ATTACH_VSI;
+
+	/*
+	 * Allocate the datapath rings and program the tx/rx queue contexts.
+	 * The queue counts come from the VSI configuration.  The progress bit
+	 * is set before programming so a partial failure still tears every
+	 * queue back down.
+	 */
+	ice->ice_num_rxr = ice->ice_pf_vsi.vi_nrxq;
+	ice->ice_num_txr = ice->ice_pf_vsi.vi_ntxq;
+	ice->ice_num_rx_groups = 1;
+	ice->ice_tx_ring_size = ICE_DEF_TX_RING_SIZE;
+	ice->ice_rx_ring_size = ICE_DEF_RX_RING_SIZE;
+	ice->ice_pf_vsi.vi_max_frame = ICE_RX_BUF_SIZE;
+
+	if (!ice_tx_rings_alloc(ice))
+		goto fail;
+	ice->ice_attach_progress |= ICE_ATTACH_RINGS;
+	if (!ice_rx_rings_alloc(ice))
+		goto fail;
+
+	ice->ice_attach_progress |= ICE_ATTACH_QUEUES;
+	if (ice_queues_program(ice) != ICE_SUCCESS)
+		goto fail;
+
+	ice_queues_intr_map(ice);
+	ice->ice_attach_progress |= ICE_ATTACH_QUEUE_INTR;
 
 	mutex_enter(&ice_glock);
 	list_insert_tail(&ice_glist, ice);

@@ -65,6 +65,26 @@ extern "C" {
 #define	ICE_MAX_MTU		9728		/* E810 jumbo frame maximum */
 #define	ICE_MAX_FUNCS		8
 
+/*
+ * Datapath constants.
+ */
+#define	ICE_DESC_ALIGN		128		/* descriptor ring base align */
+#define	ICE_DMA_ALIGNMENT	0x1000		/* packet buffer alignment */
+#define	ICE_TX_MAX_BUFSZ	0x00003fff	/* per-descriptor max (16K-1) */
+#define	ICE_TX_MAX_COOKIE	8		/* descs per non-LSO packet */
+#define	ICE_TX_LSO_MAX_COOKIE	32		/* descs per LSO packet */
+#define	ICE_TX_SMALL_PKT	512		/* small-copy threshold */
+
+#define	ICE_DEF_TX_RING_SIZE	1024
+#define	ICE_DEF_RX_RING_SIZE	1024
+#define	ICE_MIN_RING_SIZE	64
+#define	ICE_MAX_RING_SIZE	4096
+#define	ICE_RX_BUF_SIZE		2048		/* posted rx data buffer */
+
+#define	ICE_ITR_IDX_0		0		/* ITR slot for queue vectors */
+#define	ICE_ITR_DEFAULT_INTERVAL 0x32		/* 50us in 2us units */
+#define	ICE_Q_ENA_MAX_WAIT	50		/* QENA_STAT poll, 20us each */
+
 typedef enum ice_state {
 	ICE_STATE_ATTACHED	= 1 << 0,
 	ICE_STATE_RESET_PENDING	= 1 << 1,	/* GRST seen; recovery is M7 */
@@ -88,7 +108,12 @@ typedef enum ice_attach_state {
 	ICE_ATTACH_ADD_INTR	= 1 << 5,
 	ICE_ATTACH_OICR_TASKQ	= 1 << 6,
 	ICE_ATTACH_ENABLE_INTR	= 1 << 7,
-	ICE_ATTACH_VSI		= 1 << 8
+	ICE_ATTACH_DDP		= 1 << 8,	/* DDP loaded or safe mode */
+	ICE_ATTACH_VSI		= 1 << 9,
+	ICE_ATTACH_RINGS	= 1 << 10,	/* ring DMA allocated */
+	ICE_ATTACH_QUEUES	= 1 << 11,	/* tx/rx queues programmed */
+	ICE_ATTACH_QUEUE_INTR	= 1 << 12,	/* queue->vector wired */
+	ICE_ATTACH_MAC		= 1 << 13	/* mac_register done */
 } ice_attach_state_t;
 
 /* The driver-chosen software handle for the single PF data VSI. */
@@ -116,7 +141,133 @@ typedef struct ice_vsi {
 	list_t			vi_macs;	/* for teardown */
 
 	boolean_t		vi_rss_set;
+
+	uint16_t		vi_max_frame;	/* posted rx frame size */
 } ice_vsi_t;
+
+/*
+ * A single DMA allocation: descriptor ring or packet buffer.
+ */
+typedef struct ice_dma_buffer {
+	caddr_t			idb_va;
+	size_t			idb_len;
+	ddi_acc_handle_t	idb_acc_handle;
+	ddi_dma_handle_t	idb_dma_handle;
+	uint_t			idb_ncookies;
+	ddi_dma_cookie_t	idb_cookie;	/* single cookie (sgllen 1) */
+} ice_dma_buffer_t;
+
+#define	ICE_DMA_PA(idb)		((idb)->idb_cookie.dmac_laddress)
+
+typedef enum ice_tcb_type {
+	ITCB_NOT_USED,
+	ITCB_SMALL_COPY,
+	ITCB_COPY,
+	ITCB_BIND,
+	ITCB_LSO_BIND
+} ice_tcb_type_t;
+
+struct ice_tx_ring;
+typedef struct ice_tx_ctrl_block {
+	struct ice_tx_ring	*itcb_ring;
+	ice_tcb_type_t		itcb_type;
+	uint32_t		itcb_len;
+	ice_dma_buffer_t	*itcb_buf;	/* copy buffer (pool) */
+	mblk_t			*itcb_mp;
+	ddi_dma_handle_t	itcb_dmah;
+	ddi_dma_handle_t	itcb_lso_dmah;
+} ice_tx_ctrl_block_t;
+
+typedef struct ice_txq_stat {
+	kstat_named_t		ictxs_bytes;
+	kstat_named_t		ictxs_packets;
+	kstat_named_t		ictxs_bind_bytes;
+	kstat_named_t		ictxs_bind_frags;
+	kstat_named_t		ictxs_copy_bytes;
+	kstat_named_t		ictxs_copy_frags;
+	kstat_named_t		ictxs_bind_fails;
+	kstat_named_t		ictxs_no_pkt_cache;
+	kstat_named_t		ictxs_drops;
+	kstat_named_t		ictxs_blocked;
+} ice_txq_stat_t;
+
+typedef struct ice_tx_ring {
+	struct ice		*itxr_ice;	/* RO */
+	uint32_t		itxr_index;	/* absolute HW tx queue index */
+	uint32_t		itxr_vec;	/* MSI-X vector index */
+	uint32_t		itxr_q_teid;	/* core: from ice_ena_vsi_txq */
+
+	kmutex_t		itxr_lock;
+	kcondvar_t		itxr_cv;
+	boolean_t		itxr_quiesce;
+	boolean_t		itxr_blocked;
+
+	mac_ring_handle_t	itxr_mactxring;
+
+	ice_dma_buffer_t	itxr_dma;	/* descriptor ring */
+	struct ice_tx_desc	*itxr_descs;
+	uint16_t		itxr_size;	/* descriptor count */
+	uint16_t		itxr_avail;
+	uint16_t		itxr_head;
+	uint16_t		itxr_tail;
+
+	ice_tx_ctrl_block_t	**itxr_tcbs;	/* [itxr_size], by slot */
+	kmutex_t		itxr_tcb_lock;
+	ice_tx_ctrl_block_t	**itxr_tcb_free_list;
+	uint16_t		itxr_tcb_nfree;
+
+	kstat_t			*itxr_kstat;
+	ice_txq_stat_t		itxr_stats;
+} ice_tx_ring_t;
+
+typedef enum ice_rcb_state {
+	IRXB_FREE,
+	IRXB_ONRING,
+	IRXB_ONLOAN
+} ice_rcb_state_t;
+
+struct ice_rx_ring;
+typedef struct ice_rx_ctrl_block {
+	mblk_t			*ircb_mp;
+	struct ice_rx_ring	*ircb_ring;
+	ice_dma_buffer_t	ircb_dma;
+	frtn_t			ircb_free_rtn;
+	ice_rcb_state_t		ircb_state;
+} ice_rx_ctrl_block_t;
+
+typedef struct ice_rxq_stat {
+	kstat_named_t		icrxs_bytes;
+	kstat_named_t		icrxs_packets;
+	kstat_named_t		icrxs_bind_bytes;
+	kstat_named_t		icrxs_bind_segs;
+	kstat_named_t		icrxs_copy_bytes;
+	kstat_named_t		icrxs_copy_segs;
+	kstat_named_t		icrxs_desc_error;
+	kstat_named_t		icrxs_copy_nomem;
+	kstat_named_t		icrxs_no_rcb;
+} ice_rxq_stat_t;
+
+typedef struct ice_rx_ring {
+	struct ice		*irxr_ice;	/* RO */
+	uint32_t		irxr_index;	/* absolute HW rx queue index */
+	uint32_t		irxr_vec;	/* MSI-X vector index */
+	boolean_t		irxr_shutdown;
+
+	kmutex_t		irxr_lock;
+	mac_ring_handle_t	irxr_macrxring;
+	uint64_t		irxr_rxgen;
+
+	ice_dma_buffer_t	irxr_desc_dma;	/* descriptor ring */
+	union ice_32b_rx_flex_desc *irxr_descs;
+	ice_rx_ctrl_block_t	**irxr_rcbs;	/* [irxr_size], by slot */
+	uint16_t		irxr_size;	/* descriptor count */
+	uint16_t		irxr_head;
+	uint16_t		irxr_tail;
+	uint32_t		irxr_dbuf;	/* posted data buffer size */
+
+	kstat_t			*irxr_kstat;
+	ice_rxq_stat_t		irxr_stats;
+} ice_rx_ring_t;
 
 typedef struct ice {
 	dev_info_t		*ice_dip;
@@ -171,7 +322,35 @@ typedef struct ice {
 
 	ice_vsi_t		ice_pf_vsi;		/* control plane (M5) */
 
-	mac_handle_t		ice_mac_hdl;		/* NULL until M6 */
+	/*
+	 * Datapath rings.  Counts derive from the VSI queue configuration.
+	 */
+	uint_t			ice_num_txr;
+	uint_t			ice_num_rxr;
+	uint_t			ice_num_rx_groups;
+	ice_tx_ring_t		*ice_txr;	/* [ice_num_txr] */
+	ice_rx_ring_t		*ice_rxr;	/* [ice_num_rxr] */
+
+	uint32_t		ice_tx_ring_size;
+	uint32_t		ice_rx_ring_size;
+
+	/* Shared TX copy-buffer pools. */
+	kmutex_t		ice_buf_lock;
+	ice_dma_buffer_t	*ice_bufs;	/* backing array */
+	ice_dma_buffer_t	**ice_dma_bufs;	/* free stack */
+	uint_t			ice_buf_sz;
+	uint_t			ice_buf_alloc;
+	kmutex_t		ice_small_buf_lock;
+	ice_dma_buffer_t	*ice_small_bufs;
+	ice_dma_buffer_t	**ice_dma_small_bufs;
+	uint_t			ice_small_buf_sz;
+	uint_t			ice_small_buf_alloc;
+
+	/* DDP firmware. */
+	boolean_t		ice_safe_mode;
+	enum ice_ddp_state	ice_ddp_state;
+
+	mac_handle_t		ice_mac_hdl;		/* set in M6b */
 } ice_t;
 
 /*
@@ -197,6 +376,44 @@ extern void ice_link_status_update(ice_t *);
  */
 extern boolean_t ice_vsi_init(ice_t *);
 extern void ice_vsi_fini(ice_t *);
+
+/*
+ * ice_dma.c
+ */
+extern void ice_dma_acc_attr(ice_t *, ddi_device_acc_attr_t *);
+extern void ice_dma_ring_attr(ice_t *, ddi_dma_attr_t *);
+extern void ice_pkt_dma_attr(ice_t *, ddi_dma_attr_t *);
+extern void ice_pkt_txbind_attr(ice_t *, ddi_dma_attr_t *);
+extern void ice_pkt_txbind_lso_attr(ice_t *, ddi_dma_attr_t *);
+extern boolean_t ice_dma_alloc(ice_t *, ice_dma_buffer_t *, ddi_dma_attr_t *,
+    ddi_device_acc_attr_t *, boolean_t, size_t, boolean_t);
+extern void ice_dma_free(ice_dma_buffer_t *);
+extern int ice_check_dma_handle(ddi_dma_handle_t);
+extern ice_dma_buffer_t *ice_buf_alloc(ice_t *);
+extern void ice_buf_free(ice_t *, ice_dma_buffer_t *);
+extern ice_dma_buffer_t *ice_small_buf_alloc(ice_t *);
+extern void ice_small_buf_free(ice_t *, ice_dma_buffer_t *);
+extern void ice_buf_init(ice_t *);
+extern void ice_buf_fini(ice_t *);
+
+/*
+ * ice_tx.c
+ */
+extern boolean_t ice_tx_rings_alloc(ice_t *);
+extern void ice_tx_rings_free(ice_t *);
+extern int ice_tx_ring_program(ice_t *, ice_tx_ring_t *);
+extern void ice_tx_ring_unprogram(ice_t *, ice_tx_ring_t *);
+extern void ice_map_txq_vector(ice_t *, ice_tx_ring_t *);
+
+/*
+ * ice_rx.c
+ */
+extern boolean_t ice_rx_rings_alloc(ice_t *);
+extern void ice_rx_rings_free(ice_t *);
+extern int ice_rx_ring_program(ice_t *, ice_rx_ring_t *);
+extern void ice_rx_ring_unprogram(ice_t *, ice_rx_ring_t *);
+extern void ice_map_rxq_vector(ice_t *, ice_rx_ring_t *);
+extern void ice_cfg_itr(ice_t *, uint32_t);
 
 #ifdef __cplusplus
 }
