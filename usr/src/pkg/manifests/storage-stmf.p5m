@@ -91,6 +91,8 @@ dir  path=usr/lib/mdb/kvm/$(ARCH64) group=sys
 file path=usr/lib/mdb/kvm/$(ARCH64)/stmf.so group=sys mode=0555
 file path=usr/lib/mdb/kvm/$(ARCH64)/stmf_sbd.so group=sys mode=0555
 dir  path=usr/sbin
+file path=usr/sbin/nvmf-connect mode=0555
+file path=usr/sbin/nvmfadm mode=0555
 file path=usr/sbin/nvmfd mode=0555
 file path=usr/sbin/sbdadm mode=0555
 file path=usr/sbin/stmfadm mode=0555
