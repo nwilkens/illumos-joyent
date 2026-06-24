@@ -328,6 +328,72 @@ ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 	return (ret);
 }
 
+/*
+ * SFF module (transceiver) access.  Pages 0xa0/0xa2 are the I2C device
+ * addresses of the SFF-8472 diagnostic memory; the admin-queue command reads at
+ * most 16 bytes per request.
+ */
+#define	ICE_SFF_8472_BASE	0xa0
+#define	ICE_SFF_8472_DIAG	0xa2
+#define	ICE_SFF_PAGE_LEN	256
+#define	ICE_SFF_READ_CHUNK	16
+
+static int
+ice_transceiver_info(void *arg, uint_t id, mac_transceiver_info_t *infop)
+{
+	ice_t *ice = arg;
+	struct ice_link_status *li = &ice->ice_hw.port_info->phy.link_info;
+	boolean_t present, usable;
+
+	if (id != 0 || infop == NULL)
+		return (EINVAL);
+
+	mutex_enter(&ice->ice_lock);
+	present = (li->link_info & ICE_AQ_MEDIA_AVAILABLE) != 0;
+	usable = present && (li->an_info & ICE_AQ_QUALIFIED_MODULE) != 0;
+	mutex_exit(&ice->ice_lock);
+
+	mac_transceiver_info_set_present(infop, present);
+	mac_transceiver_info_set_usable(infop, usable);
+
+	return (0);
+}
+
+static int
+ice_transceiver_read(void *arg, uint_t id, uint_t page, void *buf,
+    size_t nbytes, off_t offset, size_t *nread)
+{
+	ice_t *ice = arg;
+	struct ice_hw *hw = &ice->ice_hw;
+	uint8_t *out = buf;
+	size_t i;
+
+	if (id != 0 || buf == NULL || nbytes == 0 || nread == NULL ||
+	    (page != ICE_SFF_8472_BASE && page != ICE_SFF_8472_DIAG) ||
+	    offset < 0)
+		return (EINVAL);
+	if (nbytes > ICE_SFF_PAGE_LEN || offset >= ICE_SFF_PAGE_LEN ||
+	    offset + nbytes > ICE_SFF_PAGE_LEN)
+		return (EINVAL);
+
+	mutex_enter(&ice->ice_lock);
+	for (i = 0; i < nbytes; ) {
+		uint8_t len = (uint8_t)MIN(nbytes - i, ICE_SFF_READ_CHUNK);
+
+		if (ice_aq_sff_eeprom(hw, 0, (uint8_t)page,
+		    (uint16_t)(offset + i), 0, 0, &out[i], len, false,
+		    NULL) != ICE_SUCCESS) {
+			mutex_exit(&ice->ice_lock);
+			return (EIO);
+		}
+		i += len;
+	}
+	mutex_exit(&ice->ice_lock);
+
+	*nread = nbytes;
+	return (0);
+}
+
 static boolean_t
 ice_m_getcapab(void *arg, mac_capab_t capab, void *cap_data)
 {
@@ -364,6 +430,16 @@ ice_m_getcapab(void *arg, mac_capab_t capab, void *cap_data)
 		uint32_t *txflags = cap_data;
 
 		*txflags = HCKSUM_INET_PARTIAL | HCKSUM_IPHDRCKSUM;
+		break;
+	}
+
+	case MAC_CAPAB_TRANSCEIVER: {
+		mac_capab_transceiver_t *mct = cap_data;
+
+		mct->mct_flags = 0;
+		mct->mct_ntransceivers = 1;
+		mct->mct_info = ice_transceiver_info;
+		mct->mct_read = ice_transceiver_read;
 		break;
 	}
 
