@@ -103,6 +103,25 @@
  */
 static uint_t nvmf_tcp_max_transmit_data = 256 * 1024;
 
+/*
+ * Upper bound on a single received PDU's advertised length (ntcph_plen).  The
+ * RX framing loop buffers a whole PDU before validating it, so without a
+ * ceiling a peer could advertise a near-4GiB plen and force the host to
+ * accumulate that much memory.  Any legitimate PDU is far smaller (in-capsule
+ * data is ~16KiB and a data PDU is bounded by nvmf_tcp_max_transmit_data, plus
+ * headers, digests, and PDA padding); 1MiB is a generous ceiling.  Overridable
+ * through /etc/system.
+ */
+static uint_t nvmf_tcp_max_receive_pdu = 1024 * 1024;
+
+/*
+ * Minimum spacing between wire-triggered CE_WARN/CE_NOTE messages.  A malicious
+ * or broken peer can drive these (digest mismatches, termination requests,
+ * etc.) arbitrarily fast; rate-limiting keeps a peer from flooding the log.
+ */
+static hrtime_t nvmf_tcp_warn_interval = 5 * (hrtime_t)NANOSEC;
+static volatile hrtime_t nvmf_tcp_warn_last;
+
 struct nvmf_tcp_capsule;
 struct nvmf_tcp_qpair;
 
@@ -328,6 +347,23 @@ nvmf_tcp_mblk_copydata(mblk_t *mp, uint_t off, uint_t len, void *dst)
 }
 
 /*
+ * Returns B_TRUE at most once per nvmf_tcp_warn_interval, so wire-triggered
+ * diagnostics can be gated to keep a peer from flooding the system log.  The
+ * unsynchronized read/update can race and let an extra message through, which
+ * is harmless for a rate-limited warning.
+ */
+static boolean_t
+nvmf_tcp_warn_ok(void)
+{
+	hrtime_t now = gethrtime();
+
+	if (now - nvmf_tcp_warn_last < nvmf_tcp_warn_interval)
+		return (B_FALSE);
+	nvmf_tcp_warn_last = now;
+	return (B_TRUE);
+}
+
+/*
  * Command-buffer allocation and reference counting.  Direct ports of the
  * FreeBSD helpers of the same name.
  */
@@ -528,7 +564,9 @@ nvmf_tcp_validate_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 		nvmf_tcp_mblk_copydata(mp, ch->ntcph_hlen, sizeof (rx_digest),
 		    &rx_digest);
 		if (digest != rx_digest) {
-			cmn_err(CE_WARN, "NVMe/TCP: Header digest mismatch");
+			if (nvmf_tcp_warn_ok())
+				cmn_err(CE_WARN,
+				    "NVMe/TCP: Header digest mismatch");
 			nvmf_tcp_report_error(qp,
 			    NVMF_TCP_TERM_REQ_FES_HDGST_ERROR, rx_digest, mp,
 			    hlen);
@@ -543,7 +581,9 @@ nvmf_tcp_validate_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 		nvmf_tcp_mblk_copydata(mp, plen - sizeof (rx_digest),
 		    sizeof (rx_digest), &rx_digest);
 		if (digest != rx_digest) {
-			cmn_err(CE_WARN, "NVMe/TCP: Data digest mismatch");
+			if (nvmf_tcp_warn_ok())
+				cmn_err(CE_WARN,
+				    "NVMe/TCP: Data digest mismatch");
 			pdu->rp_data_digest_mismatch = B_TRUE;
 		}
 	}
@@ -567,12 +607,15 @@ nvmf_tcp_handle_term_req(nvmf_tcp_rxpdu_t *pdu)
 
 	hdr = (const void *)pdu->rp_hdr;
 
-	cmn_err(CE_WARN,
-	    "NVMe/TCP: Received termination request: fes 0x%x fei 0x%x",
-	    LE_16(hdr->nttr_fes),
-	    (uint32_t)hdr->nttr_fei[0] | ((uint32_t)hdr->nttr_fei[1] << 8) |
-	    ((uint32_t)hdr->nttr_fei[2] << 16) |
-	    ((uint32_t)hdr->nttr_fei[3] << 24));
+	if (nvmf_tcp_warn_ok()) {
+		cmn_err(CE_WARN,
+		    "NVMe/TCP: Received termination request: fes 0x%x fei 0x%x",
+		    LE_16(hdr->nttr_fes),
+		    (uint32_t)hdr->nttr_fei[0] |
+		    ((uint32_t)hdr->nttr_fei[1] << 8) |
+		    ((uint32_t)hdr->nttr_fei[2] << 16) |
+		    ((uint32_t)hdr->nttr_fei[3] << 24));
+	}
 	nvmf_tcp_free_pdu(pdu);
 	return (ECONNRESET);
 }
@@ -645,8 +688,16 @@ nvmf_tcp_construct_pdu(nvmf_tcp_qpair_t *qp, void *hdr, size_t hlen,
 	if (qp->tq_header_digests)
 		plen += sizeof (digest);
 	if (data_len != 0) {
+		uint32_t pda = qp->tq_txpda;
+
 		ASSERT3U(msgdsize(data), ==, data_len);
-		pdo = P2ROUNDUP(plen, qp->tq_txpda);
+		/*
+		 * The negotiated PDA is peer-controlled and not guaranteed
+		 * to be a power of two, so P2ROUNDUP() cannot be used.
+		 * tcp_allocate_qpair() rejects a zero PDA; guard here as well
+		 * since it is a divisor.
+		 */
+		pdo = (pda != 0) ? ((plen + pda - 1) / pda) * pda : plen;
 		pad = pdo - plen;
 		plen = pdo + data_len;
 		if (qp->tq_data_digests)
@@ -1262,7 +1313,12 @@ nvmf_tcp_dispatch_pdu(nvmf_tcp_qpair_t *qp,
 	}
 	pdu->rp_hdr = (const nvmf_tcp_common_pdu_hdr_t *)pdu->rp_mp->b_rptr;
 
-	switch (ch->ntcph_pdu_type) {
+	/*
+	 * pullupmsg() above may have reallocated the lead mblk, leaving the
+	 * caller's 'ch' pointer dangling.  Dispatch off the refreshed
+	 * pdu->rp_hdr, never 'ch', for any field read past this point.
+	 */
+	switch (pdu->rp_hdr->ntcph_pdu_type) {
 	default:
 		VERIFY(0);
 		return (ECONNRESET);
@@ -1394,6 +1450,15 @@ nvmf_tcp_rx_drain(nvmf_tcp_qpair_t *qp)
 
 			nvmf_tcp_peek_common_hdr(qp->tq_rx_mp, &ch);
 			qp->tq_rx_needed = LE_32(ch.ntcph_plen);
+
+			/*
+			 * Reject an absurd advertised length before buffering
+			 * it: the loop accumulates tq_rx_needed bytes before
+			 * any validation runs, so an over-large plen is a
+			 * memory-exhaustion vector.  Fatal to the connection.
+			 */
+			if (qp->tq_rx_needed > nvmf_tcp_max_receive_pdu)
+				return (ECONNRESET);
 
 			/*
 			 * Malformed PDUs will be reported as errors by
@@ -1816,7 +1881,7 @@ tcp_allocate_qpair(boolean_t controller, const nvlist_t *nvl)
 {
 	nvmf_tcp_qpair_t *qp;
 	ksocket_t so;
-	uint64_t fd, scratch;
+	uint64_t fd, scratch, rxpda, txpda;
 	boolean_t bscratch;
 	int error;
 
@@ -1840,6 +1905,21 @@ tcp_allocate_qpair(boolean_t controller, const nvlist_t *nvl)
 		return (NULL);
 
 	/*
+	 * The PDAs come from a (potentially malicious) handoff nvlist and are
+	 * used as a modulus when validating a peer's PDU data offset, so a zero
+	 * PDA would be a divide-by-zero panic.  tq_rxpda/tq_txpda are uint8_t, so
+	 * a value that does not fit in a byte (e.g. 256) would truncate to zero
+	 * and slip past a bare "!= 0" check; reject anything that is zero or wider
+	 * than the field.  Done up front, before the socket is adopted, so there
+	 * is nothing to unwind.
+	 */
+	rxpda = fnvlist_lookup_uint64((nvlist_t *)nvl, "rxpda");
+	txpda = fnvlist_lookup_uint64((nvlist_t *)nvl, "txpda");
+	if (rxpda == 0 || (uint8_t)rxpda != rxpda ||
+	    txpda == 0 || (uint8_t)txpda != txpda)
+		return (NULL);
+
+	/*
 	 * Turn the userland file descriptor "fd" into a ksocket_t.  This runs in
 	 * the ioctl caller's process context (getsonode()/getf() resolve against
 	 * the calling process's open-file table), which is guaranteed because the
@@ -1854,8 +1934,8 @@ tcp_allocate_qpair(boolean_t controller, const nvlist_t *nvl)
 	qp = kmem_zalloc(sizeof (*qp), KM_SLEEP);
 	qp->tq_so = so;
 	qp->tq_refs = 1;
-	qp->tq_txpda = (uint8_t)fnvlist_lookup_uint64((nvlist_t *)nvl, "txpda");
-	qp->tq_rxpda = (uint8_t)fnvlist_lookup_uint64((nvlist_t *)nvl, "rxpda");
+	qp->tq_txpda = (uint8_t)txpda;
+	qp->tq_rxpda = (uint8_t)rxpda;
 	qp->tq_header_digests = fnvlist_lookup_boolean_value((nvlist_t *)nvl,
 	    "header_digests");
 	qp->tq_data_digests = fnvlist_lookup_boolean_value((nvlist_t *)nvl,
@@ -2167,27 +2247,31 @@ tcp_validate_command_capsule(struct nvmf_capsule *nc)
 	switch (sgl_type) {
 	case NVME_SGL_TYPE_ICD:
 		if (tc->tc_rx_pdu.rp_data_len != LE_32(sgl->sgl_len)) {
-			cmn_err(CE_WARN, "NVMe/TCP: Command Capsule with "
-			    "mismatched ICD length");
+			if (nvmf_tcp_warn_ok())
+				cmn_err(CE_WARN, "NVMe/TCP: Command Capsule "
+				    "with mismatched ICD length");
 			return (NVME_CQE_SC_GEN_INV_DSGL_LEN);
 		}
 		break;
 	case NVME_SGL_TYPE_COMMAND_BUFFER:
 		if (tc->tc_rx_pdu.rp_data_len != 0) {
-			cmn_err(CE_WARN,
-			    "NVMe/TCP: Command Buffer SGL with ICD");
+			if (nvmf_tcp_warn_ok())
+				cmn_err(CE_WARN,
+				    "NVMe/TCP: Command Buffer SGL with ICD");
 			return (NVME_CQE_SC_GEN_INV_FLD);
 		}
 		break;
 	default:
-		cmn_err(CE_WARN,
-		    "NVMe/TCP: Invalid SGL type in Command Capsule");
+		if (nvmf_tcp_warn_ok())
+			cmn_err(CE_WARN,
+			    "NVMe/TCP: Invalid SGL type in Command Capsule");
 		return (NVME_CQE_SC_GEN_INV_SGL_DESC);
 	}
 
 	if (sgl->sgl_addr != 0) {
-		cmn_err(CE_WARN,
-		    "NVMe/TCP: Invalid SGL offset in Command Capsule");
+		if (nvmf_tcp_warn_ok())
+			cmn_err(CE_WARN,
+			    "NVMe/TCP: Invalid SGL offset in Command Capsule");
 		return (NVME_CQE_SC_GEN_INV_SGL_OFF);
 	}
 
