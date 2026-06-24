@@ -141,12 +141,16 @@ ice_tx_ring_alloc(ice_t *ice, ice_tx_ring_t *itr, uint_t index)
 	itr->itxr_tcb_free_list = kmem_zalloc(itr->itxr_size *
 	    sizeof (ice_tx_ctrl_block_t *), KM_SLEEP);
 
+	/*
+	 * The by-slot parked array starts all-NULL (it is kmem_zalloc'd above):
+	 * ice_tx_emit() is the sole populator, parking a TCB only at a packet's
+	 * first-descriptor slot.  Every TCB begins life only on the free list.
+	 */
 	for (i = 0; i < itr->itxr_size; i++) {
 		ice_tx_ctrl_block_t *itcb = &itr->itxr_tcb_area[i];
 
 		itcb->itcb_ring = itr;
 		itcb->itcb_type = ITCB_NOT_USED;
-		itr->itxr_tcbs[i] = itcb;
 		itr->itxr_tcb_free_list[i] = itcb;
 	}
 	itr->itxr_tcb_nfree = itr->itxr_size;
@@ -803,6 +807,16 @@ ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs, uint_t ntcb,
 	wr32(hw, QTX_COMM_DBELL(itr->itxr_index), tail);
 	ice_flush(hw);
 
+	/*
+	 * The descriptors are already parked, so a faulted doorbell write only
+	 * latches the error (stopping further tx until replumb); it must not
+	 * unwind the TCBs the caller would otherwise free a second time.
+	 */
+	if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
+		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
+	}
+
 	return (B_TRUE);
 }
 
@@ -848,6 +862,11 @@ ice_tx_recycle(ice_tx_ring_t *itr)
 
 	(void) ddi_dma_sync(itr->itxr_dma.idb_dma_handle, 0, 0,
 	    DDI_DMA_SYNC_FORKERNEL);
+	if (ice_check_dma_handle(itr->itxr_dma.idb_dma_handle) != DDI_FM_OK) {
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
+		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
+		return (0);
+	}
 
 	head = itr->itxr_head;
 	inflight = itr->itxr_size - itr->itxr_avail;
@@ -1000,12 +1019,18 @@ ice_ring_tx(void *arg, mblk_t *mp)
 		return (NULL);
 	}
 
+	/*
+	 * Check quiesce and mark this call in flight atomically so ice_tx_stop
+	 * cannot start freeing parked control blocks while a transmit is mid
+	 * way through ice_tx_one (which builds blocks outside the lock).
+	 */
 	mutex_enter(&itr->itxr_lock);
 	if (itr->itxr_quiesce) {
 		mutex_exit(&itr->itxr_lock);
 		freemsgchain(mp);
 		return (NULL);
 	}
+	itr->itxr_tx_active++;
 	mutex_exit(&itr->itxr_lock);
 
 	while (mp != NULL) {
@@ -1019,6 +1044,11 @@ ice_ring_tx(void *arg, mblk_t *mp)
 		}
 		mp = next;
 	}
+
+	mutex_enter(&itr->itxr_lock);
+	if (--itr->itxr_tx_active == 0)
+		cv_signal(&itr->itxr_cv);
+	mutex_exit(&itr->itxr_lock);
 
 	return (mp);
 }
@@ -1063,6 +1093,10 @@ ice_tx_stop(ice_t *ice)
 
 		mutex_enter(&itr->itxr_lock);
 		itr->itxr_quiesce = B_TRUE;
+
+		/* Wait for in-flight transmits to drain before freeing TCBs. */
+		while (itr->itxr_tx_active > 0)
+			cv_wait(&itr->itxr_cv, &itr->itxr_lock);
 
 		for (slot = 0; slot < itr->itxr_size; slot++) {
 			if (itr->itxr_tcbs[slot] == NULL)

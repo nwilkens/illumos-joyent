@@ -793,8 +793,9 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 
 	/*
 	 * Load the DDP package before the VSI: a missing or rejected package
-	 * drops the device into safe mode, which clamps the queue counts the
-	 * VSI configuration reads.
+	 * drops the device into safe mode, which zeroes the rss_table_size that
+	 * ice_rss_setup() reads (the queue and vector counts are fixed and
+	 * unaffected).
 	 */
 	if (!ice_ddp_load(ice))
 		goto fail;

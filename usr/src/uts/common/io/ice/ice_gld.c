@@ -233,6 +233,13 @@ ice_m_start(void *arg)
 	ice_t *ice = arg;
 
 	/*
+	 * Clear any latched datapath error: mac start fully re-programs the
+	 * queues and rings below, so it is the recovery point for a device that
+	 * faulted while plumbed and was then replumbed.
+	 */
+	atomic_and_32(&ice->ice_state, ~ICE_STATE_ERROR);
+
+	/*
 	 * Program and enable the queues on each start so the hardware ring head
 	 * resets in lockstep with software, then allocate the rx control-block
 	 * pool and admit traffic.  The per-ring start callbacks post buffers.

@@ -758,6 +758,7 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes)
 		union ice_32b_rx_flex_desc *desc = &irr->irxr_descs[head];
 		ice_rx_ctrl_block_t *rcb = irr->irxr_rcbs[head];
 		mblk_t *mp;
+		boolean_t bound;
 		uint16_t status0, plen, ptype;
 
 		if (poll_bytes > 0 && bytes >= (uint_t)poll_bytes)
@@ -810,14 +811,28 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes)
 		}
 
 		mp = NULL;
-		if (plen >= ICE_RX_COPY_THRESHOLD)
+		bound = B_FALSE;
+		if (plen >= ICE_RX_COPY_THRESHOLD) {
 			mp = ice_rx_bind(irr, head, rcb, plen);
+			if (mp != NULL)
+				bound = B_TRUE;
+		}
 		if (mp == NULL)
 			mp = ice_rx_copy(irr, rcb, plen);
 		if (mp == NULL) {
 			/* Out of memory: drop, leave buffer in place. */
 			goto recycle;
 		}
+
+		/*
+		 * A bound frame's slot already holds the replacement buffer
+		 * ice_rx_bind() posted.  A copied frame's buffer stays on the
+		 * ring, so its descriptor must be re-posted before the tail
+		 * advances; hardware's writeback aliased over read.pkt_addr, so
+		 * an unposted slot would DMA the next frame to garbage.
+		 */
+		if (!bound)
+			ice_rx_reset_desc(irr, head, rcb);
 
 		ptype = LE16_TO_CPU(desc->wb.ptype_flex_flags0) &
 		    ICE_RX_FLEX_DESC_PTYPE_M;
@@ -862,6 +877,10 @@ recycle:
 
 	irr->irxr_tail = (head == 0) ? irr->irxr_size - 1 : head - 1;
 	wr32(hw, QRX_TAIL(irr->irxr_index), irr->irxr_tail);
+	if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
+		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
+	}
 
 	if (npkts > 0) {
 		irr->irxr_stats.icrxs_bytes.value.ui64 += bytes;

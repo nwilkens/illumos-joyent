@@ -199,9 +199,10 @@ typedef struct ice_tx_ring {
 	uint32_t		itxr_q_teid;	/* core: from ice_ena_vsi_txq */
 
 	kmutex_t		itxr_lock;
-	kcondvar_t		itxr_cv;
+	kcondvar_t		itxr_cv;	/* stop waits for tx drain */
 	boolean_t		itxr_quiesce;
 	boolean_t		itxr_blocked;
+	uint_t			itxr_tx_active;	/* in-flight tx calls */
 
 	mac_ring_handle_t	itxr_mactxring;
 
