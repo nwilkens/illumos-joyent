@@ -29,14 +29,13 @@
  * entry, tracked on the VSI's vi_macs list).  Link state is reported from cache
  * ice_intr.c maintains; the MAC path never blocks on hardware.
  *
- * Hardware checksum and LSO offloads are not advertised in this milestone:
- * ice_m_getcapab returns B_FALSE for MAC_CAPAB_HCKSUM and MAC_CAPAB_LSO.  The
- * rings carry traffic; the offload descriptor paths land later.
+ * Hardware checksum offload is advertised (MAC_CAPAB_HCKSUM); LSO is not yet.
  */
 
 #include <sys/mac_provider.h>
 #include <sys/mac_ether.h>
 #include <sys/vlan.h>
+#include <sys/dlpi.h>
 
 #include "ice.h"
 #include "ice_common.h"
@@ -361,8 +360,14 @@ ice_m_getcapab(void *arg, mac_capab_t capab, void *cap_data)
 		}
 		break;
 
-	/* Offloads are not advertised this milestone. */
-	case MAC_CAPAB_HCKSUM:
+	case MAC_CAPAB_HCKSUM: {
+		uint32_t *txflags = cap_data;
+
+		*txflags = HCKSUM_INET_PARTIAL | HCKSUM_IPHDRCKSUM;
+		break;
+	}
+
+	/* LSO is not advertised yet. */
 	case MAC_CAPAB_LSO:
 	default:
 		return (B_FALSE);

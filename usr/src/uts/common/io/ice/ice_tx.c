@@ -28,6 +28,9 @@
 
 #include <sys/strsubr.h>
 #include <sys/strsun.h>
+#include <sys/pattr.h>
+#include <sys/ethernet.h>
+#include <netinet/in.h>
 
 #include "ice.h"
 #include "ice_common.h"
@@ -518,7 +521,7 @@ ice_tx_copy_packet(ice_tx_ring_t *itr, mblk_t *mp, size_t msglen,
  */
 static void
 ice_tx_write_desc(ice_tx_ring_t *itr, uint16_t slot, uint64_t pa,
-    uint32_t len, uint64_t cmd)
+    uint32_t len, uint64_t cmd, uint64_t off)
 {
 	struct ice_tx_desc *desc = &itr->itxr_descs[slot];
 	uint64_t qw1;
@@ -527,10 +530,88 @@ ice_tx_write_desc(ice_tx_ring_t *itr, uint16_t slot, uint64_t pa,
 
 	qw1 = ((uint64_t)ICE_TX_DESC_DTYPE_DATA << ICE_TXD_QW1_DTYPE_S) |
 	    (cmd << ICE_TXD_QW1_CMD_S) |
+	    (off << ICE_TXD_QW1_OFFSET_S) |
 	    ((uint64_t)len << ICE_TXD_QW1_TX_BUF_SZ_S);
 
 	desc->buf_addr = CPU_TO_LE64(pa);
 	desc->cmd_type_offset_bsz = CPU_TO_LE64(qw1);
+}
+
+/*
+ * Translate a frame's requested checksum offloads into the data-descriptor
+ * command and offset fields the hardware reads on every descriptor of the
+ * packet.  The header lengths come from mac_ether_offload_info().  Returns
+ * B_FALSE only when an offload was asked for but the headers could not be
+ * parsed, in which case the caller drops the frame rather than emit a bad
+ * descriptor.
+ */
+static boolean_t
+ice_tx_offload(mblk_t *mp, uint64_t *cmdp, uint64_t *offp)
+{
+	mac_ether_offload_info_t meo;
+	uint32_t chkflags;
+	uint64_t cmd = 0, off = 0;
+	const uint32_t l23 = MEOI_L2INFO_SET | MEOI_L3INFO_SET;
+
+	*cmdp = 0;
+	*offp = 0;
+
+	mac_hcksum_get(mp, NULL, NULL, NULL, NULL, &chkflags);
+	if (chkflags == 0)
+		return (B_TRUE);
+
+	mac_ether_offload_info(mp, &meo);
+
+	if ((chkflags & HCK_IPV4_HDRCKSUM) != 0) {
+		if ((meo.meoi_flags & l23) != l23 ||
+		    meo.meoi_l3proto != ETHERTYPE_IP)
+			return (B_FALSE);
+		cmd |= ICE_TX_DESC_CMD_IIPT_IPV4_CSUM;
+		off |= (uint64_t)(meo.meoi_l2hlen >> 1) <<
+		    ICE_TX_DESC_LEN_MACLEN_S;
+		off |= (uint64_t)(meo.meoi_l3hlen >> 2) <<
+		    ICE_TX_DESC_LEN_IPLEN_S;
+	}
+
+	if ((chkflags & HCK_PARTIALCKSUM) != 0) {
+		if ((meo.meoi_flags & MEOI_L4INFO_SET) == 0)
+			return (B_FALSE);
+
+		if ((chkflags & HCK_IPV4_HDRCKSUM) == 0) {
+			if ((meo.meoi_flags & l23) != l23)
+				return (B_FALSE);
+			if (meo.meoi_l3proto == ETHERTYPE_IP)
+				cmd |= ICE_TX_DESC_CMD_IIPT_IPV4;
+			else if (meo.meoi_l3proto == ETHERTYPE_IPV6)
+				cmd |= ICE_TX_DESC_CMD_IIPT_IPV6;
+			else
+				return (B_FALSE);
+			off |= (uint64_t)(meo.meoi_l2hlen >> 1) <<
+			    ICE_TX_DESC_LEN_MACLEN_S;
+			off |= (uint64_t)(meo.meoi_l3hlen >> 2) <<
+			    ICE_TX_DESC_LEN_IPLEN_S;
+		}
+
+		switch (meo.meoi_l4proto) {
+		case IPPROTO_TCP:
+			cmd |= ICE_TX_DESC_CMD_L4T_EOFT_TCP;
+			break;
+		case IPPROTO_UDP:
+			cmd |= ICE_TX_DESC_CMD_L4T_EOFT_UDP;
+			break;
+		case IPPROTO_SCTP:
+			cmd |= ICE_TX_DESC_CMD_L4T_EOFT_SCTP;
+			break;
+		default:
+			return (B_FALSE);
+		}
+		off |= (uint64_t)(meo.meoi_l4hlen >> 2) <<
+		    ICE_TX_DESC_LEN_L4_LEN_S;
+	}
+
+	*cmdp = cmd;
+	*offp = off;
+	return (B_TRUE);
 }
 
 /*
@@ -629,7 +710,7 @@ ice_tx_sync_tcb(ice_t *ice, ice_tx_ctrl_block_t *tcb)
  */
 static boolean_t
 ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs, uint_t ntcb,
-    uint_t ndesc, mblk_t *mp)
+    uint_t ndesc, mblk_t *mp, uint64_t ocmd, uint64_t ooff)
 {
 	ice_t *ice = itr->itxr_ice;
 	struct ice_hw *hw = &ice->ice_hw;
@@ -661,14 +742,16 @@ ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs, uint_t ntcb,
 				    ddi_dma_cookie_get(tcb->itcb_dmah, c);
 
 				ice_tx_write_desc(itr, tail,
-				    ck->dmac_laddress, ck->dmac_size, 0);
+				    ck->dmac_laddress, ck->dmac_size, ocmd,
+				    ooff);
 				last = tail;
 				tail = ice_tx_ring_next(itr, tail);
 				written++;
 			}
 		} else {
 			ice_tx_write_desc(itr, tail,
-			    ICE_DMA_PA(tcb->itcb_buf), tcb->itcb_len, 0);
+			    ICE_DMA_PA(tcb->itcb_buf), tcb->itcb_len, ocmd,
+			    ooff);
 			last = tail;
 			tail = ice_tx_ring_next(itr, tail);
 			written++;
@@ -835,10 +918,17 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 	ice_tx_ctrl_block_t *tcbs[ICE_TX_MAX_COOKIE];
 	ice_tx_build_t res;
 	size_t msglen;
+	uint64_t ocmd, ooff;
 	uint_t ntcb = 0, ndesc = 0;
 	uint_t i;
 
 	msglen = msgdsize(mp);
+
+	if (!ice_tx_offload(mp, &ocmd, &ooff)) {
+		freemsg(mp);
+		itr->itxr_stats.ictxs_drops.value.ui64++;
+		return (B_TRUE);
+	}
 
 	res = ice_tx_build_tcbs(itr, mp, msglen, tcbs, &ntcb, &ndesc);
 	if (res == ICE_TX_BUILD_NORES) {
@@ -873,7 +963,7 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 		}
 	}
 
-	if (!ice_tx_emit(itr, tcbs, ntcb, ndesc, mp)) {
+	if (!ice_tx_emit(itr, tcbs, ntcb, ndesc, mp, ocmd, ooff)) {
 		mutex_exit(&itr->itxr_lock);
 		/*
 		 * Fatal DMA error: the device is wedged.  Drop the frame; the

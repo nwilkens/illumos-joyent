@@ -27,6 +27,9 @@
  * the tail doorbell.
  */
 
+#include <sys/strsun.h>
+#include <sys/pattr.h>
+
 #include "ice.h"
 #include "ice_common.h"
 #include "ice_lan_tx_rx.h"
@@ -672,6 +675,41 @@ ice_rx_bind(ice_rx_ring_t *irr, uint16_t idx, ice_rx_ctrl_block_t *rcb,
 }
 
 /*
+ * Report hardware checksum results to mac.  The flex writeback gives the
+ * integrity-processed bit and per-layer error bits; the ptype identifies which
+ * layers are present.  A clear error bit on a present, processed layer is a
+ * verified-good checksum.  Tunneled and unknown packets are left unverified.
+ */
+static void
+ice_rx_hcksum(ice_rx_ring_t *irr, mblk_t *mp, uint16_t status0, uint16_t ptype)
+{
+	struct ice_rx_ptype_decoded pinfo = ice_decode_rx_desc_ptype(ptype);
+	uint32_t cksum = 0;
+
+	if (pinfo.known == 0)
+		return;
+	if ((status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_L3L4P_S)) == 0)
+		return;
+
+	if (pinfo.outer_ip == ICE_RX_PTYPE_OUTER_IP &&
+	    pinfo.outer_ip_ver == ICE_RX_PTYPE_OUTER_IPV4 &&
+	    pinfo.tunnel_type == ICE_RX_PTYPE_TUNNEL_NONE &&
+	    (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_IPE_S)) == 0)
+		cksum |= HCK_IPV4_HDRCKSUM_OK;
+
+	if (pinfo.outer_ip == ICE_RX_PTYPE_OUTER_IP &&
+	    pinfo.tunnel_type == ICE_RX_PTYPE_TUNNEL_NONE &&
+	    (pinfo.inner_prot == ICE_RX_PTYPE_INNER_PROT_TCP ||
+	    pinfo.inner_prot == ICE_RX_PTYPE_INNER_PROT_UDP ||
+	    pinfo.inner_prot == ICE_RX_PTYPE_INNER_PROT_SCTP) &&
+	    (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_L4E_S)) == 0)
+		cksum |= HCK_FULLCKSUM_OK;
+
+	if (cksum != 0)
+		mac_hcksum_set(mp, 0, 0, 0, 0, cksum);
+}
+
+/*
  * Drain the rx ring, returning an mblk chain of received frames.
  *
  * poll_bytes > 0 caps the bytes delivered (mac polling); poll_bytes == 0 means
@@ -697,7 +735,7 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes)
 		union ice_32b_rx_flex_desc *desc = &irr->irxr_descs[head];
 		ice_rx_ctrl_block_t *rcb = irr->irxr_rcbs[head];
 		mblk_t *mp;
-		uint16_t status0, plen;
+		uint16_t status0, plen, ptype;
 
 		if (poll_bytes > 0 && bytes >= (uint_t)poll_bytes)
 			break;
@@ -757,6 +795,10 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes)
 			/* Out of memory: drop, leave buffer in place. */
 			goto recycle;
 		}
+
+		ptype = LE16_TO_CPU(desc->wb.ptype_flex_flags0) &
+		    ICE_RX_FLEX_DESC_PTYPE_M;
+		ice_rx_hcksum(irr, mp, status0, ptype);
 
 		if (mp_tail == NULL)
 			mp_head = mp_tail = mp;
