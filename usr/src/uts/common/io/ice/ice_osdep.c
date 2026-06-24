@@ -206,7 +206,20 @@ ice_alloc_dma_mem(struct ice_hw *hw, struct ice_dma_mem *mem, u64 size)
 		return (NULL);
 	}
 
-	ASSERT3U(ncookie, ==, 1);
+	/*
+	 * A single cookie is requested via dma_attr_sgllen; fail closed
+	 * rather than use only the first segment if more are returned.
+	 */
+	if (ncookie != 1) {
+		(void) ddi_dma_unbind_handle(mem->idm_dma_handle);
+		ddi_dma_mem_free(&mem->idm_acc_handle);
+		ddi_dma_free_handle(&mem->idm_dma_handle);
+		mem->idm_acc_handle = NULL;
+		mem->idm_dma_handle = NULL;
+		mem->va = NULL;
+		return (NULL);
+	}
+
 	mem->pa = cookie.dmac_laddress;
 	mem->size = (size_t)size;
 
