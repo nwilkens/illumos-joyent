@@ -105,6 +105,8 @@ typedef struct nvmft_task_priv {
 	struct nvmf_capsule	*ntp_nc;
 	struct nvmft_qpair	*ntp_qp;
 	boolean_t		ntp_success_sent;
+	/* Command payload length, charged against ctrlr_pending_bytes. */
+	uint32_t		ntp_data_len;
 	/*
 	 * Non-NULL for driver-issued (internal) tasks that capture their read
 	 * data into a local buffer instead of sending it to a host -- used to
@@ -128,6 +130,32 @@ typedef struct nvmft_internal_io {
 	uint32_t	iio_buflen;
 	uint32_t	iio_xfered;
 } nvmft_internal_io_t;
+
+/*
+ * Bound the number of commands concurrently in flight per controller
+ * (nvmft_max_active_commands) so a fast writeback-cached initiator cannot overrun
+ * the backing store's drain rate.  Over-cap commands are DEFERRED (queued and
+ * re-dispatched on completion) rather than refused, so the initiator paces itself
+ * via SQ-credit backpressure: the host maps any non-zero CQE to EIO and will not
+ * retry.  nvmft_max_pending_bytes is a secondary byte ceiling.  Either cap is
+ * disabled when 0 (with the count cap off the legacy nvmft_max_pending_commands
+ * refuse-path still applies as a hard backstop).
+ */
+uint_t nvmft_max_active_commands = 16;
+uint_t nvmft_max_pending_commands = 8192;
+uint64_t nvmft_max_pending_bytes = 1024ULL * 1024 * 1024;	/* 1 GiB */
+
+/*
+ * A command deferred by the in-flight cap above.  Holds just enough to post the
+ * STMF task later: the Fabrics capsule and the qpair it arrived on.  Queued on
+ * nvmft_controller_t.ctrlr_deferred under ctrlr_lock.
+ */
+typedef struct nvmft_deferred_cmd {
+	list_node_t		ndc_link;
+	struct nvmft_qpair	*ndc_qp;
+	struct nvmf_capsule	*ndc_nc;
+	uint32_t		ndc_data_len;
+} nvmft_deferred_cmd_t;
 
 /* lport ops (modeled on srpt_stp.c). */
 static stmf_status_t nvmft_lport_xfer_data(scsi_task_t *task,
@@ -575,8 +603,9 @@ nvmft_build_identify_nsid(nvmft_controller_t *ctrlr, uint32_t nsid,
 {
 	uint64_t nblocks;
 	uint32_t blksize;
+	uint8_t guid[16];
 
-	if (!nvmft_ns_mapped(ctrlr, nsid, NULL))
+	if (!nvmft_ns_mapped(ctrlr, nsid, guid))
 		return (B_FALSE);
 	if (nvmft_lu_read_capacity(ctrlr, nsid, &nblocks, &blksize) != 0)
 		return (B_FALSE);
@@ -590,6 +619,14 @@ nvmft_build_identify_nsid(nvmft_controller_t *ctrlr, uint32_t nsid,
 	nsdata->id_nlbaf = 0;			/* a single LBA format */
 	nsdata->id_flbas.lba_format = 0;	/* format 0 in use */
 	nsdata->id_lbaf[0].lbaf_lbads = (uint8_t)(highbit(blksize) - 1);
+	/*
+	 * Expose the LU GUID as the NVMe 1.2+ namespace globally-unique
+	 * identifier (NGUID).  Real controllers populate this in Identify
+	 * Namespace as well as in the Namespace Identification Descriptor (CNS
+	 * 3); the illumos host builds its devid from the Identify Namespace
+	 * NGUID, so without this the blkdev attach fails (no devid).
+	 */
+	(void) memcpy(nsdata->id_nguid, guid, sizeof (guid));
 	return (B_TRUE);
 }
 
@@ -619,60 +656,9 @@ nvmft_build_nsid_desc(nvmft_controller_t *ctrlr, uint32_t nsid, uint8_t *buf,
 
 /*
  * ============================================================================
- * Active namespace bookkeeping (ported from ctl_frontend_nvmf.c)
- * ============================================================================
- */
-
-void
-nvmft_populate_active_nslist(nvmft_port_t *np, uint32_t nsid,
-    nvme_identify_nsid_list_t *nslist)
-{
-	uint_t i, count, nitems;
-
-	nitems = sizeof (nslist->nl_nsid) / sizeof (nslist->nl_nsid[0]);
-	mutex_enter(&np->np_lock);
-	count = 0;
-	for (i = 0; i < np->np_num_ns; i++) {
-		if (np->np_active_ns[i] <= nsid)
-			continue;
-		nslist->nl_nsid[count] = LE_32(np->np_active_ns[i]);
-		count++;
-		if (count == nitems)
-			break;
-	}
-	mutex_exit(&np->np_lock);
-}
-
-/*
- * ============================================================================
  * NVMe command -> scsi_task_t translation + dispatch
  * ============================================================================
  */
-
-/*
- * Encode an unsigned integer big-endian into a CDB field.
- */
-static void
-nvmft_cdb_put64(uint8_t *p, uint64_t v)
-{
-	p[0] = (uint8_t)(v >> 56);
-	p[1] = (uint8_t)(v >> 48);
-	p[2] = (uint8_t)(v >> 40);
-	p[3] = (uint8_t)(v >> 32);
-	p[4] = (uint8_t)(v >> 24);
-	p[5] = (uint8_t)(v >> 16);
-	p[6] = (uint8_t)(v >> 8);
-	p[7] = (uint8_t)v;
-}
-
-static void
-nvmft_cdb_put32(uint8_t *p, uint32_t v)
-{
-	p[0] = (uint8_t)(v >> 24);
-	p[1] = (uint8_t)(v >> 16);
-	p[2] = (uint8_t)(v >> 8);
-	p[3] = (uint8_t)v;
-}
 
 /*
  * Translate an NVMe NVM command into a SCSI CDB on the supplied scsi_task_t and
@@ -715,15 +701,15 @@ nvmft_translate_cmd(scsi_task_t *task, const nvme_sqe_t *cmd,
 	switch (opc) {
 	case NVME_OPC_NVM_READ:
 		cdb[0] = SCMD_READ_G4;			/* READ(16) */
-		nvmft_cdb_put64(&cdb[2], slba);
-		nvmft_cdb_put32(&cdb[10], nlb);
+		BE_OUT64(&cdb[2], slba);
+		BE_OUT32(&cdb[10], nlb);
 		task->task_flags |= TF_READ_DATA;
 		task->task_expected_xfer_length = data_len;
 		break;
 	case NVME_OPC_NVM_WRITE:
 		cdb[0] = SCMD_WRITE_G4;			/* WRITE(16) */
-		nvmft_cdb_put64(&cdb[2], slba);
-		nvmft_cdb_put32(&cdb[10], nlb);
+		BE_OUT64(&cdb[2], slba);
+		BE_OUT32(&cdb[10], nlb);
 		task->task_flags |= TF_WRITE_DATA;
 		task->task_expected_xfer_length = data_len;
 		break;
@@ -734,8 +720,8 @@ nvmft_translate_cmd(scsi_task_t *task, const nvme_sqe_t *cmd,
 	default:
 		/*
 		 * PORT-TODO (NVMEOF.md R3): WRITE_ZERO -> WRITE SAME(16),
-		 * DSET_MGMT -> UNMAP.  RESV_* are handled before translation by
-		 * nvmft_resv_dispatch().
+		 * DSET_MGMT -> UNMAP.  The reservation opcodes (RESV_*) are a
+		 * deferred decision (see nvmft_resv.c) and are not yet dispatched.
 		 */
 		return (B_FALSE);
 	}
@@ -766,6 +752,203 @@ nvmft_cmd_translatable(uint8_t opc)
 }
 
 /*
+ * Whether a newly arrived command must be deferred rather than posted now.
+ * Called with ctrlr_lock held.  Always admit when nothing is in flight so a
+ * single command larger than the byte cap still makes progress.
+ */
+static boolean_t
+nvmft_should_defer(nvmft_controller_t *ctrlr, uint32_t data_len)
+{
+	ASSERT(MUTEX_HELD(&ctrlr->ctrlr_lock));
+
+	if (ctrlr->ctrlr_pending_commands == 0)
+		return (B_FALSE);
+	if (nvmft_max_active_commands != 0 &&
+	    ctrlr->ctrlr_pending_commands >= nvmft_max_active_commands)
+		return (B_TRUE);
+	if (nvmft_max_pending_commands != 0 &&
+	    ctrlr->ctrlr_pending_commands >= nvmft_max_pending_commands)
+		return (B_TRUE);
+	if (nvmft_max_pending_bytes != 0 &&
+	    ctrlr->ctrlr_pending_bytes + data_len > nvmft_max_pending_bytes)
+		return (B_TRUE);
+	return (B_FALSE);
+}
+
+/*
+ * Pop the next deferred command if there is now room to post it, charging it
+ * against the in-flight accounting.  Called with ctrlr_lock held; the caller
+ * posts the returned command (via nvmft_post_command) after dropping the lock.
+ * Returns NULL when the queue is empty or still over a cap.
+ */
+static nvmft_deferred_cmd_t *
+nvmft_admit_one_deferred(nvmft_controller_t *ctrlr)
+{
+	nvmft_deferred_cmd_t *d;
+
+	ASSERT(MUTEX_HELD(&ctrlr->ctrlr_lock));
+
+	if (ctrlr->ctrlr_deferred_commands == 0)
+		return (NULL);
+	d = list_head(&ctrlr->ctrlr_deferred);
+	if (nvmft_should_defer(ctrlr, d->ndc_data_len))
+		return (NULL);
+
+	list_remove(&ctrlr->ctrlr_deferred, d);
+	ctrlr->ctrlr_deferred_commands--;
+	if (ctrlr->ctrlr_pending_commands == 0)
+		ctrlr->ctrlr_start_busy = gethrtime();
+	ctrlr->ctrlr_pending_commands++;
+	ctrlr->ctrlr_pending_bytes += d->ndc_data_len;
+	return (d);
+}
+
+/* Controller lifecycle hooks for the deferred-command queue (nvmft_var.h). */
+void
+nvmft_deferred_init(nvmft_controller_t *ctrlr)
+{
+	list_create(&ctrlr->ctrlr_deferred, sizeof (nvmft_deferred_cmd_t),
+	    offsetof(nvmft_deferred_cmd_t, ndc_link));
+}
+
+/*
+ * Drop every queued (never-posted) command, freeing its capsule.  Called from
+ * controller shutdown after the I/O qpairs are stopped, so no new command can
+ * be deferred.  Queued commands were never posted to STMF and are not counted
+ * in ctrlr_pending_commands, so they are simply discarded -- the host's
+ * association is tearing down and will not see a completion for them.
+ */
+void
+nvmft_deferred_drain(nvmft_controller_t *ctrlr)
+{
+	list_t drain;
+	nvmft_deferred_cmd_t *d;
+
+	list_create(&drain, sizeof (nvmft_deferred_cmd_t),
+	    offsetof(nvmft_deferred_cmd_t, ndc_link));
+
+	mutex_enter(&ctrlr->ctrlr_lock);
+	list_move_tail(&drain, &ctrlr->ctrlr_deferred);
+	ctrlr->ctrlr_deferred_commands = 0;
+	mutex_exit(&ctrlr->ctrlr_lock);
+
+	while ((d = list_remove_head(&drain)) != NULL) {
+		nvmf_free_capsule(d->ndc_nc);
+		kmem_free(d, sizeof (*d));
+	}
+	list_destroy(&drain);
+}
+
+void
+nvmft_deferred_fini(nvmft_controller_t *ctrlr)
+{
+	VERIFY0(ctrlr->ctrlr_deferred_commands);
+	list_destroy(&ctrlr->ctrlr_deferred);
+}
+
+/*
+ * Allocate and post the STMF task for an admitted command.  The in-flight
+ * accounting was already charged (in dispatch or admit).  On STMF task-alloc
+ * failure -- rare, STMF resource exhaustion -- the slot is rolled back and the
+ * next deferred command is admitted and posted in the same loop (iteratively,
+ * never recursively), so the deferred queue cannot stall on a failed post.
+ */
+static void
+nvmft_post_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
+    uint32_t data_len)
+{
+	nvmft_controller_t *ctrlr = nvmft_qpair_ctrlr(qp);
+	nvmft_port_t *np = ctrlr->ctrlr_np;
+
+	for (;;) {
+		const nvme_sqe_t *cmd = nvmf_capsule_sqe(nc);
+		scsi_task_t *task;
+		nvmft_task_priv_t *priv;
+		nvmft_deferred_cmd_t *d;
+		uint8_t lun[8];
+
+		/*
+		 * STMF LUN is the NVMe NSID minus one, encoded as a single-level
+		 * LUN.  stmf_task_alloc() decodes luNbr = lun[1] | ((lun[0] & 0x3f)
+		 * << 8), so the 14-bit LUN splits across lun[0:1] for NSIDs >= 256.
+		 */
+		(void) bzero(lun, sizeof (lun));
+		lun[0] = (uint8_t)(((LE_32(cmd->sqe_nsid) - 1) >> 8) & 0x3f);
+		lun[1] = (uint8_t)((LE_32(cmd->sqe_nsid) - 1) & 0xff);
+
+		task = stmf_task_alloc(np->np_lport, ctrlr->ctrlr_session, lun,
+		    16 /* cdb_length */, 0);
+		if (task != NULL) {
+			priv = kmem_zalloc(sizeof (*priv), KM_SLEEP);
+			priv->ntp_nc = nc;
+			priv->ntp_qp = qp;
+			priv->ntp_data_len = data_len;
+			task->task_port_private = priv;
+			task->task_flags |= TF_ATTR_SIMPLE_QUEUE;
+
+			/*
+			 * The Fabrics transport consumes a command's data as one
+			 * logically contiguous, in-order byte stream:
+			 * nvmf_send_controller_data() (C2H) requires each chunk's
+			 * offset to be sequential over the whole command and only
+			 * stamps the LAST_PDU / implicit-SUCCESS flag on the chunk
+			 * that ends the transfer.  FreeBSD's CTL hands the controller
+			 * the entire transfer in a single memdesc; stmf_sbd, left to
+			 * itself, would split a READ into up to task_max_nbufs
+			 * concurrent dbufs completed out of order.
+			 *
+			 * Force a single in-flight dbuf so sbd issues the data
+			 * sequentially at advancing db_relative_offset and marks
+			 * DB_SEND_STATUS_GOOD only on the final chunk.
+			 * task_max_xfer_len / task_1st_xfer_len are pinned to the
+			 * full transfer length so the LU prefers one buffer for the
+			 * whole command where its own sl_max_xfer_len permits.
+			 */
+			task->task_max_nbufs = 1;
+			task->task_max_xfer_len = data_len;
+			task->task_1st_xfer_len = data_len;
+
+			/*
+			 * The opcode was already vetted by nvmft_cmd_translatable(),
+			 * so the translation cannot fail here.  VERIFY the invariant
+			 * rather than kmem_free()'ing an allocated-and-linked STMF
+			 * task (which would corrupt the LU task list); a posted task
+			 * is disposed only through STMF.
+			 */
+			VERIFY(nvmft_translate_cmd(task, cmd, data_len));
+			stmf_post_task(task, NULL);
+			return;
+		}
+
+		/*
+		 * Could not allocate the STMF task.  Error this command back to the
+		 * host, release its in-flight slot, and admit the next deferred
+		 * command (if any) to post on the next loop iteration -- so a failed
+		 * post still drains the backpressure queue.
+		 */
+		(void) nvmft_send_generic_error(qp, nc,
+		    NVME_CQE_SC_GEN_INTERNAL_ERR);
+		nvmf_free_capsule(nc);
+
+		mutex_enter(&ctrlr->ctrlr_lock);
+		ASSERT3U(ctrlr->ctrlr_pending_commands, >, 0);
+		ctrlr->ctrlr_pending_commands--;
+		ctrlr->ctrlr_pending_bytes -= data_len;
+		if (ctrlr->ctrlr_pending_commands == 0)
+			cv_signal(&ctrlr->ctrlr_pending_cv);
+		d = nvmft_admit_one_deferred(ctrlr);
+		mutex_exit(&ctrlr->ctrlr_lock);
+
+		if (d == NULL)
+			return;
+		qp = d->ndc_qp;
+		nc = d->ndc_nc;
+		data_len = d->ndc_data_len;
+		kmem_free(d, sizeof (*d));
+	}
+}
+
+/*
  * Dispatch a received command capsule to the STMF LU.
  *
  * (FreeBSD: nvmft_dispatch_command -> ctl_alloc_io / ctl_run.)
@@ -776,11 +959,7 @@ nvmft_dispatch_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 {
 	nvmft_controller_t *ctrlr = nvmft_qpair_ctrlr(qp);
 	const nvme_sqe_t *cmd = nvmf_capsule_sqe(nc);
-	nvmft_port_t *np = ctrlr->ctrlr_np;
-	scsi_task_t *task;
-	nvmft_task_priv_t *priv;
 	uint32_t data_len;
-	uint8_t lun[8];
 
 	_NOTE(ARGUNUSED(admin));
 
@@ -820,72 +999,46 @@ nvmft_dispatch_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 		return;
 	}
 
+	data_len = (uint32_t)nvmf_capsule_data_len(nc);
+
 	mutex_enter(&ctrlr->ctrlr_lock);
+	if (nvmft_should_defer(ctrlr, data_len)) {
+		/*
+		 * At the in-flight cap.  Queue the command rather than refuse it:
+		 * the host maps any non-zero CQE to EIO and does not retry
+		 * NS_NOTRDY, so refusing would corrupt the I/O.  Deferring leaves
+		 * the command outstanding (no CQE), so the initiator simply runs
+		 * out of SQ credits and paces itself; nvmft_lport_task_free()
+		 * re-dispatches it when a slot frees.
+		 */
+		nvmft_deferred_cmd_t *d = kmem_alloc(sizeof (*d), KM_NOSLEEP);
+		if (d != NULL) {
+			d->ndc_qp = qp;
+			d->ndc_nc = nc;
+			d->ndc_data_len = data_len;
+			list_insert_tail(&ctrlr->ctrlr_deferred, d);
+			ctrlr->ctrlr_deferred_commands++;
+			mutex_exit(&ctrlr->ctrlr_lock);
+			return;
+		}
+		/*
+		 * Out of memory to even queue it.  Fall back to the transient
+		 * Namespace Not Ready refusal (DNR=0) rather than dropping the
+		 * command silently.
+		 */
+		mutex_exit(&ctrlr->ctrlr_lock);
+		(void) nvmft_send_generic_error(qp, nc,
+		    NVME_CQE_SC_GEN_NVM_NS_NOTRDY);
+		nvmf_free_capsule(nc);
+		return;
+	}
 	if (ctrlr->ctrlr_pending_commands == 0)
 		ctrlr->ctrlr_start_busy = gethrtime();
 	ctrlr->ctrlr_pending_commands++;
+	ctrlr->ctrlr_pending_bytes += data_len;
 	mutex_exit(&ctrlr->ctrlr_lock);
 
-	/*
-	 * STMF LUN is the NVMe NSID minus one, encoded as a single-level LUN.
-	 * stmf_task_alloc() decodes luNbr = lun[1] | ((lun[0] & 0x3f) << 8), so
-	 * the 14-bit LUN must be split across lun[0:1] for NSIDs >= 256.
-	 */
-	(void) bzero(lun, sizeof (lun));
-	lun[0] = (uint8_t)(((LE_32(cmd->sqe_nsid) - 1) >> 8) & 0x3f);
-	lun[1] = (uint8_t)((LE_32(cmd->sqe_nsid) - 1) & 0xff);
-
-	task = stmf_task_alloc(np->np_lport, ctrlr->ctrlr_session, lun,
-	    16 /* cdb_length */, 0);
-	if (task == NULL) {
-		(void) nvmft_send_generic_error(qp, nc,
-		    NVME_CQE_SC_GEN_INTERNAL_ERR);
-		nvmf_free_capsule(nc);
-		mutex_enter(&ctrlr->ctrlr_lock);
-		ASSERT3U(ctrlr->ctrlr_pending_commands, >, 0);
-		ctrlr->ctrlr_pending_commands--;
-		if (ctrlr->ctrlr_pending_commands == 0)
-			cv_signal(&ctrlr->ctrlr_pending_cv);
-		mutex_exit(&ctrlr->ctrlr_lock);
-		return;
-	}
-
-	priv = kmem_zalloc(sizeof (*priv), KM_SLEEP);
-	priv->ntp_nc = nc;
-	priv->ntp_qp = qp;
-	task->task_port_private = priv;
-	task->task_flags |= TF_ATTR_SIMPLE_QUEUE;
-
-	data_len = (uint32_t)nvmf_capsule_data_len(nc);
-
-	/*
-	 * The Fabrics transport consumes a command's data as one logically
-	 * contiguous, in-order byte stream: nvmf_send_controller_data() (C2H)
-	 * requires each chunk's offset to be sequential over the whole command
-	 * and only stamps the LAST_PDU / implicit-SUCCESS flag on the chunk that
-	 * ends the transfer.  FreeBSD's CTL hands the controller the entire
-	 * transfer in a single memdesc; stmf_sbd, left to itself, would split a
-	 * READ into up to task_max_nbufs concurrent dbufs completed out of order.
-	 *
-	 * Force a single in-flight dbuf so sbd issues the data sequentially at
-	 * advancing db_relative_offset and marks DB_SEND_STATUS_GOOD only on the
-	 * final chunk.  task_max_xfer_len / task_1st_xfer_len are pinned to the
-	 * full transfer length so the LU prefers one buffer for the whole
-	 * command where its own sl_max_xfer_len permits.
-	 */
-	task->task_max_nbufs = 1;
-	task->task_max_xfer_len = data_len;
-	task->task_1st_xfer_len = data_len;
-
-	/*
-	 * The opcode was already vetted by nvmft_cmd_translatable() above, so the
-	 * translation cannot fail here.  VERIFY the invariant rather than
-	 * kmem_free()'ing an allocated-and-linked STMF task (which would corrupt
-	 * the LU task list); a posted task is disposed only through STMF.
-	 */
-	VERIFY(nvmft_translate_cmd(task, cmd, data_len));
-
-	stmf_post_task(task, NULL);
+	nvmft_post_command(qp, nc, data_len);
 }
 
 void
@@ -912,7 +1065,7 @@ nvmft_terminate_commands(nvmft_controller_t *ctrlr)
 
 /*
  * ============================================================================
- * Data movement: lport_xfer_data + handle_datamove
+ * Data movement: lport_xfer_data
  * ============================================================================
  */
 
@@ -1282,31 +1435,6 @@ done:
 }
 
 /*
- * Deferred datamove worker invoked from the qpair datamove taskq for tasks
- * queued by nvmft_qpair_datamove().  (FreeBSD: nvmft_handle_datamove(union
- * ctl_io) dispatched from the per-qpair datamove queue.)  STMF drives transfers
- * directly through lport_xfer_data(), so this path exists only for transfers
- * the transport asked us to defer; it is currently unused because
- * nvmft_lport_xfer_data() handles both directions inline.
- */
-void
-nvmft_handle_datamove(scsi_task_t *task)
-{
-	_NOTE(ARGUNUSED(task));
-}
-
-/*
- * The qpair is gone before a queued datamove could run.  Fail the task so STMF
- * tears it down.  (FreeBSD nvmft_abort_datamove marked the ctl_io aborted and
- * called ctl_datamove_done.)
- */
-void
-nvmft_abort_datamove(scsi_task_t *task)
-{
-	stmf_abort(STMF_QUEUE_TASK_ABORT, task, STMF_ABORTED, NULL);
-}
-
-/*
  * ============================================================================
  * Status phase: lport_send_status
  * ============================================================================
@@ -1519,6 +1647,7 @@ nvmft_lport_task_free(scsi_task_t *task)
 {
 	nvmft_task_priv_t *priv = task->task_port_private;
 	nvmft_controller_t *ctrlr;
+	nvmft_deferred_cmd_t *d;
 
 	if (priv == NULL)
 		return;
@@ -1541,15 +1670,23 @@ nvmft_lport_task_free(scsi_task_t *task)
 	mutex_enter(&ctrlr->ctrlr_lock);
 	ASSERT3U(ctrlr->ctrlr_pending_commands, >, 0);
 	ctrlr->ctrlr_pending_commands--;
+	ctrlr->ctrlr_pending_bytes -= priv->ntp_data_len;
 	if (ctrlr->ctrlr_pending_commands == 0) {
 		ctrlr->ctrlr_busy_total +=
 		    gethrtime() - ctrlr->ctrlr_start_busy;
 		cv_signal(&ctrlr->ctrlr_pending_cv);
 	}
+	/* This slot just freed: re-dispatch the next deferred command, if any. */
+	d = nvmft_admit_one_deferred(ctrlr);
 	mutex_exit(&ctrlr->ctrlr_lock);
 
 	task->task_port_private = NULL;
 	kmem_free(priv, sizeof (*priv));
+
+	if (d != NULL) {
+		nvmft_post_command(d->ndc_qp, d->ndc_nc, d->ndc_data_len);
+		kmem_free(d, sizeof (*d));
+	}
 }
 
 /*
@@ -1557,7 +1694,7 @@ nvmft_lport_task_free(scsi_task_t *task)
  * scsi_task_t.  Cancel any in-flight transport data transfer; the transport
  * invokes our receive completion callback with an error, which fails the dbuf
  * back to STMF.  STMF then frees the task through lport_task_free, which frees
- * the capsule.  (FreeBSD: nvmft_abort_datamove / nvmf_abort_capsule_data.)
+ * the capsule.  (FreeBSD: nvmf_abort_capsule_data.)
  *
  * Locking / lifecycle: STMF guarantees the task referenced by arg stays valid
  * for the duration of this call and serialises abort against lport_task_free,
@@ -1566,7 +1703,7 @@ nvmft_lport_task_free(scsi_task_t *task)
  * completed windows.  nvmf_abort_capsule_data() is a no-op when no H2C receive
  * is outstanding (its io_len is 0), so it is safe to call unconditionally for a
  * task that has a capsule; we rely on that rather than tracking outstanding-xfer
- * state in the task private (see todos).
+ * state in the task private.
  */
 /* ARGSUSED */
 static stmf_status_t
@@ -1836,28 +1973,4 @@ static void
 nvmft_dbuf_store_destroy(stmf_dbuf_store_t *ds)
 {
 	stmf_free(ds);
-}
-
-/*
- * ============================================================================
- * taskq helpers (FreeBSD nvmft_enqueue_task / nvmft_drain_task)
- * ============================================================================
- */
-
-void
-nvmft_enqueue_task(taskq_ent_t *task, task_func_t *func, void *arg)
-{
-	taskq_dispatch_ent(nvmft_global->ns_taskq, func, arg, 0, task);
-}
-
-void
-nvmft_drain_task(taskq_ent_t *task)
-{
-	/*
-	 * PORT-TODO: illumos taskq has no per-entry drain; wait_for_completion
-	 * via taskq_wait or track completion on the entry.  For the scaffold a
-	 * full taskq_wait is a safe (if coarse) drain.
-	 */
-	_NOTE(ARGUNUSED(task));
-	taskq_wait(nvmft_global->ns_taskq);
 }

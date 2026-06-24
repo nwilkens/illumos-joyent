@@ -29,16 +29,14 @@
  *   -------                       -------
  *   bool                          boolean_t (B_TRUE/B_FALSE)
  *   htole16/32/64                 LE_16/LE_32/LE_64 (sys/byteorder.h)
- *   NVMEF()/NVMEV() field macros  bitx32/bitset32 not available here; the
- *                                 register fields are written with explicit
- *                                 shifts/masks against nvme_reg.h definitions.
+ *   NVMEF()/NVMEV() field macros  nvme_reg_cap_t / nvme_reg_cc_t bitfield
+ *                                 unions (io/nvme/nvme_reg.h)
  *   struct nvme_controller_data   nvme_identify_ctrl_t (sys/nvme.h)
  *   PAGE_SIZE / ffs               PAGESIZE / highbit
  *
  * The Identify Controller data structure differs in field naming between
- * FreeBSD's struct nvme_controller_data and illumos's nvme_identify_ctrl_t.
- * The field semantics are identical; see the per-field PORT-TODO notes where a
- * field name could not be matched 1:1 against <sys/nvme.h> in this scaffold.
+ * FreeBSD's struct nvme_controller_data and illumos's nvme_identify_ctrl_t, but
+ * the field semantics are identical.
  */
 
 #include <sys/types.h>
@@ -59,15 +57,6 @@
 
 #include "nvmft_var.h"
 
-/*
- * NVMe register field helpers.  FreeBSD uses NVMEF(field, v) to shift a value
- * into a register field and NVMEV(field, v) to extract it.  illumos's
- * <sys/nvme.h> exposes the register layouts but not these generic accessors,
- * so we reproduce the two we need locally.  These operate on the *_SHIFT and
- * *_MASK style fields; for the scaffold the relevant CAP/CC fields are encoded
- * with explicit constants matching the NVMe 1.4 base spec.
- */
-
 boolean_t
 nvmf_nqn_valid(const char *nqn)
 {
@@ -80,24 +69,19 @@ nvmf_nqn_valid(const char *nqn)
 }
 
 /*
- * Compute the initial value of the Controller Capabilities (CAP) property.
+ * Compute the initial value of the Controller Capabilities (CAP) property.  The
+ * only runtime-significant fields for a Fabrics controller are TO (timeout), CQR,
+ * MQES, MPSMIN/MPSMAX and CSS; everything else is zero.
  *
  * (FreeBSD: _nvmf_controller_cap)
- *
- * PORT-TODO (FreeBSD nvmft_subr.c:_nvmf_controller_cap): the FreeBSD source
- * builds CAP from the NVMEF(NVME_CAP_*) field macros.  This scaffold encodes
- * the same fields using the bit positions from the NVMe 1.4 base spec so it can
- * be reviewed independently of the eventual <sys/nvme.h> field-macro choices.
- * The only runtime-significant fields for a Fabrics controller are TO (timeout),
- * CQR, MQES, MPSMIN/MPSMAX and CSS; everything else is zero.
  */
 uint64_t
 _nvmf_controller_cap(uint32_t max_io_qsize, uint8_t enable_timeout)
 {
-	uint32_t caphi, caplo;
+	nvme_reg_cap_t cap;
 	uint_t mps;
 
-	caphi = 0;
+	cap.r = 0;
 	if (max_io_qsize != 0) {
 		/*
 		 * Memory Page Size min/max are expressed as (log2(size) - 12).
@@ -108,71 +92,60 @@ _nvmf_controller_cap(uint32_t max_io_qsize, uint8_t enable_timeout)
 			mps = 0;
 		else
 			mps -= 12;
-		/* MPSMAX bits 55:52, MPSMIN bits 51:48 of CAP (>>32). */
-		caphi |= (mps & 0xf) << 20;	/* MPSMAX */
-		caphi |= (mps & 0xf) << 16;	/* MPSMIN */
+		cap.b.cap_mpsmax = mps & 0xf;
+		cap.b.cap_mpsmin = mps & 0xf;
+		cap.b.cap_mqes = (uint16_t)(max_io_qsize - 1);
 	}
-	/* CSS bit 44 (NVM command set) set in the high dword (>>32). */
-	caphi |= (1u << 5);			/* CSS: NVM command set */
+	cap.b.cap_css = NVME_CAP_CSS_NVM;
+	cap.b.cap_cqr = 1;
+	cap.b.cap_to = enable_timeout;
 
-	/* CQR bit 16, TO bits 31:24, AMS bits 18:17 of CAP low dword. */
-	caplo = (1u << 16);			/* CQR */
-	caplo |= ((uint32_t)enable_timeout) << 24;	/* TO */
-	if (max_io_qsize != 0)
-		caplo |= (max_io_qsize - 1) & 0xffff;	/* MQES */
-
-	return ((uint64_t)caphi << 32 | caplo);
+	return (cap.r);
 }
 
 /*
  * Validate a proposed new Controller Configuration (CC) value.
  *
- * (FreeBSD: _nvmf_validate_cc)
+ * The Linux initiator writes non-zero IOCQES/IOSQES for discovery controllers,
+ * which FreeBSD tolerates outside of STRICT_CHECKS; the same leniency is kept
+ * here (IOCQES/IOSQES of 0 are accepted alongside the spec values).
  *
- * PORT-TODO (FreeBSD nvmft_subr.c:_nvmf_validate_cc): this scaffold checks the
- * IOCQES/IOSQES/SHN/AMS/MPS/CSS fields using explicit shifts.  The Linux
- * initiator writes non-zero IOCQES/IOSQES for discovery controllers, which the
- * FreeBSD source tolerates outside of STRICT_CHECKS; the same leniency is kept
- * here.  Finish wiring these against the canonical <sys/nvme.h> CC field macros
- * once selected.
+ * (FreeBSD: _nvmf_validate_cc)
  */
 boolean_t
 _nvmf_validate_cc(uint32_t max_io_qsize, uint64_t cap, uint32_t old_cc,
     uint32_t new_cc)
 {
-	uint32_t caphi, changes, field;
+	nvme_reg_cc_t oldcc, newcc, changes;
+	nvme_reg_cap_t capr;
 
 	_NOTE(ARGUNUSED(max_io_qsize));
 
-	changes = old_cc ^ new_cc;
+	oldcc.r = old_cc;
+	newcc.r = new_cc;
+	changes.r = old_cc ^ new_cc;
+	capr.r = cap;
 
-	field = (new_cc >> 20) & 0xf;		/* IOCQES */
-	if (field != 0 && field != 4)
+	if (newcc.b.cc_iocqes != 0 && newcc.b.cc_iocqes != 4)
 		return (B_FALSE);
-	field = (new_cc >> 16) & 0xf;		/* IOSQES */
-	if (field != 0 && field != 6)
+	if (newcc.b.cc_iosqes != 0 && newcc.b.cc_iosqes != 6)
 		return (B_FALSE);
-	field = (new_cc >> 14) & 0x3;		/* SHN */
-	if (field == 3)
+	if (newcc.b.cc_shn == 3)
 		return (B_FALSE);
-	field = (new_cc >> 11) & 0x7;		/* AMS */
-	if (field != 0)
-		return (B_FALSE);
-
-	caphi = cap >> 32;
-	field = (new_cc >> 7) & 0xf;		/* MPS */
-	if (field < ((caphi >> 20) & 0xf) || field > ((caphi >> 16) & 0xf))
+	if (newcc.b.cc_ams != 0)
 		return (B_FALSE);
 
-	field = (new_cc >> 4) & 0x7;		/* CSS */
-	if (field != 0 && field != 0x7)
+	if (newcc.b.cc_mps < capr.b.cap_mpsmin ||
+	    newcc.b.cc_mps > capr.b.cap_mpsmax)
+		return (B_FALSE);
+
+	if (newcc.b.cc_css != 0 && newcc.b.cc_css != 0x7)
 		return (B_FALSE);
 
 	/* AMS, MPS, and CSS can only change while CC.EN is 0. */
-	if ((old_cc & 0x1) != 0 &&
-	    (((changes >> 11) & 0x7) != 0 ||
-	    ((changes >> 7) & 0xf) != 0 ||
-	    ((changes >> 4) & 0x7) != 0))
+	if (oldcc.b.cc_en != 0 &&
+	    (changes.b.cc_ams != 0 || changes.b.cc_mps != 0 ||
+	    changes.b.cc_css != 0))
 		return (B_FALSE);
 
 	return (B_TRUE);

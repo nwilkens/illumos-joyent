@@ -128,6 +128,7 @@ nvmft_controller_alloc(nvmft_port_t *np, uint16_t cntlid,
 	ctrlr->ctrlr_np = np;
 	mutex_init(&ctrlr->ctrlr_lock, NULL, MUTEX_DRIVER, NULL);
 	cv_init(&ctrlr->ctrlr_pending_cv, NULL, CV_DRIVER, NULL);
+	nvmft_deferred_init(ctrlr);
 
 	ctrlr->ctrlr_cdata = np->np_cdata;
 	ctrlr->ctrlr_cdata.id_cntlid = LE_16(cntlid);
@@ -151,6 +152,7 @@ nvmft_controller_alloc(nvmft_port_t *np, uint16_t cntlid,
 	if (nvmft_session_register(ctrlr) != 0) {
 		kmem_free(ctrlr->ctrlr_changed_ns,
 		    sizeof (*ctrlr->ctrlr_changed_ns));
+		nvmft_deferred_fini(ctrlr);
 		cv_destroy(&ctrlr->ctrlr_pending_cv);
 		mutex_destroy(&ctrlr->ctrlr_lock);
 		kmem_free(ctrlr, sizeof (*ctrlr));
@@ -165,6 +167,7 @@ nvmft_controller_free(nvmft_controller_t *ctrlr)
 {
 	ASSERT3P(ctrlr->ctrlr_io_qpairs, ==, NULL);
 	nvmft_session_deregister(ctrlr);
+	nvmft_deferred_fini(ctrlr);
 	cv_destroy(&ctrlr->ctrlr_pending_cv);
 	mutex_destroy(&ctrlr->ctrlr_lock);
 	kmem_free(ctrlr->ctrlr_changed_ns, sizeof (*ctrlr->ctrlr_changed_ns));
@@ -437,6 +440,13 @@ nvmft_controller_shutdown(void *arg)
 		}
 	}
 	mutex_exit(&ctrlr->ctrlr_lock);
+
+	/*
+	 * The I/O qpairs are shut down, so no new command can arrive or be
+	 * deferred.  Discard any commands still queued for backpressure (they were
+	 * never posted to STMF) before draining the in-flight ones below.
+	 */
+	nvmft_deferred_drain(ctrlr);
 
 	/* Terminate active STMF tasks. */
 	nvmft_terminate_commands(ctrlr);

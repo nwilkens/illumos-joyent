@@ -29,13 +29,11 @@
  *   struct mtx lock               kmutex_t lock
  *   refcount(9) qp_refs           uint_t qp_refs guarded by lock
  *   BITSET cidset (64K bits)      uint8_t bitmap (NUM_CIDS/8 bytes), BT_* macros
- *   struct task datamove_task     taskq_ent_t + nvmft taskq
- *   STAILQ of union ctl_io        list_t of scsi_task_t (STMF datamove queue)
  *   nvlist_get_bool/_number       nvlist_lookup_boolean_value/_uint64
  *   le16toh/htole16               LE_16
  *
- * The CTL datamove union (union ctl_io) is replaced by STMF's scsi_task_t; the
- * actual data transfer is performed by nvmft_handle_datamove() in nvmft_stmf.c.
+ * STMF drives data transfers inline through lport_xfer_data (nvmft_stmf.c), so
+ * the FreeBSD per-qpair datamove queue (union ctl_io) has no counterpart here.
  */
 
 #include <sys/types.h>
@@ -44,18 +42,13 @@
 #include <sys/cmn_err.h>
 #include <sys/ksynch.h>
 #include <sys/kmem.h>
-#include <sys/list.h>
 #include <sys/bitmap.h>
-#include <sys/taskq.h>
 #include <sys/nvpair.h>
 #include <sys/sunddi.h>		/* bzero/memcpy/strlcpy */
 
 #include <sys/nvme.h>
 #include <sys/nvme/nvmf.h>
 #include <sys/nvme/nvmf_transport.h>
-
-#include <sys/time.h>		/* hrtime_t (sys/stmf.h needs it) */
-#include <sys/stmf.h>
 
 #include "nvmft_var.h"
 
@@ -90,34 +83,13 @@ struct nvmft_qpair {
 	uint16_t		qp_sqhd;
 	volatile uint_t		qp_refs;	/* internal refs on qp_qp */
 
-	taskq_ent_t		qp_datamove_task;
-	list_t			qp_datamove_queue;	/* scsi_task_t list */
-	boolean_t		qp_datamove_active;
-
 	kmutex_t		qp_lock;
 
 	char			qp_name[16];
 };
 
-/*
- * STMF scsi_task_t has no embedded list linkage that we own, so the datamove
- * queue threads tasks through task_port_private via a small wrapper.  The
- * wrapper is allocated by nvmft_qpair_datamove() and freed when the task is
- * dispatched or aborted.
- *
- * PORT-TODO (FreeBSD nvmft_qpair.c uses io_hdr.links / STAILQ): confirm whether
- * the STMF task lifecycle lets us instead stash a list_node_t in a per-task
- * scratch area allocated alongside the scsi_task_t at stmf_task_alloc() time;
- * if so this wrapper allocation can be removed.
- */
-typedef struct nvmft_datamove_ent {
-	list_node_t	nde_link;
-	scsi_task_t	*nde_task;
-} nvmft_datamove_ent_t;
-
 static int	_nvmft_send_generic_error(struct nvmft_qpair *qp,
     struct nvmf_capsule *nc, uint8_t sc_status);
-static void	nvmft_datamove_task(void *context);
 
 static void
 nvmft_qpair_error(void *arg, int error)
@@ -203,13 +175,10 @@ nvmft_qpair_init(nvmf_trtype_t trtype, const nvlist_t *params, uint16_t qid,
 	(void) strlcpy(qp->qp_name, name, sizeof (qp->qp_name));
 	mutex_init(&qp->qp_lock, NULL, MUTEX_DRIVER, NULL);
 	qp->qp_cids = kmem_zalloc(CIDSET_WORDS * sizeof (ulong_t), KM_SLEEP);
-	list_create(&qp->qp_datamove_queue, sizeof (nvmft_datamove_ent_t),
-	    offsetof(nvmft_datamove_ent_t, nde_link));
 
 	qp->qp_qp = nvmf_allocate_qpair(trtype, B_TRUE, params,
 	    nvmft_qpair_error, qp, nvmft_receive_capsule, qp);
 	if (qp->qp_qp == NULL) {
-		list_destroy(&qp->qp_datamove_queue);
 		mutex_destroy(&qp->qp_lock);
 		kmem_free(qp->qp_cids, CIDSET_WORDS * sizeof (ulong_t));
 		kmem_free(qp, sizeof (*qp));
@@ -223,49 +192,23 @@ nvmft_qpair_init(nvmf_trtype_t trtype, const nvlist_t *params, uint16_t qid,
 void
 nvmft_qpair_shutdown(struct nvmft_qpair *qp)
 {
-	list_t datamove_queue;
 	struct nvmf_qpair *nq;
-	nvmft_datamove_ent_t *ent;
 	boolean_t free_it;
-
-	list_create(&datamove_queue, sizeof (nvmft_datamove_ent_t),
-	    offsetof(nvmft_datamove_ent_t, nde_link));
 
 	mutex_enter(&qp->qp_lock);
 	nq = qp->qp_qp;
 	qp->qp_qp = NULL;
-	list_move_tail(&datamove_queue, &qp->qp_datamove_queue);
 	free_it = (nq != NULL && --qp->qp_refs == 0);
 	mutex_exit(&qp->qp_lock);
 
 	if (free_it)
 		nvmf_free_qpair(nq);
-
-	while ((ent = list_remove_head(&datamove_queue)) != NULL) {
-		nvmft_abort_datamove(ent->nde_task);
-		kmem_free(ent, sizeof (*ent));
-	}
-	list_destroy(&datamove_queue);
-
-	/*
-	 * Wait for any in-flight datamove task for this qpair to finish.  This
-	 * runs from the controller shutdown/terminate worker on ns_taskq, so it
-	 * must drain ns_datamove_taskq (a different taskq) and never ns_taskq
-	 * itself, which would self-wait and deadlock.  taskq_wait() is coarse
-	 * (it waits for all datamove tasks, not just this qpair's) but correct;
-	 * illumos taskq has no per-entry drain.
-	 *
-	 * PORT-TODO: replace with the corrected nvmft_drain_task() once that
-	 * shared helper in nvmft_stmf.c targets ns_datamove_taskq.
-	 */
-	taskq_wait(nvmft_global->ns_datamove_taskq);
 }
 
 void
 nvmft_qpair_destroy(struct nvmft_qpair *qp)
 {
 	nvmft_qpair_shutdown(qp);
-	list_destroy(&qp->qp_datamove_queue);
 	mutex_destroy(&qp->qp_lock);
 	kmem_free(qp->qp_cids, CIDSET_WORDS * sizeof (ulong_t));
 	kmem_free(qp, sizeof (*qp));
@@ -517,68 +460,4 @@ nvmft_finish_accept(struct nvmft_qpair *qp,
 		rsp.nfcr_sqhd = LE_16(0xffff);
 	rsp.nfcr_status_code_specific.success.cntlid = LE_16(ctrlr->ctrlr_cntlid);
 	return (nvmft_send_connect_response(qp, &rsp));
-}
-
-/*
- * Queue an STMF datamove for asynchronous processing on the qpair's datamove
- * taskq.  (FreeBSD: nvmft_qpair_datamove enqueuing a union ctl_io.)
- */
-void
-nvmft_qpair_datamove(struct nvmft_qpair *qp, scsi_task_t *task)
-{
-	nvmft_datamove_ent_t *ent;
-	boolean_t enqueue;
-
-	ent = kmem_zalloc(sizeof (*ent), KM_SLEEP);
-	ent->nde_task = task;
-
-	mutex_enter(&qp->qp_lock);
-	if (qp->qp_qp == NULL) {
-		mutex_exit(&qp->qp_lock);
-		kmem_free(ent, sizeof (*ent));
-		nvmft_abort_datamove(task);
-		return;
-	}
-	enqueue = list_is_empty(&qp->qp_datamove_queue);
-	list_insert_tail(&qp->qp_datamove_queue, ent);
-	mutex_exit(&qp->qp_lock);
-
-	/*
-	 * Datamove work MUST run on ns_datamove_taskq, not ns_taskq: the
-	 * controller shutdown/terminate worker runs on ns_taskq and drains the
-	 * datamove taskq via nvmft_qpair_shutdown() -> nvmft_drain_qpair_task().
-	 * Dispatching here onto ns_taskq would make that worker wait on its own
-	 * taskq and deadlock (see nvmft_var.h: the two taskqs must differ).
-	 *
-	 * PORT-TODO: the shared nvmft_enqueue_task()/nvmft_drain_task() wrappers
-	 * in nvmft_stmf.c currently target ns_taskq; they must be corrected to
-	 * ns_datamove_taskq.  Until then this file enforces the documented
-	 * invariant locally by dispatching/draining ns_datamove_taskq directly.
-	 */
-	if (enqueue)
-		taskq_dispatch_ent(nvmft_global->ns_datamove_taskq,
-		    nvmft_datamove_task, qp, 0, &qp->qp_datamove_task);
-}
-
-static void
-nvmft_datamove_task(void *context)
-{
-	struct nvmft_qpair *qp = context;
-	nvmft_datamove_ent_t *ent;
-	scsi_task_t *task;
-	boolean_t abort;
-
-	mutex_enter(&qp->qp_lock);
-	while ((ent = list_remove_head(&qp->qp_datamove_queue)) != NULL) {
-		task = ent->nde_task;
-		abort = (qp->qp_qp == NULL);
-		mutex_exit(&qp->qp_lock);
-		kmem_free(ent, sizeof (*ent));
-		if (abort)
-			nvmft_abort_datamove(task);
-		else
-			nvmft_handle_datamove(task);
-		mutex_enter(&qp->qp_lock);
-	}
-	mutex_exit(&qp->qp_lock);
 }

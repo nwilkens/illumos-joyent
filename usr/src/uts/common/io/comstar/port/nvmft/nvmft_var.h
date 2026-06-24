@@ -37,8 +37,8 @@
  *   TAILQ_*                          list_t / list_node_t (sys/list.h)
  *   refcount(9)                      uint_t refs guarded by lock
  *
- * The CTL-specific datamove queue (struct ctl_io_hdr) is replaced by an STMF
- * scsi_task_t datamove queue; see nvmft_stmf.c.
+ * The CTL-specific datamove queue (struct ctl_io_hdr) has no counterpart: STMF
+ * drives data transfers inline through lport_xfer_data; see nvmft_stmf.c.
  */
 
 #ifndef	_NVMFT_VAR_H
@@ -133,7 +133,12 @@ typedef struct nvmft_port {
 	list_t			np_controllers;	/* nvmft_controller list */
 	kcondvar_t		np_controllers_cv; /* np_controllers drain, np_lock */
 
-	/* Sorted array of active namespace IDs (== STMF LUN id + 1). */
+	/*
+	 * Sorted array of active namespace IDs (== STMF LUN id + 1).  Never
+	 * populated today (always NULL/0); retained only because nvmft_ana.c
+	 * still reads these fields.  Their removal is part of the deferred ANA
+	 * decision and must land atomically with the nvmft_ana.c change.
+	 */
 	uint32_t		*np_active_ns;
 	uint_t			np_num_ns;
 
@@ -190,10 +195,25 @@ typedef struct nvmft_controller {
 	/*
 	 * Each queue can have at most UINT16_MAX commands, so the total across
 	 * all queues fits in a uint32_t.  Guarded by ctrlr_lock; the shutdown
-	 * path waits on ctrlr_pending_cv for this to drain.
+	 * path waits on ctrlr_pending_cv for this to drain.  ctrlr_pending_bytes
+	 * is the in-flight command payload (admission control, nvmft_stmf.c).
 	 */
 	uint32_t		ctrlr_pending_commands;
+	uint64_t		ctrlr_pending_bytes;
 	kcondvar_t		ctrlr_pending_cv;
+
+	/*
+	 * Writeback backpressure: commands that arrive while ctrlr_pending_commands
+	 * is at the in-flight cap are queued here (nvmft_deferred_cmd_t) instead of
+	 * posted to STMF, and re-dispatched as in-flight commands complete.  This
+	 * bounds the commands concurrently in flight so a fast writeback-cached
+	 * initiator cannot overrun the backing store's drain rate; the initiator
+	 * paces itself via SQ-credit backpressure (the host maps any non-zero CQE to
+	 * EIO and will not retry).  Guarded by ctrlr_lock; drained on controller
+	 * shutdown before the qpairs are freed.
+	 */
+	list_t			ctrlr_deferred;
+	uint32_t		ctrlr_deferred_commands;
 
 	/* Keep-alive (FreeBSD: callout ka_timer + ka_active_traffic). */
 	volatile uint_t		ctrlr_ka_active_traffic;
@@ -239,17 +259,8 @@ typedef struct nvmft_softc {
 	dev_info_t		*ns_dip;
 	stmf_port_provider_t	*ns_pp;		/* registered with STMF */
 
-	/*
-	 * Two distinct worker taskqs.  ns_taskq runs controller
-	 * shutdown/terminate work; ns_datamove_taskq runs per-qpair datamove
-	 * work.  They must not be the same taskq: the shutdown worker drains the
-	 * datamove taskq, and illumos forbids waiting on / dispatching to the
-	 * taskq one is executing on.  (FreeBSD used a single nvmft_taskq and
-	 * drained only the specific per-qpair task; the illumos split achieves the
-	 * same non-self-wait property.)
-	 */
-	taskq_t			*ns_taskq;	/* control (shutdown/terminate) */
-	taskq_t			*ns_datamove_taskq;	/* qpair datamove */
+	/* Worker taskq for controller shutdown/terminate work. */
+	taskq_t			*ns_taskq;
 
 	kmutex_t		ns_lock;	/* protects ns_ports */
 	list_t			ns_ports;	/* nvmft_port list */
@@ -295,15 +306,12 @@ boolean_t nvmft_build_identify_nsid(nvmft_controller_t *ctrlr, uint32_t nsid,
 	    nvme_identify_nsid_t *nsdata);
 boolean_t nvmft_build_nsid_desc(nvmft_controller_t *ctrlr, uint32_t nsid,
 	    uint8_t *buf, size_t buflen);
-void	nvmft_populate_active_nslist(nvmft_port_t *np, uint32_t nsid,
-	    nvme_identify_nsid_list_t *nslist);
 void	nvmft_dispatch_command(struct nvmft_qpair *qp,
 	    struct nvmf_capsule *nc, boolean_t admin);
 void	nvmft_terminate_commands(nvmft_controller_t *ctrlr);
-void	nvmft_abort_datamove(scsi_task_t *task);
-void	nvmft_handle_datamove(scsi_task_t *task);
-void	nvmft_enqueue_task(taskq_ent_t *task, task_func_t *func, void *arg);
-void	nvmft_drain_task(taskq_ent_t *task);
+void	nvmft_deferred_init(nvmft_controller_t *ctrlr);
+void	nvmft_deferred_drain(nvmft_controller_t *ctrlr);
+void	nvmft_deferred_fini(nvmft_controller_t *ctrlr);
 
 /* nvmft_controller.c */
 void	nvmft_controller_error(nvmft_controller_t *ctrlr,
@@ -326,7 +334,6 @@ struct nvmft_qpair *nvmft_qpair_init(nvmf_trtype_t trtype,
 void	nvmft_qpair_shutdown(struct nvmft_qpair *qp);
 void	nvmft_qpair_destroy(struct nvmft_qpair *qp);
 nvmft_controller_t *nvmft_qpair_ctrlr(struct nvmft_qpair *qp);
-void	nvmft_qpair_datamove(struct nvmft_qpair *qp, scsi_task_t *task);
 uint16_t nvmft_qpair_id(struct nvmft_qpair *qp);
 const char *nvmft_qpair_name(struct nvmft_qpair *qp);
 uint32_t nvmft_max_ioccsz(struct nvmft_qpair *qp);

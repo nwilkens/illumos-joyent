@@ -69,14 +69,6 @@ static char nvmft_pp_name[] = "nvmft";
 
 #define	NVMFT_NAME_VERSION	"NVMe-oF Target Port Provider"
 
-/*
- * Worker thread count for the datamove taskq.  FreeBSD started mp_ncpus threads
- * on its single nvmft_taskq; a small fixed pool is sufficient here because the
- * datamove taskq carries only deferred per-qpair transfers, and must allow at
- * least one transfer to run while a shutdown worker drains the queue.
- */
-#define	NVMFT_DATAMOVE_NTHREADS	4
-
 static int nvmft_drv_attach(dev_info_t *, ddi_attach_cmd_t);
 static int nvmft_drv_detach(dev_info_t *, ddi_detach_cmd_t);
 static int nvmft_drv_getinfo(dev_info_t *, ddi_info_cmd_t, void *, void **);
@@ -146,25 +138,9 @@ _init(void)
 	    offsetof(nvmft_port_t, np_link));
 
 	/*
-	 * Two worker taskqs split the roles that FreeBSD's single nvmft_taskq
-	 * served (created in nvmft_init()):
-	 *
-	 *   ns_taskq          controller shutdown / terminate work.
-	 *   ns_datamove_taskq per-qpair datamove work.
-	 *
-	 * They MUST be distinct.  The shutdown worker (running on ns_taskq) drains
-	 * the qpair datamove work via taskq_wait()/nvmft_drain_task(); illumos
-	 * forbids waiting on, or dispatching to, the taskq you are executing on
-	 * (taskq.c: ASSERT(tq != curthread->t_taskq) in both taskq_wait() and
-	 * taskq_dispatch_ent()).  A single shared taskq would self-wait and
-	 * deadlock every controller shutdown.  This mirrors FreeBSD draining only
-	 * the specific qp->datamove_task rather than the whole queue.
-	 *
-	 * Neither taskq may be TASKQ_DYNAMIC: every consumer uses the preallocated
-	 * taskq_dispatch_ent() path, which asserts !TASKQ_DYNAMIC.  The control
-	 * taskq is single-threaded to keep shutdown/terminate ordering serialized;
-	 * the datamove taskq is multi-threaded so transfers can proceed while a
-	 * shutdown worker drains them.
+	 * Single-threaded to keep controller shutdown/terminate ordering
+	 * serialized.  Not TASKQ_DYNAMIC: consumers use the preallocated
+	 * taskq_dispatch_ent() path, which asserts !TASKQ_DYNAMIC.
 	 */
 	nvmft_global->ns_taskq = taskq_create("nvmft", 1, minclsyspri, 1,
 	    INT_MAX, 0);
@@ -176,20 +152,8 @@ _init(void)
 		return (ENOMEM);
 	}
 
-	nvmft_global->ns_datamove_taskq = taskq_create("nvmft_datamove",
-	    NVMFT_DATAMOVE_NTHREADS, minclsyspri, 1, INT_MAX, 0);
-	if (nvmft_global->ns_datamove_taskq == NULL) {
-		taskq_destroy(nvmft_global->ns_taskq);
-		list_destroy(&nvmft_global->ns_ports);
-		mutex_destroy(&nvmft_global->ns_lock);
-		kmem_free(nvmft_global, sizeof (nvmft_softc_t));
-		nvmft_global = NULL;
-		return (ENOMEM);
-	}
-
 	status = mod_install(&nvmft_modlinkage);
 	if (status != DDI_SUCCESS) {
-		taskq_destroy(nvmft_global->ns_datamove_taskq);
 		taskq_destroy(nvmft_global->ns_taskq);
 		list_destroy(&nvmft_global->ns_ports);
 		mutex_destroy(&nvmft_global->ns_lock);
@@ -222,7 +186,6 @@ _fini(void)
 	if (status != DDI_SUCCESS)
 		return (status);
 
-	taskq_destroy(nvmft_global->ns_datamove_taskq);
 	taskq_destroy(nvmft_global->ns_taskq);
 	list_destroy(&nvmft_global->ns_ports);
 	mutex_destroy(&nvmft_global->ns_lock);
@@ -723,15 +686,13 @@ nvmft_drv_ioctl(dev_t dev, int cmd, intptr_t data, int mode, cred_t *cred,
 }
 
 /*
- * STMF port-provider configuration callback.  STMF invokes this with
- * provider-specific configuration data (delivered by libstmf/stmfadm) as part
- * of, and after, registration.  Modeled on srpt_pp_cb().
+ * STMF port-provider configuration callback.  Modeled on srpt_pp_cb().
  *
- * PORT-TODO: parse the STMF_PROVIDER_DATA_UPDATED nvlist into the per-subsystem
- * parameters (subnqn, portid, serial, max_io_qsize, ioccsz, iorcsz, nn) and
- * call nvmft_port_alloc()/nvmft_port_rele() to create/destroy the exported
- * subsystem's stmf_local_port_t.  This replaces FreeBSD's nvmft_port_create()
- * being driven directly by a ctl_req ioctl.
+ * By design, nvmft subsystems are created and destroyed through the
+ * NVMFT_IOC_SUBSYS_* ioctls (driven by nvmfd/nvmfadm), which call
+ * nvmft_port_alloc()/nvmft_port_rele() directly.  STMF_PROVIDER_DATA_UPDATED is
+ * therefore intentionally not handled here: this provider does not carry its
+ * configuration in the STMF provider-data nvlist.  This callback only logs.
  */
 /* ARGSUSED */
 static void
