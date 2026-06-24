@@ -781,6 +781,15 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 
 	ice_link_status_update(ice);
 
+	/*
+	 * Load the DDP package before the VSI: a missing or rejected package
+	 * drops the device into safe mode, which clamps the queue counts the
+	 * VSI configuration reads.
+	 */
+	if (!ice_ddp_load(ice))
+		goto fail;
+	ice->ice_attach_progress |= ICE_ATTACH_DDP;
+
 	if (!ice_vsi_init(ice))
 		goto fail;
 	ice->ice_attach_progress |= ICE_ATTACH_VSI;

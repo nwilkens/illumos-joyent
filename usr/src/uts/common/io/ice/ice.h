@@ -391,6 +391,11 @@ extern boolean_t ice_vsi_init(ice_t *);
 extern void ice_vsi_fini(ice_t *);
 
 /*
+ * ice_ddp.c
+ */
+extern boolean_t ice_ddp_load(ice_t *);
+
+/*
  * ice_dma.c
  */
 extern void ice_dma_acc_attr(ice_t *, ddi_device_acc_attr_t *);
