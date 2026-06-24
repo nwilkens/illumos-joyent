@@ -310,9 +310,30 @@ ice_intr_oicr(ice_t *ice)
 }
 
 static uint_t
-ice_intr_queue(ice_t *ice __unused, uint_t vector __unused)
+ice_intr_queue(ice_t *ice, uint_t vector)
 {
-	/* Queue vectors are wired up with the data path (M5). */
+	struct ice_hw *hw = &ice->ice_hw;
+	uint_t i;
+
+	/*
+	 * A queue vector services the rx and tx rings mapped to it.  Rx
+	 * delivery is suppressed while mac polls the ring (ice_rx_ring_intr).
+	 */
+	for (i = 0; i < ice->ice_num_rxr; i++) {
+		if (ice->ice_rxr[i].irxr_vec == vector)
+			ice_rx_ring_intr(&ice->ice_rxr[i]);
+	}
+	for (i = 0; i < ice->ice_num_txr; i++) {
+		if (ice->ice_txr[i].itxr_vec == vector)
+			ice_tx_ring_intr(&ice->ice_txr[i]);
+	}
+
+	wr32(hw, GLINT_DYN_CTL(vector),
+	    GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |
+	    ((ICE_ITR_IDX_0 << GLINT_DYN_CTL_ITR_INDX_S) &
+	    GLINT_DYN_CTL_ITR_INDX_M));
+	ice_flush(hw);
+
 	return (DDI_INTR_CLAIMED);
 }
 

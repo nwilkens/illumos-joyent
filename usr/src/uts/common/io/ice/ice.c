@@ -522,27 +522,41 @@ ice_add_intr_handlers(ice_t *ice)
 	return (B_TRUE);
 }
 
-static int
+/*
+ * Program and enable every tx/rx queue.  Called from mac start so each plumb
+ * cycle re-adds the tx scheduler node and rewrites the rx context, resetting
+ * the hardware ring head to zero in lockstep with the software pointers.  On
+ * partial failure the queues programmed so far are unwound.
+ */
+int
 ice_queues_program(ice_t *ice)
 {
-	uint_t i;
+	uint_t i, j;
 	int status;
 
 	for (i = 0; i < ice->ice_num_txr; i++) {
 		status = ice_tx_ring_program(ice, &ice->ice_txr[i]);
-		if (status != ICE_SUCCESS)
+		if (status != ICE_SUCCESS) {
+			while (i-- > 0)
+				ice_tx_ring_unprogram(ice, &ice->ice_txr[i]);
 			return (status);
+		}
 	}
 	for (i = 0; i < ice->ice_num_rxr; i++) {
 		status = ice_rx_ring_program(ice, &ice->ice_rxr[i]);
-		if (status != ICE_SUCCESS)
+		if (status != ICE_SUCCESS) {
+			while (i-- > 0)
+				ice_rx_ring_unprogram(ice, &ice->ice_rxr[i]);
+			for (j = 0; j < ice->ice_num_txr; j++)
+				ice_tx_ring_unprogram(ice, &ice->ice_txr[j]);
 			return (status);
+		}
 	}
 
 	return (ICE_SUCCESS);
 }
 
-static void
+void
 ice_queues_disable(ice_t *ice)
 {
 	uint_t i;
@@ -583,6 +597,15 @@ static void
 ice_unconfigure(ice_t *ice)
 {
 	/*
+	 * The MAC handle (a higher progress bit) is unregistered by ice_detach
+	 * before this runs, so the datapath is already quiesced: mac_stop drove
+	 * ice_rx_stop()/ice_tx_stop(), draining loans and reclaiming TCBs.  The
+	 * shared copy-buffer pools can now be freed.
+	 */
+	if (ice->ice_attach_progress & ICE_ATTACH_BUFS)
+		ice_buf_fini(ice);
+
+	/*
 	 * Tear down the datapath before the VSI: the queues belong to the VSI
 	 * and the queue disables ride the admin queue, which a lower progress
 	 * bit (ice_deinit_hw) undoes later.
@@ -590,8 +613,23 @@ ice_unconfigure(ice_t *ice)
 	if (ice->ice_attach_progress & ICE_ATTACH_QUEUE_INTR)
 		ice_queues_intr_unmap(ice);
 
-	if (ice->ice_attach_progress & ICE_ATTACH_QUEUES)
-		ice_queues_disable(ice);
+	/*
+	 * Fence the interrupt handlers before freeing anything they touch.
+	 * Masking (ice_intr_disable) only stops new deliveries; removing the
+	 * handler is what waits out one already running on another CPU.  The
+	 * queue ISR dereferences the ring arrays, so the handlers must be
+	 * removed before the rings are freed and before the OICR taskq, which
+	 * the OICR handler dispatches onto, is destroyed.
+	 */
+	if (ice->ice_attach_progress & ICE_ATTACH_ENABLE_INTR) {
+		ice_intr_disable(ice);
+		ice_intr_oicr_disable(ice);
+		wr32(&ice->ice_hw, PFINT_OICR_ENA, 0);
+		ice_flush(&ice->ice_hw);
+	}
+
+	if (ice->ice_attach_progress & ICE_ATTACH_ADD_INTR)
+		ice_rem_intr_handlers(ice);
 
 	if (ice->ice_attach_progress & ICE_ATTACH_RINGS) {
 		ice_tx_rings_free(ice);
@@ -605,23 +643,6 @@ ice_unconfigure(ice_t *ice)
 	 */
 	if (ice->ice_attach_progress & ICE_ATTACH_VSI)
 		ice_vsi_fini(ice);
-
-	/*
-	 * Quiesce interrupts before tearing down anything the OICR handler or
-	 * its taskq touch.  Masking only stops new deliveries; ddi_intr_remove_
-	 * handler() is what fences a handler already running on another CPU, so
-	 * removing the handlers must precede destroying the taskq they dispatch
-	 * onto and freeing the buffer they read.
-	 */
-	if (ice->ice_attach_progress & ICE_ATTACH_ENABLE_INTR) {
-		ice_intr_disable(ice);
-		ice_intr_oicr_disable(ice);
-		wr32(&ice->ice_hw, PFINT_OICR_ENA, 0);
-		ice_flush(&ice->ice_hw);
-	}
-
-	if (ice->ice_attach_progress & ICE_ATTACH_ADD_INTR)
-		ice_rem_intr_handlers(ice);
 
 	if (ice->ice_attach_progress & ICE_ATTACH_OICR_TASKQ) {
 		/* No handler can dispatch now; drain then free. */
@@ -783,12 +804,25 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	if (!ice_rx_rings_alloc(ice))
 		goto fail;
 
-	ice->ice_attach_progress |= ICE_ATTACH_QUEUES;
-	if (ice_queues_program(ice) != ICE_SUCCESS)
-		goto fail;
-
+	/*
+	 * Wire the queue->vector routing now; the queues themselves are
+	 * programmed and enabled by mac start so each plumb cycle resets the
+	 * hardware ring head.  The routing is keyed on the queue index and is
+	 * inert until a queue is enabled.
+	 */
 	ice_queues_intr_map(ice);
 	ice->ice_attach_progress |= ICE_ATTACH_QUEUE_INTR;
+
+	ice_buf_init(ice);
+	ice->ice_attach_progress |= ICE_ATTACH_BUFS;
+
+	/*
+	 * Register with MAC last: once this returns the datapath is reachable
+	 * by clients, so everything it touches must already be live.
+	 */
+	if (!ice_mac_register(ice))
+		goto fail;
+	ice->ice_attach_progress |= ICE_ATTACH_MAC;
 
 	mutex_enter(&ice_glock);
 	list_insert_tail(&ice_glist, ice);
@@ -816,6 +850,16 @@ ice_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	ice = ddi_get_soft_state(ice_state_p, instance);
 	if (ice == NULL)
 		return (DDI_FAILURE);
+
+	/*
+	 * Unregister from MAC first: it fails if a client is still bound, in
+	 * which case the driver must remain attached.
+	 */
+	if (ice->ice_attach_progress & ICE_ATTACH_MAC) {
+		if (ice_mac_unregister(ice) != 0)
+			return (DDI_FAILURE);
+		ice->ice_attach_progress &= ~ICE_ATTACH_MAC;
+	}
 
 	mutex_enter(&ice_glock);
 	list_remove(&ice_glist, ice);

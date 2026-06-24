@@ -111,8 +111,8 @@ typedef enum ice_attach_state {
 	ICE_ATTACH_DDP		= 1 << 8,	/* DDP loaded or safe mode */
 	ICE_ATTACH_VSI		= 1 << 9,
 	ICE_ATTACH_RINGS	= 1 << 10,	/* ring DMA allocated */
-	ICE_ATTACH_QUEUES	= 1 << 11,	/* tx/rx queues programmed */
-	ICE_ATTACH_QUEUE_INTR	= 1 << 12,	/* queue->vector wired */
+	ICE_ATTACH_QUEUE_INTR	= 1 << 11,	/* queue->vector wired */
+	ICE_ATTACH_BUFS		= 1 << 12,	/* tx copy-buffer pools */
 	ICE_ATTACH_MAC		= 1 << 13	/* mac_register done */
 } ice_attach_state_t;
 
@@ -211,6 +211,7 @@ typedef struct ice_tx_ring {
 	uint16_t		itxr_head;
 	uint16_t		itxr_tail;
 
+	ice_tx_ctrl_block_t	*itxr_tcb_area;	/* [itxr_size] backing */
 	ice_tx_ctrl_block_t	**itxr_tcbs;	/* [itxr_size], by slot */
 	kmutex_t		itxr_tcb_lock;
 	ice_tx_ctrl_block_t	**itxr_tcb_free_list;
@@ -252,8 +253,10 @@ typedef struct ice_rx_ring {
 	uint32_t		irxr_index;	/* absolute HW rx queue index */
 	uint32_t		irxr_vec;	/* MSI-X vector index */
 	boolean_t		irxr_shutdown;
+	boolean_t		irxr_intr_poll;	/* mac is polling this ring */
 
 	kmutex_t		irxr_lock;
+	kcondvar_t		irxr_cv;	/* teardown waits on loans */
 	mac_ring_handle_t	irxr_macrxring;
 	uint64_t		irxr_rxgen;
 
@@ -264,6 +267,14 @@ typedef struct ice_rx_ring {
 	uint16_t		irxr_head;
 	uint16_t		irxr_tail;
 	uint32_t		irxr_dbuf;	/* posted data buffer size */
+
+	/* Control-block backing + spare free stack for loaned buffers. */
+	ice_rx_ctrl_block_t	*irxr_rcb_area;	/* [irxr_nrcb] backing */
+	ice_rx_ctrl_block_t	**irxr_free_rcbs;
+	uint_t			irxr_nrcb;	/* size + reserve */
+	uint_t			irxr_nfree;
+	uint_t			irxr_nreserve;	/* loan high-water */
+	uint_t			irxr_nloaned;	/* outstanding loans */
 
 	kstat_t			*irxr_kstat;
 	ice_rxq_stat_t		irxr_stats;
@@ -359,6 +370,8 @@ typedef struct ice {
 /*PRINTFLIKE2*/
 extern void ice_error(ice_t *, const char *, ...);
 extern int ice_check_acc_handle(ddi_acc_handle_t);
+extern int ice_queues_program(ice_t *);
+extern void ice_queues_disable(ice_t *);
 
 /*
  * ice_intr.c
@@ -414,6 +427,35 @@ extern int ice_rx_ring_program(ice_t *, ice_rx_ring_t *);
 extern void ice_rx_ring_unprogram(ice_t *, ice_rx_ring_t *);
 extern void ice_map_rxq_vector(ice_t *, ice_rx_ring_t *);
 extern void ice_cfg_itr(ice_t *, uint32_t);
+
+/*
+ * ice_tx.c -- packet datapath
+ */
+extern mblk_t *ice_ring_tx(void *, mblk_t *);
+extern void ice_tx_start(ice_t *);
+extern void ice_tx_stop(ice_t *);
+extern void ice_tx_ring_intr(ice_tx_ring_t *);
+extern int ice_ring_tx_stat(mac_ring_driver_t, uint_t, uint64_t *);
+
+/*
+ * ice_rx.c -- packet datapath
+ */
+extern void ice_rx_recycle(caddr_t);
+extern boolean_t ice_rx_start(ice_t *);
+extern void ice_rx_stop(ice_t *);
+extern void ice_rx_ring_intr(ice_rx_ring_t *);
+extern mblk_t *ice_ring_rx_poll(void *, int);
+extern int ice_ring_rx_start(mac_ring_driver_t, uint64_t);
+extern void ice_ring_rx_stop(mac_ring_driver_t);
+extern int ice_ring_rx_stat(mac_ring_driver_t, uint_t, uint64_t *);
+extern int ice_ring_rx_intr_enable(mac_intr_handle_t);
+extern int ice_ring_rx_intr_disable(mac_intr_handle_t);
+
+/*
+ * ice_gld.c
+ */
+extern boolean_t ice_mac_register(ice_t *);
+extern int ice_mac_unregister(ice_t *);
 
 #ifdef __cplusplus
 }
