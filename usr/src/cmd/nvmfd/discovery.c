@@ -32,7 +32,6 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <assert.h>
 #include <err.h>
 #include <libnvmf.h>
 #include <pthread.h>
@@ -83,6 +82,54 @@ static struct io_controller_data *io_controllers;
 static struct nvmf_association *discovery_na;
 static u_int num_io_controllers;
 
+/*
+ * Decode a local socket address into the NVMe-oF transport address fields: the
+ * adrfam, the numeric host string (traddr), and optionally the port string
+ * (trsvcid) and whether the address is the wildcard (INADDR_ANY/in6addr_any).
+ * Returns 0 on success or -1 for an unsupported family or conversion failure;
+ * callers choose whether that is fatal.
+ */
+static int
+sockaddr_to_traddr(const struct sockaddr_storage *ss, uint8_t *adrfam,
+    char *traddr, size_t traddr_len, char *trsvcid, size_t trsvcid_len,
+    bool *wildcard)
+{
+	switch (ss->ss_family) {
+	case AF_INET: {
+		const struct sockaddr_in *sin = (const struct sockaddr_in *)ss;
+
+		*adrfam = NVMF_ADRFAM_IPV4;
+		if (inet_ntop(AF_INET, &sin->sin_addr, traddr, traddr_len) ==
+		    NULL)
+			return (-1);
+		if (trsvcid != NULL)
+			(void) snprintf(trsvcid, trsvcid_len, "%u",
+			    ntohs(sin->sin_port));
+		if (wildcard != NULL)
+			*wildcard = (sin->sin_addr.s_addr == htonl(INADDR_ANY));
+		return (0);
+	}
+	case AF_INET6: {
+		const struct sockaddr_in6 *sin6 =
+		    (const struct sockaddr_in6 *)ss;
+
+		*adrfam = NVMF_ADRFAM_IPV6;
+		if (inet_ntop(AF_INET6, &sin6->sin6_addr, traddr, traddr_len) ==
+		    NULL)
+			return (-1);
+		if (trsvcid != NULL)
+			(void) snprintf(trsvcid, trsvcid_len, "%u",
+			    ntohs(sin6->sin6_port));
+		if (wildcard != NULL)
+			*wildcard = (memcmp(&sin6->sin6_addr, &in6addr_any,
+			    sizeof (in6addr_any)) == 0);
+		return (0);
+	}
+	default:
+		return (-1);
+	}
+}
+
 static bool
 init_discovery_log_entry(nvmf_discovery_log_page_entry_t *entry, int s,
     const char *subnqn)
@@ -97,39 +144,11 @@ init_discovery_log_entry(nvmf_discovery_log_page_entry_t *entry, int s,
 
 	(void) memset(entry, 0, sizeof (*entry));
 	entry->ndle_trtype = NVMF_TRTYPE_TCP;
-	switch (ss.ss_family) {
-	case AF_INET: {
-		struct sockaddr_in *sin;
-
-		sin = (struct sockaddr_in *)&ss;
-		entry->ndle_adrfam = NVMF_ADRFAM_IPV4;
-		(void) snprintf((char *)entry->ndle_trsvcid,
-		    sizeof (entry->ndle_trsvcid), "%u", ntohs(sin->sin_port));
-		if (inet_ntop(AF_INET, &sin->sin_addr,
-		    (char *)entry->ndle_traddr,
-		    sizeof (entry->ndle_traddr)) == NULL)
-			err(1, "inet_ntop");
-		wildcard = (sin->sin_addr.s_addr == htonl(INADDR_ANY));
-		break;
-	}
-	case AF_INET6: {
-		struct sockaddr_in6 *sin6;
-
-		sin6 = (struct sockaddr_in6 *)&ss;
-		entry->ndle_adrfam = NVMF_ADRFAM_IPV6;
-		(void) snprintf((char *)entry->ndle_trsvcid,
-		    sizeof (entry->ndle_trsvcid), "%u", ntohs(sin6->sin6_port));
-		if (inet_ntop(AF_INET6, &sin6->sin6_addr,
-		    (char *)entry->ndle_traddr,
-		    sizeof (entry->ndle_traddr)) == NULL)
-			err(1, "inet_ntop");
-		wildcard = (memcmp(&sin6->sin6_addr, &in6addr_any,
-		    sizeof (in6addr_any)) == 0);
-		break;
-	}
-	default:
+	if (sockaddr_to_traddr(&ss, &entry->ndle_adrfam,
+	    (char *)entry->ndle_traddr, sizeof (entry->ndle_traddr),
+	    (char *)entry->ndle_trsvcid, sizeof (entry->ndle_trsvcid),
+	    &wildcard) != 0)
 		errx(1, "Unsupported address family %u", ss.ss_family);
-	}
 	entry->ndle_subtype = NVMF_SUBTYPE_NVME;
 	/*
 	 * TREQ bit 2 (the LSB of the reserved field, past the 2-bit secure
@@ -200,33 +219,11 @@ build_discovery_log_page(struct discovery_controller *dc)
 	}
 
 	(void) memset(traddr, 0, sizeof (traddr));
-	switch (ss.ss_family) {
-	case AF_INET: {
-		struct sockaddr_in *sin;
-
-		sin = (struct sockaddr_in *)&ss;
-		adrfam = NVMF_ADRFAM_IPV4;
-		if (inet_ntop(AF_INET, &sin->sin_addr, traddr,
-		    sizeof (traddr)) == NULL) {
-			warn("build_discovery_log_page: inet_ntop");
-			return;
-		}
-		break;
-	}
-	case AF_INET6: {
-		struct sockaddr_in6 *sin6;
-
-		sin6 = (struct sockaddr_in6 *)&ss;
-		adrfam = NVMF_ADRFAM_IPV6;
-		if (inet_ntop(AF_INET6, &sin6->sin6_addr, traddr,
-		    sizeof (traddr)) == NULL) {
-			warn("build_discovery_log_page: inet_ntop");
-			return;
-		}
-		break;
-	}
-	default:
-		assert(false);
+	if (sockaddr_to_traddr(&ss, &adrfam, traddr, sizeof (traddr),
+	    NULL, 0, NULL) != 0) {
+		warnx("build_discovery_log_page: unsupported address family %u",
+		    ss.ss_family);
+		return;
 	}
 
 	nentries = 0;
@@ -329,6 +326,7 @@ discovery_thread(void *arg)
 
 	(void) close(dta->s);
 	free(dta);
+	nvmfd_handshake_end();
 	return (NULL);
 }
 
@@ -379,11 +377,20 @@ handle_discovery_socket(int s)
 	dta->s = s;
 	dta->c = init_controller(qp, &cdata);
 
+	if (!nvmfd_handshake_begin()) {
+		warnx("Too many concurrent connections; dropping discovery "
+		    "qpair");
+		free_controller(dta->c);
+		free(dta);
+		goto error;
+	}
+
 	error = pthread_create(&thr, NULL, discovery_thread, dta);
 	if (error != 0) {
 		warnc(error, "Failed to create discovery thread");
 		free_controller(dta->c);
 		free(dta);
+		nvmfd_handshake_end();
 		goto error;
 	}
 

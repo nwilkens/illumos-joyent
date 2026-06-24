@@ -37,11 +37,10 @@
  *                                       (libuuid) for the string NQN form
  *
  * The Fabrics *host* kernel driver lives under io/nvmf_host and exposes the
- * NVMF_HANDOFF_HOST / RECONNECT / CONNECTION_STATUS ioctls on its control minor
- * (NVMF_HOST_DEV below); the handoff/reconnect/status wrappers drive them.
- * NVMF_DISCONNECT_HOST/ALL are issued here but not yet handled by the kernel
- * ioctl switch (they return ENOTTY until that case is wired).  The target
- * daemon (nvmfd) does not use these host entry points.
+ * NVMF_HANDOFF_HOST / RECONNECT / CONNECTION_STATUS and DISCONNECT_HOST/ALL
+ * ioctls on its control minor (NVMF_HOST_DEV below); the handoff/reconnect/
+ * status/disconnect wrappers drive them.  The target daemon (nvmfd) does not
+ * use these host entry points.
  */
 
 #include <sys/types.h>
@@ -1085,6 +1084,20 @@ int
 nvmf_reconnect_params(int fd, nvlist_t **nvlp)
 {
 	return (nvmf_read_ioc_nv(fd, NVMF_RECONNECT_PARAMS, nvlp));
+}
+
+int
+nvmf_list_controller(nvlist_t **nvlp)
+{
+	int error, fd;
+
+	fd = open(NVMF_HOST_DEV, O_RDWR);
+	if (fd == -1)
+		return (errno);
+
+	error = nvmf_read_ioc_nv(fd, NVMF_LIST_CONTROLLER, nvlp);
+	(void) close(fd);
+	return (error);
 }
 
 int

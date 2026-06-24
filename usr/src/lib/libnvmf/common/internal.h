@@ -266,6 +266,7 @@ extern uint32_t nvmf_crc32c(uint32_t crc, const void *buf, size_t len);
 #define	NVMF_RECONNECT_PARAMS	(NVMF_IOC | 203)
 #define	NVMF_RECONNECT_HOST	(NVMF_IOC | 204)
 #define	NVMF_CONNECTION_STATUS	(NVMF_IOC | 205)
+#define	NVMF_LIST_CONTROLLER	(NVMF_IOC | 206)
 
 /* Shared lower-level controller helpers (nvmf_subr.c). */
 extern uint64_t _nvmf_controller_cap(uint32_t max_io_qsize,

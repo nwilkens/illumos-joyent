@@ -25,9 +25,10 @@ include ../Makefile.cmd.64
 # nvmf-connect is the NVMe-oF host (initiator) connect tool.  It runs the
 # Fabrics CONNECT handshake with libnvmf and hands the established qpairs to the
 # kernel nvmf_host driver.  -lnvmf supplies the Fabrics protocol + the handoff
-# packer; -lsocket provides the TCP listener and getaddrinfo(3SOCKET).
+# packer; -lsocket provides the TCP listener and getaddrinfo(3SOCKET); -lnvpair
+# is used by the "list" subcommand to read the controller nvlist.
 #
-LDLIBS +=	-lnvmf -lsocket
+LDLIBS +=	-lnvmf -lsocket -lnvpair
 
 CPPFLAGS +=	-I$(SRC)/uts/common
 CPPFLAGS +=	-I$(SRC)/uts/common/io/nvme

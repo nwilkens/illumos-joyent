@@ -62,6 +62,10 @@ extern bool header_digests;
 extern bool flow_control_disable;
 extern uint32_t maxh2cdata;
 
+/* nvmfd.c - concurrent-handshake admission control */
+bool	nvmfd_handshake_begin(void);
+void	nvmfd_handshake_end(void);
+
 /* controller.c */
 void	controller_handle_admin_commands(struct controller *c,
     handle_command *cb, void *cb_arg);

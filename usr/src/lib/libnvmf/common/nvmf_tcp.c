@@ -157,6 +157,8 @@ tcp_alloc_command_buffer(nvmf_tcp_qpair_t *qp, void *data,
 	nvmf_tcp_command_buffer_t *cb;
 
 	cb = malloc(sizeof (*cb));
+	if (cb == NULL)
+		return (NULL);
 	cb->qp = qp;
 	cb->data = data;
 	cb->data_offset = data_offset;
@@ -408,8 +410,10 @@ nvmf_tcp_read_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 		return (error);
 	}
 
-	/* Read the rest of the PDU. */
+	/* Read the rest of the PDU.  plen is attacker-controlled off the wire. */
 	pdu->hdr = malloc(plen);
+	if (pdu->hdr == NULL)
+		return (ENOMEM);
 	(void) memcpy(pdu->hdr, &ch, sizeof (ch));
 	error = nvmf_tcp_read_buffer(qp->s, (char *)pdu->hdr + sizeof (ch),
 	    plen - sizeof (ch));
@@ -1325,9 +1329,12 @@ tcp_transmit_command(struct nvmf_capsule *nc)
 	 * If data will be transferred using a command buffer, allocate a
 	 * buffer structure and queue it.
 	 */
-	if (nc->nc_data_len != 0 && !use_icd)
+	if (nc->nc_data_len != 0 && !use_icd) {
 		tc->cb = tcp_alloc_command_buffer(qp, nc->nc_data, 0,
 		    nc->nc_data_len, sqe->sqe_cid, 0, !nc->nc_send_data);
+		if (tc->cb == NULL)
+			return (ENOMEM);
+	}
 
 	return (0);
 }
@@ -1457,6 +1464,8 @@ tcp_receive_r2t_data(const struct nvmf_capsule *nc, uint32_t data_offset,
 
 	cb = tcp_alloc_command_buffer(qp, buf, data_offset, len,
 	    nc->nc_sqe.sqe_cid, ttag, true);
+	if (cb == NULL)
+		return (ENOMEM);
 
 	/* Parse received PDUs until the data transfer is complete. */
 	while (cb->data_xfered < cb->data_len) {

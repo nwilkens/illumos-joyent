@@ -34,13 +34,16 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <assert.h>
 #include <err.h>
 #include <errno.h>
 #include <libnvmf.h>
 #include <netdb.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -57,6 +60,47 @@ uint32_t maxh2cdata = 256 * 1024;
 
 static const char *subnqn;
 static volatile sig_atomic_t quit = 0;
+
+/*
+ * Each accepted connection runs its Fabrics CONNECT handshake in a detached
+ * worker thread that blocks on socket reads.  A stalled peer would otherwise
+ * pin a thread indefinitely, so bound both how long a handshake read may block
+ * (SO_RCVTIMEO, applied per accepted socket) and how many handshakes may run
+ * concurrently.  The cap is deliberately generous: it only sheds load under a
+ * connection flood, well above any legitimate fan-in.
+ */
+#define	NVMFD_HANDSHAKE_RCVTIMEO	30	/* seconds */
+#define	NVMFD_MAX_HANDSHAKES		1024
+
+static pthread_mutex_t handshake_lock = PTHREAD_MUTEX_INITIALIZER;
+static u_int handshake_count;
+
+/*
+ * Reserve a handshake slot for a newly accepted connection.  Returns false (and
+ * reserves nothing) when the cap is reached so the caller closes the socket.
+ */
+bool
+nvmfd_handshake_begin(void)
+{
+	bool ok;
+
+	(void) pthread_mutex_lock(&handshake_lock);
+	ok = handshake_count < NVMFD_MAX_HANDSHAKES;
+	if (ok)
+		handshake_count++;
+	(void) pthread_mutex_unlock(&handshake_lock);
+	return (ok);
+}
+
+/* Release the slot reserved by nvmfd_handshake_begin() when a worker exits. */
+void
+nvmfd_handshake_end(void)
+{
+	(void) pthread_mutex_lock(&handshake_lock);
+	assert(handshake_count > 0);
+	handshake_count--;
+	(void) pthread_mutex_unlock(&handshake_lock);
+}
 
 /*
  * Listening sockets are tracked in a small pollfd array.  Each entry carries
@@ -127,9 +171,14 @@ create_passive_sockets(const char *port, bool discovery)
 	created = false;
 
 	for (ai = list; ai != NULL; ai = ai->ai_next) {
+		int on = 1;
+
 		s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 		if (s == -1)
 			continue;
+
+		/* Allow a daemon restart to rebind while old conns linger. */
+		(void) setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof (on));
 
 		if (bind(s, ai->ai_addr, ai->ai_addrlen) != 0) {
 			(void) close(s);
@@ -154,8 +203,10 @@ static void
 handle_connections(void)
 {
 	struct pollfd *fds;
+	struct timeval rcvtimeo;
 	nfds_t i;
 	int s;
+	int nodelay;
 
 	(void) signal(SIGHUP, handle_sig);
 	(void) signal(SIGINT, handle_sig);
@@ -186,6 +237,29 @@ handle_connections(void)
 				warn("accept");
 				continue;
 			}
+
+			/*
+			 * Disable Nagle on the data connection before it is
+			 * handed off to the kernel: NVMe/TCP is a request/
+			 * response PDU protocol and Nagle vs the peer's delayed
+			 * ACKs adds ~40ms stalls per round trip, most visible on
+			 * C2H read-data PDUs.  The option persists into the
+			 * kernel-owned socket after the handoff.
+			 */
+			nodelay = 1;
+			(void) setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
+			    &nodelay, sizeof (nodelay));
+
+			/*
+			 * Bound how long the handshake worker can block on a
+			 * stalled peer's reads.  The option persists into the
+			 * kernel-owned socket but only governs the userland
+			 * handshake; the kernel installs its own callbacks.
+			 */
+			rcvtimeo.tv_sec = NVMFD_HANDSHAKE_RCVTIMEO;
+			rcvtimeo.tv_usec = 0;
+			(void) setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+			    &rcvtimeo, sizeof (rcvtimeo));
 
 			switch (listen_sockets[i].ls_kind) {
 			case LISTEN_DISCOVERY:

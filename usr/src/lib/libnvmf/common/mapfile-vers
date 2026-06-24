@@ -103,6 +103,7 @@ SYMBOL_VERSION ILLUMOS_0.1 {
 	nvmf_reconnect_params;
 	nvmf_reconnect_host;
 	nvmf_connection_status;
+	nvmf_list_controller;
 
     local:
 	*;

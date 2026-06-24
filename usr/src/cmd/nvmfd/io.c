@@ -124,6 +124,7 @@ out:
 	if (qp != NULL)
 		nvmf_free_qpair(qp);
 	(void) close(s);
+	nvmfd_handshake_end();
 	return (NULL);
 }
 
@@ -133,10 +134,17 @@ handle_io_socket(int s)
 	pthread_t thr;
 	int error;
 
+	if (!nvmfd_handshake_begin()) {
+		warnx("Too many concurrent connections; dropping I/O qpair");
+		(void) close(s);
+		return;
+	}
+
 	error = pthread_create(&thr, NULL, io_socket_thread,
 	    (void *)(intptr_t)s);
 	if (error != 0) {
 		warnc(error, "Failed to create I/O qpair thread");
 		(void) close(s);
+		nvmfd_handshake_end();
 	}
 }

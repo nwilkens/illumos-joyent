@@ -35,10 +35,12 @@
 #include <sys/socket.h>
 #include <sys/sysmacros.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <err.h>
 #include <errno.h>
 #include <getopt.h>
 #include <netdb.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,8 +69,10 @@ usage(void)
 	    "             [-r reconnect_delay]\n"
 	    "             [-l ctrl_loss_tmo] [-q hostnqn] [-F] [-g] [-G]\n"
 	    "             <address:port> <subnqn>\n"
-	    "  %s discover [-t tcp] [-q hostnqn] <address[:port]>\n",
-	    progname, progname);
+	    "  %s discover   [-t tcp] [-q hostnqn] <address[:port]>\n"
+	    "  %s disconnect [<subnqn>]\n"
+	    "  %s list\n",
+	    progname, progname, progname, progname);
 	exit(2);
 }
 
@@ -119,19 +123,47 @@ parse_address(const char *in, const char **address, const char **port,
 	*port = cp + 1;
 }
 
+/*
+ * Parse an unsigned numeric option, rejecting trailing garbage, overflow, and
+ * values outside [0, max].  (Matches the validation nvmfd and nvmfadm use.)
+ */
+static ulong_t
+parse_uint(const char *str, ulong_t max, const char *what)
+{
+	char *end;
+	ulong_t value;
+
+	errno = 0;
+	value = strtoul(str, &end, 0);
+	if (errno != 0 || end == str || *end != '\0' || value > max)
+		errx(2, "invalid %s %s", what, str);
+	return (value);
+}
+
 static uint16_t
 parse_cntlid(const char *cntlid)
 {
-	ulong_t value;
-
 	if (strcasecmp(cntlid, "dynamic") == 0)
 		return (NVMF_CNTLID_DYNAMIC);
 	if (strcasecmp(cntlid, "static") == 0)
 		return (NVMF_CNTLID_STATIC_ANY);
-	value = strtoul(cntlid, NULL, 0);
-	if (value > NVMF_CNTLID_STATIC_MAX)
-		errx(2, "invalid controller ID %s", cntlid);
-	return ((uint16_t)value);
+	return ((uint16_t)parse_uint(cntlid, NVMF_CNTLID_STATIC_MAX,
+	    "controller ID"));
+}
+
+/*
+ * NVMe/TCP is a request/response PDU protocol; Nagle's algorithm interacts with
+ * the peer's delayed ACKs to add ~40ms stalls per round trip (most visible on
+ * C2H read-data PDUs), so disable it on every fabric socket.  The option is a
+ * property of the TCP endpoint, so it persists across the fd handoff into the
+ * kernel-owned socket and applies to the kernel's PDU sends too.
+ */
+static void
+tcp_set_nodelay(int s)
+{
+	int on = 1;
+
+	(void) setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &on, sizeof (on));
 }
 
 /*
@@ -163,6 +195,7 @@ tcp_connect(int adrfam, const char *address, const char *port,
 			(void) close(s);
 			continue;
 		}
+		tcp_set_nodelay(s);
 		if (ai_out != NULL)
 			*ai_out = ai;
 		if (list_out != NULL)
@@ -190,6 +223,7 @@ tcp_connect_ai(struct addrinfo *ai)
 		(void) close(s);
 		return (-1);
 	}
+	tcp_set_nodelay(s);
 	return (s);
 }
 
@@ -341,19 +375,24 @@ cmd_connect(int argc, char *argv[])
 			o.cntlid = parse_cntlid(optarg);
 			break;
 		case 'i':
-			o.num_io_queues = (uint16_t)strtoul(optarg, NULL, 0);
+			o.num_io_queues = (uint16_t)parse_uint(optarg,
+			    UINT16_MAX, "number of I/O queues");
 			break;
 		case 'Q':
-			o.queue_size = (uint16_t)strtoul(optarg, NULL, 0);
+			o.queue_size = (uint16_t)parse_uint(optarg, UINT16_MAX,
+			    "queue size");
 			break;
 		case 'k':
-			o.kato_sec = (uint32_t)strtoul(optarg, NULL, 0);
+			o.kato_sec = (uint32_t)parse_uint(optarg, UINT32_MAX,
+			    "keep-alive timeout");
 			break;
 		case 'r':
-			o.reconnect_delay = (uint32_t)strtoul(optarg, NULL, 0);
+			o.reconnect_delay = (uint32_t)parse_uint(optarg,
+			    UINT32_MAX, "reconnect delay");
 			break;
 		case 'l':
-			o.ctrl_loss_tmo = (uint32_t)strtoul(optarg, NULL, 0);
+			o.ctrl_loss_tmo = (uint32_t)parse_uint(optarg,
+			    UINT32_MAX, "controller loss timeout");
 			break;
 		case 'q':
 			o.hostnqn = optarg;
@@ -618,6 +657,100 @@ out:
 	return (rc);
 }
 
+static int
+cmd_list(int argc, char *argv[])
+{
+	nvlist_t *nvl = NULL;
+	nvlist_t **ns = NULL;
+	char *s, *svc;
+	boolean_t connected = B_FALSE;
+	uint32_t u32;
+	uint_t nscnt = 0, i;
+	int error;
+
+	(void) argc;
+	(void) argv;
+
+	error = nvmf_list_controller(&nvl);
+	if (error != 0) {
+		warnc(error, "failed to list host controller");
+		return (1);
+	}
+
+	(void) nvlist_lookup_boolean_value(nvl, "connected", &connected);
+	if (!connected && nvlist_lookup_string(nvl, "subnqn", &s) != 0) {
+		(void) printf("no fabric controller connected\n");
+		nvlist_free(nvl);
+		return (0);
+	}
+
+	(void) printf("nvmf controller (%s)\n",
+	    connected ? "connected" : "disconnected");
+	if (nvlist_lookup_string(nvl, "subnqn", &s) == 0)
+		(void) printf("    subnqn:    %s\n", s);
+	if (nvlist_lookup_string(nvl, "traddr", &s) == 0) {
+		svc = NULL;
+		(void) nvlist_lookup_string(nvl, "trsvcid", &svc);
+		(void) printf("    transport: tcp  address: %s:%s\n", s,
+		    svc != NULL ? svc : "");
+	}
+	if (nvlist_lookup_string(nvl, "hostnqn", &s) == 0)
+		(void) printf("    hostnqn:   %s\n", s);
+	if (nvlist_lookup_uint32(nvl, "num_io_queues", &u32) == 0)
+		(void) printf("    io queues: %u\n", u32);
+	if (nvlist_lookup_string(nvl, "model", &s) == 0 && s[0] != '\0')
+		(void) printf("    model:     %s\n", s);
+	if (nvlist_lookup_string(nvl, "serial", &s) == 0 && s[0] != '\0')
+		(void) printf("    serial:    %s\n", s);
+	if (nvlist_lookup_string(nvl, "firmware", &s) == 0 && s[0] != '\0')
+		(void) printf("    firmware:  %s\n", s);
+
+	if (nvlist_lookup_nvlist_array(nvl, "namespaces", &ns, &nscnt) == 0) {
+		for (i = 0; i < nscnt; i++) {
+			uint32_t nsid = 0, blksize = 0;
+			uint64_t size = 0;
+			boolean_t nsconn = B_FALSE;
+
+			(void) nvlist_lookup_uint32(ns[i], "nsid", &nsid);
+			(void) nvlist_lookup_uint64(ns[i], "size", &size);
+			(void) nvlist_lookup_uint32(ns[i], "blksize", &blksize);
+			(void) nvlist_lookup_boolean_value(ns[i], "connected",
+			    &nsconn);
+			(void) printf("    namespace %u: %.2f GiB, %u-byte "
+			    "blocks (%s)\n", nsid,
+			    (double)size / (1024.0 * 1024.0 * 1024.0), blksize,
+			    nsconn ? "online" : "offline");
+		}
+	}
+
+	nvlist_free(nvl);
+	return (0);
+}
+
+static int
+cmd_disconnect(int argc, char *argv[])
+{
+	const char *subnqn = NULL;
+	int error;
+
+	/*
+	 * The single-instance host disconnects its one association regardless of
+	 * the NQN, so the subnqn argument is optional and advisory; it is
+	 * accepted for symmetry with connect and forward compatibility.
+	 */
+	if (argc > 1)
+		subnqn = argv[1];
+
+	error = nvmf_disconnect_host(subnqn != NULL ? subnqn : "");
+	if (error != 0) {
+		warnc(error, "failed to disconnect");
+		return (1);
+	}
+
+	(void) printf("disconnected\n");
+	return (0);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -630,6 +763,10 @@ main(int argc, char *argv[])
 		return (cmd_connect(argc - 1, argv + 1));
 	if (strcmp(argv[1], "discover") == 0)
 		return (cmd_discover(argc - 1, argv + 1));
+	if (strcmp(argv[1], "disconnect") == 0)
+		return (cmd_disconnect(argc - 1, argv + 1));
+	if (strcmp(argv[1], "list") == 0)
+		return (cmd_list(argc - 1, argv + 1));
 
 	usage();
 	return (2);

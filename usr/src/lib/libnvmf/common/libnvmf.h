@@ -435,6 +435,12 @@ extern int nvmf_reconnect_host(int fd,
  */
 extern int nvmf_connection_status(int fd, nvlist_t **nvlp);
 
+/*
+ * Enumerate a kernel host controller and its namespaces (illumos extension).
+ * The caller must destroy the returned nvlist.
+ */
+extern int nvmf_list_controller(nvlist_t **nvlp);
+
 #ifdef __cplusplus
 }
 #endif

@@ -36,6 +36,7 @@
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <assert.h>
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -109,16 +110,8 @@ nvmft_handoff_qpair(struct nvmf_qpair *qp,
 		return;
 	}
 
-	/*
-	 * libnvmf reports the packed length in nv.size (from nvlist_pack); the
-	 * kernel copies in nv.size bytes.  Mirror it into nv.len so both fields
-	 * carry the packed length, matching the carrier convention used by the
-	 * other nvmft control ioctls.
-	 */
-	if (nv.size == 0)
-		nv.size = nv.len;
-	if (nv.len == 0)
-		nv.len = nv.size;
+	/* nvmf_pack_ioc_nvlist() sets both fields to the packed length. */
+	assert(nv.size == nv.len && nv.size != 0);
 
 	if (ioctl(nvmft_fd, NVMFT_IOC_HANDOFF, &nv) != 0)
 		warn("ioctl(NVMFT_IOC_HANDOFF)");
