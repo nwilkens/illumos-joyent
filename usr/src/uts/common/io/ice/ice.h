@@ -10,7 +10,7 @@
  */
 
 /*
- * Copyright 2026 MNX Cloud, Inc.
+ * Copyright 2026 Edgecast Cloud LLC.
  */
 
 #ifndef _ICE_H
