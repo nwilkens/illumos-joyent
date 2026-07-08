@@ -32,6 +32,7 @@
 # Copyright 2021 OmniOS Community Edition (OmniOSce) Association.
 # Copyright 2024 MNX Cloud, Inc.
 # Copyright 2025 Edgecast Cloud LLC.
+# Copyright 2026 Oxide Computer Company
 #
 
 include ../Makefile.master
@@ -311,7 +312,6 @@ COMMON_SUBDIRS=		\
 	pcidb		\
 	pcidr		\
 	pcieadm		\
-	pcieb		\
 	pcitool		\
 	pfexec		\
 	pfexecd		\
