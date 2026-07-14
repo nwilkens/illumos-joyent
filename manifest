@@ -4715,6 +4715,7 @@ f usr/include/sys/nvme/kioxia_cd8.h 0644 root bin
 f usr/include/sys/nvme/micron.h 0644 root bin
 f usr/include/sys/nvme/micron_7300.h 0644 root bin
 f usr/include/sys/nvme/micron_74x0.h 0644 root bin
+f usr/include/sys/nvme/micron_7600.h 0644 root bin
 f usr/include/sys/nvme/micron_9550.h 0644 root bin
 f usr/include/sys/nvme/micron_x500.h 0644 root bin
 f usr/include/sys/nvme/ocp.h 0644 root bin
@@ -10480,7 +10481,6 @@ f usr/lib/pci/pcidb 0555 root bin
 f usr/lib/pci/pcidr 0555 root bin
 f usr/lib/pci/pcidr_plugin.so 0755 root bin
 f usr/lib/pci/pcieadm 0555 root bin
-f usr/lib/pci/pcieb 0555 root bin
 f usr/lib/pfexecd 0555 root bin
 d usr/lib/picl 0755 root sys
 f usr/lib/picl/picld 0555 root sys

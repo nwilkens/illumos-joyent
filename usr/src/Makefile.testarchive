@@ -10,6 +10,7 @@
 #
 # Copyright 2021 Joyent, Inc.
 # Copyright 2024 MNX Cloud, Inc.
+# Copyright 2026 Edgecast Cloud LLC.
 #
 
 #
@@ -26,6 +27,7 @@ TEST_IPS_MANIFEST_FILES = \
     system-io-tests.p5m \
     system-test-cryptotest.p5m \
     system-test-elftest.p5m \
+    system-test-i2ctest.p5m \
     system-test-libctest.p5m \
     system-test-libproctest.p5m \
     system-test-libsectest.p5m \
