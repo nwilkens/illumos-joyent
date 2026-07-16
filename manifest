@@ -4934,6 +4934,7 @@ f usr/include/sys/socketvar.h 0644 root bin
 f usr/include/sys/sockfilter.h 0644 root bin
 f usr/include/sys/sockio.h 0644 root bin
 f usr/include/sys/soundcard.h 0644 root bin
+f usr/include/sys/spawn.h 0644 root bin
 f usr/include/sys/spl.h 0644 root bin
 f usr/include/sys/squeue.h 0644 root bin
 f usr/include/sys/squeue_impl.h 0644 root bin
