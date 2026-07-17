@@ -37,6 +37,7 @@
 #include <sys/vlan.h>
 #include <sys/dlpi.h>
 #include <sys/netlb.h>
+#include <sys/policy.h>
 #include <sys/stream.h>
 #include <sys/strsun.h>
 
@@ -346,6 +347,9 @@ ice_m_ioctl(void *arg, queue_t *q, mblk_t *mp)
 		break;
 	case LB_SET_MODE:
 		size = 0;
+		error = secpolicy_net_config(iocp->ioc_cr, B_FALSE);
+		if (error != 0)
+			break;
 		if (iocp->ioc_count != sizeof (uint32_t) ||
 		    !ice_loopback_payload(mp, sizeof (uint32_t))) {
 			error = EINVAL;

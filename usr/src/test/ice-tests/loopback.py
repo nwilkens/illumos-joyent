@@ -30,6 +30,17 @@ def main() -> None:
     for command in ("LB_GET_INFO_SIZE", "LB_GET_INFO", "LB_GET_MODE", "LB_SET_MODE"):
         assert command in gld
 
+    ioctl = function(
+        gld,
+        "ice_m_ioctl(void *arg, queue_t *q, mblk_t *mp)\n{",
+        "\n/*\n * MAC callbacks.",
+    )
+    set_mode = ioctl[ioctl.index("case LB_SET_MODE:") : ioctl.index("default:")]
+    privilege = set_mode.index("secpolicy_net_config(iocp->ioc_cr, B_FALSE)")
+    payload = set_mode.index("ice_loopback_payload", privilege)
+    transition = set_mode.index("ice_loopback_mode_set", payload)
+    assert privilege < payload < transition
+
     setter = function(
         gld,
         "ice_loopback_mode_set(ice_t *ice, uint32_t mode)\n{",
