@@ -60,6 +60,7 @@ ice_fltr_entry_init(struct ice_fltr_list_entry *e, uint16_t handle,
     const uint8_t *addr)
 {
 	bzero(e, sizeof (*e));
+	e->fltr_info.flag = ICE_FLTR_TX;
 	e->fltr_info.lkup_type = ICE_SW_LKUP_MAC;
 	e->fltr_info.fltr_act = ICE_FWD_TO_VSI;
 	e->fltr_info.vsi_handle = handle;
