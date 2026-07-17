@@ -10,6 +10,7 @@ python3 usr/src/test/ice-tests/link_state.py
 python3 usr/src/test/ice-tests/fma_dma.py
 python3 usr/src/test/ice-tests/dma_lifetime.py
 python3 usr/src/test/ice-tests/mac_filter.py
+python3 usr/src/test/ice-tests/vsi_tx_vlan.py
 python3 usr/src/test/ice-tests/loopback.py
 python3 usr/src/test/ice-tests/hw_stats.py
 ```
@@ -37,6 +38,8 @@ explicit bound flag rather than physical address zero, while preserving the
 common-code-visible `va`/`pa`/`size` structure prefix.
 
 `mac_filter.py` verifies identical MAC filter construction for add and remove.
+
+`vsi_tx_vlan.py` verifies that the PF data VSI admits tagged and untagged Tx.
 
 `loopback.py` verifies the standard netlb ioctl surface, its explicit STREAMS
 and strsun dependencies, the `PRIV_SYS_NET_CONFIG` gate on mode changes,

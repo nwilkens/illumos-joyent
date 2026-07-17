@@ -155,13 +155,16 @@ ice_vsi_ctx_fill(ice_t *ice, struct ice_vsi_ctx *ctx)
 	ctx->vf_num = 0;
 
 	ctx->info.valid_sections = CPU_TO_LE16(ICE_AQ_VSI_PROP_SW_VALID |
-	    ICE_AQ_VSI_PROP_RXQ_MAP_VALID | ICE_AQ_VSI_PROP_Q_OPT_VALID);
+	    ICE_AQ_VSI_PROP_VLAN_VALID | ICE_AQ_VSI_PROP_RXQ_MAP_VALID |
+	    ICE_AQ_VSI_PROP_Q_OPT_VALID);
 
 	/* switch ids are small; the field is a u8 */
 	ctx->info.sw_id = (u8)hw->port_info->sw_id;
 	/* Prune frames the VSI itself sourced; do not loop them back. */
 	ctx->info.sw_flags = ICE_AQ_VSI_SW_FLAG_SRC_PRUNE;
 	ctx->info.sw_flags2 = ICE_AQ_VSI_SW_FLAG_LAN_ENA;
+	/* A zero Tx mode blocks every host frame and increments GLV_TEPC. */
+	ctx->info.inner_vlan_flags = ICE_AQ_VSI_INNER_VLAN_TX_MODE_ALL;
 
 	/*
 	 * Contiguous rx-queue map: q_mapping[0] is the first absolute queue and
