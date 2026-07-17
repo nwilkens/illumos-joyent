@@ -53,7 +53,8 @@ gcc -Wall -Wextra -Werror -idirafter usr/src/uts/common \
 
 `hw_stats.py` verifies the hardware statistics wiring: both counter refreshes
 run under the stat lock, the clear-on-read VSI register is serviced through the
-common code, the kstat callbacks reject writes and lock correctly, teardown
-deletes the kstats before destroying their lock, attach installs stats before
-MAC while detach removes them before unmapping registers, and `ice_m_stat`
-sources the MAC counters under the stat lock.
+common code, attach captures both hardware baselines before exposing the
+kstats, the kstat callbacks reject writes and lock correctly, teardown deletes
+the kstats before destroying their lock, attach installs stats before MAC while
+detach removes them before unmapping registers, and `ice_m_stat` sources the
+MAC counters under the stat lock.

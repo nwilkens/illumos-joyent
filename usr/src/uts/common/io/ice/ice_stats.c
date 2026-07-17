@@ -331,6 +331,17 @@ ice_stats_init(ice_t *ice)
 {
 	mutex_init(&ice->ice_stat_lock, NULL, MUTEX_DRIVER, NULL);
 
+	/*
+	 * Establish both hardware baselines before exposing either kstat.
+	 * Otherwise, traffic and clear-on-read errors before the first observer
+	 * would be discarded as pre-attach activity.
+	 */
+	mutex_enter(&ice->ice_stat_lock);
+	ice_stats_update_port(ice);
+	ice_stats_update_vsi(ice);
+	mutex_exit(&ice->ice_stat_lock);
+	ice_stats_check_acc(ice);
+
 	if (!ice_pf_kstat_init(ice))
 		goto fail;
 	if (!ice_vsi_kstat_init(ice))

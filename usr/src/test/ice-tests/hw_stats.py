@@ -47,6 +47,17 @@ def main() -> None:
         assert "return (EACCES)" in body
         assert "mutex_enter(&ice->ice_stat_lock)" in body
 
+    # Capture both baselines under the lock before kstat_install can expose a
+    # reader.  This also clears GLV_REPC at attach rather than first use.
+    init = function(stats, "ice_stats_init(ice_t *ice)\n{", "\nvoid\nice_stats_fini")
+    lock = init.index("mutex_enter(&ice->ice_stat_lock)")
+    port = init.index("ice_stats_update_port(ice)", lock)
+    vsi = init.index("ice_stats_update_vsi(ice)", port)
+    unlock = init.index("mutex_exit(&ice->ice_stat_lock)", vsi)
+    check = init.index("ice_stats_check_acc(ice)", unlock)
+    install = init.index("ice_pf_kstat_init(ice)", check)
+    assert lock < port < vsi < unlock < check < install
+
     # Teardown deletes kstats before destroying the lock they take.
     fini = stats[stats.index("ice_stats_fini(ice_t *ice)\n{"):]
     delete = fini.index("kstat_delete(ice->ice_pf_kstat)")
