@@ -309,60 +309,65 @@ ice_small_buf_free(ice_t *ice, ice_dma_buffer_t *buf)
 	mutex_exit(&ice->ice_small_buf_lock);
 }
 
-void
+boolean_t
 ice_buf_init(ice_t *ice)
 {
-	size_t i, n_buf;
 	ddi_dma_attr_t attr;
 	ddi_device_acc_attr_t acc;
+	uint_t i, n;
 
 	ice_pkt_dma_attr(ice, &attr);
 	ice_dma_acc_attr(ice, &acc);
 
-	n_buf = 0;
-
 	/*
-	 * Enough buffers for every RX ring -- eventually we can probably be
-	 * smarter here and cap this at some limit to spread amongst the RX
-	 * rings.
+	 * These pools back only the tx copy path (rx has its own control-block
+	 * buffers), so size them to one tx ring's worth: at most every
+	 * descriptor in flight is a copied packet holding a single buffer.
+	 * The allocations use DDI_DMA_DONTWAIT so a shortage fails the attach
+	 * cleanly rather than blocking or panicking.
 	 */
-	for (i = 0; i < ice->ice_num_rxr; i++) {
-		n_buf += ice->ice_rxr[i].irxr_size;
-	}
-
-	/* Add for TX + margin for loanup. */
-	n_buf += ice->ice_txr[0].itxr_size;
+	n = 0;
+	for (i = 0; i < ice->ice_num_txr; i++)
+		n += ice->ice_txr[i].itxr_size;
 
 	mutex_enter(&ice->ice_buf_lock);
-
-	ice->ice_dma_bufs = kmem_zalloc(n_buf * sizeof (ice_dma_buffer_t *),
+	ice->ice_dma_bufs = kmem_zalloc(n * sizeof (ice_dma_buffer_t *),
 	    KM_SLEEP);
-	ice->ice_bufs = kmem_zalloc(n_buf * sizeof (ice_dma_buffer_t),
-	    KM_SLEEP);
-	for (i = 0; i < n_buf; i++) {
-		VERIFY(ice_dma_alloc(ice, &ice->ice_bufs[i], &attr, &acc,
-		    B_TRUE, ICE_RX_BUF_SIZE, B_TRUE));
+	ice->ice_bufs = kmem_zalloc(n * sizeof (ice_dma_buffer_t), KM_SLEEP);
+	ice->ice_buf_sz = n;
+	for (i = 0; i < n; i++) {
+		if (!ice_dma_alloc(ice, &ice->ice_bufs[i], &attr, &acc, B_TRUE,
+		    ICE_RX_BUF_SIZE, B_FALSE)) {
+			mutex_exit(&ice->ice_buf_lock);
+			ice_error(ice, "failed to allocate tx copy buffers");
+			ice_buf_fini(ice);
+			return (B_FALSE);
+		}
 		ice->ice_dma_bufs[i] = &ice->ice_bufs[i];
 	}
-	ice->ice_buf_sz = ice->ice_buf_alloc = n_buf;
+	ice->ice_buf_alloc = n;
 	mutex_exit(&ice->ice_buf_lock);
 
 	mutex_enter(&ice->ice_small_buf_lock);
-
-	n_buf = ice->ice_rxr[0].irxr_size + ice->ice_txr[0].itxr_size;
-	ice->ice_dma_small_bufs =
-	    kmem_zalloc(n_buf * sizeof (ice_dma_buffer_t *), KM_SLEEP);
-	ice->ice_small_bufs = kmem_zalloc(n_buf * sizeof (ice_dma_buffer_t),
+	ice->ice_dma_small_bufs = kmem_zalloc(n * sizeof (ice_dma_buffer_t *),
 	    KM_SLEEP);
-
-	for (i = 0; i < n_buf; i++) {
-		VERIFY(ice_dma_alloc(ice, &ice->ice_small_bufs[i], &attr,
-		    &acc, B_TRUE, ICE_TX_SMALL_PKT, B_TRUE));
+	ice->ice_small_bufs = kmem_zalloc(n * sizeof (ice_dma_buffer_t),
+	    KM_SLEEP);
+	ice->ice_small_buf_sz = n;
+	for (i = 0; i < n; i++) {
+		if (!ice_dma_alloc(ice, &ice->ice_small_bufs[i], &attr, &acc,
+		    B_TRUE, ICE_TX_SMALL_PKT, B_FALSE)) {
+			mutex_exit(&ice->ice_small_buf_lock);
+			ice_error(ice, "failed to allocate tx small buffers");
+			ice_buf_fini(ice);
+			return (B_FALSE);
+		}
 		ice->ice_dma_small_bufs[i] = &ice->ice_small_bufs[i];
 	}
-	ice->ice_small_buf_sz = ice->ice_small_buf_alloc = n_buf;
-
+	ice->ice_small_buf_alloc = n;
 	mutex_exit(&ice->ice_small_buf_lock);
+
+	return (B_TRUE);
 }
 
 void
@@ -376,26 +381,31 @@ ice_buf_fini(ice_t *ice)
 	 * all loaned buffers before tearing the pool down.
 	 */
 	mutex_enter(&ice->ice_small_buf_lock);
-	for (i = 0; i < ice->ice_small_buf_sz; i++)
-		ice_dma_free(&ice->ice_small_bufs[i]);
-	kmem_free(ice->ice_dma_small_bufs,
-	    ice->ice_small_buf_sz * sizeof (ice_dma_buffer_t *));
-	kmem_free(ice->ice_small_bufs,
-	    ice->ice_small_buf_sz * sizeof (ice_dma_buffer_t));
-	ice->ice_dma_small_bufs = NULL;
-	ice->ice_small_bufs = NULL;
+	if (ice->ice_small_bufs != NULL) {
+		for (i = 0; i < ice->ice_small_buf_sz; i++)
+			ice_dma_free(&ice->ice_small_bufs[i]);
+		kmem_free(ice->ice_dma_small_bufs,
+		    ice->ice_small_buf_sz * sizeof (ice_dma_buffer_t *));
+		kmem_free(ice->ice_small_bufs,
+		    ice->ice_small_buf_sz * sizeof (ice_dma_buffer_t));
+		ice->ice_dma_small_bufs = NULL;
+		ice->ice_small_bufs = NULL;
+	}
 	ice->ice_small_buf_alloc = 0;
 	ice->ice_small_buf_sz = 0;
 	mutex_exit(&ice->ice_small_buf_lock);
 
 	mutex_enter(&ice->ice_buf_lock);
-	for (i = 0; i < ice->ice_buf_sz; i++)
-		ice_dma_free(&ice->ice_bufs[i]);
-	kmem_free(ice->ice_dma_bufs,
-	    ice->ice_buf_sz * sizeof (ice_dma_buffer_t *));
-	kmem_free(ice->ice_bufs, ice->ice_buf_sz * sizeof (ice_dma_buffer_t));
-	ice->ice_dma_bufs = NULL;
-	ice->ice_bufs = NULL;
+	if (ice->ice_bufs != NULL) {
+		for (i = 0; i < ice->ice_buf_sz; i++)
+			ice_dma_free(&ice->ice_bufs[i]);
+		kmem_free(ice->ice_dma_bufs,
+		    ice->ice_buf_sz * sizeof (ice_dma_buffer_t *));
+		kmem_free(ice->ice_bufs,
+		    ice->ice_buf_sz * sizeof (ice_dma_buffer_t));
+		ice->ice_dma_bufs = NULL;
+		ice->ice_bufs = NULL;
+	}
 	ice->ice_buf_alloc = 0;
 	ice->ice_buf_sz = 0;
 	mutex_exit(&ice->ice_buf_lock);

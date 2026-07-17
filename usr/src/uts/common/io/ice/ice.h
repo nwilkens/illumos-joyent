@@ -414,7 +414,7 @@ extern ice_dma_buffer_t *ice_buf_alloc(ice_t *);
 extern void ice_buf_free(ice_t *, ice_dma_buffer_t *);
 extern ice_dma_buffer_t *ice_small_buf_alloc(ice_t *);
 extern void ice_small_buf_free(ice_t *, ice_dma_buffer_t *);
-extern void ice_buf_init(ice_t *);
+extern boolean_t ice_buf_init(ice_t *);
 extern void ice_buf_fini(ice_t *);
 
 /*

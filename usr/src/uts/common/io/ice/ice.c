@@ -833,7 +833,8 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	ice_queues_intr_map(ice);
 	ice->ice_attach_progress |= ICE_ATTACH_QUEUE_INTR;
 
-	ice_buf_init(ice);
+	if (!ice_buf_init(ice))
+		goto fail;
 	ice->ice_attach_progress |= ICE_ATTACH_BUFS;
 
 	/*
