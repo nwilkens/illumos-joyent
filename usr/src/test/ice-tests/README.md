@@ -10,3 +10,7 @@ python3 usr/src/test/ice-tests/rx_checksum.py
 `rx_checksum.py` verifies that receive checksum metadata is captured before
 the descriptor is reposted and that all hardware-reported L3/L4 checksum error
 bits suppress checksum validation.
+
+`admin_interrupt.py` verifies that every interrupt on the dedicated admin
+vector can schedule a bounded, single-flight ARQ drain without depending on an
+OICR cause bit, while packet queues remain on separate vectors.

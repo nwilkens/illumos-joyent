@@ -52,11 +52,6 @@
 	PFINT_OICR_PCI_EXCEPTION_M | PFINT_OICR_HMC_ERR_M |	\
 	PFINT_OICR_PE_CRITERR_M | PFINT_OICR_VFLR_M)
 
-/* Causes that imply deferred (taskq) work. */
-#define	ICE_OICR_TASKQ_MASK	\
-	(PFINT_OICR_INTEVENT_M | PFINT_OICR_LINK_STAT_CHANGE_M |	\
-	PFINT_OICR_GRST_M)
-
 static void
 ice_link_state_set(ice_t *ice, link_state_t state)
 {
@@ -276,25 +271,23 @@ ice_intr_oicr(ice_t *ice)
 		return (DDI_INTR_CLAIMED);
 	}
 
-	if (oicr == 0)
-		return (DDI_INTR_CLAIMED);
-
 	if (oicr & PFINT_OICR_GRST_M)
 		atomic_or_32(&ice->ice_state, ICE_STATE_RESET_PENDING);
 
 	/*
-	 * ice has no dedicated admin-queue cause bit, so any control-queue or
-	 * link cause dispatches the worker, which decides if there is work.  A
-	 * single in-flight worker coalesces a storm of interrupts.
+	 * PFINT_FW_CTL and PFINT_OICR share this dedicated admin vector.  The
+	 * hardware may clear PFINT_FW_CTL_INTEVENT while acknowledging the
+	 * interrupt, so PFINT_OICR cannot reliably say whether the ARQ fired.
+	 * Check it on every admin interrupt, as FreeBSD does.  The pending flag
+	 * coalesces a burst into one single-threaded, bounded drain and packet
+	 * queue interrupts use separate vectors.
 	 */
-	if (oicr & ICE_OICR_TASKQ_MASK) {
-		mutex_enter(&ice->ice_lock);
-		if (!ice->ice_oicr_pending) {
-			ice->ice_oicr_pending = B_TRUE;
-			dispatch = B_TRUE;
-		}
-		mutex_exit(&ice->ice_lock);
+	mutex_enter(&ice->ice_lock);
+	if (!ice->ice_oicr_pending) {
+		ice->ice_oicr_pending = B_TRUE;
+		dispatch = B_TRUE;
 	}
+	mutex_exit(&ice->ice_lock);
 
 	if (dispatch && ddi_taskq_dispatch(ice->ice_oicr_taskq, ice_oicr_task,
 	    ice, DDI_NOSLEEP) != DDI_SUCCESS) {
