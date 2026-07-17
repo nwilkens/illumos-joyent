@@ -521,6 +521,8 @@ ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 {
 	ice_t *ice = arg;
 	struct ice_hw_port_stats *ps = &ice->ice_stat_port_cur;
+	uint16_t speed = 0;
+	boolean_t advertised = B_FALSE;
 	int ret = 0;
 
 	/* Link properties are served from the cached link state. */
@@ -536,8 +538,79 @@ ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 		*val = ice->ice_link_duplex;
 		mutex_exit(&ice->ice_lse_lock);
 		return (0);
+	case ETHER_STAT_CAP_1000FDX:
+		speed = ICE_AQ_LINK_SPEED_1000MB;
+		break;
+	case ETHER_STAT_CAP_2500FDX:
+		speed = ICE_AQ_LINK_SPEED_2500MB;
+		break;
+	case ETHER_STAT_CAP_5000FDX:
+		speed = ICE_AQ_LINK_SPEED_5GB;
+		break;
+	case ETHER_STAT_CAP_10GFDX:
+		speed = ICE_AQ_LINK_SPEED_10GB;
+		break;
+	case ETHER_STAT_CAP_25GFDX:
+		speed = ICE_AQ_LINK_SPEED_25GB;
+		break;
+	case ETHER_STAT_CAP_40GFDX:
+		speed = ICE_AQ_LINK_SPEED_40GB;
+		break;
+	case ETHER_STAT_CAP_50GFDX:
+		speed = ICE_AQ_LINK_SPEED_50GB;
+		break;
+	case ETHER_STAT_CAP_100GFDX:
+		speed = ICE_AQ_LINK_SPEED_100GB;
+		break;
+	case ETHER_STAT_ADV_CAP_1000FDX:
+		speed = ICE_AQ_LINK_SPEED_1000MB;
+		advertised = B_TRUE;
+		break;
+	case ETHER_STAT_ADV_CAP_2500FDX:
+		speed = ICE_AQ_LINK_SPEED_2500MB;
+		advertised = B_TRUE;
+		break;
+	case ETHER_STAT_ADV_CAP_5000FDX:
+		speed = ICE_AQ_LINK_SPEED_5GB;
+		advertised = B_TRUE;
+		break;
+	case ETHER_STAT_ADV_CAP_10GFDX:
+		speed = ICE_AQ_LINK_SPEED_10GB;
+		advertised = B_TRUE;
+		break;
+	case ETHER_STAT_ADV_CAP_25GFDX:
+		speed = ICE_AQ_LINK_SPEED_25GB;
+		advertised = B_TRUE;
+		break;
+	case ETHER_STAT_ADV_CAP_40GFDX:
+		speed = ICE_AQ_LINK_SPEED_40GB;
+		advertised = B_TRUE;
+		break;
+	case ETHER_STAT_ADV_CAP_50GFDX:
+		speed = ICE_AQ_LINK_SPEED_50GB;
+		advertised = B_TRUE;
+		break;
+	case ETHER_STAT_ADV_CAP_100GFDX:
+		speed = ICE_AQ_LINK_SPEED_100GB;
+		advertised = B_TRUE;
+		break;
+	case ETHER_STAT_CAP_AUTONEG:
+	case ETHER_STAT_ADV_CAP_AUTONEG:
+		*val = 1;
+		return (0);
 	default:
 		break;
+	}
+
+	if (speed != 0) {
+		mutex_enter(&ice->ice_lse_lock);
+		if (advertised) {
+			*val = (ice->ice_phy_speeds_adv & speed) != 0;
+		} else {
+			*val = (ice->ice_phy_speeds_supp & speed) != 0;
+		}
+		mutex_exit(&ice->ice_lse_lock);
+		return (0);
 	}
 
 	/*
@@ -770,6 +843,8 @@ ice_m_getprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 	ice_t *ice = arg;
 	int ret = 0;
 	uint64_t speed;
+	uint16_t phy_speed = 0;
+	boolean_t advertised = B_FALSE;
 	uint8_t *u8;
 
 	_NOTE(ARGUNUSED(pr_name));
@@ -807,6 +882,65 @@ ice_m_getprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 		u8 = pr_val;
 		*u8 = 1;
 		break;
+	case MAC_PROP_ADV_100FDX_CAP:
+	case MAC_PROP_EN_100FDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_100FDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_100MB;
+		break;
+	case MAC_PROP_ADV_1000FDX_CAP:
+	case MAC_PROP_EN_1000FDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_1000FDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_1000MB;
+		break;
+	case MAC_PROP_ADV_2500FDX_CAP:
+	case MAC_PROP_EN_2500FDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_2500FDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_2500MB;
+		break;
+	case MAC_PROP_ADV_5000FDX_CAP:
+	case MAC_PROP_EN_5000FDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_5000FDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_5GB;
+		break;
+	case MAC_PROP_ADV_10GFDX_CAP:
+	case MAC_PROP_EN_10GFDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_10GFDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_10GB;
+		break;
+	case MAC_PROP_ADV_25GFDX_CAP:
+	case MAC_PROP_EN_25GFDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_25GFDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_25GB;
+		break;
+	case MAC_PROP_ADV_40GFDX_CAP:
+	case MAC_PROP_EN_40GFDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_40GFDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_40GB;
+		break;
+	case MAC_PROP_ADV_50GFDX_CAP:
+	case MAC_PROP_EN_50GFDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_50GFDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_50GB;
+		break;
+	case MAC_PROP_ADV_100GFDX_CAP:
+	case MAC_PROP_EN_100GFDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_100GFDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_100GB;
+		break;
+	case MAC_PROP_ADV_FEC_CAP:
+		if (pr_valsize < sizeof (link_fec_t)) {
+			ret = EOVERFLOW;
+			break;
+		}
+		*(link_fec_t *)pr_val = ice->ice_fec_neg;
+		break;
+	case MAC_PROP_EN_FEC_CAP:
+		if (pr_valsize < sizeof (link_fec_t)) {
+			ret = EOVERFLOW;
+			break;
+		}
+		*(link_fec_t *)pr_val = LINK_FEC_AUTO;
+		break;
 	case MAC_PROP_FLOWCTRL:
 		if (pr_valsize < sizeof (link_flowctrl_t)) {
 			ret = EOVERFLOW;
@@ -819,6 +953,21 @@ ice_m_getprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 		break;
 	}
 
+	if (phy_speed != 0) {
+		if (pr_valsize < sizeof (uint8_t)) {
+			ret = EOVERFLOW;
+		} else {
+			u8 = pr_val;
+			if (advertised) {
+				*u8 = (ice->ice_phy_speeds_adv &
+				    phy_speed) != 0;
+			} else {
+				*u8 = (ice->ice_phy_speeds_supp &
+				    phy_speed) != 0;
+			}
+		}
+	}
+
 	mutex_exit(&ice->ice_lse_lock);
 
 	return (ret);
@@ -828,15 +977,74 @@ static void
 ice_m_propinfo(void *arg, const char *pr_name, mac_prop_id_t pr_num,
     mac_prop_info_handle_t prh)
 {
-	_NOTE(ARGUNUSED(arg, pr_name));
+	ice_t *ice = arg;
+	uint16_t phy_speed = 0;
+	boolean_t advertised = B_FALSE;
+
+	_NOTE(ARGUNUSED(pr_name));
+
+	mutex_enter(&ice->ice_lse_lock);
 
 	switch (pr_num) {
 	case MAC_PROP_DUPLEX:
 	case MAC_PROP_SPEED:
 	case MAC_PROP_STATUS:
-	case MAC_PROP_AUTONEG:
 	case MAC_PROP_FLOWCTRL:
 		mac_prop_info_set_perm(prh, MAC_PROP_PERM_READ);
+		break;
+	case MAC_PROP_AUTONEG:
+		mac_prop_info_set_perm(prh, MAC_PROP_PERM_READ);
+		mac_prop_info_set_default_uint8(prh, 1);
+		break;
+	case MAC_PROP_ADV_100FDX_CAP:
+	case MAC_PROP_EN_100FDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_100FDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_100MB;
+		break;
+	case MAC_PROP_ADV_1000FDX_CAP:
+	case MAC_PROP_EN_1000FDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_1000FDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_1000MB;
+		break;
+	case MAC_PROP_ADV_2500FDX_CAP:
+	case MAC_PROP_EN_2500FDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_2500FDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_2500MB;
+		break;
+	case MAC_PROP_ADV_5000FDX_CAP:
+	case MAC_PROP_EN_5000FDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_5000FDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_5GB;
+		break;
+	case MAC_PROP_ADV_10GFDX_CAP:
+	case MAC_PROP_EN_10GFDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_10GFDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_10GB;
+		break;
+	case MAC_PROP_ADV_25GFDX_CAP:
+	case MAC_PROP_EN_25GFDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_25GFDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_25GB;
+		break;
+	case MAC_PROP_ADV_40GFDX_CAP:
+	case MAC_PROP_EN_40GFDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_40GFDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_40GB;
+		break;
+	case MAC_PROP_ADV_50GFDX_CAP:
+	case MAC_PROP_EN_50GFDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_50GFDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_50GB;
+		break;
+	case MAC_PROP_ADV_100GFDX_CAP:
+	case MAC_PROP_EN_100GFDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_100GFDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_100GB;
+		break;
+	case MAC_PROP_ADV_FEC_CAP:
+	case MAC_PROP_EN_FEC_CAP:
+		mac_prop_info_set_perm(prh, MAC_PROP_PERM_READ);
+		mac_prop_info_set_default_fec(prh, LINK_FEC_AUTO);
 		break;
 	case MAC_PROP_MTU:
 		mac_prop_info_set_perm(prh, MAC_PROP_PERM_READ);
@@ -846,6 +1054,19 @@ ice_m_propinfo(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 	default:
 		break;
 	}
+
+	if (phy_speed != 0) {
+		mac_prop_info_set_perm(prh, MAC_PROP_PERM_READ);
+		if (advertised) {
+			mac_prop_info_set_default_uint8(prh,
+			    (ice->ice_phy_speeds_adv & phy_speed) != 0);
+		} else {
+			mac_prop_info_set_default_uint8(prh,
+			    (ice->ice_phy_speeds_supp & phy_speed) != 0);
+		}
+	}
+
+	mutex_exit(&ice->ice_lse_lock);
 }
 
 static mac_callbacks_t ice_m_callbacks = {

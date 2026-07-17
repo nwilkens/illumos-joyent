@@ -13,6 +13,7 @@ python3 usr/src/test/ice-tests/mac_filter.py
 python3 usr/src/test/ice-tests/vsi_tx_vlan.py
 python3 usr/src/test/ice-tests/loopback.py
 python3 usr/src/test/ice-tests/hw_stats.py
+python3 usr/src/test/ice-tests/link_speed_caps.py
 ```
 
 `rx_checksum.py` verifies that receive checksum metadata is captured before
@@ -70,3 +71,8 @@ kstat snapshot reads the hardware counter bank once, and unsupported MAC
 statistics do not trigger register reads. Register-access faults from a
 supported MAC statistic report degraded service and return `EIO`, while
 private-kstat failures retain the established unaffected-service policy.
+
+`link_speed_caps.py` verifies that PHY setup advertises the full media speed
+set with automatic FEC, media insertion reapplies that configuration, and the
+cached supported and advertised speed/FEC values reach the GLDv3 statistics
+and read-only property callbacks.

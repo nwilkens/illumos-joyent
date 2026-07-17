@@ -713,6 +713,7 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	ice->ice_dip = dip;
 	ice->ice_instance = instance;
 	ice->ice_link_state = LINK_STATE_UNKNOWN;
+	ice->ice_fec_neg = LINK_FEC_NONE;
 	mutex_init(&ice->ice_lock, NULL, MUTEX_DRIVER, NULL);
 	mutex_init(&ice->ice_loopback_lock, NULL, MUTEX_DRIVER, NULL);
 
@@ -800,6 +801,7 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 
 	/* Enable the PHY; firmware will not bring the link up on its own. */
 	ice_setup_link(ice);
+	ice_phy_caps_update(ice);
 
 	/*
 	 * Load the DDP package before the VSI: a missing or rejected package

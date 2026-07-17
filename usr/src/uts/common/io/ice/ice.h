@@ -388,6 +388,9 @@ typedef struct ice {
 	uint64_t		ice_link_speed;
 	link_duplex_t		ice_link_duplex;
 	link_flowctrl_t		ice_link_fctl;
+	uint16_t		ice_phy_speeds_supp;
+	uint16_t		ice_phy_speeds_adv;
+	link_fec_t		ice_fec_neg;
 	/* Adaptive mutex: loopback transitions run only in thread context. */
 	kmutex_t		ice_loopback_lock;
 	uint32_t		ice_loopback_mode;
@@ -461,6 +464,7 @@ extern void ice_intr_oicr_disable(ice_t *);
 extern boolean_t ice_set_link_events(ice_t *);
 extern void ice_link_status_update(ice_t *);
 extern void ice_setup_link(ice_t *);
+extern void ice_phy_caps_update(ice_t *);
 
 /*
  * ice_vsi.c

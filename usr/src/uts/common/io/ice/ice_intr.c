@@ -169,17 +169,118 @@ ice_link_loopback_update(ice_t *ice, uint32_t mode)
 	mutex_exit(&ice->ice_lse_lock);
 }
 
+static uint16_t
+ice_phy_types_to_speeds(const struct ice_aqc_get_phy_caps_data *pcaps)
+{
+	static const uint16_t speeds[] = {
+		ICE_AQ_LINK_SPEED_1000MB,
+		ICE_AQ_LINK_SPEED_2500MB,
+		ICE_AQ_LINK_SPEED_5GB,
+		ICE_AQ_LINK_SPEED_10GB,
+		ICE_AQ_LINK_SPEED_25GB,
+		ICE_AQ_LINK_SPEED_40GB,
+		ICE_AQ_LINK_SPEED_50GB,
+		ICE_AQ_LINK_SPEED_100GB
+	};
+	u64 caps_low = LE64_TO_CPU(pcaps->phy_type_low);
+	u64 caps_high = LE64_TO_CPU(pcaps->phy_type_high);
+	uint16_t mask = 0;
+	uint_t i;
+
+	for (i = 0; i < ARRAY_SIZE(speeds); i++) {
+		u64 phy_low = 0;
+		u64 phy_high = 0;
+
+		ice_update_phy_type(&phy_low, &phy_high, speeds[i]);
+		if ((caps_low & phy_low) != 0 || (caps_high & phy_high) != 0)
+			mask |= speeds[i];
+	}
+
+	return (mask);
+}
+
+static link_fec_t
+ice_phy_fec_negotiated(uint8_t fec_info)
+{
+	link_fec_t fec = 0;
+
+	fec_info &= ICE_AQ_FEC_MASK;
+	if ((fec_info & (ICE_AQ_LINK_25G_RS_528_FEC_EN |
+	    ICE_AQ_LINK_25G_RS_544_FEC_EN)) != 0)
+		fec |= LINK_FEC_RS;
+	if ((fec_info & ICE_AQ_LINK_25G_KR_FEC_EN) != 0)
+		fec |= LINK_FEC_BASE_R;
+
+	return (fec != 0 ? fec : LINK_FEC_NONE);
+}
+
+void
+ice_phy_caps_update(ice_t *ice)
+{
+	struct ice_hw *hw = &ice->ice_hw;
+	struct ice_port_info *pi = hw->port_info;
+	struct ice_aqc_get_phy_caps_data pcaps;
+	struct ice_aqc_get_phy_caps_data active;
+	uint16_t speeds_supp = 0;
+	uint16_t speeds_adv = 0;
+	boolean_t update = B_FALSE;
+	int status;
+
+	if (pi == NULL)
+		return;
+
+	mutex_enter(&ice->ice_lse_lock);
+	while (ice->ice_lse_flags & ICE_LSE_F_UPDATING)
+		cv_wait(&ice->ice_lse_cv, &ice->ice_lse_lock);
+	ice->ice_lse_flags |= ICE_LSE_F_UPDATING;
+	mutex_exit(&ice->ice_lse_lock);
+
+	bzero(&pcaps, sizeof (pcaps));
+	status = ice_aq_get_phy_caps(pi, false,
+	    ICE_AQC_REPORT_TOPO_CAP_MEDIA, &pcaps, NULL);
+	if (status != ICE_SUCCESS) {
+		ice_error(ice, "failed to read media PHY caps: %d", status);
+		goto out;
+	}
+
+	bzero(&active, sizeof (active));
+	status = ice_aq_get_phy_caps(pi, false, ICE_AQC_REPORT_ACTIVE_CFG,
+	    &active, NULL);
+	if (status != ICE_SUCCESS) {
+		ice_error(ice, "failed to read active PHY config: %d", status);
+		goto out;
+	}
+
+	speeds_supp = ice_phy_types_to_speeds(&pcaps);
+	speeds_adv = ice_phy_types_to_speeds(&active);
+	update = B_TRUE;
+
+out:
+	mutex_enter(&ice->ice_lse_lock);
+	if (update) {
+		ice->ice_phy_speeds_supp = speeds_supp;
+		ice->ice_phy_speeds_adv = speeds_adv;
+		ice->ice_fec_neg = ice_phy_fec_negotiated(
+		    pi->phy.link_info.fec_info);
+	}
+	ice->ice_lse_flags &= ~ICE_LSE_F_UPDATING;
+	cv_broadcast(&ice->ice_lse_cv);
+	mutex_exit(&ice->ice_lse_lock);
+}
+
 /*
  * Refresh the cached link state from hardware.  The blocking common-code read
  * runs outside ice_lse_lock; a single in-flight update is enforced with the
  * UPDATING flag so concurrent callers (taskq and attach) serialize.
  */
-void
-ice_link_status_update(ice_t *ice)
+static void
+ice_link_status_update_impl(ice_t *ice, boolean_t *media_inserted)
 {
 	struct ice_port_info *pi = ice->ice_hw.port_info;
 	int rc;
 
+	if (media_inserted != NULL)
+		*media_inserted = B_FALSE;
 	if (pi == NULL)
 		return;
 
@@ -193,13 +294,27 @@ ice_link_status_update(ice_t *ice)
 	rc = ice_update_link_info(pi);
 
 	mutex_enter(&ice->ice_lse_lock);
-	if (rc == 0)
+	if (media_inserted != NULL) {
+		*media_inserted =
+		    (pi->phy.link_info.link_info &
+		    ICE_AQ_MEDIA_AVAILABLE) != 0 &&
+		    (pi->phy.link_info_old.link_info &
+		    ICE_AQ_MEDIA_AVAILABLE) == 0;
+	}
+	if (rc == 0) {
 		ice_link_prop_update(ice);
-	else
+	} else {
 		ice_error(ice, "link info update failed: %d", rc);
+	}
 	ice->ice_lse_flags &= ~ICE_LSE_F_UPDATING;
 	cv_broadcast(&ice->ice_lse_cv);
 	mutex_exit(&ice->ice_lse_lock);
+}
+
+void
+ice_link_status_update(ice_t *ice)
+{
+	ice_link_status_update_impl(ice, NULL);
 }
 
 /*
@@ -213,6 +328,7 @@ ice_oicr_task(void *arg)
 	ice_t *ice = arg;
 	struct ice_hw *hw = &ice->ice_hw;
 	struct ice_rq_event_info evt;
+	boolean_t media_inserted;
 	uint16_t pending;
 	uint_t guard = 0;
 	int rc;
@@ -237,7 +353,10 @@ ice_oicr_task(void *arg)
 
 		switch (LE_16(evt.desc.opcode)) {
 		case ice_aqc_opc_get_link_status:
-			ice_link_status_update(ice);
+			ice_link_status_update_impl(ice, &media_inserted);
+			if (media_inserted)
+				ice_setup_link(ice);
+			ice_phy_caps_update(ice);
 			break;
 		default:
 			break;
@@ -440,11 +559,9 @@ ice_intr_disable(ice_t *ice)
 }
 
 /*
- * Bring the PHY up.  In strict link-management mode firmware does not enable
- * the link on its own: the driver reads the active PHY caps, copies them into a
- * set-phy-cfg request with the link-enable and auto-update bits added, and
- * issues it.  With no media present firmware returns busy; it has saved the
- * config and applies it when a module is later inserted, so that is benign.
+ * Bring the PHY up.  The active configuration can contain only the current
+ * fallback mode, so use the full media/default capabilities to keep
+ * autonegotiation from becoming pinned there.
  */
 void
 ice_setup_link(ice_t *ice)
@@ -453,21 +570,30 @@ ice_setup_link(ice_t *ice)
 	struct ice_port_info *pi = hw->port_info;
 	struct ice_aqc_get_phy_caps_data pcaps;
 	struct ice_aqc_set_phy_cfg_data cfg;
+	u8 report_mode = ice_fw_supports_report_dflt_cfg(hw) ?
+	    ICE_AQC_REPORT_DFLT_CFG : ICE_AQC_REPORT_TOPO_CAP_MEDIA;
 	int status;
 
 	if (pi == NULL)
 		return;
 
 	bzero(&pcaps, sizeof (pcaps));
-	status = ice_aq_get_phy_caps(pi, false, ICE_AQC_REPORT_ACTIVE_CFG,
-	    &pcaps, NULL);
+	status = ice_aq_get_phy_caps(pi, false, report_mode, &pcaps, NULL);
 	if (status != ICE_SUCCESS) {
 		ice_error(ice, "failed to read PHY caps: %d", status);
 		return;
 	}
 
+	/*
+	 * With no module, topology capabilities can be empty.  The insertion
+	 * event will re-drive the configuration once media is identifiable.
+	 */
+	if (pcaps.phy_type_low == 0 && pcaps.phy_type_high == 0)
+		return;
+
 	bzero(&cfg, sizeof (cfg));
 	ice_copy_phy_caps_to_cfg(pi, &pcaps, &cfg);
+	(void) ice_cfg_phy_fec(pi, &cfg, ICE_FEC_AUTO);
 	cfg.caps |= ICE_AQ_PHY_ENA_AUTO_LINK_UPDT | ICE_AQ_PHY_ENA_LINK;
 
 	status = ice_aq_set_phy_cfg(hw, pi, &cfg, NULL);
@@ -477,10 +603,8 @@ ice_setup_link(ice_t *ice)
 }
 
 /*
- * Ask firmware to deliver link up/down events on the admin receive queue.  The
- * event mask is inverted: a clear bit means "deliver".  Only link up/down is
- * requested; all other link events are masked off because the driver does not
- * act on them.
+ * Ask firmware to deliver link and media events on the admin receive queue.
+ * The event mask is inverted: a clear bit means "deliver".
  */
 boolean_t
 ice_set_link_events(ice_t *ice)
