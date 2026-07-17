@@ -704,6 +704,7 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 
 	ice->ice_dip = dip;
 	ice->ice_instance = instance;
+	ice->ice_link_state = LINK_STATE_UNKNOWN;
 	mutex_init(&ice->ice_lock, NULL, MUTEX_DRIVER, NULL);
 
 	/*

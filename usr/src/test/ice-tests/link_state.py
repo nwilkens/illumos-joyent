@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[4]
+ATTACH_SOURCE = REPO / "usr/src/uts/common/io/ice/ice.c"
 INTR_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_intr.c"
 GLD_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_gld.c"
 
@@ -17,6 +18,17 @@ def function(source: str, signature: str, following: str) -> str:
 
 
 def main() -> None:
+    attach_source = ATTACH_SOURCE.read_text(encoding="utf-8")
+    attach = function(
+        attach_source,
+        "ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)\n{",
+        "\nstatic int\nice_detach",
+    )
+    unknown = attach.index("ice->ice_link_state = LINK_STATE_UNKNOWN")
+    query = attach.index("ice_link_status_update(ice)", unknown)
+    register = attach.index("ice_mac_register(ice)", query)
+    assert unknown < query < register
+
     intr_source = INTR_SOURCE.read_text(encoding="utf-8")
     publisher = function(
         intr_source,

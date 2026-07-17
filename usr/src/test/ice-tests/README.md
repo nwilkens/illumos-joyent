@@ -19,4 +19,6 @@ OICR cause bit, while packet queues remain on separate vectors.
 
 `link_state.py` verifies that the attach-time link state is published only
 after successful MAC registration and that publication is serialized with
-asynchronous link updates through the link-state lock.
+asynchronous link updates through the link-state lock. It also verifies that
+the cache starts at `LINK_STATE_UNKNOWN`, preserving an honest result if the
+initial hardware query fails.
