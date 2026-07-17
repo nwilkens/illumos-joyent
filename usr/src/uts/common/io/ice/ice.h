@@ -547,6 +547,7 @@ extern boolean_t ice_stats_init(ice_t *);
 extern void ice_stats_fini(ice_t *);
 extern void ice_stats_update_port(ice_t *);
 extern void ice_stats_update_vsi(ice_t *);
+extern int ice_vsi_loopback_set(ice_t *, boolean_t);
 extern void ice_link_loopback_update(ice_t *, uint32_t);
 extern void ice_loopback_fini(ice_t *);
 

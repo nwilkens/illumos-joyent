@@ -179,6 +179,51 @@ ice_vsi_ctx_fill(ice_t *ice, struct ice_vsi_ctx *ctx)
 	    ICE_AQ_VSI_Q_OPT_RSS_LUT_M) | ICE_AQ_VSI_Q_OPT_RSS_TPLZ;
 }
 
+/*
+ * Permit or reject frames that the PF VSI itself transmitted.  The cached
+ * common-code context is the authoritative copy of the other switch-section
+ * fields, so preserve it and update the cache only after firmware accepts the
+ * change.  The loopback mutex serializes mode changes; detach disables
+ * loopback before tearing down the VSI.
+ */
+int
+ice_vsi_loopback_set(ice_t *ice, boolean_t enable)
+{
+	struct ice_hw *hw = &ice->ice_hw;
+	ice_vsi_t *vsi = &ice->ice_pf_vsi;
+	struct ice_vsi_ctx *cached;
+	struct ice_vsi_ctx ctx;
+	u8 flags;
+	int status;
+
+	ASSERT(MUTEX_HELD(&ice->ice_loopback_lock));
+
+	cached = ice_get_vsi_ctx(hw, vsi->vi_handle);
+	if (cached == NULL)
+		return (ICE_ERR_DOES_NOT_EXIST);
+
+	flags = cached->info.sw_flags;
+	if (enable)
+		flags |= ICE_AQ_VSI_SW_FLAG_ALLOW_LB;
+	else
+		flags &= ~ICE_AQ_VSI_SW_FLAG_ALLOW_LB;
+	if (flags == cached->info.sw_flags)
+		return (ICE_SUCCESS);
+
+	bzero(&ctx, sizeof (ctx));
+	ctx.info = cached->info;
+	ctx.info.valid_sections = CPU_TO_LE16(ICE_AQ_VSI_PROP_SW_VALID);
+	ctx.info.sw_flags = flags;
+
+	status = ice_update_vsi(hw, vsi->vi_handle, &ctx, NULL);
+	if (status == ICE_SUCCESS) {
+		cached->info.sw_flags = flags;
+		cached->info.valid_sections |= ctx.info.valid_sections;
+	}
+
+	return (status);
+}
+
 static int
 ice_vsi_setup(ice_t *ice)
 {

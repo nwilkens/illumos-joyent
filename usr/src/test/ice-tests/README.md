@@ -38,8 +38,9 @@ common-code-visible `va`/`pa`/`size` structure prefix.
 `loopback.py` verifies the standard netlb ioctl surface, its explicit STREAMS
 and strsun dependencies, the `PRIV_SYS_NET_CONFIG` gate on mode changes,
 adaptive thread-context serialization around the firmware command,
-firmware-command and link-state ordering, detach cleanup, physical-event
-override, and absence of loopback branches in the packet datapath.
+rollback-safe VSI permission and MAC-command ordering, common-code VSI cache
+updates, link-state ordering, detach cleanup, physical-event override, and
+absence of loopback branches in the packet datapath.
 `ice_loopback.c` is the small userland controller used for hardware validation.
 It sends each netlb command through STREAMS `I_STR`, so the driver receives the
 inline payload and exact `ioc_count` it validates. Build it on illumos from the

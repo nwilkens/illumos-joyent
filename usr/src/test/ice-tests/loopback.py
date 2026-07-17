@@ -9,6 +9,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[4]
 ATTACH_SOURCE = REPO / "usr/src/uts/common/io/ice/ice.c"
 GLD_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_gld.c"
+VSI_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_vsi.c"
 INTR_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_intr.c"
 RX_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_rx.c"
 TX_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_tx.c"
@@ -41,18 +42,52 @@ def main() -> None:
     transition = set_mode.index("ice_loopback_mode_set", payload)
     assert privilege < payload < transition
 
+    enable = function(
+        gld,
+        "ice_loopback_enable(ice_t *ice)\n{",
+        "\nstatic int\nice_loopback_disable",
+    )
+    permit = enable.index("ice_vsi_loopback_set(ice, B_TRUE)")
+    mac_enable = enable.index("ice_aq_set_mac_loopback", permit)
+    rollback = enable.index("ice_vsi_loopback_set(ice, B_FALSE)", mac_enable)
+    assert permit < mac_enable < rollback
+
+    disable = function(
+        gld,
+        "ice_loopback_disable(ice_t *ice)\n{",
+        "\nstatic int\nice_loopback_mode_set",
+    )
+    mac_disable = disable.index("ice_aq_set_mac_loopback")
+    revoke = disable.index("ice_vsi_loopback_set(ice, B_FALSE)", mac_disable)
+    rollback = disable.index("ice_aq_set_mac_loopback", revoke)
+    assert mac_disable < revoke < rollback
+
     setter = function(
         gld,
         "ice_loopback_mode_set(ice_t *ice, uint32_t mode)\n{",
         "\nvoid\nice_loopback_fini",
     )
-    aq = setter.index("ice_aq_set_mac_loopback")
-    publish = setter.index("ice_link_loopback_update", aq)
+    transition = setter.index("ice_loopback_enable(ice)")
+    publish = setter.index("ice_link_loopback_update", transition)
     refresh = setter.index("ice_link_status_update", publish)
     lock_enter = setter.index("mutex_enter(&ice->ice_loopback_lock)")
     lock_exit = setter.rindex("mutex_exit(&ice->ice_loopback_lock)")
     assert "ice->ice_lock" not in setter
-    assert lock_enter < aq < publish < refresh < lock_exit
+    assert lock_enter < transition < publish < refresh < lock_exit
+
+    vsi = VSI_SOURCE.read_text(encoding="utf-8")
+    vsi_set = function(
+        vsi,
+        "ice_vsi_loopback_set(ice_t *ice, boolean_t enable)\n{",
+        "\nstatic int\nice_vsi_setup",
+    )
+    assert "ASSERT(MUTEX_HELD(&ice->ice_loopback_lock))" in vsi_set
+    assert "ICE_AQ_VSI_PROP_SW_VALID" in vsi_set
+    assert "flags |= ICE_AQ_VSI_SW_FLAG_ALLOW_LB" in vsi_set
+    assert "flags &= ~ICE_AQ_VSI_SW_FLAG_ALLOW_LB" in vsi_set
+    update = vsi_set.index("ice_update_vsi")
+    cache = vsi_set.index("cached->info.sw_flags = flags", update)
+    assert update < cache
 
     attach = ATTACH_SOURCE.read_text(encoding="utf-8")
     assert "mutex_init(&ice->ice_loopback_lock, NULL, MUTEX_DRIVER, NULL)" in attach

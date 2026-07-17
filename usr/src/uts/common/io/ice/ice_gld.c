@@ -238,11 +238,58 @@ static const lb_property_t ice_loopback_modes[] = {
 };
 
 static int
+ice_loopback_enable(ice_t *ice)
+{
+	int rollback, status;
+
+	status = ice_vsi_loopback_set(ice, B_TRUE);
+	if (status != ICE_SUCCESS) {
+		ice_error(ice, "!failed to permit VSI loopback: %d", status);
+		return (EIO);
+	}
+
+	status = ice_aq_set_mac_loopback(&ice->ice_hw, true, NULL);
+	if (status == ICE_SUCCESS)
+		return (0);
+
+	rollback = ice_vsi_loopback_set(ice, B_FALSE);
+	if (rollback != ICE_SUCCESS) {
+		ice_error(ice, "!failed to roll back VSI loopback: %d",
+		    rollback);
+	}
+	ice_error(ice, "!failed to enable MAC loopback: %d", status);
+	return (EIO);
+}
+
+static int
+ice_loopback_disable(ice_t *ice)
+{
+	int rollback, status;
+
+	status = ice_aq_set_mac_loopback(&ice->ice_hw, false, NULL);
+	if (status != ICE_SUCCESS) {
+		ice_error(ice, "!failed to disable MAC loopback: %d", status);
+		return (EIO);
+	}
+
+	status = ice_vsi_loopback_set(ice, B_FALSE);
+	if (status == ICE_SUCCESS)
+		return (0);
+
+	rollback = ice_aq_set_mac_loopback(&ice->ice_hw, true, NULL);
+	if (rollback != ICE_SUCCESS) {
+		ice_error(ice, "!failed to restore MAC loopback: %d", rollback);
+	}
+	ice_error(ice, "!failed to revoke VSI loopback: %d", status);
+	return (EIO);
+}
+
+static int
 ice_loopback_mode_set(ice_t *ice, uint32_t mode)
 {
 	boolean_t enable;
 	uint32_t current;
-	int status;
+	int error, rollback;
 
 	if (mode != ICE_LB_NONE && mode != ICE_LB_INTERNAL_MAC)
 		return (EINVAL);
@@ -257,14 +304,21 @@ ice_loopback_mode_set(ice_t *ice, uint32_t mode)
 	}
 
 	enable = mode == ICE_LB_INTERNAL_MAC;
-	status = ice_aq_set_mac_loopback(&ice->ice_hw, enable, NULL);
-	if (status != ICE_SUCCESS) {
+	error = enable ? ice_loopback_enable(ice) : ice_loopback_disable(ice);
+	if (error != 0) {
 		mutex_exit(&ice->ice_loopback_lock);
-		ice_error(ice, "!failed to %s MAC loopback: %d",
-		    enable ? "enable" : "disable", status);
-		return (EIO);
+		return (error);
 	}
 	if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {
+		if (enable) {
+			rollback = ice_loopback_disable(ice);
+		} else {
+			rollback = ice_loopback_enable(ice);
+		}
+		if (rollback != 0) {
+			ice_error(ice, "!failed to restore loopback after "
+			    "register access fault");
+		}
 		mutex_exit(&ice->ice_loopback_lock);
 		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
 		return (EIO);
