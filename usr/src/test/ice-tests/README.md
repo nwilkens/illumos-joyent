@@ -34,11 +34,11 @@ common-code control-queue allocations, and retains datapath handle checks.
 explicit bound flag rather than physical address zero, while preserving the
 common-code-visible `va`/`pa`/`size` structure prefix.
 
-`loopback.py` verifies the standard netlb ioctl surface, firmware-command and
-link-state ordering, detach cleanup, physical-event override, and absence of
-loopback branches in the packet datapath. `ice_loopback.c` is the small
-userland controller used for hardware validation. Build it on illumos from
-the source root with:
+`loopback.py` verifies the standard netlb ioctl surface, its explicit STREAMS
+and strsun dependencies, firmware-command and link-state ordering, detach
+cleanup, physical-event override, and absence of loopback branches in the
+packet datapath. `ice_loopback.c` is the small userland controller used for
+hardware validation. Build it on illumos from the source root with:
 
 ```
 gcc -Wall -Wextra -Werror -idirafter usr/src/uts/common \

@@ -21,6 +21,8 @@ def function(source: str, signature: str, following: str) -> str:
 
 def main() -> None:
     gld = GLD_SOURCE.read_text(encoding="utf-8")
+    assert "#include <sys/stream.h>" in gld
+    assert "#include <sys/strsun.h>" in gld
     assert "MC_IOCTL | MC_GETCAPAB" in gld
     assert ".mc_ioctl = ice_m_ioctl" in gld
     for command in ("LB_GET_INFO_SIZE", "LB_GET_INFO", "LB_GET_MODE", "LB_SET_MODE"):

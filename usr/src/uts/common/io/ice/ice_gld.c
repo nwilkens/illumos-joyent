@@ -38,6 +38,7 @@
 #include <sys/dlpi.h>
 #include <sys/netlb.h>
 #include <sys/stream.h>
+#include <sys/strsun.h>
 
 #include "ice.h"
 #include "ice_common.h"
