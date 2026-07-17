@@ -8,6 +8,7 @@ python3 usr/src/test/ice-tests/rx_checksum.py
 python3 usr/src/test/ice-tests/admin_interrupt.py
 python3 usr/src/test/ice-tests/link_state.py
 python3 usr/src/test/ice-tests/fma_dma.py
+python3 usr/src/test/ice-tests/dma_lifetime.py
 ```
 
 `rx_checksum.py` verifies that receive checksum metadata is captured before
@@ -27,3 +28,7 @@ initial hardware query fails.
 `fma_dma.py` verifies that the driver advertises and preserves the negotiated
 DMA-checking capability, applies `DDI_DMA_FLAGERR` to both datapath and
 common-code control-queue allocations, and retains datapath handle checks.
+
+`dma_lifetime.py` verifies that common-code DMA ownership is tracked by an
+explicit bound flag rather than physical address zero, while preserving the
+common-code-visible `va`/`pa`/`size` structure prefix.

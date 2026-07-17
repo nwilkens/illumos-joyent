@@ -233,6 +233,7 @@ ice_alloc_dma_mem(struct ice_hw *hw, struct ice_dma_mem *mem, u64 size)
 	}
 
 	mem->pa = cookie.dmac_laddress;
+	mem->idm_bound = B_TRUE;
 	mem->size = (size_t)size;
 
 	return (mem->va);
@@ -243,10 +244,12 @@ ice_free_dma_mem(struct ice_hw *hw, struct ice_dma_mem *mem)
 {
 	_NOTE(ARGUNUSED(hw));
 
-	if (mem->pa != 0) {
+	if (mem->idm_bound) {
+		VERIFY3P(mem->idm_dma_handle, !=, NULL);
 		(void) ddi_dma_unbind_handle(mem->idm_dma_handle);
-		mem->pa = 0;
+		mem->idm_bound = B_FALSE;
 	}
+	mem->pa = 0;
 
 	if (mem->idm_acc_handle != NULL) {
 		ddi_dma_mem_free(&mem->idm_acc_handle);
@@ -260,6 +263,7 @@ ice_free_dma_mem(struct ice_hw *hw, struct ice_dma_mem *mem)
 	}
 
 	mem->size = 0;
+	ASSERT(!mem->idm_bound);
 }
 
 void

@@ -196,6 +196,7 @@ struct ice_dma_mem {
 
 	ddi_acc_handle_t	idm_acc_handle;
 	ddi_dma_handle_t	idm_dma_handle;
+	boolean_t		idm_bound;
 };
 
 extern void *ice_alloc_dma_mem(struct ice_hw *, struct ice_dma_mem *, u64);
