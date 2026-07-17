@@ -545,51 +545,64 @@ ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 	 * the port's view, which aggregates every VSI on the function.
 	 */
 	mutex_enter(&ice->ice_stat_lock);
-	ice_stats_update_port(ice);
 
 	switch (stat) {
 	case MAC_STAT_RBYTES:
+		ice_stats_update_port(ice);
 		*val = ps->eth.rx_bytes;
 		break;
 	case MAC_STAT_IPACKETS:
+		ice_stats_update_port(ice);
 		*val = ps->eth.rx_unicast + ps->eth.rx_multicast +
 		    ps->eth.rx_broadcast;
 		break;
 	case MAC_STAT_OBYTES:
+		ice_stats_update_port(ice);
 		*val = ps->eth.tx_bytes;
 		break;
 	case MAC_STAT_OPACKETS:
+		ice_stats_update_port(ice);
 		*val = ps->eth.tx_unicast + ps->eth.tx_multicast +
 		    ps->eth.tx_broadcast;
 		break;
 	case MAC_STAT_MULTIRCV:
+		ice_stats_update_port(ice);
 		*val = ps->eth.rx_multicast;
 		break;
 	case MAC_STAT_BRDCSTRCV:
+		ice_stats_update_port(ice);
 		*val = ps->eth.rx_broadcast;
 		break;
 	case MAC_STAT_MULTIXMT:
+		ice_stats_update_port(ice);
 		*val = ps->eth.tx_multicast;
 		break;
 	case MAC_STAT_BRDCSTXMT:
+		ice_stats_update_port(ice);
 		*val = ps->eth.tx_broadcast;
 		break;
 	case MAC_STAT_IERRORS:
+		ice_stats_update_port(ice);
 		*val = ps->crc_errors + ps->illegal_bytes + ps->rx_len_errors;
 		break;
 	case MAC_STAT_UNDERFLOWS:
+		ice_stats_update_port(ice);
 		*val = ps->rx_undersize + ps->rx_fragments;
 		break;
 	case MAC_STAT_OVERFLOWS:
+		ice_stats_update_port(ice);
 		*val = ps->rx_oversize + ps->rx_jabber;
 		break;
 	case ETHER_STAT_FCS_ERRORS:
+		ice_stats_update_port(ice);
 		*val = ps->crc_errors;
 		break;
 	case ETHER_STAT_TOOLONG_ERRORS:
+		ice_stats_update_port(ice);
 		*val = ps->rx_oversize;
 		break;
 	case ETHER_STAT_MACRCV_ERRORS:
+		ice_stats_update_port(ice);
 		*val = ps->rx_len_errors + ps->rx_undersize +
 		    ps->rx_fragments + ps->rx_oversize + ps->rx_jabber;
 		break;

@@ -430,6 +430,7 @@ typedef struct ice {
 	kmutex_t		ice_stat_lock;
 	boolean_t		ice_stat_port_loaded;
 	boolean_t		ice_stat_vsi_loaded;
+	hrtime_t		ice_stat_port_last_update;
 	struct ice_hw_port_stats ice_stat_port_cur;
 	struct ice_hw_port_stats ice_stat_port_prev;
 	struct ice_eth_stats	ice_stat_vsi_cur;

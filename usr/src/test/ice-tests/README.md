@@ -57,4 +57,6 @@ common code, attach captures both hardware baselines before exposing the
 kstats, the kstat callbacks reject writes and lock correctly, teardown deletes
 the kstats before destroying their lock, attach installs stats before MAC while
 detach removes them before unmapping registers, and `ice_m_stat` sources the
-MAC counters under the stat lock.
+MAC counters under the stat lock. Port refreshes are rate-limited so a MAC
+kstat snapshot reads the hardware counter bank once, and unsupported MAC
+statistics do not trigger register reads.

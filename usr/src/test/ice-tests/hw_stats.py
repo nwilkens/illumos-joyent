@@ -84,9 +84,25 @@ def main() -> None:
     mstat = function(gld, "ice_m_stat(void *arg, uint_t stat, uint64_t *val)\n{", "\n/*")
     assert "ice_stats_update_port(ice)" in mstat
     assert "mutex_enter(&ice->ice_stat_lock)" in mstat
+    locked = mstat[mstat.index("mutex_enter(&ice->ice_stat_lock)") :]
+    assert locked.index("switch (stat)") < locked.index("ice_stats_update_port(ice)")
+    assert locked.count("ice_stats_update_port(ice)") == 14
+    assert locked.rindex("ice_stats_update_port(ice)") < locked.index("default:")
     for stat in ("MAC_STAT_RBYTES", "MAC_STAT_IPACKETS", "MAC_STAT_OBYTES",
                  "MAC_STAT_OPACKETS", "MAC_STAT_IERRORS"):
         assert stat in mstat
+
+    # A MAC kstat snapshot invokes m_stat once per field.  Bound those calls to
+    # one hardware refresh window and do not read registers for unsupported
+    # fields.
+    port_update = function(
+        stats,
+        "ice_stats_update_port(ice_t *ice)\n{",
+        "\nvoid\nice_stats_update_vsi",
+    )
+    assert "ICE_STATS_MIN_UPDATE_NS" in stats
+    assert "ice_stat_port_last_update" in port_update
+    assert "now - ice->ice_stat_port_last_update" in port_update
 
     # The new object is built.
     assert "ice_stats.o" in MAKEFILE.read_text(encoding="utf-8")

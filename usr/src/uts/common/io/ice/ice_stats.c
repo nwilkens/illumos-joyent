@@ -33,10 +33,14 @@
 #include <sys/types.h>
 #include <sys/kstat.h>
 #include <sys/ddifm.h>
+#include <sys/time.h>
 
 #include "ice.h"
 #include "ice_common.h"
 #include "ice_switch.h"
+
+/* Coalesce the individual callbacks made for one MAC kstat snapshot. */
+#define	ICE_STATS_MIN_UPDATE_NS	MSEC2NSEC(10)
 
 /*
  * Refresh the cached port counters.  ice_stat_update40 reads a 40-bit counter
@@ -50,10 +54,15 @@ ice_stats_update_port(ice_t *ice)
 	struct ice_hw_port_stats *cur = &ice->ice_stat_port_cur;
 	struct ice_hw_port_stats *prev = &ice->ice_stat_port_prev;
 	boolean_t loaded = ice->ice_stat_port_loaded;
+	hrtime_t now;
 	uint8_t lport;
 
 	ASSERT(MUTEX_HELD(&ice->ice_stat_lock));
 
+	now = gethrtime();
+	if (ice->ice_stat_port_last_update != 0 &&
+	    now - ice->ice_stat_port_last_update < ICE_STATS_MIN_UPDATE_NS)
+		return;
 	if (hw->port_info == NULL)
 		return;
 	lport = hw->port_info->lport;
@@ -93,6 +102,7 @@ ice_stats_update_port(ice_t *ice)
 #undef	ICE_PORT_STAT32
 
 	ice->ice_stat_port_loaded = B_TRUE;
+	ice->ice_stat_port_last_update = gethrtime();
 }
 
 /*
