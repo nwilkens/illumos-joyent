@@ -97,6 +97,16 @@ ice_link_prop_update(ice_t *ice)
 
 	ASSERT(MUTEX_HELD(&ice->ice_lse_lock));
 
+	/* Internal MAC loopback is usable without a physical carrier. */
+	if (ice->ice_loopback_mode == ICE_LB_INTERNAL_MAC) {
+		ice->ice_link_state = LINK_STATE_UP;
+		ice->ice_link_speed = 0;
+		ice->ice_link_duplex = LINK_DUPLEX_FULL;
+		ice->ice_link_fctl = LINK_FLOWCTRL_NONE;
+		ice_link_state_set(ice, LINK_STATE_UP);
+		return;
+	}
+
 	if ((li->link_info & ICE_AQ_LINK_UP) == 0) {
 		ice->ice_link_state = LINK_STATE_DOWN;
 		ice->ice_link_speed = 0;
@@ -129,6 +139,34 @@ ice_link_prop_update(ice_t *ice)
 	ice->ice_link_fctl = fctl;
 
 	ice_link_state_set(ice, LINK_STATE_UP);
+}
+
+/*
+ * Apply or remove the link-state override associated with internal MAC
+ * loopback.  Disabling first publishes UNKNOWN; the caller then refreshes
+ * the real hardware state, leaving UNKNOWN if that query fails.
+ */
+void
+ice_link_loopback_update(ice_t *ice, uint32_t mode)
+{
+	link_state_t state;
+
+	ASSERT(mode == ICE_LB_NONE || mode == ICE_LB_INTERNAL_MAC);
+
+	mutex_enter(&ice->ice_lse_lock);
+	ice->ice_loopback_mode = mode;
+	ice->ice_link_speed = 0;
+	ice->ice_link_fctl = LINK_FLOWCTRL_NONE;
+	if (mode == ICE_LB_INTERNAL_MAC) {
+		state = LINK_STATE_UP;
+		ice->ice_link_duplex = LINK_DUPLEX_FULL;
+	} else {
+		state = LINK_STATE_UNKNOWN;
+		ice->ice_link_duplex = LINK_DUPLEX_UNKNOWN;
+	}
+	ice->ice_link_state = state;
+	ice_link_state_set(ice, state);
+	mutex_exit(&ice->ice_lse_lock);
 }
 
 /*

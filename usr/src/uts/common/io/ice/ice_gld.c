@@ -36,6 +36,8 @@
 #include <sys/mac_ether.h>
 #include <sys/vlan.h>
 #include <sys/dlpi.h>
+#include <sys/netlb.h>
+#include <sys/stream.h>
 
 #include "ice.h"
 #include "ice_common.h"
@@ -222,6 +224,147 @@ ice_fill_group(void *arg, mac_ring_type_t rtype, const int index,
 	infop->mgi_addmac = ice_group_add_mac;
 	infop->mgi_remmac = ice_group_remove_mac;
 	infop->mgi_count = ice->ice_num_rxr;
+}
+
+/*
+ * Standard netlb(4I) loopback modes.  The firmware command implements an
+ * internal MAC loopback; no physical media is involved.
+ */
+static const lb_property_t ice_loopback_modes[] = {
+	{ normal, "normal", ICE_LB_NONE },
+	{ internal, "MAC", ICE_LB_INTERNAL_MAC }
+};
+
+static int
+ice_loopback_mode_set(ice_t *ice, uint32_t mode)
+{
+	boolean_t enable;
+	uint32_t current;
+	int status;
+
+	if (mode != ICE_LB_NONE && mode != ICE_LB_INTERNAL_MAC)
+		return (EINVAL);
+
+	mutex_enter(&ice->ice_lock);
+	mutex_enter(&ice->ice_lse_lock);
+	current = ice->ice_loopback_mode;
+	mutex_exit(&ice->ice_lse_lock);
+	if (mode == current) {
+		mutex_exit(&ice->ice_lock);
+		return (0);
+	}
+
+	enable = mode == ICE_LB_INTERNAL_MAC;
+	status = ice_aq_set_mac_loopback(&ice->ice_hw, enable, NULL);
+	if (status != ICE_SUCCESS) {
+		mutex_exit(&ice->ice_lock);
+		ice_error(ice, "!failed to %s MAC loopback: %d",
+		    enable ? "enable" : "disable", status);
+		return (EIO);
+	}
+	if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {
+		mutex_exit(&ice->ice_lock);
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
+		return (EIO);
+	}
+
+	ice_link_loopback_update(ice, mode);
+	mutex_exit(&ice->ice_lock);
+
+	if (!enable)
+		ice_link_status_update(ice);
+
+	return (0);
+}
+
+void
+ice_loopback_fini(ice_t *ice)
+{
+	uint32_t mode;
+
+	mutex_enter(&ice->ice_lse_lock);
+	mode = ice->ice_loopback_mode;
+	mutex_exit(&ice->ice_lse_lock);
+	if (mode != ICE_LB_NONE)
+		(void) ice_loopback_mode_set(ice, ICE_LB_NONE);
+}
+
+static boolean_t
+ice_loopback_payload(mblk_t *mp, size_t size)
+{
+	return (mp->b_cont != NULL && MBLKL(mp->b_cont) >= size);
+}
+
+static void
+ice_m_ioctl(void *arg, queue_t *q, mblk_t *mp)
+{
+	ice_t *ice = arg;
+	struct iocblk *iocp;
+	lb_info_sz_t infosz;
+	uint32_t mode;
+	size_t size;
+	int error = 0;
+
+	if (MBLKL(mp) < sizeof (*iocp)) {
+		miocnak(q, mp, 0, EINVAL);
+		return;
+	}
+	iocp = (struct iocblk *)(uintptr_t)mp->b_rptr;
+
+	switch (iocp->ioc_cmd) {
+	case LB_GET_INFO_SIZE:
+		size = sizeof (lb_info_sz_t);
+		if (iocp->ioc_count != size || !ice_loopback_payload(mp, size)) {
+			error = EINVAL;
+			break;
+		}
+		infosz = sizeof (ice_loopback_modes);
+		bcopy(&infosz, mp->b_cont->b_rptr, size);
+		break;
+	case LB_GET_INFO:
+		size = sizeof (ice_loopback_modes);
+		if (iocp->ioc_count != size || !ice_loopback_payload(mp, size)) {
+			error = EINVAL;
+			break;
+		}
+		bcopy(ice_loopback_modes, mp->b_cont->b_rptr, size);
+		break;
+	case LB_GET_MODE:
+		size = sizeof (uint32_t);
+		if (iocp->ioc_count != size || !ice_loopback_payload(mp, size)) {
+			error = EINVAL;
+			break;
+		}
+		mutex_enter(&ice->ice_lse_lock);
+		mode = ice->ice_loopback_mode;
+		mutex_exit(&ice->ice_lse_lock);
+		bcopy(&mode, mp->b_cont->b_rptr, size);
+		break;
+	case LB_SET_MODE:
+		size = 0;
+		if (iocp->ioc_count != sizeof (uint32_t) ||
+		    !ice_loopback_payload(mp, sizeof (uint32_t))) {
+			error = EINVAL;
+			break;
+		}
+		bcopy(mp->b_cont->b_rptr, &mode, sizeof (mode));
+		error = ice_loopback_mode_set(ice, mode);
+		break;
+	default:
+		error = EINVAL;
+		break;
+	}
+
+	if (error != 0) {
+		miocnak(q, mp, 0, error);
+		return;
+	}
+
+	iocp->ioc_count = size;
+	iocp->ioc_error = 0;
+	iocp->ioc_rval = 0;
+	mp->b_datap->db_type = M_IOCACK;
+	qreply(q, mp);
 }
 
 /*
@@ -562,7 +705,8 @@ ice_m_propinfo(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 }
 
 static mac_callbacks_t ice_m_callbacks = {
-	.mc_callbacks = MC_GETCAPAB | MC_SETPROP | MC_GETPROP | MC_PROPINFO,
+	.mc_callbacks = MC_IOCTL | MC_GETCAPAB | MC_SETPROP | MC_GETPROP |
+	    MC_PROPINFO,
 	.mc_getstat = ice_m_stat,
 	.mc_start = ice_m_start,
 	.mc_stop = ice_m_stop,
@@ -570,6 +714,7 @@ static mac_callbacks_t ice_m_callbacks = {
 	.mc_multicst = ice_m_multicst,
 	.mc_unicst = NULL,		/* rx groups: unicast via addmac */
 	.mc_tx = NULL,			/* tx is per-ring (MAC_CAPAB_RINGS) */
+	.mc_ioctl = ice_m_ioctl,
 	.mc_getcapab = ice_m_getcapab,
 	.mc_setprop = ice_m_setprop,
 	.mc_getprop = ice_m_getprop,

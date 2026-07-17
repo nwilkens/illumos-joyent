@@ -881,6 +881,7 @@ ice_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 			return (DDI_FAILURE);
 		ice->ice_attach_progress &= ~ICE_ATTACH_MAC;
 	}
+	ice_loopback_fini(ice);
 
 	mutex_enter(&ice_glock);
 	list_remove(&ice_glist, ice);

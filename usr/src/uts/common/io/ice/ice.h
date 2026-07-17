@@ -65,6 +65,10 @@ extern "C" {
 #define	ICE_MAX_MTU		9728		/* E810 jumbo frame maximum */
 #define	ICE_MAX_FUNCS		8
 
+/* Standard netlb(4I) modes supported by ice_m_ioctl(). */
+#define	ICE_LB_NONE		0
+#define	ICE_LB_INTERNAL_MAC	1
+
 /*
  * Datapath constants.
  */
@@ -332,6 +336,7 @@ typedef struct ice {
 	uint64_t		ice_link_speed;
 	link_duplex_t		ice_link_duplex;
 	link_flowctrl_t		ice_link_fctl;
+	uint32_t		ice_loopback_mode;
 
 	ice_vsi_t		ice_pf_vsi;		/* control plane (M5) */
 
@@ -465,6 +470,8 @@ extern int ice_ring_rx_intr_disable(mac_intr_handle_t);
 extern boolean_t ice_mac_register(ice_t *);
 extern int ice_mac_unregister(ice_t *);
 extern void ice_link_state_publish(ice_t *);
+extern void ice_link_loopback_update(ice_t *, uint32_t);
+extern void ice_loopback_fini(ice_t *);
 
 #ifdef __cplusplus
 }
