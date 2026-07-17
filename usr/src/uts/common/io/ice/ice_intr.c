@@ -18,7 +18,7 @@
  * cause" (OICR) vector that carries admin-queue async events, link-status
  * changes, and error causes, and the taskq that drains the admin receive
  * queue off the interrupt.  Link state is read through the common code and
- * cached in the softc; it is not reported to MAC until mac_register lands.
+ * cached in the softc; it is reported to MAC once mac_register lands.
  */
 
 #include <sys/atomic.h>
@@ -65,6 +65,19 @@ ice_link_state_set(ice_t *ice, link_state_t state)
 		return;
 
 	mac_link_update(ice->ice_mac_hdl, state);
+}
+
+/*
+ * Publish the state cached by the attach-time hardware query after the MAC
+ * handle becomes valid.  Serialize with asynchronous link updates so MAC
+ * always receives the newest cached state.
+ */
+void
+ice_link_state_publish(ice_t *ice)
+{
+	mutex_enter(&ice->ice_lse_lock);
+	ice_link_state_set(ice, ice->ice_link_state);
+	mutex_exit(&ice->ice_lse_lock);
 }
 
 /*

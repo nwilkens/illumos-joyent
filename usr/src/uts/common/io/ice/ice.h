@@ -464,6 +464,7 @@ extern int ice_ring_rx_intr_disable(mac_intr_handle_t);
  */
 extern boolean_t ice_mac_register(ice_t *);
 extern int ice_mac_unregister(ice_t *);
+extern void ice_link_state_publish(ice_t *);
 
 #ifdef __cplusplus
 }

@@ -616,6 +616,8 @@ ice_mac_register(ice_t *ice)
 		return (B_FALSE);
 	}
 
+	ice_link_state_publish(ice);
+
 	return (B_TRUE);
 }
 
