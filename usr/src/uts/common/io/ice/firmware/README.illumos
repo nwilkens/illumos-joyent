@@ -7,7 +7,8 @@ falls back to Safe Mode.
 
 `usr/src/uts/intel/ice/Makefile` installs the package as
 `/kernel/firmware/ice/ice.pkg`.  The package manifest must include that path
-when the driver is integrated into an IPS package.
+when the driver is integrated into an IPS package.  A successful attach logs
+the active package name and version reported by the device.
 
 The file is imported byte-for-byte from FreeBSD `freebsd-src` commit
 `d0b1a389003b1e6ff5bcf35a7c04654ea7ff87bd`:

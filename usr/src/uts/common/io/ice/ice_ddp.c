@@ -90,6 +90,19 @@ ice_ddp_load(ice_t *ice)
 		ice_error(ice, "!ice.pkg init failed (%d); using safe mode",
 		    state);
 		ice_ddp_safe_mode(ice);
+	} else {
+		char name[ICE_PKG_NAME_SIZE + 1];
+
+		/*
+		 * The package name is firmware input and need not be
+		 * terminated.
+		 */
+		bcopy(hw->active_pkg_name, name, ICE_PKG_NAME_SIZE);
+		name[ICE_PKG_NAME_SIZE] = '\0';
+		dev_err(ice->ice_dip, CE_NOTE,
+		    "DDP package active: %s version %u.%u.%u.%u", name,
+		    hw->active_pkg_ver.major, hw->active_pkg_ver.minor,
+		    hw->active_pkg_ver.update, hw->active_pkg_ver.draft);
 	}
 
 	return (B_TRUE);
