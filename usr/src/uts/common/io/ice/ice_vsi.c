@@ -180,11 +180,15 @@ ice_vsi_ctx_fill(ice_t *ice, struct ice_vsi_ctx *ctx)
 }
 
 /*
- * Permit or reject frames that the PF VSI itself transmitted.  The cached
- * common-code context is the authoritative copy of the other switch-section
- * fields, so preserve it and update the cache only after firmware accepts the
- * change.  The loopback mutex serializes mode changes; detach disables
- * loopback before tearing down the VSI.
+ * Permit or reject local loopback for frames that the PF VSI transmitted.
+ * Both loopback flags are required for the local VEB path, and source pruning
+ * must be disabled so that the VSI can receive frames bearing its own source
+ * MAC address.  Restore source pruning when leaving this privileged,
+ * transient diagnostic mode.  The cached common-code context is the
+ * authoritative copy of the other switch-section fields, so preserve it and
+ * update the cache only after firmware accepts the change.  The loopback
+ * mutex serializes mode changes; detach disables loopback before tearing down
+ * the VSI.
  */
 int
 ice_vsi_loopback_set(ice_t *ice, boolean_t enable)
@@ -203,10 +207,15 @@ ice_vsi_loopback_set(ice_t *ice, boolean_t enable)
 		return (ICE_ERR_DOES_NOT_EXIST);
 
 	flags = cached->info.sw_flags;
-	if (enable)
-		flags |= ICE_AQ_VSI_SW_FLAG_ALLOW_LB;
-	else
-		flags &= ~ICE_AQ_VSI_SW_FLAG_ALLOW_LB;
+	if (enable) {
+		flags |= ICE_AQ_VSI_SW_FLAG_ALLOW_LB |
+		    ICE_AQ_VSI_SW_FLAG_LOCAL_LB;
+		flags &= ~ICE_AQ_VSI_SW_FLAG_SRC_PRUNE;
+	} else {
+		flags &= ~(ICE_AQ_VSI_SW_FLAG_ALLOW_LB |
+		    ICE_AQ_VSI_SW_FLAG_LOCAL_LB);
+		flags |= ICE_AQ_VSI_SW_FLAG_SRC_PRUNE;
+	}
 	if (flags == cached->info.sw_flags)
 		return (ICE_SUCCESS);
 

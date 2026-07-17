@@ -83,8 +83,16 @@ def main() -> None:
     )
     assert "ASSERT(MUTEX_HELD(&ice->ice_loopback_lock))" in vsi_set
     assert "ICE_AQ_VSI_PROP_SW_VALID" in vsi_set
-    assert "flags |= ICE_AQ_VSI_SW_FLAG_ALLOW_LB" in vsi_set
-    assert "flags &= ~ICE_AQ_VSI_SW_FLAG_ALLOW_LB" in vsi_set
+    assert "flags |= ICE_AQ_VSI_SW_FLAG_ALLOW_LB |" in vsi_set
+    assert "flags &= ~(ICE_AQ_VSI_SW_FLAG_ALLOW_LB |" in vsi_set
+    assert vsi_set.count("ICE_AQ_VSI_SW_FLAG_LOCAL_LB") == 2
+    prune_disable = vsi_set.index(
+        "flags &= ~ICE_AQ_VSI_SW_FLAG_SRC_PRUNE"
+    )
+    prune_restore = vsi_set.index(
+        "flags |= ICE_AQ_VSI_SW_FLAG_SRC_PRUNE", prune_disable
+    )
+    assert prune_disable < prune_restore
     update = vsi_set.index("ice_update_vsi")
     cache = vsi_set.index("cached->info.sw_flags = flags", update)
     assert update < cache
