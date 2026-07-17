@@ -10,7 +10,7 @@
 #
 
 #
-# Copyright 2026 MNX Cloud, Inc.
+# Copyright 2026 Edgecast Cloud LLC.
 #
 
 UTSBASE = ../..
@@ -23,6 +23,11 @@ include $(UTSBASE)/intel/Makefile.intel
 
 CPPFLAGS	+= -I$(UTSBASE)/common/io/ice
 CPPFLAGS	+= -I$(UTSBASE)/common/io/ice/core
+
+#
+# The driver registers with the MAC framework (GLDv3).
+#
+LDFLAGS		+= -N misc/mac
 
 ALL_TARGET	= $(BINARY)
 INSTALL_TARGET	= $(BINARY) $(ROOTMODULE)
