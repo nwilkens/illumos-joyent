@@ -612,6 +612,12 @@ ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 	}
 	mutex_exit(&ice->ice_stat_lock);
 
+	if (ret == 0 &&
+	    ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
+		return (EIO);
+	}
+
 	return (ret);
 }
 

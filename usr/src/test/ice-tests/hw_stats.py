@@ -88,6 +88,11 @@ def main() -> None:
     assert locked.index("switch (stat)") < locked.index("ice_stats_update_port(ice)")
     assert locked.count("ice_stats_update_port(ice)") == 14
     assert locked.rindex("ice_stats_update_port(ice)") < locked.index("default:")
+    unlock = mstat.index("mutex_exit(&ice->ice_stat_lock)", mstat.index("mutex_enter"))
+    acc = mstat.index("ice_check_acc_handle", unlock)
+    degraded = mstat.index("DDI_SERVICE_DEGRADED", acc)
+    io_error = mstat.index("return (EIO)", degraded)
+    assert unlock < acc < degraded < io_error
     for stat in ("MAC_STAT_RBYTES", "MAC_STAT_IPACKETS", "MAC_STAT_OBYTES",
                  "MAC_STAT_OPACKETS", "MAC_STAT_IERRORS"):
         assert stat in mstat

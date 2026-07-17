@@ -153,9 +153,9 @@ ice_stats_update_vsi(ice_t *ice)
 }
 
 /*
- * Report a degraded FMA state if a register access faulted during a refresh.
- * A failed statistics read does not affect service, so it is recorded as
- * unaffected, matching i40e and ixgbe.
+ * A failed private-kstat refresh does not affect service, so record it as
+ * unaffected, matching i40e and ixgbe.  The GLDv3 MAC-stat path applies its
+ * stronger degraded-service policy in ice_m_stat().
  */
 static void
 ice_stats_check_acc(ice_t *ice)

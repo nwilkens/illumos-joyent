@@ -59,4 +59,6 @@ the kstats before destroying their lock, attach installs stats before MAC while
 detach removes them before unmapping registers, and `ice_m_stat` sources the
 MAC counters under the stat lock. Port refreshes are rate-limited so a MAC
 kstat snapshot reads the hardware counter bank once, and unsupported MAC
-statistics do not trigger register reads.
+statistics do not trigger register reads. Register-access faults from a
+supported MAC statistic report degraded service and return `EIO`, while
+private-kstat failures retain the established unaffected-service policy.
