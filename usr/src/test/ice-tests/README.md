@@ -38,7 +38,9 @@ common-code-visible `va`/`pa`/`size` structure prefix.
 and strsun dependencies, firmware-command and link-state ordering, detach
 cleanup, physical-event override, and absence of loopback branches in the
 packet datapath. `ice_loopback.c` is the small userland controller used for
-hardware validation. Build it on illumos from the source root with:
+hardware validation. It sends each netlb command through STREAMS `I_STR`, so
+the driver receives the inline payload and exact `ioc_count` it validates.
+Build it on illumos from the source root with:
 
 ```
 gcc -Wall -Wextra -Werror -idirafter usr/src/uts/common \

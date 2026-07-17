@@ -2,6 +2,7 @@
 
 """Check ICE internal MAC loopback control and isolation invariants."""
 
+import re
 from pathlib import Path
 
 
@@ -11,6 +12,7 @@ GLD_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_gld.c"
 INTR_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_intr.c"
 RX_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_rx.c"
 TX_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_tx.c"
+TOOL_SOURCE = REPO / "usr/src/test/ice-tests/ice_loopback.c"
 
 
 def function(source: str, signature: str, following: str) -> str:
@@ -61,6 +63,13 @@ def main() -> None:
     tx = TX_SOURCE.read_text(encoding="utf-8")
     assert "loopback" not in rx.lower()
     assert "loopback" not in tx.lower()
+
+    tool = TOOL_SOURCE.read_text(encoding="utf-8")
+    assert "#include <sys/stropts.h>" in tool
+    assert "ioctl(fd, I_STR, &str)" in tool
+    assert re.search(r"\bioctl\(fd, LB_", tool) is None
+    for command in ("LB_GET_INFO_SIZE", "LB_GET_INFO", "LB_GET_MODE", "LB_SET_MODE"):
+        assert f"netlb_ioctl(fd, {command}" in tool
 
 
 if __name__ == "__main__":

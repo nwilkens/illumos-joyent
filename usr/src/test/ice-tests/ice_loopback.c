@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/netlb.h>
+#include <sys/stropts.h>
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -36,6 +37,20 @@ fail(const char *what)
 	exit(EXIT_FAILURE);
 }
 
+static int
+netlb_ioctl(int fd, int cmd, void *data, int len)
+{
+	struct strioctl str;
+
+	bzero(&str, sizeof (str));
+	str.ic_cmd = cmd;
+	str.ic_timout = 0;
+	str.ic_len = len;
+	str.ic_dp = data;
+
+	return (ioctl(fd, I_STR, &str));
+}
+
 int
 main(int argc, char **argv)
 {
@@ -52,17 +67,18 @@ main(int argc, char **argv)
 		fail("open");
 
 	if (strcmp(argv[2], "list") == 0) {
-		if (ioctl(fd, LB_GET_INFO_SIZE, &infosz) != 0)
+		if (netlb_ioctl(fd, LB_GET_INFO_SIZE, &infosz,
+		    sizeof (infosz)) != 0)
 			fail("LB_GET_INFO_SIZE");
 		if ((info = calloc(1, infosz)) == NULL)
 			fail("calloc");
-		if (ioctl(fd, LB_GET_INFO, info) != 0)
+		if (netlb_ioctl(fd, LB_GET_INFO, info, infosz) != 0)
 			fail("LB_GET_INFO");
 		for (i = 0; i < infosz / sizeof (*info); i++)
 			(void) printf("%s %u\n", info[i].key, info[i].value);
 		free(info);
 	} else if (strcmp(argv[2], "get") == 0) {
-		if (ioctl(fd, LB_GET_MODE, &mode) != 0)
+		if (netlb_ioctl(fd, LB_GET_MODE, &mode, sizeof (mode)) != 0)
 			fail("LB_GET_MODE");
 		(void) printf("%u\n", mode);
 	} else {
@@ -72,7 +88,7 @@ main(int argc, char **argv)
 			mode = ICE_LB_INTERNAL_MAC;
 		else
 			usage(argv[0]);
-		if (ioctl(fd, LB_SET_MODE, &mode) != 0)
+		if (netlb_ioctl(fd, LB_SET_MODE, &mode, sizeof (mode)) != 0)
 			fail("LB_SET_MODE");
 	}
 
