@@ -36,6 +36,7 @@ common-code-visible `va`/`pa`/`size` structure prefix.
 
 `loopback.py` verifies the standard netlb ioctl surface, its explicit STREAMS
 and strsun dependencies, the `PRIV_SYS_NET_CONFIG` gate on mode changes,
+adaptive thread-context serialization around the firmware command,
 firmware-command and link-state ordering, detach cleanup, physical-event
 override, and absence of loopback branches in the packet datapath.
 `ice_loopback.c` is the small userland controller used for hardware validation.

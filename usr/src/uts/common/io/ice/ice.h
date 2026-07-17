@@ -336,6 +336,8 @@ typedef struct ice {
 	uint64_t		ice_link_speed;
 	link_duplex_t		ice_link_duplex;
 	link_flowctrl_t		ice_link_fctl;
+	/* Adaptive mutex: loopback transitions run only in thread context. */
+	kmutex_t		ice_loopback_lock;
 	uint32_t		ice_loopback_mode;
 
 	ice_vsi_t		ice_pf_vsi;		/* control plane (M5) */

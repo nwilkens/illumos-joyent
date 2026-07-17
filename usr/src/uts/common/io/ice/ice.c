@@ -681,6 +681,7 @@ ice_unconfigure(ice_t *ice)
 	if (ice->ice_attach_progress & ICE_ATTACH_FM_INIT)
 		ice_fm_fini(ice);
 
+	mutex_destroy(&ice->ice_loopback_lock);
 	mutex_destroy(&ice->ice_lock);
 	ice->ice_attach_progress = 0;
 }
@@ -705,6 +706,7 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	ice->ice_instance = instance;
 	ice->ice_link_state = LINK_STATE_UNKNOWN;
 	mutex_init(&ice->ice_lock, NULL, MUTEX_DRIVER, NULL);
+	mutex_init(&ice->ice_loopback_lock, NULL, MUTEX_DRIVER, NULL);
 
 	/*
 	 * Wire the common code to the osdep and back to the softc before any

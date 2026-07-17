@@ -49,9 +49,14 @@ def main() -> None:
     aq = setter.index("ice_aq_set_mac_loopback")
     publish = setter.index("ice_link_loopback_update", aq)
     refresh = setter.index("ice_link_status_update", publish)
-    assert aq < publish < refresh
+    lock_enter = setter.index("mutex_enter(&ice->ice_loopback_lock)")
+    lock_exit = setter.rindex("mutex_exit(&ice->ice_loopback_lock)")
+    assert "ice->ice_lock" not in setter
+    assert lock_enter < aq < publish < refresh < lock_exit
 
     attach = ATTACH_SOURCE.read_text(encoding="utf-8")
+    assert "mutex_init(&ice->ice_loopback_lock, NULL, MUTEX_DRIVER, NULL)" in attach
+    assert "mutex_destroy(&ice->ice_loopback_lock)" in attach
     detach_start = attach.index(
         "ice_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)\n{"
     )

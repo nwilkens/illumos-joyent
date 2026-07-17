@@ -247,34 +247,33 @@ ice_loopback_mode_set(ice_t *ice, uint32_t mode)
 	if (mode != ICE_LB_NONE && mode != ICE_LB_INTERNAL_MAC)
 		return (EINVAL);
 
-	mutex_enter(&ice->ice_lock);
+	mutex_enter(&ice->ice_loopback_lock);
 	mutex_enter(&ice->ice_lse_lock);
 	current = ice->ice_loopback_mode;
 	mutex_exit(&ice->ice_lse_lock);
 	if (mode == current) {
-		mutex_exit(&ice->ice_lock);
+		mutex_exit(&ice->ice_loopback_lock);
 		return (0);
 	}
 
 	enable = mode == ICE_LB_INTERNAL_MAC;
 	status = ice_aq_set_mac_loopback(&ice->ice_hw, enable, NULL);
 	if (status != ICE_SUCCESS) {
-		mutex_exit(&ice->ice_lock);
+		mutex_exit(&ice->ice_loopback_lock);
 		ice_error(ice, "!failed to %s MAC loopback: %d",
 		    enable ? "enable" : "disable", status);
 		return (EIO);
 	}
 	if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {
-		mutex_exit(&ice->ice_lock);
+		mutex_exit(&ice->ice_loopback_lock);
 		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
 		return (EIO);
 	}
 
 	ice_link_loopback_update(ice, mode);
-	mutex_exit(&ice->ice_lock);
-
 	if (!enable)
 		ice_link_status_update(ice);
+	mutex_exit(&ice->ice_loopback_lock);
 
 	return (0);
 }
