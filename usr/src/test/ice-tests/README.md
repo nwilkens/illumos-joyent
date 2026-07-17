@@ -37,4 +37,10 @@ common-code-visible `va`/`pa`/`size` structure prefix.
 `loopback.py` verifies the standard netlb ioctl surface, firmware-command and
 link-state ordering, detach cleanup, physical-event override, and absence of
 loopback branches in the packet datapath. `ice_loopback.c` is the small
-userland controller used for hardware validation.
+userland controller used for hardware validation. Build it on illumos from
+the source root with:
+
+```
+gcc -Wall -Wextra -Werror -idirafter usr/src/uts/common \
+    -o /tmp/ice_loopback usr/src/test/ice-tests/ice_loopback.c
+```

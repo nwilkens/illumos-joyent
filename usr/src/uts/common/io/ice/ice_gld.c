@@ -314,7 +314,8 @@ ice_m_ioctl(void *arg, queue_t *q, mblk_t *mp)
 	switch (iocp->ioc_cmd) {
 	case LB_GET_INFO_SIZE:
 		size = sizeof (lb_info_sz_t);
-		if (iocp->ioc_count != size || !ice_loopback_payload(mp, size)) {
+		if (iocp->ioc_count != size ||
+		    !ice_loopback_payload(mp, size)) {
 			error = EINVAL;
 			break;
 		}
@@ -323,7 +324,8 @@ ice_m_ioctl(void *arg, queue_t *q, mblk_t *mp)
 		break;
 	case LB_GET_INFO:
 		size = sizeof (ice_loopback_modes);
-		if (iocp->ioc_count != size || !ice_loopback_payload(mp, size)) {
+		if (iocp->ioc_count != size ||
+		    !ice_loopback_payload(mp, size)) {
 			error = EINVAL;
 			break;
 		}
@@ -331,7 +333,8 @@ ice_m_ioctl(void *arg, queue_t *q, mblk_t *mp)
 		break;
 	case LB_GET_MODE:
 		size = sizeof (uint32_t);
-		if (iocp->ioc_count != size || !ice_loopback_payload(mp, size)) {
+		if (iocp->ioc_count != size ||
+		    !ice_loopback_payload(mp, size)) {
 			error = EINVAL;
 			break;
 		}
