@@ -100,7 +100,7 @@ ice_ddp_load(ice_t *ice)
 		bcopy(hw->active_pkg_name, name, ICE_PKG_NAME_SIZE);
 		name[ICE_PKG_NAME_SIZE] = '\0';
 		dev_err(ice->ice_dip, CE_NOTE,
-		    "DDP package active: %s version %u.%u.%u.%u", name,
+		    "!DDP package active: %s version %u.%u.%u.%u", name,
 		    hw->active_pkg_ver.major, hw->active_pkg_ver.minor,
 		    hw->active_pkg_ver.update, hw->active_pkg_ver.draft);
 	}
