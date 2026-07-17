@@ -711,7 +711,8 @@ ice_rx_hcksum(ice_rx_ring_t *irr, mblk_t *mp, uint16_t status0, uint16_t ptype)
 	if (pinfo.outer_ip == ICE_RX_PTYPE_OUTER_IP &&
 	    pinfo.outer_ip_ver == ICE_RX_PTYPE_OUTER_IPV4 &&
 	    pinfo.tunnel_type == ICE_RX_PTYPE_TUNNEL_NONE &&
-	    (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_IPE_S)) == 0)
+	    (status0 & (BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_IPE_S) |
+	    BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_EIPE_S))) == 0)
 		cksum |= HCK_IPV4_HDRCKSUM_OK;
 
 	/*
@@ -724,7 +725,8 @@ ice_rx_hcksum(ice_rx_ring_t *irr, mblk_t *mp, uint16_t status0, uint16_t ptype)
 	    (pinfo.inner_prot == ICE_RX_PTYPE_INNER_PROT_TCP ||
 	    pinfo.inner_prot == ICE_RX_PTYPE_INNER_PROT_UDP ||
 	    pinfo.inner_prot == ICE_RX_PTYPE_INNER_PROT_SCTP) &&
-	    (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_L4E_S)) == 0 &&
+	    (status0 & (BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_L4E_S) |
+	    BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_EUDPE_S))) == 0 &&
 	    (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_IPV6EXADD_S)) == 0)
 		cksum |= HCK_FULLCKSUM_OK;
 
@@ -782,6 +784,8 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes)
 
 		plen = LE16_TO_CPU(desc->wb.pkt_len) &
 		    ICE_RX_FLX_DESC_PKT_LEN_M;
+		ptype = LE16_TO_CPU(desc->wb.ptype_flex_flags0) &
+		    ICE_RX_FLEX_DESC_PTYPE_M;
 
 		/*
 		 * The single most important defensive check: a length larger
@@ -834,8 +838,6 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes)
 		if (!bound)
 			ice_rx_reset_desc(irr, head, rcb);
 
-		ptype = LE16_TO_CPU(desc->wb.ptype_flex_flags0) &
-		    ICE_RX_FLEX_DESC_PTYPE_M;
 		ice_rx_hcksum(irr, mp, status0, ptype);
 
 		if (mp_tail == NULL)
