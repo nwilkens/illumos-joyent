@@ -596,6 +596,14 @@ static void
 ice_unconfigure(ice_t *ice)
 {
 	/*
+	 * Delete the kstats first: their update callbacks read hardware
+	 * registers, so they must stop before the register mapping is torn
+	 * down.  kstat_delete() waits out any in-progress read.
+	 */
+	if (ice->ice_attach_progress & ICE_ATTACH_STATS)
+		ice_stats_fini(ice);
+
+	/*
 	 * The MAC handle (a higher progress bit) is unregistered by ice_detach
 	 * before this runs, so the datapath is already quiesced: mac_stop drove
 	 * ice_rx_stop()/ice_tx_stop(), draining loans and reclaiming TCBs.  The
@@ -838,6 +846,10 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	if (!ice_buf_init(ice))
 		goto fail;
 	ice->ice_attach_progress |= ICE_ATTACH_BUFS;
+
+	if (!ice_stats_init(ice))
+		goto fail;
+	ice->ice_attach_progress |= ICE_ATTACH_STATS;
 
 	/*
 	 * Register with MAC last: once this returns the datapath is reachable

@@ -118,7 +118,8 @@ typedef enum ice_attach_state {
 	ICE_ATTACH_RINGS	= 1 << 10,	/* ring DMA allocated */
 	ICE_ATTACH_QUEUE_INTR	= 1 << 11,	/* queue->vector wired */
 	ICE_ATTACH_BUFS		= 1 << 12,	/* tx copy-buffer pools */
-	ICE_ATTACH_MAC		= 1 << 13	/* mac_register done */
+	ICE_ATTACH_STATS	= 1 << 13,	/* hardware stat kstats */
+	ICE_ATTACH_MAC		= 1 << 14	/* mac_register done */
 } ice_attach_state_t;
 
 /* The driver-chosen software handle for the single PF data VSI. */
@@ -286,6 +287,57 @@ typedef struct ice_rx_ring {
 	ice_rxq_stat_t		irxr_stats;
 } ice_rx_ring_t;
 
+/*
+ * Physical-port hardware statistics, read from the GLPRT_* MAC counters.  The
+ * counters are per logical port and therefore aggregate every VSI and VF on
+ * the function, so they describe the wire rather than this interface.
+ */
+typedef struct ice_pf_kstats {
+	kstat_named_t		ipk_rx_bytes;
+	kstat_named_t		ipk_rx_unicast;
+	kstat_named_t		ipk_rx_multicast;
+	kstat_named_t		ipk_rx_broadcast;
+	kstat_named_t		ipk_tx_bytes;
+	kstat_named_t		ipk_tx_unicast;
+	kstat_named_t		ipk_tx_multicast;
+	kstat_named_t		ipk_tx_broadcast;
+	kstat_named_t		ipk_crc_errors;
+	kstat_named_t		ipk_illegal_bytes;
+	kstat_named_t		ipk_mac_local_faults;
+	kstat_named_t		ipk_mac_remote_faults;
+	kstat_named_t		ipk_rx_len_errors;
+	kstat_named_t		ipk_rx_undersize;
+	kstat_named_t		ipk_rx_fragments;
+	kstat_named_t		ipk_rx_oversize;
+	kstat_named_t		ipk_rx_jabber;
+	kstat_named_t		ipk_tx_dropped_link_down;
+	kstat_named_t		ipk_link_xon_rx;
+	kstat_named_t		ipk_link_xoff_rx;
+	kstat_named_t		ipk_link_xon_tx;
+	kstat_named_t		ipk_link_xoff_tx;
+} ice_pf_kstats_t;
+
+/*
+ * Per-VSI hardware statistics, read from the GLV_* counters for this
+ * interface's VSI.  Unlike the port counters these isolate traffic actually
+ * switched to this VSI, so a receive that advances the port counters but not
+ * these localizes a fault to the switch or VSI configuration.
+ */
+typedef struct ice_vsi_kstats {
+	kstat_named_t		ivk_rx_bytes;
+	kstat_named_t		ivk_rx_unicast;
+	kstat_named_t		ivk_rx_multicast;
+	kstat_named_t		ivk_rx_broadcast;
+	kstat_named_t		ivk_rx_discards;
+	kstat_named_t		ivk_rx_no_desc;
+	kstat_named_t		ivk_rx_errors;
+	kstat_named_t		ivk_tx_bytes;
+	kstat_named_t		ivk_tx_unicast;
+	kstat_named_t		ivk_tx_multicast;
+	kstat_named_t		ivk_tx_broadcast;
+	kstat_named_t		ivk_tx_errors;
+} ice_vsi_kstats_t;
+
 typedef struct ice {
 	dev_info_t		*ice_dip;
 	int			ice_instance;
@@ -369,6 +421,21 @@ typedef struct ice {
 	/* DDP firmware. */
 	boolean_t		ice_safe_mode;
 	enum ice_ddp_state	ice_ddp_state;
+
+	/*
+	 * Hardware statistics.  The MAC counters do not reset on a PF reset, so
+	 * the common-code helpers subtract a first-read baseline; ice_stat_lock
+	 * serializes the kstat and mac_stat readers that share that baseline.
+	 */
+	kmutex_t		ice_stat_lock;
+	boolean_t		ice_stat_port_loaded;
+	boolean_t		ice_stat_vsi_loaded;
+	struct ice_hw_port_stats ice_stat_port_cur;
+	struct ice_hw_port_stats ice_stat_port_prev;
+	struct ice_eth_stats	ice_stat_vsi_cur;
+	struct ice_eth_stats	ice_stat_vsi_prev;
+	kstat_t			*ice_pf_kstat;
+	kstat_t			*ice_vsi_kstat;
 
 	mac_handle_t		ice_mac_hdl;		/* set in M6b */
 } ice_t;
@@ -472,6 +539,14 @@ extern int ice_ring_rx_intr_disable(mac_intr_handle_t);
 extern boolean_t ice_mac_register(ice_t *);
 extern int ice_mac_unregister(ice_t *);
 extern void ice_link_state_publish(ice_t *);
+
+/*
+ * Hardware statistics (ice_stats.c).
+ */
+extern boolean_t ice_stats_init(ice_t *);
+extern void ice_stats_fini(ice_t *);
+extern void ice_stats_update_port(ice_t *);
+extern void ice_stats_update_vsi(ice_t *);
 extern void ice_link_loopback_update(ice_t *, uint32_t);
 extern void ice_loopback_fini(ice_t *);
 

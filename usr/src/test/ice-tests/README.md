@@ -10,6 +10,7 @@ python3 usr/src/test/ice-tests/link_state.py
 python3 usr/src/test/ice-tests/fma_dma.py
 python3 usr/src/test/ice-tests/dma_lifetime.py
 python3 usr/src/test/ice-tests/loopback.py
+python3 usr/src/test/ice-tests/hw_stats.py
 ```
 
 `rx_checksum.py` verifies that receive checksum metadata is captured before
@@ -48,3 +49,10 @@ source root with:
 gcc -Wall -Wextra -Werror -idirafter usr/src/uts/common \
     -o /tmp/ice_loopback usr/src/test/ice-tests/ice_loopback.c
 ```
+
+`hw_stats.py` verifies the hardware statistics wiring: both counter refreshes
+run under the stat lock, the clear-on-read VSI register is serviced through the
+common code, the kstat callbacks reject writes and lock correctly, teardown
+deletes the kstats before destroying their lock, attach installs stats before
+MAC while detach removes them before unmapping registers, and `ice_m_stat`
+sources the MAC counters under the stat lock.

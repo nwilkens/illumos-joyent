@@ -465,22 +465,85 @@ static int
 ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 {
 	ice_t *ice = arg;
+	struct ice_hw_port_stats *ps = &ice->ice_stat_port_cur;
 	int ret = 0;
 
-	mutex_enter(&ice->ice_lse_lock);
+	/* Link properties are served from the cached link state. */
 	switch (stat) {
 	case MAC_STAT_IFSPEED:
+		mutex_enter(&ice->ice_lse_lock);
 		/* Cached speed is in Mbit/s; MAC wants bits/s. */
 		*val = ice->ice_link_speed * 1000000ULL;
-		break;
+		mutex_exit(&ice->ice_lse_lock);
+		return (0);
 	case ETHER_STAT_LINK_DUPLEX:
+		mutex_enter(&ice->ice_lse_lock);
 		*val = ice->ice_link_duplex;
+		mutex_exit(&ice->ice_lse_lock);
+		return (0);
+	default:
+		break;
+	}
+
+	/*
+	 * The remaining statistics come from the physical-port MAC counters.
+	 * GLDv3 conflates port and interface statistics; as with i40e we report
+	 * the port's view, which aggregates every VSI on the function.
+	 */
+	mutex_enter(&ice->ice_stat_lock);
+	ice_stats_update_port(ice);
+
+	switch (stat) {
+	case MAC_STAT_RBYTES:
+		*val = ps->eth.rx_bytes;
+		break;
+	case MAC_STAT_IPACKETS:
+		*val = ps->eth.rx_unicast + ps->eth.rx_multicast +
+		    ps->eth.rx_broadcast;
+		break;
+	case MAC_STAT_OBYTES:
+		*val = ps->eth.tx_bytes;
+		break;
+	case MAC_STAT_OPACKETS:
+		*val = ps->eth.tx_unicast + ps->eth.tx_multicast +
+		    ps->eth.tx_broadcast;
+		break;
+	case MAC_STAT_MULTIRCV:
+		*val = ps->eth.rx_multicast;
+		break;
+	case MAC_STAT_BRDCSTRCV:
+		*val = ps->eth.rx_broadcast;
+		break;
+	case MAC_STAT_MULTIXMT:
+		*val = ps->eth.tx_multicast;
+		break;
+	case MAC_STAT_BRDCSTXMT:
+		*val = ps->eth.tx_broadcast;
+		break;
+	case MAC_STAT_IERRORS:
+		*val = ps->crc_errors + ps->illegal_bytes + ps->rx_len_errors;
+		break;
+	case MAC_STAT_UNDERFLOWS:
+		*val = ps->rx_undersize + ps->rx_fragments;
+		break;
+	case MAC_STAT_OVERFLOWS:
+		*val = ps->rx_oversize + ps->rx_jabber;
+		break;
+	case ETHER_STAT_FCS_ERRORS:
+		*val = ps->crc_errors;
+		break;
+	case ETHER_STAT_TOOLONG_ERRORS:
+		*val = ps->rx_oversize;
+		break;
+	case ETHER_STAT_MACRCV_ERRORS:
+		*val = ps->rx_len_errors + ps->rx_undersize +
+		    ps->rx_fragments + ps->rx_oversize + ps->rx_jabber;
 		break;
 	default:
 		ret = ENOTSUP;
 		break;
 	}
-	mutex_exit(&ice->ice_lse_lock);
+	mutex_exit(&ice->ice_stat_lock);
 
 	return (ret);
 }
