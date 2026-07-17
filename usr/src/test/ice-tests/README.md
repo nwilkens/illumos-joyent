@@ -7,6 +7,7 @@ E810 device. Run them from anywhere in the source tree with:
 python3 usr/src/test/ice-tests/rx_checksum.py
 python3 usr/src/test/ice-tests/admin_interrupt.py
 python3 usr/src/test/ice-tests/link_state.py
+python3 usr/src/test/ice-tests/fma_dma.py
 ```
 
 `rx_checksum.py` verifies that receive checksum metadata is captured before
@@ -22,3 +23,7 @@ after successful MAC registration and that publication is serialized with
 asynchronous link updates through the link-state lock. It also verifies that
 the cache starts at `LINK_STATE_UNKNOWN`, preserving an honest result if the
 initial hardware query fails.
+
+`fma_dma.py` verifies that the driver advertises and preserves the negotiated
+DMA-checking capability, applies `DDI_DMA_FLAGERR` to both datapath and
+common-code control-queue allocations, and retains datapath handle checks.

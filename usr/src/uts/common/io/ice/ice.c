@@ -191,19 +191,18 @@ ice_fm_init(ice_t *ice)
 	ddi_iblock_cookie_t iblk;
 
 	/*
-	 * DMACHK is advertised with the data path (M6b), where the per-buffer
-	 * ddi_fm_dma_err_get checks that honor it live.  Advertising it here,
-	 * with no checker wired, would misrepresent the FMA posture.
+	 * The data path checks DMA handles after synchronization, and all DMA
+	 * attributes honor the negotiated capability with DDI_DMA_FLAGERR.
 	 */
 	ice->ice_fm_caps = ddi_prop_get_int(DDI_DEV_T_ANY, ice->ice_dip,
 	    DDI_PROP_DONTPASS, "fm-capable",
 	    DDI_FM_EREPORT_CAPABLE | DDI_FM_ACCCHK_CAPABLE |
-	    DDI_FM_ERRCB_CAPABLE);
+	    DDI_FM_DMACHK_CAPABLE | DDI_FM_ERRCB_CAPABLE);
 
 	if (ice->ice_fm_caps < 0)
 		ice->ice_fm_caps = 0;
 	ice->ice_fm_caps &= (DDI_FM_EREPORT_CAPABLE | DDI_FM_ACCCHK_CAPABLE |
-	    DDI_FM_ERRCB_CAPABLE);
+	    DDI_FM_DMACHK_CAPABLE | DDI_FM_ERRCB_CAPABLE);
 
 	if (ice->ice_fm_caps == 0)
 		return;

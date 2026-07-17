@@ -28,6 +28,7 @@
 #include <sys/pci_cap.h>
 #include <sys/sdt.h>
 
+#include "ice.h"
 #include "ice_common.h"
 #include "ice_osdep.h"
 
@@ -169,19 +170,30 @@ void *
 ice_alloc_dma_mem(struct ice_hw *hw, struct ice_dma_mem *mem, u64 size)
 {
 	struct ice_osdep *osdep = OS_DEP(hw);
+	ddi_device_acc_attr_t acc_attr = ice_acc_attr;
+	ddi_dma_attr_t dma_attr = ice_dma_attr;
 	ddi_dma_cookie_t cookie;
 	uint_t ncookie;
 	size_t len;
 	int rc;
 
-	rc = ddi_dma_alloc_handle(osdep->ios_dip, &ice_dma_attr,
+	/*
+	 * Attribute copies are per allocation because different device
+	 * instances may negotiate different FMA capabilities.
+	 */
+	if (DDI_FM_DMA_ERR_CAP(osdep->ios_ice->ice_fm_caps)) {
+		dma_attr.dma_attr_flags = DDI_DMA_FLAGERR;
+		acc_attr.devacc_attr_access = DDI_FLAGERR_ACC;
+	}
+
+	rc = ddi_dma_alloc_handle(osdep->ios_dip, &dma_attr,
 	    DDI_DMA_DONTWAIT, NULL, &mem->idm_dma_handle);
 	if (rc != DDI_SUCCESS) {
 		mem->idm_dma_handle = NULL;
 		return (NULL);
 	}
 
-	rc = ddi_dma_mem_alloc(mem->idm_dma_handle, size, &ice_acc_attr,
+	rc = ddi_dma_mem_alloc(mem->idm_dma_handle, size, &acc_attr,
 	    DDI_DMA_STREAMING, DDI_DMA_DONTWAIT, NULL, (caddr_t *)&mem->va,
 	    &len, &mem->idm_acc_handle);
 	if (rc != DDI_SUCCESS) {
