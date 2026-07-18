@@ -123,9 +123,11 @@ CTASSERT(ICE_TXD_CTX_MAX_MSS <= (ICE_TXD_CTX_QW1_MSS_M >>
 
 typedef enum ice_state {
 	ICE_STATE_ATTACHED	= 1 << 0,
-	ICE_STATE_RESET_PENDING	= 1 << 1,	/* GRST seen; recovery is M7 */
-	ICE_STATE_ERROR		= 1 << 2,	/* acc-handle fault latched */
-	ICE_STATE_STARTED	= 1 << 3
+	ICE_STATE_RESET_PENDING	= 1 << 1,	/* GRST seen; rebuild owed */
+	ICE_STATE_ERROR		= 1 << 2,	/* datapath fail-closed */
+	ICE_STATE_STARTED	= 1 << 3,
+	ICE_STATE_PFR_REQ	= 1 << 4,	/* fatal cause; PFR owed */
+	ICE_STATE_RESET_FAILED	= 1 << 5	/* rebuild failed; terminal */
 } ice_state_t;
 
 /* ice_lse_flags bits (protected by ice_lse_lock). */
@@ -419,6 +421,7 @@ typedef struct ice {
 	/* OICR deferred async work; thread context, serialized via ice_lock. */
 	ddi_taskq_t		*ice_oicr_taskq;
 	boolean_t		ice_oicr_pending;	/* ice_lock */
+	uint32_t		ice_oicr_cause;		/* ice_lock */
 	uint8_t			*ice_aqbuf;		/* ARQ scratch buffer */
 
 	/*

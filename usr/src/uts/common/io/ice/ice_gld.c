@@ -441,6 +441,17 @@ static int
 ice_m_start(void *arg)
 {
 	ice_t *ice = arg;
+	uint32_t blocked = ICE_STATE_RESET_FAILED | ICE_STATE_PFR_REQ |
+	    ICE_STATE_RESET_PENDING;
+
+	/*
+	 * Refuse to start while the hardware is untrustworthy: a terminally
+	 * failed reset (reload needed), or a fatal cause or reset still owed a
+	 * rebuild.  A replumb must not clear the fail-closed state or reprogram
+	 * queues on stale hardware; the rebuild alone clears these bits.
+	 */
+	if ((ice->ice_state & blocked) != 0)
+		return (EIO);
 
 	/*
 	 * Clear any latched datapath error: mac start fully re-programs the

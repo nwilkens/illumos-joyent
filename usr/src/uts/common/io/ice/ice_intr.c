@@ -52,6 +52,19 @@
 	PFINT_OICR_PCI_EXCEPTION_M | PFINT_OICR_HMC_ERR_M |	\
 	PFINT_OICR_PE_CRITERR_M | PFINT_OICR_VFLR_M)
 
+/*
+ * Fatal causes that leave the function on untrustworthy state and require a PF
+ * reset and rebuild.  GRST (a reset already under way) and MAL_DETECT (needs
+ * per-PF register decode) are handled separately.
+ */
+#define	ICE_OICR_FATAL_MASK	\
+	(PFINT_OICR_ECC_ERR_M | PFINT_OICR_PCI_EXCEPTION_M |	\
+	PFINT_OICR_HMC_ERR_M | PFINT_OICR_PE_CRITERR_M)
+
+/* Causes the OICR worker logs and acts on (see ice_oicr_fatal). */
+#define	ICE_OICR_CAUSE_MASK	\
+	(ICE_OICR_FATAL_MASK | PFINT_OICR_GRST_M | PFINT_OICR_MAL_DETECT_M)
+
 static void
 ice_link_state_set(ice_t *ice, link_state_t state)
 {
@@ -322,6 +335,87 @@ ice_link_status_update(ice_t *ice)
  * The loop is bounded both by the firmware-reported pending count and by a
  * hard element cap.
  */
+/*
+ * Decode a malicious-driver-detection event.  Clear the global detection
+ * registers so the cause does not re-fire, and if this function is the offender
+ * fail the datapath closed and request a rebuild.  Returns B_TRUE only when
+ * this function caused the event.
+ */
+static boolean_t
+ice_oicr_mdd(ice_t *ice)
+{
+	struct ice_hw *hw = &ice->ice_hw;
+	boolean_t pf_mdd = B_FALSE;
+
+	if (rd32(hw, GL_MDET_TX_PQM) != 0)
+		wr32(hw, GL_MDET_TX_PQM, 0xffffffff);
+	if (rd32(hw, GL_MDET_TX_TCLAN) != 0)
+		wr32(hw, GL_MDET_TX_TCLAN, 0xffffffff);
+	if (rd32(hw, GL_MDET_RX) != 0)
+		wr32(hw, GL_MDET_RX, 0xffffffff);
+
+	if ((rd32(hw, PF_MDET_TX_PQM) & PF_MDET_TX_PQM_VALID_M) != 0) {
+		wr32(hw, PF_MDET_TX_PQM, 0xffffffff);
+		pf_mdd = B_TRUE;
+	}
+	if ((rd32(hw, PF_MDET_TX_TCLAN) & PF_MDET_TX_TCLAN_VALID_M) != 0) {
+		wr32(hw, PF_MDET_TX_TCLAN, 0xffffffff);
+		pf_mdd = B_TRUE;
+	}
+	if ((rd32(hw, PF_MDET_RX) & PF_MDET_RX_VALID_M) != 0) {
+		wr32(hw, PF_MDET_RX, 0xffffffff);
+		pf_mdd = B_TRUE;
+	}
+
+	if (pf_mdd) {
+		ice_error(ice, "malicious driver event on this function; "
+		    "datapath halted pending reset");
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
+		atomic_or_32(&ice->ice_state,
+		    ICE_STATE_ERROR | ICE_STATE_PFR_REQ);
+	} else {
+		ice_error(ice, "malicious driver event on another function");
+	}
+
+	return (pf_mdd);
+}
+
+/*
+ * Report the fatal OICR causes latched by the ISR and fail the link closed so
+ * clients stop offering traffic.  The datapath already observes ICE_STATE_ERROR
+ * and stops touching hardware; reset rebuild, when requested, runs separately.
+ */
+static void
+ice_oicr_fatal(ice_t *ice, uint32_t cause)
+{
+	boolean_t fault = (cause & (ICE_OICR_FATAL_MASK |
+	    PFINT_OICR_GRST_M)) != 0;
+
+	if ((cause & PFINT_OICR_ECC_ERR_M) != 0)
+		ice_error(ice, "ECC error detected; datapath halted");
+	if ((cause & PFINT_OICR_PCI_EXCEPTION_M) != 0)
+		ice_error(ice, "PCIe exception detected; datapath halted");
+	if ((cause & PFINT_OICR_HMC_ERR_M) != 0)
+		ice_error(ice, "HMC error detected; datapath halted");
+	if ((cause & PFINT_OICR_PE_CRITERR_M) != 0)
+		ice_error(ice, "PE critical error detected; datapath halted");
+	if ((cause & PFINT_OICR_GRST_M) != 0)
+		ice_error(ice, "global reset detected; datapath halted");
+	if ((cause & PFINT_OICR_MAL_DETECT_M) != 0 && ice_oicr_mdd(ice))
+		fault = B_TRUE;
+
+	/*
+	 * Only fail the link closed when this function actually faulted; a
+	 * malicious-driver event on another function must not down our link.
+	 */
+	if (fault) {
+		mutex_enter(&ice->ice_lse_lock);
+		ice->ice_link_state = LINK_STATE_DOWN;
+		ice_link_state_set(ice, LINK_STATE_DOWN);
+		mutex_exit(&ice->ice_lse_lock);
+	}
+}
+
 static void
 ice_oicr_task(void *arg)
 {
@@ -331,11 +425,25 @@ ice_oicr_task(void *arg)
 	boolean_t media_inserted;
 	uint16_t pending;
 	uint_t guard = 0;
+	uint32_t cause;
 	int rc;
 
 	mutex_enter(&ice->ice_lock);
 	ice->ice_oicr_pending = B_FALSE;
+	cause = ice->ice_oicr_cause;
+	ice->ice_oicr_cause = 0;
 	mutex_exit(&ice->ice_lock);
+
+	if (cause != 0)
+		ice_oicr_fatal(ice, cause);
+
+	/*
+	 * A reset in progress or owed leaves the admin queue unusable or about
+	 * to be rebuilt; skip the drain.
+	 */
+	if (hw->reset_ongoing || (ice->ice_state &
+	    (ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ)) != 0)
+		return;
 
 	bzero(&evt, sizeof (evt));
 	evt.buf_len = ICE_AQ_MAX_BUF_LEN;
@@ -367,11 +475,6 @@ ice_oicr_task(void *arg)
 		ice_error(ice, "admin receive queue drain cap hit; pending %u",
 		    pending);
 	}
-
-	/*
-	 * A detected global reset is latched in ICE_STATE_RESET_PENDING; full
-	 * reset recovery is deferred until the data path exists (M7).
-	 */
 }
 
 static void
@@ -441,8 +544,26 @@ ice_intr_oicr(ice_t *ice)
 		return (DDI_INTR_CLAIMED);
 	}
 
-	if (oicr & PFINT_OICR_GRST_M)
-		atomic_or_32(&ice->ice_state, ICE_STATE_RESET_PENDING);
+	if (oicr & PFINT_OICR_GRST_M) {
+		/*
+		 * A reset is being performed on the function.  Make concurrent
+		 * admin-queue commands soft-fail instead of hanging on
+		 * resetting hardware, and fail the datapath closed.
+		 */
+		hw->reset_ongoing = true;
+		atomic_or_32(&ice->ice_state,
+		    ICE_STATE_RESET_PENDING | ICE_STATE_ERROR);
+	}
+	if ((oicr & ICE_OICR_FATAL_MASK) != 0) {
+		/*
+		 * ECC/PCIe/HMC/PE-critical errors leave the function on
+		 * untrustworthy state.  Fail the datapath closed and request a
+		 * PF reset rebuild.
+		 */
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
+		atomic_or_32(&ice->ice_state,
+		    ICE_STATE_ERROR | ICE_STATE_PFR_REQ);
+	}
 
 	/*
 	 * PFINT_FW_CTL and PFINT_OICR share this dedicated admin vector.  The
@@ -450,9 +571,11 @@ ice_intr_oicr(ice_t *ice)
 	 * interrupt, so PFINT_OICR cannot reliably say whether the ARQ fired.
 	 * Check it on every admin interrupt, as FreeBSD does.  The pending flag
 	 * coalesces a burst into one single-threaded, bounded drain and packet
-	 * queue interrupts use separate vectors.
+	 * queue interrupts use separate vectors.  Latch any fatal/reset causes
+	 * in the same critical section for the worker to log and act on.
 	 */
 	mutex_enter(&ice->ice_lock);
+	ice->ice_oicr_cause |= oicr & ICE_OICR_CAUSE_MASK;
 	if (!ice->ice_oicr_pending) {
 		ice->ice_oicr_pending = B_TRUE;
 		dispatch = B_TRUE;
