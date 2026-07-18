@@ -9,6 +9,7 @@ REPO = Path(__file__).resolve().parents[4]
 ATTACH_SOURCE = REPO / "usr/src/uts/common/io/ice/ice.c"
 GLD_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_gld.c"
 STATS_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_stats.c"
+RX_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_rx.c"
 MAKEFILE = REPO / "usr/src/uts/common/Makefile.files"
 
 
@@ -111,6 +112,19 @@ def main() -> None:
 
     # The new object is built.
     assert "ice_stats.o" in MAKEFILE.read_text(encoding="utf-8")
+
+    # Per-ring rx counters are published as named kstats (mirroring tx_ring_*)
+    # and torn down with the ring.
+    rx = RX_SOURCE.read_text(encoding="utf-8")
+    init = function(rx, "ice_rx_kstat_init(ice_t *ice, ice_rx_ring_t *irr)\n{",
+        "\nstatic boolean_t\nice_rx_ring_alloc")
+    assert '"rx_ring_%u"' in init
+    assert "kstat_install(irr->irxr_kstat)" in init
+    for field in ("rx_bytes", "rx_packets", "rx_desc_error", "rx_no_rcb"):
+        assert '"' + field + '"' in init, field
+    free = function(rx, "ice_rx_ring_free(ice_rx_ring_t *irr)\n{",
+        "\nstatic boolean_t\nice_rx_kstat_init")
+    assert "kstat_delete(irr->irxr_kstat)" in free
 
 
 if __name__ == "__main__":

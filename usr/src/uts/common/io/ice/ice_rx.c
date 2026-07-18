@@ -42,6 +42,11 @@
 static void
 ice_rx_ring_free(ice_rx_ring_t *irr)
 {
+	if (irr->irxr_kstat != NULL) {
+		kstat_delete(irr->irxr_kstat);
+		irr->irxr_kstat = NULL;
+	}
+
 	if (irr->irxr_rcbs != NULL) {
 		kmem_free(irr->irxr_rcbs,
 		    irr->irxr_size * sizeof (ice_rx_ctrl_block_t *));
@@ -55,6 +60,41 @@ ice_rx_ring_free(ice_rx_ring_t *irr)
 
 	cv_destroy(&irr->irxr_cv);
 	mutex_destroy(&irr->irxr_lock);
+}
+
+static boolean_t
+ice_rx_kstat_init(ice_t *ice, ice_rx_ring_t *irr)
+{
+	ice_rxq_stat_t *rxs = &irr->irxr_stats;
+	char name[KSTAT_STRLEN];
+
+	(void) snprintf(name, sizeof (name), "rx_ring_%u", irr->irxr_index);
+	irr->irxr_kstat = kstat_create(ICE_MODULE_NAME, ice->ice_instance, name,
+	    "net", KSTAT_TYPE_NAMED,
+	    sizeof (ice_rxq_stat_t) / sizeof (kstat_named_t),
+	    KSTAT_FLAG_VIRTUAL);
+	if (irr->irxr_kstat == NULL)
+		return (B_FALSE);
+
+	irr->irxr_kstat->ks_data = rxs;
+	kstat_named_init(&rxs->icrxs_bytes, "rx_bytes", KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_packets, "rx_packets", KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_bind_bytes, "rx_bind_bytes",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_bind_segs, "rx_bind_segs",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_copy_bytes, "rx_copy_bytes",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_copy_segs, "rx_copy_segs",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_desc_error, "rx_desc_error",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_copy_nomem, "rx_copy_nomem",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_no_rcb, "rx_no_rcb", KSTAT_DATA_UINT64);
+	kstat_install(irr->irxr_kstat);
+
+	return (B_TRUE);
 }
 
 static boolean_t
@@ -109,6 +149,18 @@ ice_rx_ring_alloc(ice_t *ice, ice_rx_ring_t *irr, uint_t index)
 	 */
 	irr->irxr_rcbs = kmem_zalloc(
 	    irr->irxr_size * sizeof (ice_rx_ctrl_block_t *), KM_SLEEP);
+
+	if (!ice_rx_kstat_init(ice, irr)) {
+		ice_error(ice, "failed to create rx ring %u kstat", index);
+		kmem_free(irr->irxr_rcbs,
+		    irr->irxr_size * sizeof (ice_rx_ctrl_block_t *));
+		irr->irxr_rcbs = NULL;
+		ice_dma_free(&irr->irxr_desc_dma);
+		irr->irxr_descs = NULL;
+		cv_destroy(&irr->irxr_cv);
+		mutex_destroy(&irr->irxr_lock);
+		return (B_FALSE);
+	}
 
 	return (B_TRUE);
 }
