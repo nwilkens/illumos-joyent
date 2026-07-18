@@ -22,6 +22,7 @@ MODULE		= ice
 OBJECTS		= $(ICE_OBJS:%=$(OBJS_DIR)/%) $(ICE_INTC_OBJS:%=$(OBJS_DIR)/%)
 ROOTMODULE	= $(ROOT_DRV_DIR)/$(MODULE)
 ROOTFIRMWARE	= $(FWFILES:%=$(ROOT_FIRMWARE_DIR)/$(MODULE)/%)
+CONF_SRCDIR	= $(UTSBASE)/common/io/ice
 
 include $(UTSBASE)/intel/Makefile.intel
 
@@ -34,7 +35,7 @@ CPPFLAGS	+= -I$(UTSBASE)/common/io/ice/core
 LDFLAGS		+= -N misc/mac
 
 ALL_TARGET	= $(BINARY)
-INSTALL_TARGET	= $(BINARY) $(ROOTMODULE) $(ROOTFIRMWARE)
+INSTALL_TARGET	= $(BINARY) $(ROOTMODULE) $(ROOTFIRMWARE) $(ROOT_CONFFILE)
 
 #
 # The core/ files are vendored Intel common code; relax the smatch checks they
