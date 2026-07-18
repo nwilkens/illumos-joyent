@@ -87,6 +87,8 @@ def main() -> None:
         r"\s*\(uint_t\)ice->ice_intr_count - 1\)",
         allocator,
     )
+    # Vector accounting must be logged so the scaling ceiling is observable.
+    assert "MSI-X vectors: fw=" in allocator
 
     vsi_source = VSI_SOURCE.read_text(encoding="utf-8")
     setup = function(

@@ -55,7 +55,7 @@ extern "C" {
  * link events, and errors); queue vectors begin at 1.
  */
 #define	ICE_INTR_MSIX_MIN	2
-#define	ICE_MAX_INTR_QUEUES	8
+#define	ICE_MAX_INTR_QUEUES	16
 
 CTASSERT((ICE_MAX_INTR_QUEUES & (ICE_MAX_INTR_QUEUES - 1)) == 0);
 CTASSERT(ICE_INTR_MSIX_MIN == 2);

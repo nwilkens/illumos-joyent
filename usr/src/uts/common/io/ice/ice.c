@@ -496,6 +496,15 @@ ice_alloc_intrs(ice_t *ice)
 	 */
 	ASSERT3U((uint_t)ice->ice_nqueues, <=, (uint_t)ice->ice_intr_count - 1);
 
+	/*
+	 * Report the vector accounting so the scaling ceiling is visible:
+	 * firmware advertised, platform available, requested, granted, and the
+	 * resulting data-queue count.
+	 */
+	dev_err(ice->ice_dip, CE_NOTE, "!MSI-X vectors: fw=%u avail=%d "
+	    "requested=%d granted=%d data-queues=%u", nvec, navail, request,
+	    actual, ice->ice_nqueues);
+
 	if (ddi_intr_get_pri(ice->ice_intr_handles[0], &ice->ice_intr_pri) !=
 	    DDI_SUCCESS ||
 	    ddi_intr_get_cap(ice->ice_intr_handles[0], &ice->ice_intr_cap) !=
