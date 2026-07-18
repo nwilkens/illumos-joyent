@@ -17,12 +17,15 @@
 #define	_ICE_H
 
 #include <sys/types.h>
+#include <sys/inttypes.h>
+#include <sys/debug.h>
 #include <sys/conf.h>
 #include <sys/ddi.h>
 #include <sys/sunddi.h>
 #include <sys/modctl.h>
 #include <sys/pci.h>
 #include <sys/list.h>
+#include <sys/ethernet.h>
 #include <sys/mac_provider.h>
 #include <sys/mac_ether.h>
 #include <sys/ddifm.h>
@@ -62,8 +65,16 @@ extern "C" {
 #define	ICE_HW_MAX_MSIX		2048
 #define	ICE_MAX_VSI		768
 #define	ICE_MIN_MTU		68		/* conventional minimum MTU */
-#define	ICE_MAX_MTU		9728		/* E810 jumbo frame maximum */
+#define	ICE_MAX_MTU	\
+	(ICE_AQ_SET_MAC_FRAME_SIZE_MAX - sizeof (struct ether_vlan_header) - \
+	ETHERFCSL)
+#define	ICE_MAX_FRAME_SIZE	ICE_AQ_SET_MAC_FRAME_SIZE_MAX
+#define	ICE_DEFAULT_MTU		ETHERMTU
 #define	ICE_MAX_FUNCS		8
+
+CTASSERT(ICE_MAX_MTU + sizeof (struct ether_vlan_header) + ETHERFCSL ==
+    ICE_MAX_FRAME_SIZE);
+CTASSERT(ICE_MAX_FRAME_SIZE <= UINT16_MAX);
 
 /* Standard netlb(4I) modes supported by ice_m_ioctl(). */
 #define	ICE_LB_NONE		0
@@ -95,7 +106,8 @@ extern "C" {
 typedef enum ice_state {
 	ICE_STATE_ATTACHED	= 1 << 0,
 	ICE_STATE_RESET_PENDING	= 1 << 1,	/* GRST seen; recovery is M7 */
-	ICE_STATE_ERROR		= 1 << 2	/* acc-handle fault latched */
+	ICE_STATE_ERROR		= 1 << 2,	/* acc-handle fault latched */
+	ICE_STATE_STARTED	= 1 << 3
 } ice_state_t;
 
 /* ice_lse_flags bits (protected by ice_lse_lock). */
@@ -397,6 +409,7 @@ typedef struct ice {
 	kmutex_t		ice_loopback_lock;
 	uint32_t		ice_loopback_mode;
 
+	uint32_t		ice_mtu;
 	ice_vsi_t		ice_pf_vsi;		/* control plane (M5) */
 
 	/*
@@ -452,6 +465,7 @@ typedef struct ice {
 /*PRINTFLIKE2*/
 extern void ice_error(ice_t *, const char *, ...);
 extern int ice_check_acc_handle(ddi_acc_handle_t);
+extern void ice_update_mtu(ice_t *);
 extern int ice_queues_program(ice_t *);
 extern void ice_queues_disable(ice_t *);
 

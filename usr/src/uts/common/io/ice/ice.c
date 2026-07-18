@@ -315,7 +315,8 @@ ice_validate_caps(ice_t *ice)
 		return (B_FALSE);
 	}
 
-	if (c->max_mtu < ICE_MIN_MTU || c->max_mtu > ICE_MAX_MTU) {
+	if (c->max_mtu < ICE_MIN_MTU ||
+	    c->max_mtu > ICE_MAX_FRAME_SIZE) {
 		ice_error(ice, "implausible maximum MTU %u", c->max_mtu);
 		return (B_FALSE);
 	}
@@ -328,6 +329,13 @@ ice_validate_caps(ice_t *ice)
 	}
 
 	return (B_TRUE);
+}
+
+void
+ice_update_mtu(ice_t *ice)
+{
+	ice->ice_pf_vsi.vi_max_frame = ice->ice_mtu +
+	    sizeof (struct ether_vlan_header) + ETHERFCSL;
 }
 
 /*
@@ -700,6 +708,7 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	ice_t *ice;
 	struct ice_hw *hw;
 	struct ice_osdep *osdep;
+	int mtu;
 	int instance;
 
 	if (cmd != DDI_ATTACH)
@@ -828,7 +837,14 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	ice->ice_num_rx_groups = 1;
 	ice->ice_tx_ring_size = ICE_DEF_TX_RING_SIZE;
 	ice->ice_rx_ring_size = ICE_DEF_RX_RING_SIZE;
-	ice->ice_pf_vsi.vi_max_frame = ICE_RX_BUF_SIZE;
+	mtu = ddi_prop_get_int(DDI_DEV_T_ANY, ice->ice_dip,
+	    DDI_PROP_DONTPASS, "default_mtu", ICE_DEFAULT_MTU);
+	if (mtu < ICE_MIN_MTU)
+		mtu = ICE_MIN_MTU;
+	else if (mtu > ICE_MAX_MTU)
+		mtu = ICE_MAX_MTU;
+	ice->ice_mtu = mtu;
+	ice_update_mtu(ice);
 
 	if (!ice_tx_rings_alloc(ice))
 		goto fail;

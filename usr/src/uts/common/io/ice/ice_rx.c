@@ -228,10 +228,11 @@ ice_rx_ring_program(ice_t *ice, ice_rx_ring_t *irr)
 	rlan.hsplit_1 = 0;
 	rlan.showiv = 0;
 	/*
-	 * Single-buffer receive: the maximum frame must not exceed the posted
-	 * data buffer, or hardware could write past the end of it.
+	 * A frame may span up to ICE_RX_MAX_DESC 2048-byte buffers, bounded by
+	 * vi_max_frame.  rxmax is a 14-bit field and the hardware frame limit
+	 * is safely representable.
 	 */
-	rlan.rxmax = MIN(ice->ice_pf_vsi.vi_max_frame, irr->irxr_dbuf);
+	rlan.rxmax = ice->ice_pf_vsi.vi_max_frame;
 	rlan.lrxqthresh = 1;
 	/* ice_write_rxq_ctx forces prefena = 1; set it for clarity. */
 	rlan.prefena = 1;

@@ -456,6 +456,7 @@ ice_m_start(void *arg)
 		return (EIO);
 	}
 	ice_tx_start(ice);
+	atomic_or_32(&ice->ice_state, ICE_STATE_STARTED);
 
 	return (0);
 }
@@ -466,10 +467,11 @@ ice_m_stop(void *arg)
 	ice_t *ice = arg;
 
 	/*
-	 * Disable the queues first so hardware stops touching descriptors and
-	 * buffers, then reclaim the tx control blocks and the rx pool (the
-	 * latter waits for any loaned buffers to return).
+	 * Mark the device stopped, then disable the queues so hardware stops
+	 * touching descriptors and buffers.  Reclaim the tx control blocks and
+	 * the rx pool (the latter waits for any loaned buffers to return).
 	 */
+	atomic_and_32(&ice->ice_state, ~ICE_STATE_STARTED);
 	ice_queues_disable(ice);
 	ice_tx_stop(ice);
 	ice_rx_stop(ice);
@@ -823,14 +825,31 @@ static int
 ice_m_setprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
     uint_t pr_valsize, const void *pr_val)
 {
-	_NOTE(ARGUNUSED(arg, pr_name, pr_valsize, pr_val));
+	ice_t *ice = arg;
+	uint32_t mtu;
+	int ret;
 
-	/*
-	 * Link configuration (autoneg, per-speed advertisement, flow control)
-	 * is not settable yet, and MTU resizing requires reprogramming the rx
-	 * rings, which is out of this milestone's scope.
-	 */
+	_NOTE(ARGUNUSED(pr_name));
+
 	switch (pr_num) {
+	case MAC_PROP_MTU: {
+		if (pr_valsize < sizeof (mtu))
+			return (EINVAL);
+		bcopy(pr_val, &mtu, sizeof (mtu));
+		if (mtu == ice->ice_mtu)
+			return (0);
+		if (mtu < ICE_MIN_MTU || mtu > ICE_MAX_MTU)
+			return (EINVAL);
+		if (ice->ice_state & ICE_STATE_STARTED)
+			return (EBUSY);
+
+		ret = mac_maxsdu_update(ice->ice_mac_hdl, mtu);
+		if (ret != 0)
+			return (ret);
+		ice->ice_mtu = mtu;
+		ice_update_mtu(ice);
+		return (0);
+	}
 	default:
 		return (ENOTSUP);
 	}
@@ -948,6 +967,13 @@ ice_m_getprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 		}
 		bcopy(&ice->ice_link_fctl, pr_val, sizeof (link_flowctrl_t));
 		break;
+	case MAC_PROP_MTU:
+		if (pr_valsize < sizeof (uint32_t)) {
+			ret = EOVERFLOW;
+			break;
+		}
+		bcopy(&ice->ice_mtu, pr_val, sizeof (uint32_t));
+		break;
 	default:
 		ret = ENOTSUP;
 		break;
@@ -1047,9 +1073,8 @@ ice_m_propinfo(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 		mac_prop_info_set_default_fec(prh, LINK_FEC_AUTO);
 		break;
 	case MAC_PROP_MTU:
-		mac_prop_info_set_perm(prh, MAC_PROP_PERM_READ);
 		mac_prop_info_set_range_uint32(prh, ICE_MIN_MTU,
-		    ICE_RX_BUF_SIZE - sizeof (struct ether_vlan_header));
+		    ICE_MAX_MTU);
 		break;
 	default:
 		break;
@@ -1107,11 +1132,7 @@ ice_mac_register(ice_t *ice)
 	mac->m_dst_addr = NULL;
 	mac->m_callbacks = &ice_m_callbacks;
 	mac->m_min_sdu = ICE_MIN_MTU;
-	/*
-	 * Single-buffer receive bounds the frame to one posted buffer until
-	 * multi-buffer/jumbo rx lands; advertise the matching payload size.
-	 */
-	mac->m_max_sdu = ICE_RX_BUF_SIZE - sizeof (struct ether_vlan_header);
+	mac->m_max_sdu = ice->ice_mtu;
 	mac->m_pdata = NULL;
 	mac->m_pdata_size = 0;
 	mac->m_priv_props = NULL;
