@@ -319,17 +319,17 @@ ice_rx_ring_unprogram(ice_t *ice, ice_rx_ring_t *irr)
 /*
  * Receive packet datapath.
  *
- * Each rx ring posts irxr_size single-segment data buffers (ICE_RX_BUF_SIZE)
- * to the hardware and decodes the Flex-NIC (RxDID 2) writeback the hardware
- * produces.  A control block (ice_rx_ctrl_block_t) owns each posted buffer and
- * a desballoc(9F) loaner mblk; a large frame is loaned up the stack (the slot
- * is refilled from a spare control block), a small frame is copied into a fresh
- * mblk and the buffer is left on the ring.  Loaned buffers return through
+ * Each rx ring posts irxr_size data buffers (ICE_RX_BUF_SIZE) to the hardware
+ * and decodes the Flex-NIC (RxDID 2) writeback the hardware produces.  A
+ * control block (ice_rx_ctrl_block_t) owns each posted buffer and a
+ * desballoc(9F) loaner mblk; a large segment is loaned up the stack (the slot
+ * is refilled from a spare control block), a small segment is copied into a
+ * fresh mblk and the buffer is left on the ring.  Loaned buffers return through
  * ice_rx_recycle(); teardown blocks until every loan is back.
  *
  * Everything the hardware writes into the descriptor writeback is untrusted.
- * The decode reads the Descriptor Done bit first, issues a read barrier before
- * touching any other writeback field, and clamps the reported length to the
+ * The decode reads each Descriptor Done bit first, issues a read barrier before
+ * touching any other writeback field, and clamps every segment length to the
  * posted buffer size before it is ever used to advance b_wptr or size a copy.
  */
 
@@ -735,12 +735,198 @@ ice_rx_hcksum(ice_rx_ring_t *irr, mblk_t *mp, uint16_t status0, uint16_t ptype)
 }
 
 /*
- * Drain the rx ring, returning an mblk chain of received frames.
+ * Re-post every descriptor in a frame that cannot be delivered.  Advancing
+ * irxr_head is unconditional: even a hostile chain that never supplies EOP
+ * must not wedge the ring on the same descriptor forever.
+ */
+static void
+ice_rx_discard_frame(ice_rx_ring_t *irr, uint16_t nsegs)
+{
+	uint16_t h = irr->irxr_head;
+	uint16_t i;
+
+	ASSERT(MUTEX_HELD(&irr->irxr_lock));
+	ASSERT3U(nsegs, >, 0);
+	ASSERT3U(nsegs, <=, ICE_RX_MAX_DESC);
+
+	for (i = 0; i < nsegs; i++) {
+		ice_rx_reset_desc(irr, h, irr->irxr_rcbs[h]);
+		h = ice_rx_next(irr, h);
+	}
+
+	irr->irxr_head = h;
+}
+
+/*
+ * Validate one complete frame without changing ring state, then assemble its
+ * descriptor buffers into a b_cont chain.  On entry, a non-zero *total_lenp
+ * is the remaining budget for a non-empty poll result; zero means unlimited.
+ * A frame that exceeds that budget is deferred without consuming any slots.
+ */
+static mblk_t *
+ice_ring_rx_frame(ice_rx_ring_t *irr, uint32_t *total_lenp,
+    boolean_t *deferp)
+{
+	ice_t *ice = irr->irxr_ice;
+	mblk_t *mp_head = NULL, *mp_tail = NULL;
+	ice_rx_ctrl_block_t *loaned[ICE_RX_MAX_DESC];
+	uint16_t seglens[ICE_RX_MAX_DESC];
+	uint32_t frame_limit = *total_lenp;
+	uint32_t total = 0;
+	uint16_t h = irr->irxr_head;
+	uint16_t eop_status0 = 0, eop_ptype = 0;
+	uint16_t nsegs = 0, nloans = 0, i;
+	boolean_t bad = B_FALSE, eop = B_FALSE;
+	boolean_t dma_fault = B_FALSE;
+
+	ASSERT(MUTEX_HELD(&irr->irxr_lock));
+
+	*total_lenp = 0;
+	*deferp = B_FALSE;
+
+	/*
+	 * Pass A: validate only.  DD is authoritative for every descriptor;
+	 * no other writeback field is read until after the consumer barrier.
+	 */
+	for (;;) {
+		union ice_32b_rx_flex_desc *desc = &irr->irxr_descs[h];
+		uint16_t status0, seglen;
+
+		(void) ddi_dma_sync(irr->irxr_desc_dma.idb_dma_handle,
+		    (off_t)((uintptr_t)desc - (uintptr_t)irr->irxr_descs),
+		    sizeof (*desc), DDI_DMA_SYNC_FORKERNEL);
+
+		status0 = LE16_TO_CPU(desc->wb.status_error0);
+		if ((status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_DD_S)) == 0) {
+			*deferp = B_TRUE;
+			return (NULL);
+		}
+
+		membar_consumer();
+
+		seglen = LE16_TO_CPU(desc->wb.pkt_len) &
+		    ICE_RX_FLX_DESC_PKT_LEN_M;
+		if (seglen == 0 || seglen > irr->irxr_dbuf)
+			bad = B_TRUE;
+
+		seglens[nsegs] = seglen;
+		total += seglen;
+		nsegs++;
+
+		if ((status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_EOF_S)) != 0) {
+			eop_status0 = status0;
+			eop_ptype = LE16_TO_CPU(desc->wb.ptype_flex_flags0) &
+			    ICE_RX_FLEX_DESC_PTYPE_M;
+			eop = B_TRUE;
+			break;
+		}
+
+		if (nsegs == ICE_RX_MAX_DESC)
+			break;
+		h = ice_rx_next(irr, h);
+	}
+
+	if (!eop || total > ice->ice_pf_vsi.vi_max_frame ||
+	    (eop && (eop_status0 &
+	    BIT(ICE_RX_FLEX_DESC_STATUS0_RXE_S)) != 0))
+		bad = B_TRUE;
+
+	if (bad) {
+		ice_rx_discard_frame(irr, nsegs);
+		irr->irxr_stats.icrxs_desc_error.value.ui64++;
+		return (NULL);
+	}
+
+	/* Do not consume a second or later frame that exceeds a poll budget. */
+	if (frame_limit != 0 && total > frame_limit) {
+		*deferp = B_TRUE;
+		return (NULL);
+	}
+
+	/* Pass B: every segment is present and its length is now trusted. */
+	h = irr->irxr_head;
+	for (i = 0; i < nsegs; i++) {
+		ice_rx_ctrl_block_t *rcb = irr->irxr_rcbs[h];
+		mblk_t *mp = NULL;
+		uint16_t seglen = seglens[i];
+		boolean_t bound = B_FALSE;
+
+		if (ddi_dma_sync(rcb->ircb_dma.idb_dma_handle, 0, seglen,
+		    DDI_DMA_SYNC_FORKERNEL) != DDI_SUCCESS ||
+		    ice_check_dma_handle(rcb->ircb_dma.idb_dma_handle) !=
+		    DDI_FM_OK) {
+			dma_fault = B_TRUE;
+			goto assemble_fail;
+		}
+
+		if (seglen >= ICE_RX_COPY_THRESHOLD) {
+			mp = ice_rx_bind(irr, h, rcb, seglen);
+			if (mp != NULL) {
+				bound = B_TRUE;
+				loaned[nloans++] = rcb;
+			}
+		}
+		if (mp == NULL)
+			mp = ice_rx_copy(irr, rcb, seglen);
+		if (mp == NULL)
+			goto assemble_fail;
+
+		/* ice_rx_bind() has already posted a replacement. */
+		if (!bound)
+			ice_rx_reset_desc(irr, h, rcb);
+
+		if (mp_tail == NULL)
+			mp_head = mp_tail = mp;
+		else {
+			mp_tail->b_cont = mp;
+			mp_tail = mp;
+		}
+
+		h = ice_rx_next(irr, h);
+	}
+
+	ice_rx_hcksum(irr, mp_head, eop_status0, eop_ptype);
+	irr->irxr_head = h;
+	*total_lenp = total;
+	return (mp_head);
+
+assemble_fail:
+	/*
+	 * desballoc(9F) invokes ice_rx_recycle() synchronously from
+	 * freemsg(9F).  Mark partial loans returned while holding the ring
+	 * lock so the callback takes its non-loaned path and cannot recursively
+	 * enter this mutex; re-arm and stack the control blocks afterwards.
+	 */
+	for (i = 0; i < nloans; i++) {
+		ASSERT3S(loaned[i]->ircb_state, ==, IRXB_ONLOAN);
+		ASSERT3U(irr->irxr_nloaned, >, 0);
+		irr->irxr_nloaned--;
+		loaned[i]->ircb_state = IRXB_FREE;
+	}
+	if (mp_head != NULL)
+		freemsg(mp_head);
+	for (i = 0; i < nloans; i++) {
+		(void) ice_rx_alloc_mp(loaned[i]);
+		ice_rcb_free(irr, loaned[i]);
+	}
+
+	ice_rx_discard_frame(irr, nsegs);
+
+	if (dma_fault) {
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
+		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
+	}
+
+	return (NULL);
+}
+
+/*
+ * Drain the rx ring, returning a b_next chain of received frames.  Segments
+ * within a frame are linked with b_cont by ice_ring_rx_frame().
  *
  * poll_bytes > 0 caps the bytes delivered (mac polling); poll_bytes == 0 means
- * deliver everything ready (interrupt context).  Single-buffer receive: every
- * descriptor that hardware completes is a whole frame (EOF).  Refilled slots
- * advance the tail doorbell so hardware can reuse them.
+ * deliver everything ready (interrupt context).  Refilled slots advance the
+ * tail doorbell so hardware can reuse them.
  */
 static mblk_t *
 ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes)
@@ -748,8 +934,8 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes)
 	ice_t *ice = irr->irxr_ice;
 	struct ice_hw *hw = &ice->ice_hw;
 	mblk_t *mp_head = NULL, *mp_tail = NULL;
-	uint16_t head = irr->irxr_head;
-	uint_t bytes = 0, npkts = 0, nposted = 0;
+	uint32_t bytes = 0;
+	uint_t npkts = 0, nposted = 0;
 
 	ASSERT(MUTEX_HELD(&irr->irxr_lock));
 
@@ -757,88 +943,34 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes)
 		return (NULL);
 
 	for (;;) {
-		union ice_32b_rx_flex_desc *desc = &irr->irxr_descs[head];
-		ice_rx_ctrl_block_t *rcb = irr->irxr_rcbs[head];
 		mblk_t *mp;
-		boolean_t bound;
-		uint16_t status0, plen, ptype;
+		uint32_t total_len = 0;
+		uint16_t frame_head = irr->irxr_head;
+		boolean_t defer;
 
-		if (poll_bytes > 0 && bytes >= (uint_t)poll_bytes)
+		if (poll_bytes > 0 && bytes >= (uint32_t)poll_bytes)
+			break;
+		if (poll_bytes > 0 && bytes > 0)
+			total_len = (uint32_t)poll_bytes - bytes;
+
+		mp = ice_ring_rx_frame(irr, &total_len, &defer);
+		if (defer)
 			break;
 
-		/*
-		 * Sync and read the Done bit before anything else: until DD is
-		 * set the rest of the writeback is stale.  The read barrier
-		 * keeps the length/error loads below from being reordered ahead
-		 * of the DD observation.
-		 */
-		(void) ddi_dma_sync(irr->irxr_desc_dma.idb_dma_handle,
-		    (off_t)((uintptr_t)desc - (uintptr_t)irr->irxr_descs),
-		    sizeof (*desc), DDI_DMA_SYNC_FORKERNEL);
+		if (irr->irxr_head >= frame_head)
+			nposted += irr->irxr_head - frame_head;
+		else
+			nposted += irr->irxr_size - frame_head +
+			    irr->irxr_head;
 
-		status0 = LE16_TO_CPU(desc->wb.status_error0);
-		if ((status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_DD_S)) == 0)
-			break;
-
-		membar_consumer();
-
-		plen = LE16_TO_CPU(desc->wb.pkt_len) &
-		    ICE_RX_FLX_DESC_PKT_LEN_M;
-		ptype = LE16_TO_CPU(desc->wb.ptype_flex_flags0) &
-		    ICE_RX_FLEX_DESC_PTYPE_M;
-
-		/*
-		 * The single most important defensive check: a length larger
-		 * than the buffer we posted (or zero) is a hardware/firmware
-		 * lie that would overrun the buffer.  Drop and recycle in
-		 * place; never advance b_wptr or size a copy past the buffer.
-		 */
-		if (plen == 0 || plen > irr->irxr_dbuf) {
-			irr->irxr_stats.icrxs_desc_error.value.ui64++;
-			goto recycle;
-		}
-
-		/* Receive MAC error: drop the frame, keep the buffer. */
-		if ((status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_RXE_S)) != 0) {
-			irr->irxr_stats.icrxs_desc_error.value.ui64++;
-			goto recycle;
-		}
-
-		if (ddi_dma_sync(rcb->ircb_dma.idb_dma_handle, 0, plen,
-		    DDI_DMA_SYNC_FORKERNEL) != DDI_SUCCESS ||
-		    ice_check_dma_handle(rcb->ircb_dma.idb_dma_handle) !=
-		    DDI_FM_OK) {
-			ddi_fm_service_impact(ice->ice_dip,
-			    DDI_SERVICE_DEGRADED);
-			atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
-			break;
-		}
-
-		mp = NULL;
-		bound = B_FALSE;
-		if (plen >= ICE_RX_COPY_THRESHOLD) {
-			mp = ice_rx_bind(irr, head, rcb, plen);
-			if (mp != NULL)
-				bound = B_TRUE;
-		}
-		if (mp == NULL)
-			mp = ice_rx_copy(irr, rcb, plen);
 		if (mp == NULL) {
-			/* Out of memory: drop, leave buffer in place. */
-			goto recycle;
+			if ((ice->ice_state & ICE_STATE_ERROR) != 0)
+				break;
+			continue;
 		}
 
-		/*
-		 * A bound frame's slot already holds the replacement buffer
-		 * ice_rx_bind() posted.  A copied frame's buffer stays on the
-		 * ring, so its descriptor must be re-posted before the tail
-		 * advances; hardware's writeback aliased over read.pkt_addr, so
-		 * an unposted slot would DMA the next frame to garbage.
-		 */
-		if (!bound)
-			ice_rx_reset_desc(irr, head, rcb);
-
-		ice_rx_hcksum(irr, mp, status0, ptype);
+		ASSERT(poll_bytes == 0 || bytes == 0 ||
+		    bytes + total_len <= (uint32_t)poll_bytes);
 
 		if (mp_tail == NULL)
 			mp_head = mp_tail = mp;
@@ -846,23 +978,12 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes)
 			mp_tail->b_next = mp;
 			mp_tail = mp;
 		}
+		bytes += total_len;
 		npkts++;
-		bytes += plen;
-		nposted++;
-		head = ice_rx_next(irr, head);
-		continue;
-
-recycle:
-		/* Re-post the same buffer into its slot and move on. */
-		ice_rx_reset_desc(irr, head, rcb);
-		nposted++;
-		head = ice_rx_next(irr, head);
 	}
 
 	if (nposted == 0)
 		return (mp_head);
-
-	irr->irxr_head = head;
 
 	/*
 	 * Hand the refilled slots back to hardware: sync the descriptors we
@@ -877,7 +998,8 @@ recycle:
 		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
 	}
 
-	irr->irxr_tail = (head == 0) ? irr->irxr_size - 1 : head - 1;
+	irr->irxr_tail = (irr->irxr_head == 0) ? irr->irxr_size - 1 :
+	    irr->irxr_head - 1;
 	wr32(hw, QRX_TAIL(irr->irxr_index), irr->irxr_tail);
 	if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {
 		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);

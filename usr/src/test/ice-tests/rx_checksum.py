@@ -18,21 +18,21 @@ def function(source: str, signature: str, following: str) -> str:
 
 def main() -> None:
     source = SOURCE.read_text(encoding="utf-8")
-    ring = function(
+    frame = function(
         source,
-        "ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes)\n{",
-        "\n/*\n * mac(9E) poll entry point.",
+        "ice_ring_rx_frame(ice_rx_ring_t *irr, uint32_t *total_lenp,",
+        "\n/*\n * Drain the rx ring",
     )
     checksum = function(
         source,
         "ice_rx_hcksum(ice_rx_ring_t *irr, mblk_t *mp, uint16_t status0,",
-        "\n/*\n * Drain the rx ring",
+        "\n/*\n * Re-post every descriptor",
     )
 
-    snapshot = ring.index("desc->wb.ptype_flex_flags0")
-    assert ring.count("desc->wb.ptype_flex_flags0") == 1
-    assert snapshot < ring.index("ice_rx_bind(irr, head")
-    assert snapshot < ring.index("ice_rx_reset_desc(irr, head")
+    snapshot = frame.index("desc->wb.ptype_flex_flags0")
+    assert frame.count("desc->wb.ptype_flex_flags0") == 1
+    assert snapshot < frame.index("ice_rx_bind(irr, h")
+    assert snapshot < frame.index("ice_rx_reset_desc(irr, h")
 
     compact = re.sub(r"\s+", "", checksum)
     assert (

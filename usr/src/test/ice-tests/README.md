@@ -5,6 +5,7 @@ E810 device. Run them from anywhere in the source tree with:
 
 ```
 python3 usr/src/test/ice-tests/rx_checksum.py
+python3 usr/src/test/ice-tests/jumbo_rx.py
 python3 usr/src/test/ice-tests/admin_interrupt.py
 python3 usr/src/test/ice-tests/link_state.py
 python3 usr/src/test/ice-tests/fma_dma.py
@@ -19,6 +20,12 @@ python3 usr/src/test/ice-tests/link_speed_caps.py
 `rx_checksum.py` verifies that receive checksum metadata is captured before
 the descriptor is reposted and that all hardware-reported L3/L4 checksum error
 bits suppress checksum validation.
+
+`jumbo_rx.py` verifies that receive frames are assembled through an
+EOP-terminated, bounded descriptor walk; segment and total lengths are checked
+separately; only EOP metadata drives RXE and checksum handling; malformed,
+DMA-fault, and allocation-failure paths advance the ring; and frame segments
+are linked with `b_cont`.
 
 `admin_interrupt.py` verifies that every interrupt on the dedicated admin
 vector can schedule a bounded, single-flight ARQ drain without depending on an

@@ -84,6 +84,8 @@ extern "C" {
 #define	ICE_MIN_RING_SIZE	64
 #define	ICE_MAX_RING_SIZE	4096
 #define	ICE_RX_BUF_SIZE		2048		/* posted rx data buffer */
+/* ceil(ICE_AQ_SET_MAC_FRAME_SIZE_MAX / ICE_RX_BUF_SIZE) */
+#define	ICE_RX_MAX_DESC		5
 
 #define	ICE_ITR_IDX_0		0		/* ITR slot for queue vectors */
 #define	ICE_ITR_INDEX_NONE	3		/* "do not update the ITR" */
