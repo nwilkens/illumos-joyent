@@ -62,10 +62,12 @@ def main() -> None:
     rollback = disable.index("ice_aq_set_mac_loopback", revoke)
     assert mac_disable < revoke < rollback
 
+    # The loopback transition logic lives in the _locked routine; the thin
+    # ice_loopback_mode_set wrapper brackets it in the outermost rebuild lock.
     setter = function(
         gld,
-        "ice_loopback_mode_set(ice_t *ice, uint32_t mode)\n{",
-        "\nvoid\nice_loopback_fini",
+        "ice_loopback_mode_set_locked(ice_t *ice, uint32_t mode)\n{",
+        "\n/*\n * ice_rebuild_lock is the outermost",
     )
     transition = setter.index("ice_loopback_enable(ice)")
     publish = setter.index("ice_link_loopback_update", transition)
@@ -74,6 +76,14 @@ def main() -> None:
     lock_exit = setter.rindex("mutex_exit(&ice->ice_loopback_lock)")
     assert "ice->ice_lock" not in setter
     assert lock_enter < transition < publish < refresh < lock_exit
+
+    wrapper = function(
+        gld,
+        "ice_loopback_mode_set(ice_t *ice, uint32_t mode)\n{",
+        "\nvoid\nice_loopback_fini",
+    )
+    assert "mutex_enter(&ice->ice_rebuild_lock)" in wrapper
+    assert "ice_loopback_mode_set_locked(ice, mode)" in wrapper
 
     vsi = VSI_SOURCE.read_text(encoding="utf-8")
     vsi_set = function(

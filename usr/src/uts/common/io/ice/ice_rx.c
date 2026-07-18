@@ -345,6 +345,14 @@ ice_rx_ring_unprogram(ice_t *ice, ice_rx_ring_t *irr)
 /* Bind (loan) a frame at least this large; smaller frames are copied. */
 #define	ICE_RX_COPY_THRESHOLD	256
 
+/*
+ * Upper bound on the reset path's wait for loaned rx buffers to return, in
+ * microseconds.  Generous (5s total across rings) so a merely busy stack still
+ * drains, but finite so the autonomous reset taskq cannot wedge on a loan that
+ * never comes back.
+ */
+#define	ICE_RX_RESET_LOAN_WAIT_US	5000000
+
 static mblk_t *ice_ring_rx(ice_rx_ring_t *, int);
 
 /*
@@ -1224,4 +1232,72 @@ ice_rx_stop(ice_t *ice)
 		ice_rx_free_rcbs(irr);
 		mutex_exit(&irr->irxr_lock);
 	}
+}
+
+/*
+ * Reset-path variant of ice_rx_stop() with a bounded loan wait.  The reset
+ * runs on the autonomous reset taskq, so an unbounded wait for a loan that
+ * never returns would wedge that taskq (and detach's ddi_taskq_destroy)
+ * forever.  Returns B_FALSE if any ring still has loans outstanding when the
+ * shared deadline expires; such a ring is left fully intact -- its control
+ * blocks are NOT freed and its descriptors are NOT reposted -- so the loaned
+ * buffers return harmlessly through ice_rx_recycle() later, and the caller
+ * fails the rebuild closed rather than reinitialize over buffers still up the
+ * stack.  A single absolute deadline bounds the total wait across all rings.
+ */
+boolean_t
+ice_rx_stop_reset(ice_t *ice)
+{
+	clock_t deadline = ddi_get_lbolt() +
+	    drv_usectohz(ICE_RX_RESET_LOAN_WAIT_US);
+	boolean_t drained = B_TRUE;
+	uint_t i;
+
+	for (i = 0; i < ice->ice_num_rxr; i++) {
+		ice_rx_ring_t *irr = &ice->ice_rxr[i];
+
+		mutex_enter(&irr->irxr_lock);
+		irr->irxr_shutdown = B_TRUE;
+
+		while (irr->irxr_nloaned > 0) {
+			if (cv_timedwait(&irr->irxr_cv, &irr->irxr_lock,
+			    deadline) == -1)
+				break;
+		}
+
+		if (irr->irxr_nloaned > 0) {
+			drained = B_FALSE;
+			mutex_exit(&irr->irxr_lock);
+			continue;
+		}
+
+		ice_rx_free_rcbs(irr);
+		mutex_exit(&irr->irxr_lock);
+	}
+
+	return (drained);
+}
+
+/*
+ * Resume the rx rings after a reset rebuild.  Unlike a plumb, a reset does not
+ * have MAC re-drive the per-ring start callbacks, so repost the buffers, reopen
+ * each ring, and re-enable its interrupt here, preserving the MAC-assigned
+ * generation number.  ice_start_datapath() must have re-allocated the rcb pool
+ * first.
+ */
+boolean_t
+ice_rx_rings_resume(ice_t *ice)
+{
+	uint_t i;
+
+	for (i = 0; i < ice->ice_num_rxr; i++) {
+		ice_rx_ring_t *irr = &ice->ice_rxr[i];
+
+		if (ice_ring_rx_start((mac_ring_driver_t)irr,
+		    irr->irxr_rxgen) != 0)
+			return (B_FALSE);
+		(void) ice_ring_rx_intr_enable((mac_intr_handle_t)irr);
+	}
+
+	return (B_TRUE);
 }

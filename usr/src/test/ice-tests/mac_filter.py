@@ -25,10 +25,12 @@ def main() -> None:
     )
     assert "e->fltr_info.flag = ICE_FLTR_TX;" in gld_init
 
+    # The filter construction lives in the _locked routine; the thin
+    # ice_gld_set_mac wrapper brackets it in the outermost rebuild lock.
     gld_set = function(
         gld,
-        "ice_gld_set_mac(ice_t *ice, const uint8_t *addr, boolean_t add)\n{",
-        "\n/*\n * Ring callbacks.",
+        "ice_gld_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)\n{",
+        "\n/*\n * ice_rebuild_lock is the outermost",
     )
     gld_construct = gld_set.index("ice_gld_fltr_init(&e,")
     assert gld_set.count("ice_gld_fltr_init(&e,") == 1
@@ -63,7 +65,8 @@ def main() -> None:
     assert vsi_remove.index("ice_fltr_entry_init(") < vsi_remove.index(
         "ice_remove_mac(hw, &rm)"
     )
-    assert vsi.count("ice_fltr_entry_init(") == 4
+    # Definition, teardown, the two attach filters, and the rebuild replay.
+    assert vsi.count("ice_fltr_entry_init(") == 5
 
 
 if __name__ == "__main__":

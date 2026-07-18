@@ -17,6 +17,9 @@ python3 usr/src/test/ice-tests/hw_stats.py
 python3 usr/src/test/ice-tests/link_speed_caps.py
 python3 usr/src/test/ice-tests/lso.py
 python3 usr/src/test/ice-tests/rss.py
+python3 usr/src/test/ice-tests/reset_oicr.py
+python3 usr/src/test/ice-tests/reset_rebuild.py
+python3 usr/src/test/ice-tests/reset_serialize.py
 ```
 
 `rx_checksum.py` verifies that receive checksum metadata is captured before
@@ -100,6 +103,32 @@ ring-to-vector invariant is asserted at sizing and the MSI-X vector accounting
 is logged; that the queue ISR dispatches by vector index rather than scanning
 rings; and that the VSI, RSS LUT, and GLDv3 receive-ring interrupt handle use
 that multiqueue layout.
+
+`reset_oicr.py` verifies the fatal-cause OICR decode and fail-closed path: the
+ISR latches reset and fatal causes, the MDD handler clears every detection
+register and fails closed only for a this-function offender, the worker
+snapshots the causes and skips the ARQ drain during a reset, and mac start
+refuses while a reset failed terminally or a rebuild is owed.
+
+`reset_rebuild.py` verifies the reset prepare/rebuild path: prepare quiesces the
+datapath, silences the OICR, marks the link down, and marks the VSI absent while
+keeping the tracked MAC list; the rebuild reinitializes only what a reset clears
+(hardware, DDP, VSI, RSS, interrupt routing, link) and never re-runs the
+one-time attach allocations (interrupts, MAC registration, ring DMA); it clears
+`reset_ongoing` before the reinit so the admin queue is usable and clears the
+fail-closed and reset-owed state only after every rebuild step; and the terminal
+path sets `ICE_STATE_RESET_FAILED` with `DDI_SERVICE_LOST`. It also verifies that
+`ice_vsi_rebuild` recreates the VSI, replays the tracked filters, restores RSS,
+and re-applies promiscuous mode.
+
+`reset_serialize.py` verifies the reset serialization and detach safety: mac
+start/stop bracket the datapath in the outermost `ice_rebuild_lock` and start
+goes through the factored `ice_start_datapath`; the taskq worker no-ops while
+detaching and takes the rebuild lock only after dropping `ice_lock`; the reset
+taskq is destroyed after the interrupt handlers are removed and before the rings
+and VSI are freed; detach marks the device detaching under the rebuild lock
+before unconfigure; and `ice_reset_dispatch` mirrors the `oicr_pending`
+single-flight coalescing.
 
 ## On-hardware datapath acceptance
 

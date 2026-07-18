@@ -81,6 +81,19 @@ ice_link_state_set(ice_t *ice, link_state_t state)
 }
 
 /*
+ * Set the cached link state and report it to MAC under ice_lse_lock.  The
+ * reset path uses this to force the link down while the function is rebuilt.
+ */
+void
+ice_link_report(ice_t *ice, link_state_t state)
+{
+	mutex_enter(&ice->ice_lse_lock);
+	ice->ice_link_state = state;
+	ice_link_state_set(ice, state);
+	mutex_exit(&ice->ice_lse_lock);
+}
+
+/*
  * Publish the state cached by the attach-time hardware query after the MAC
  * handle becomes valid.  Serialize with asynchronous link updates so MAC
  * always receives the newest cached state.
@@ -331,6 +344,33 @@ ice_link_status_update(ice_t *ice)
 }
 
 /*
+ * Coalesce a rebuild request and hand it to the dedicated reset taskq.
+ * Mirrors the ice_oicr_pending idiom: at most one task is queued at a time,
+ * and the flag re-arms when ice_reset_task clears it.  Runs in thread context
+ * only (the OICR worker or the DEBUG test hook), never at interrupt priority.
+ */
+void
+ice_reset_dispatch(ice_t *ice)
+{
+	boolean_t dispatch = B_FALSE;
+
+	mutex_enter(&ice->ice_lock);
+	if (!ice->ice_reset_pending) {
+		ice->ice_reset_pending = B_TRUE;
+		dispatch = B_TRUE;
+	}
+	mutex_exit(&ice->ice_lock);
+
+	if (dispatch && ddi_taskq_dispatch(ice->ice_reset_taskq, ice_reset_task,
+	    ice, DDI_NOSLEEP) != DDI_SUCCESS) {
+		mutex_enter(&ice->ice_lock);
+		ice->ice_reset_pending = B_FALSE;
+		mutex_exit(&ice->ice_lock);
+		ice_error(ice, "reset taskq dispatch failed");
+	}
+}
+
+/*
  * Taskq worker: drain the admin receive queue and act on link-status events.
  * The loop is bounded both by the firmware-reported pending count and by a
  * hard element cap.
@@ -439,11 +479,17 @@ ice_oicr_task(void *arg)
 
 	/*
 	 * A reset in progress or owed leaves the admin queue unusable or about
-	 * to be rebuilt; skip the drain.
+	 * to be rebuilt; skip the drain.  When a rebuild is owed, hand it to
+	 * the dedicated reset taskq: it can run for seconds and shares this
+	 * worker's single ice_aqbuf, so it must never run here.
 	 */
 	if (hw->reset_ongoing || (ice->ice_state &
-	    (ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ)) != 0)
+	    (ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ)) != 0) {
+		if ((ice->ice_state &
+		    (ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ)) != 0)
+			ice_reset_dispatch(ice);
 		return;
+	}
 
 	bzero(&evt, sizeof (evt));
 	evt.buf_len = ICE_AQ_MAX_BUF_LEN;

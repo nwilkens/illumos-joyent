@@ -458,3 +458,70 @@ ice_vsi_fini(ice_t *ice)
 	list_destroy(&vsi->vi_macs);
 	mutex_destroy(&vsi->vi_mac_lock);
 }
+
+/*
+ * Recreate the PF data VSI and its filters after a reset.  A reset clears the
+ * VSI, its switch filters, and the RSS configuration; this rebuilds them from
+ * the software state.  The vi_macs list is the authoritative record and is
+ * replayed into hardware but never modified here.  The list_create()/mutex_init
+ * done once in ice_vsi_init() is not repeated.  Called from ice_rebuild() under
+ * ice_rebuild_lock.
+ */
+int
+ice_vsi_rebuild(ice_t *ice)
+{
+	struct ice_hw *hw = &ice->ice_hw;
+	ice_vsi_t *vsi = &ice->ice_pf_vsi;
+	struct ice_fltr_list_entry *ents = NULL;
+	ice_mac_filter_t *imf;
+	uint_t n = 0, i = 0;
+	int status;
+
+	status = ice_vsi_setup(ice);
+	if (status != ICE_SUCCESS)
+		return (status);
+
+	/*
+	 * Replay every tracked MAC filter.  Build the list under the lock but
+	 * issue the blocking admin-queue command with it dropped, matching
+	 * ice_vsi_teardown().
+	 */
+	mutex_enter(&vsi->vi_mac_lock);
+	for (imf = list_head(&vsi->vi_macs); imf != NULL;
+	    imf = list_next(&vsi->vi_macs, imf))
+		n++;
+	if (n > 0) {
+		struct LIST_HEAD_TYPE add;
+
+		ents = kmem_zalloc(n * sizeof (*ents), KM_SLEEP);
+		INIT_LIST_HEAD(&add);
+		for (imf = list_head(&vsi->vi_macs); imf != NULL;
+		    imf = list_next(&vsi->vi_macs, imf)) {
+			ice_fltr_entry_init(&ents[i], vsi->vi_handle,
+			    imf->imf_addr);
+			LIST_ADD(&ents[i].list_entry, &add);
+			i++;
+		}
+		mutex_exit(&vsi->vi_mac_lock);
+
+		status = ice_add_mac(hw, &add);
+		kmem_free(ents, n * sizeof (*ents));
+		if (status != ICE_SUCCESS) {
+			ice_error(ice, "failed to replay MAC filters: %d",
+			    status);
+			return (status);
+		}
+	} else {
+		mutex_exit(&vsi->vi_mac_lock);
+	}
+
+	status = ice_rss_setup(ice);
+	if (status != ICE_SUCCESS)
+		return (status);
+
+	/* Restore promiscuous mode if it was enabled before the reset. */
+	if (ice->ice_promisc_on && ice_promisc_apply(ice, B_TRUE) != 0)
+		return (ICE_ERR_CFG);
+
+	return (ICE_SUCCESS);
+}

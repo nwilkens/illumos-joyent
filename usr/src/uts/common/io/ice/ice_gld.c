@@ -86,7 +86,7 @@ ice_gld_find_mac(ice_vsi_t *vsi, const uint8_t *addr)
  * queue command runs with the list lock dropped because it can block.
  */
 static int
-ice_gld_set_mac(ice_t *ice, const uint8_t *addr, boolean_t add)
+ice_gld_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)
 {
 	struct ice_hw *hw = &ice->ice_hw;
 	ice_vsi_t *vsi = &ice->ice_pf_vsi;
@@ -135,6 +135,24 @@ ice_gld_set_mac(ice_t *ice, const uint8_t *addr, boolean_t add)
 	mutex_exit(&vsi->vi_mac_lock);
 
 	return (0);
+}
+
+/*
+ * ice_rebuild_lock is the outermost lock: hold it across the admin-queue filter
+ * command so a reset rebuild cannot tear the control queue down (via
+ * ice_deinit_hw) underneath ice_add_mac/ice_remove_mac.  It is taken before the
+ * vi_mac_lock the inner routine uses, matching the rebuild's own lock order.
+ */
+static int
+ice_gld_set_mac(ice_t *ice, const uint8_t *addr, boolean_t add)
+{
+	int ret;
+
+	mutex_enter(&ice->ice_rebuild_lock);
+	ret = ice_gld_set_mac_locked(ice, addr, add);
+	mutex_exit(&ice->ice_rebuild_lock);
+
+	return (ret);
 }
 
 /*
@@ -291,7 +309,7 @@ ice_loopback_disable(ice_t *ice)
 }
 
 static int
-ice_loopback_mode_set(ice_t *ice, uint32_t mode)
+ice_loopback_mode_set_locked(ice_t *ice, uint32_t mode)
 {
 	boolean_t enable;
 	uint32_t current;
@@ -336,6 +354,25 @@ ice_loopback_mode_set(ice_t *ice, uint32_t mode)
 	mutex_exit(&ice->ice_loopback_lock);
 
 	return (0);
+}
+
+/*
+ * ice_rebuild_lock is the outermost lock: hold it across the loopback
+ * admin-queue commands (ice_aq_set_mac_loopback / ice_vsi_loopback_set) so a
+ * reset rebuild cannot tear the control queue down underneath them.  Both the
+ * netlb(4I) LB_SET_MODE ioctl and ice_loopback_fini() reach the hardware only
+ * through here.
+ */
+static int
+ice_loopback_mode_set(ice_t *ice, uint32_t mode)
+{
+	int ret;
+
+	mutex_enter(&ice->ice_rebuild_lock);
+	ret = ice_loopback_mode_set_locked(ice, mode);
+	mutex_exit(&ice->ice_rebuild_lock);
+
+	return (ret);
 }
 
 void
@@ -437,34 +474,16 @@ ice_m_ioctl(void *arg, queue_t *q, mblk_t *mp)
 /*
  * MAC callbacks.
  */
-static int
-ice_m_start(void *arg)
+
+/*
+ * Program and enable the queues, post rx buffers, and admit traffic.  Factored
+ * from ice_m_start so the reset rebuild can restore the datapath directly.
+ * Programming on each start resets the hardware ring head in lockstep with the
+ * software pointers.
+ */
+int
+ice_start_datapath(ice_t *ice)
 {
-	ice_t *ice = arg;
-	uint32_t blocked = ICE_STATE_RESET_FAILED | ICE_STATE_PFR_REQ |
-	    ICE_STATE_RESET_PENDING;
-
-	/*
-	 * Refuse to start while the hardware is untrustworthy: a terminally
-	 * failed reset (reload needed), or a fatal cause or reset still owed a
-	 * rebuild.  A replumb must not clear the fail-closed state or reprogram
-	 * queues on stale hardware; the rebuild alone clears these bits.
-	 */
-	if ((ice->ice_state & blocked) != 0)
-		return (EIO);
-
-	/*
-	 * Clear any latched datapath error: mac start fully re-programs the
-	 * queues and rings below, so it is the recovery point for a device that
-	 * faulted while plumbed and was then replumbed.
-	 */
-	atomic_and_32(&ice->ice_state, ~ICE_STATE_ERROR);
-
-	/*
-	 * Program and enable the queues on each start so the hardware ring head
-	 * resets in lockstep with software, then allocate the rx control-block
-	 * pool and admit traffic.  The per-ring start callbacks post buffers.
-	 */
 	if (ice_queues_program(ice) != ICE_SUCCESS)
 		return (EIO);
 	if (!ice_rx_start(ice)) {
@@ -477,10 +496,51 @@ ice_m_start(void *arg)
 	return (0);
 }
 
+static int
+ice_m_start(void *arg)
+{
+	ice_t *ice = arg;
+	uint32_t blocked = ICE_STATE_RESET_FAILED | ICE_STATE_PFR_REQ |
+	    ICE_STATE_RESET_PENDING;
+	int ret;
+
+	/*
+	 * ice_rebuild_lock is the outermost lock and is uncontended in normal
+	 * operation; it brackets the callback so a reset rebuild cannot
+	 * interleave with a plumb.
+	 */
+	mutex_enter(&ice->ice_rebuild_lock);
+
+	/*
+	 * Refuse to start while the hardware is untrustworthy: a terminally
+	 * failed reset (reload needed), or a fatal cause or reset still owed a
+	 * rebuild.  A replumb must not clear the fail-closed state or reprogram
+	 * queues on stale hardware; the rebuild alone clears these bits.
+	 */
+	if ((ice->ice_state & blocked) != 0) {
+		mutex_exit(&ice->ice_rebuild_lock);
+		return (EIO);
+	}
+
+	/*
+	 * Clear any latched datapath error: mac start fully re-programs the
+	 * queues and rings below, so it is the recovery point for a device that
+	 * faulted while plumbed and was then replumbed.
+	 */
+	atomic_and_32(&ice->ice_state, ~ICE_STATE_ERROR);
+
+	ret = ice_start_datapath(ice);
+	mutex_exit(&ice->ice_rebuild_lock);
+
+	return (ret);
+}
+
 static void
 ice_m_stop(void *arg)
 {
 	ice_t *ice = arg;
+
+	mutex_enter(&ice->ice_rebuild_lock);
 
 	/*
 	 * Mark the device stopped, then disable the queues so hardware stops
@@ -491,21 +551,23 @@ ice_m_stop(void *arg)
 	ice_queues_disable(ice);
 	ice_tx_stop(ice);
 	ice_rx_stop(ice);
+
+	mutex_exit(&ice->ice_rebuild_lock);
 }
 
-static int
-ice_m_promisc(void *arg, boolean_t on)
+/*
+ * Apply or clear unicast + multicast promiscuous mode in both directions.
+ * Factored so the reset rebuild can replay it; broadcast is already forwarded
+ * by the default filters installed in M5.
+ */
+int
+ice_promisc_apply(ice_t *ice, boolean_t on)
 {
-	ice_t *ice = arg;
 	struct ice_hw *hw = &ice->ice_hw;
 	ice_vsi_t *vsi = &ice->ice_pf_vsi;
 	ice_declare_bitmap(mask, ICE_PROMISC_MAX);
 	int status;
 
-	/*
-	 * Unicast + multicast promiscuous in both directions.  Broadcast is
-	 * already forwarded by the default filters installed in M5.
-	 */
 	ice_zero_bitmap(mask, ICE_PROMISC_MAX);
 	ice_set_bit(ICE_PROMISC_UCAST_RX, mask);
 	ice_set_bit(ICE_PROMISC_UCAST_TX, mask);
@@ -524,6 +586,28 @@ ice_m_promisc(void *arg, boolean_t on)
 	}
 
 	return (0);
+}
+
+static int
+ice_m_promisc(void *arg, boolean_t on)
+{
+	ice_t *ice = arg;
+	int ret;
+
+	/*
+	 * ice_rebuild_lock is the outermost lock: hold it so the
+	 * ice_promisc_apply admin-queue command cannot run while a reset
+	 * rebuild tears the control queue down and back up.  ice_promisc_apply
+	 * itself must not take the lock -- ice_vsi_rebuild calls it while
+	 * already holding the lock.
+	 */
+	mutex_enter(&ice->ice_rebuild_lock);
+	ret = ice_promisc_apply(ice, on);
+	if (ret == 0)
+		ice->ice_promisc_on = on;
+	mutex_exit(&ice->ice_rebuild_lock);
+
+	return (ret);
 }
 
 static int
@@ -727,16 +811,25 @@ static int
 ice_transceiver_info(void *arg, uint_t id, mac_transceiver_info_t *infop)
 {
 	ice_t *ice = arg;
-	struct ice_link_status *li = &ice->ice_hw.port_info->phy.link_info;
+	struct ice_link_status *li;
 	boolean_t present, usable;
 
 	if (id != 0 || infop == NULL)
 		return (EINVAL);
 
+	/*
+	 * ice_rebuild_lock is the outermost lock: hold it so a reset
+	 * rebuild's ice_deinit_hw() cannot free port_info out from under this
+	 * read.  Read link_info under the lock rather than snapshotting the
+	 * pointer earlier.
+	 */
+	mutex_enter(&ice->ice_rebuild_lock);
 	mutex_enter(&ice->ice_lock);
+	li = &ice->ice_hw.port_info->phy.link_info;
 	present = (li->link_info & ICE_AQ_MEDIA_AVAILABLE) != 0;
 	usable = present && (li->an_info & ICE_AQ_QUALIFIED_MODULE) != 0;
 	mutex_exit(&ice->ice_lock);
+	mutex_exit(&ice->ice_rebuild_lock);
 
 	mac_transceiver_info_set_present(infop, present);
 	mac_transceiver_info_set_usable(infop, usable);
@@ -761,6 +854,12 @@ ice_transceiver_read(void *arg, uint_t id, uint_t page, void *buf,
 	    offset + nbytes > ICE_SFF_PAGE_LEN)
 		return (EINVAL);
 
+	/*
+	 * ice_rebuild_lock is the outermost lock: hold it across the
+	 * admin-queue SFF reads so a reset rebuild cannot tear the control
+	 * queue down underneath ice_aq_sff_eeprom().
+	 */
+	mutex_enter(&ice->ice_rebuild_lock);
 	mutex_enter(&ice->ice_lock);
 	for (i = 0; i < nbytes; ) {
 		uint8_t len = (uint8_t)MIN(nbytes - i, ICE_SFF_READ_CHUNK);
@@ -769,11 +868,13 @@ ice_transceiver_read(void *arg, uint_t id, uint_t page, void *buf,
 		    (uint16_t)(offset + i), 0, 0, &out[i], len, false,
 		    NULL) != ICE_SUCCESS) {
 			mutex_exit(&ice->ice_lock);
+			mutex_exit(&ice->ice_rebuild_lock);
 			return (EIO);
 		}
 		i += len;
 	}
 	mutex_exit(&ice->ice_lock);
+	mutex_exit(&ice->ice_rebuild_lock);
 
 	*nread = nbytes;
 	return (0);
@@ -856,7 +957,21 @@ ice_m_setprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 	uint32_t mtu;
 	int ret;
 
+#ifdef DEBUG
+	/*
+	 * Test hook: "dladm set-linkprop -p _reset=1 ice0" injects a reset
+	 * rebuild so the recovery path can be exercised without a hardware
+	 * fault.  DEBUG builds only; production resets arrive through the OICR
+	 * fatal-cause/global-reset path.
+	 */
+	if (pr_num == MAC_PROP_PRIVATE && strcmp(pr_name, "_reset") == 0) {
+		atomic_or_32(&ice->ice_state, ICE_STATE_PFR_REQ);
+		ice_reset_dispatch(ice);
+		return (0);
+	}
+#else
 	_NOTE(ARGUNUSED(pr_name));
+#endif
 
 	switch (pr_num) {
 	case MAC_PROP_MTU: {
@@ -1197,6 +1312,13 @@ ice_mac_unregister(ice_t *ice)
 		return (status);
 	}
 
+	/*
+	 * Clear the handle under ice_lse_lock: ice_link_state_set() reads
+	 * ice_mac_hdl under the same lock, so a concurrent async link update
+	 * cannot observe a torn (half-cleared) handle.
+	 */
+	mutex_enter(&ice->ice_lse_lock);
 	ice->ice_mac_hdl = NULL;
+	mutex_exit(&ice->ice_lse_lock);
 	return (0);
 }

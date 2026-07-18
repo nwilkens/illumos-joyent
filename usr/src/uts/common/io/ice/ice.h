@@ -147,13 +147,14 @@ typedef enum ice_attach_state {
 	ICE_ATTACH_ALLOC_INTR	= 1 << 5,
 	ICE_ATTACH_ADD_INTR	= 1 << 6,
 	ICE_ATTACH_OICR_TASKQ	= 1 << 7,
-	ICE_ATTACH_ENABLE_INTR	= 1 << 8,
-	ICE_ATTACH_VSI		= 1 << 9,
-	ICE_ATTACH_RINGS	= 1 << 10,	/* ring DMA allocated */
-	ICE_ATTACH_QUEUE_INTR	= 1 << 11,	/* queue->vector wired */
-	ICE_ATTACH_BUFS		= 1 << 12,	/* tx copy-buffer pools */
-	ICE_ATTACH_STATS	= 1 << 13,	/* hardware stat kstats */
-	ICE_ATTACH_MAC		= 1 << 14	/* mac_register done */
+	ICE_ATTACH_RESET_TASKQ	= 1 << 8,	/* reset taskq + rebuild lock */
+	ICE_ATTACH_ENABLE_INTR	= 1 << 9,
+	ICE_ATTACH_VSI		= 1 << 10,
+	ICE_ATTACH_RINGS	= 1 << 11,	/* ring DMA allocated */
+	ICE_ATTACH_QUEUE_INTR	= 1 << 12,	/* queue->vector wired */
+	ICE_ATTACH_BUFS		= 1 << 13,	/* tx copy-buffer pools */
+	ICE_ATTACH_STATS	= 1 << 14,	/* hardware stat kstats */
+	ICE_ATTACH_MAC		= 1 << 15	/* mac_register done */
 } ice_attach_state_t;
 
 /* The driver-chosen software handle for the single PF data VSI. */
@@ -425,6 +426,20 @@ typedef struct ice {
 	uint8_t			*ice_aqbuf;		/* ARQ scratch buffer */
 
 	/*
+	 * Reset rebuild.  ice_rebuild_lock is an adaptive mutex taken only in
+	 * thread context and is the outermost driver lock: it serializes a
+	 * rebuild against a mac start/stop.  The rebuild runs on its own
+	 * single-thread taskq so it never starves the OICR worker's ARQ drain;
+	 * ice_reset_pending coalesces dispatches under ice_lock, mirroring
+	 * ice_oicr_pending.  ice_detaching turns a queued rebuild into a no-op
+	 * once detach begins.
+	 */
+	ddi_taskq_t		*ice_reset_taskq;
+	boolean_t		ice_reset_pending;	/* ice_lock */
+	kmutex_t		ice_rebuild_lock;
+	boolean_t		ice_detaching;		/* ice_rebuild_lock */
+
+	/*
 	 * Link-state cache.  The authoritative state lives in
 	 * ice_hw.port_info->phy.link_info, refreshed by the common code; these
 	 * are the decoded values MAC will consume once mac_register lands.
@@ -446,6 +461,7 @@ typedef struct ice {
 
 	uint32_t		ice_mtu;
 	boolean_t		ice_tx_lso_enable;
+	boolean_t		ice_promisc_on;		/* replay on reset */
 	ice_vsi_t		ice_pf_vsi;		/* control plane (M5) */
 
 	/*
@@ -508,6 +524,10 @@ extern int ice_check_acc_handle(ddi_acc_handle_t);
 extern void ice_update_mtu(ice_t *);
 extern int ice_queues_program(ice_t *);
 extern void ice_queues_disable(ice_t *);
+extern void ice_reset_task(void *);
+#ifdef DEBUG
+extern void ice_test_request_reset(ice_t *);
+#endif
 
 /*
  * ice_intr.c
@@ -521,12 +541,15 @@ extern boolean_t ice_set_link_events(ice_t *);
 extern void ice_link_status_update(ice_t *);
 extern void ice_setup_link(ice_t *);
 extern void ice_phy_caps_update(ice_t *);
+extern void ice_reset_dispatch(ice_t *);
+extern void ice_link_report(ice_t *, link_state_t);
 
 /*
  * ice_vsi.c
  */
 extern boolean_t ice_vsi_init(ice_t *);
 extern void ice_vsi_fini(ice_t *);
+extern int ice_vsi_rebuild(ice_t *);
 
 /*
  * ice_ddp.c
@@ -588,6 +611,8 @@ extern int ice_ring_tx_stat(mac_ring_driver_t, uint_t, uint64_t *);
 extern void ice_rx_recycle(caddr_t);
 extern boolean_t ice_rx_start(ice_t *);
 extern void ice_rx_stop(ice_t *);
+extern boolean_t ice_rx_stop_reset(ice_t *);
+extern boolean_t ice_rx_rings_resume(ice_t *);
 extern void ice_rx_ring_intr(ice_rx_ring_t *);
 extern mblk_t *ice_ring_rx_poll(void *, int);
 extern int ice_ring_rx_start(mac_ring_driver_t, uint64_t);
@@ -602,6 +627,8 @@ extern int ice_ring_rx_intr_disable(mac_intr_handle_t);
 extern boolean_t ice_mac_register(ice_t *);
 extern int ice_mac_unregister(ice_t *);
 extern void ice_link_state_publish(ice_t *);
+extern int ice_start_datapath(ice_t *);
+extern int ice_promisc_apply(ice_t *, boolean_t);
 
 /*
  * Hardware statistics (ice_stats.c).
