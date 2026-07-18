@@ -28,9 +28,10 @@ def main() -> None:
     )
     assert "reset_ongoing = true" in prepare
     assert "ice_tx_stop(ice)" in prepare
-    # The reset path uses the bounded loan wait, not the unbounded mac_stop one.
-    assert "ice_rx_stop_reset(ice)" in prepare
-    assert "ice_rx_stop(ice)" not in prepare
+    # ice_rx_stop() is now bounded on every teardown path, so the reset shares
+    # it with mac_stop rather than needing a separate timed variant.
+    assert "ice_rx_stop(ice)" in prepare
+    assert "ice_rx_stop_reset" not in prepare
     assert "ice_intr_oicr_disable(ice)" in prepare
     assert "PFINT_OICR_ENA, 0" in prepare
     assert "LINK_STATE_DOWN" in prepare

@@ -398,12 +398,13 @@ ice_rx_ring_unprogram(ice_t *ice, ice_rx_ring_t *irr)
 #define	ICE_RX_COPY_THRESHOLD	256
 
 /*
- * Upper bound on the reset path's wait for loaned rx buffers to return, in
- * microseconds.  Generous (5s total across rings) so a merely busy stack still
- * drains, but finite so the autonomous reset taskq cannot wedge on a loan that
- * never comes back.
+ * Upper bound on a teardown path's wait for loaned rx buffers to return, in
+ * microseconds.  Bounds both the unplumb (ice_rx_stop()) and the reset and
+ * detach drains.  Generous (5s total across rings) so a merely busy stack
+ * still drains, but finite so neither an unplumb nor the autonomous reset
+ * taskq can wedge on a loan that never comes back.
  */
-#define	ICE_RX_RESET_LOAN_WAIT_US	5000000
+#define	ICE_RX_LOAN_WAIT_US	5000000
 
 static mblk_t *ice_ring_rx(ice_rx_ring_t *, int);
 
@@ -597,9 +598,10 @@ ice_rx_alloc_rcbs(ice_rx_ring_t *irr)
 }
 
 /*
- * Free the per-ring control-block backing.  Every loaned buffer must already
- * be back (ice_rx_stop() blocks on that), so every control block owns its mblk
- * and DMA buffer here.
+ * Free the per-ring control-block backing.  May only be called with
+ * irxr_nloaned == 0: a loaned control block still holds the stack's mblk in
+ * ircb_mp, so freeing here while a loan is outstanding is a double free of
+ * that mblk and a use-after-free of live DMA.
  */
 static void
 ice_rx_free_rcbs(ice_rx_ring_t *irr)
@@ -763,6 +765,15 @@ ice_rx_hcksum(ice_rx_ring_t *irr, mblk_t *mp, uint16_t status0, uint16_t ptype)
 {
 	struct ice_rx_ptype_decoded pinfo = ice_decode_rx_desc_ptype(ptype);
 	uint32_t cksum = 0;
+
+	/*
+	 * Without the DDP package the pipeline does not classify or checksum,
+	 * so the descriptor status bits carry no verdict worth reporting; see
+	 * ice_set_safe_mode_caps().  The tx side withholds the capability in
+	 * ice_m_getcapab(), and the rx side must not claim a verified checksum.
+	 */
+	if (irr->irxr_ice->ice_safe_mode)
+		return;
 
 	if (pinfo.known == 0)
 		return;
@@ -1199,8 +1210,8 @@ ice_ring_rx_start(mac_ring_driver_t rh, uint64_t gen_num)
 
 /*
  * mac(9E) ring stop: close the ring to new traffic.  Buffers and loans are
- * reclaimed by ice_rx_stop() at the softc level, which can block; this only
- * marks the ring quiescent so the datapath stops touching it.
+ * reclaimed by ice_rx_stop() at the softc level; this only marks the ring
+ * quiescent so the datapath stops touching it.
  */
 void
 ice_ring_rx_stop(mac_ring_driver_t rh)
@@ -1235,6 +1246,11 @@ ice_ring_rx_stat(mac_ring_driver_t rh, uint_t stat, uint64_t *val)
 /*
  * Allocate the control blocks for every rx ring.  Called once the queue
  * contexts are programmed; the descriptors are posted by ice_ring_rx_start().
+ *
+ * A pool may have survived a teardown that timed out waiting for loans; it is
+ * never reused, because ice_rx_recycle()'s shutdown path drops returning
+ * control blocks without re-arming them or putting them back on the free list.
+ * Reclaim it once drained, and refuse to start at all while loans remain.
  */
 boolean_t
 ice_rx_start(ice_t *ice)
@@ -1245,63 +1261,53 @@ ice_rx_start(ice_t *ice)
 		ice_rx_ring_t *irr = &ice->ice_rxr[i];
 
 		mutex_enter(&irr->irxr_lock);
+		if (irr->irxr_rcb_area != NULL) {
+			if (irr->irxr_nloaned > 0) {
+				mutex_exit(&irr->irxr_lock);
+				goto unwind;
+			}
+			ice_rx_free_rcbs(irr);
+		}
+
 		if (!ice_rx_alloc_rcbs(irr)) {
 			ice_rx_free_rcbs(irr);
 			mutex_exit(&irr->irxr_lock);
-			while (i-- > 0) {
-				irr = &ice->ice_rxr[i];
-				mutex_enter(&irr->irxr_lock);
-				ice_rx_free_rcbs(irr);
-				mutex_exit(&irr->irxr_lock);
-			}
-			return (B_FALSE);
+			goto unwind;
 		}
 		mutex_exit(&irr->irxr_lock);
 	}
 
 	return (B_TRUE);
-}
 
-/*
- * Tear down every rx ring's control blocks.  Blocks until all loaned buffers
- * have returned through ice_rx_recycle(): a loaned mblk still up the stack
- * points at a DMA buffer we cannot free.
- */
-void
-ice_rx_stop(ice_t *ice)
-{
-	uint_t i;
-
-	for (i = 0; i < ice->ice_num_rxr; i++) {
+unwind:
+	while (i-- > 0) {
 		ice_rx_ring_t *irr = &ice->ice_rxr[i];
 
 		mutex_enter(&irr->irxr_lock);
-		irr->irxr_shutdown = B_TRUE;
-
-		while (irr->irxr_nloaned > 0)
-			cv_wait(&irr->irxr_cv, &irr->irxr_lock);
-
 		ice_rx_free_rcbs(irr);
 		mutex_exit(&irr->irxr_lock);
 	}
+
+	return (B_FALSE);
 }
 
 /*
- * Reset-path variant of ice_rx_stop() with a bounded loan wait.  The reset
- * runs on the autonomous reset taskq, so an unbounded wait for a loan that
- * never returns would wedge that taskq (and detach's ddi_taskq_destroy)
- * forever.  Returns B_FALSE if any ring still has loans outstanding when the
- * shared deadline expires; such a ring is left fully intact -- its control
- * blocks are NOT freed and its descriptors are NOT reposted -- so the loaned
- * buffers return harmlessly through ice_rx_recycle() later, and the caller
- * fails the rebuild closed rather than reinitialize over buffers still up the
- * stack.  A single absolute deadline bounds the total wait across all rings.
+ * Tear down every rx ring's control blocks, bounding the wait for loaned
+ * buffers to return through ice_rx_recycle().  A loan can be held arbitrarily
+ * long by the stack with no driver bug (reassembly queues, a stopped process's
+ * socket buffer), so waiting forever would wedge the unplumb thread and, on
+ * the reset path, the reset taskq.  Returns B_FALSE if any ring still has
+ * loans outstanding when the shared deadline expires; such a ring is left
+ * fully intact -- its control blocks are NOT freed and its descriptors are NOT
+ * reposted -- so the loaned buffers return harmlessly later, and irxr_shutdown
+ * stays set so they are not re-armed.  A single absolute deadline bounds the
+ * total wait across all rings.
  */
 boolean_t
-ice_rx_stop_reset(ice_t *ice)
+ice_rx_stop(ice_t *ice)
 {
 	clock_t deadline = ddi_get_lbolt() +
-	    drv_usectohz(ICE_RX_RESET_LOAN_WAIT_US);
+	    drv_usectohz(ICE_RX_LOAN_WAIT_US);
 	boolean_t drained = B_TRUE;
 	uint_t i;
 
@@ -1324,6 +1330,44 @@ ice_rx_stop_reset(ice_t *ice)
 		}
 
 		ice_rx_free_rcbs(irr);
+		mutex_exit(&irr->irxr_lock);
+	}
+
+	return (drained);
+}
+
+/*
+ * Detach-time drain: the last gate before the rx rings themselves are freed.
+ * ice_rx_recycle() dereferences its ring, so a late loan return after the
+ * rings are gone is a use-after-free; detach must fail rather than proceed
+ * while any loan is outstanding.  Also reclaims a control-block pool left
+ * behind by an ice_rx_stop() that timed out.
+ */
+boolean_t
+ice_rx_drain(ice_t *ice)
+{
+	clock_t deadline = ddi_get_lbolt() +
+	    drv_usectohz(ICE_RX_LOAN_WAIT_US);
+	boolean_t drained = B_TRUE;
+	uint_t i;
+
+	for (i = 0; i < ice->ice_num_rxr; i++) {
+		ice_rx_ring_t *irr = &ice->ice_rxr[i];
+
+		mutex_enter(&irr->irxr_lock);
+
+		while (irr->irxr_nloaned > 0) {
+			if (cv_timedwait(&irr->irxr_cv, &irr->irxr_lock,
+			    deadline) == -1)
+				break;
+		}
+
+		if (irr->irxr_nloaned > 0) {
+			drained = B_FALSE;
+		} else if (irr->irxr_rcb_area != NULL) {
+			ice_rx_free_rcbs(irr);
+		}
+
 		mutex_exit(&irr->irxr_lock);
 	}
 

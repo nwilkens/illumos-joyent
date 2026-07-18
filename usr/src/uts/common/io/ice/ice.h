@@ -100,9 +100,21 @@ CTASSERT(ICE_MAX_FRAME_SIZE <= UINT16_MAX);
 #define	ICE_TX_LSO_MIN_MSS	64
 #define	ICE_LSO_MAXLEN		(64 * 1024)
 #define	ICE_TX_LSO_BUFSZ	P2ROUNDUP(ICE_MAX_FRAME_SIZE, PAGESIZE)
+/*
+ * The general tx copy pool must hold any MTU-legal frame in one buffer: a
+ * frame that failed to bind has nowhere else to go and would be dropped.
+ */
+#define	ICE_TX_COPY_BUFSZ	P2ROUNDUP(ICE_MAX_FRAME_SIZE, PAGESIZE)
 #define	ICE_TX_SMALL_PKT	512		/* small-copy threshold */
 
 CTASSERT(sizeof (struct ice_tx_ctx_desc) == sizeof (struct ice_tx_desc));
+/*
+ * ICE_TX_COPY_BUFSZ is page-rounded, so it is >= ICE_MAX_FRAME_SIZE by
+ * construction and is not a constant expression a CTASSERT can read.  Assert
+ * the part that matters and is constant: a whole frame still fits the length
+ * field of a single tx data descriptor.
+ */
+CTASSERT(ICE_MAX_FRAME_SIZE <= ICE_TX_MAX_BUFSZ);
 CTASSERT(ICE_LSO_MAXLEN <= (ICE_TXD_CTX_QW1_TSO_LEN_M >>
     ICE_TXD_CTX_QW1_TSO_LEN_S));
 CTASSERT(ICE_TXD_CTX_MAX_MSS <= (ICE_TXD_CTX_QW1_MSS_M >>
@@ -610,8 +622,8 @@ extern int ice_ring_tx_stat(mac_ring_driver_t, uint_t, uint64_t *);
  */
 extern void ice_rx_recycle(caddr_t);
 extern boolean_t ice_rx_start(ice_t *);
-extern void ice_rx_stop(ice_t *);
-extern boolean_t ice_rx_stop_reset(ice_t *);
+extern boolean_t ice_rx_stop(ice_t *);
+extern boolean_t ice_rx_drain(ice_t *);
 extern boolean_t ice_rx_rings_resume(ice_t *);
 extern void ice_rx_ring_intr(ice_rx_ring_t *);
 extern mblk_t *ice_ring_rx_poll(void *, int);

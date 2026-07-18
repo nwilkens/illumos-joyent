@@ -527,6 +527,16 @@ ice_alloc_intrs(ice_t *ice)
 	    DDI_INTR_PRI(ice->ice_intr_pri));
 	cv_init(&ice->ice_lse_cv, NULL, CV_DRIVER, NULL);
 
+	/*
+	 * The copy-buffer pool locks are taken from the tx completion path via
+	 * ice_tcb_free(), which runs under the MSI-X priority itxr_lock, so
+	 * they need the same interrupt cookie.
+	 */
+	mutex_init(&ice->ice_buf_lock, NULL, MUTEX_DRIVER,
+	    DDI_INTR_PRI(ice->ice_intr_pri));
+	mutex_init(&ice->ice_small_buf_lock, NULL, MUTEX_DRIVER,
+	    DDI_INTR_PRI(ice->ice_intr_pri));
+
 	return (B_TRUE);
 }
 
@@ -718,6 +728,8 @@ ice_unconfigure(ice_t *ice)
 		ice_free_intrs(ice);
 		cv_destroy(&ice->ice_lse_cv);
 		mutex_destroy(&ice->ice_lse_lock);
+		mutex_destroy(&ice->ice_small_buf_lock);
+		mutex_destroy(&ice->ice_buf_lock);
 	}
 
 	if (ice->ice_attach_progress & ICE_ATTACH_HW_INIT) {
@@ -1057,7 +1069,7 @@ ice_prepare_for_reset(ice_t *ice)
 
 	/*
 	 * Quiesce the datapath if it was running.  ice_tx_stop() waits for
-	 * in-flight transmits and ice_rx_stop_reset() for loaned buffers to
+	 * in-flight transmits and ice_rx_stop() for loaned buffers to
 	 * return under a bounded deadline, so the autonomous reset taskq cannot
 	 * wedge on a lost loan; the queue disable and interrupt unmap are best
 	 * effort on hardware that may already be resetting.  ICE_STATE_STARTED
@@ -1065,7 +1077,7 @@ ice_prepare_for_reset(ice_t *ice)
 	 */
 	if ((ice->ice_state & ICE_STATE_STARTED) != 0) {
 		ice_tx_stop(ice);
-		drained = ice_rx_stop_reset(ice);
+		drained = ice_rx_stop(ice);
 		ice_queues_disable(ice);
 		ice_queues_intr_unmap(ice);
 	}

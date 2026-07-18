@@ -271,7 +271,7 @@ ice_buf_free(ice_t *ice, ice_dma_buffer_t *buf)
 		return;
 
 	/* Make sure we're not freeing to the wrong pool. */
-	ASSERT3U(buf->idb_len, !=, ICE_TX_SMALL_PKT);
+	ASSERT3U(buf->idb_len, ==, ICE_TX_COPY_BUFSZ);
 
 	mutex_enter(&ice->ice_buf_lock);
 	ASSERT3U(ice->ice_buf_alloc, <, ice->ice_buf_sz);
@@ -369,7 +369,7 @@ ice_buf_init(ice_t *ice)
 	ice->ice_buf_sz = n;
 	for (i = 0; i < n; i++) {
 		if (!ice_dma_alloc(ice, &ice->ice_bufs[i], &attr, &acc, B_TRUE,
-		    ICE_RX_BUF_SIZE, B_FALSE)) {
+		    ICE_TX_COPY_BUFSZ, B_FALSE)) {
 			mutex_exit(&ice->ice_buf_lock);
 			ice_error(ice, "failed to allocate tx copy buffers");
 			ice_buf_fini(ice);

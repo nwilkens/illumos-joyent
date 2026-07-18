@@ -550,7 +550,13 @@ ice_m_stop(void *arg)
 	atomic_and_32(&ice->ice_state, ~ICE_STATE_STARTED);
 	ice_queues_disable(ice);
 	ice_tx_stop(ice);
-	ice_rx_stop(ice);
+	/*
+	 * mac stop cannot fail and cannot wait forever.  A loan the stack never
+	 * returns leaves ice_rx_stop() short of a full drain; it deliberately
+	 * leaves that ring's pool intact rather than freeing buffers still held
+	 * upstream, and ice_rx_start() re-checks before reusing it.
+	 */
+	(void) ice_rx_stop(ice);
 
 	mutex_exit(&ice->ice_rebuild_lock);
 }
@@ -915,6 +921,13 @@ ice_m_getcapab(void *arg, mac_capab_t capab, void *cap_data)
 	case MAC_CAPAB_HCKSUM: {
 		uint32_t *txflags = cap_data;
 
+		/*
+		 * Without the DDP package the pipeline cannot compute
+		 * checksums; see ice_set_safe_mode_caps().
+		 */
+		if (ice->ice_safe_mode)
+			return (B_FALSE);
+
 		*txflags = HCKSUM_INET_PARTIAL | HCKSUM_IPHDRCKSUM;
 		break;
 	}
@@ -932,7 +945,11 @@ ice_m_getcapab(void *arg, mac_capab_t capab, void *cap_data)
 	case MAC_CAPAB_LSO: {
 		mac_capab_lso_t *cap_lso = cap_data;
 
-		if (!ice->ice_tx_lso_enable)
+		/*
+		 * LSO also depends on the Tx checksum offload that safe mode
+		 * withholds, so it has to go at the same time.
+		 */
+		if (ice->ice_safe_mode || !ice->ice_tx_lso_enable)
 			return (B_FALSE);
 
 		cap_lso->lso_flags = LSO_TX_BASIC_TCP_IPV4 |

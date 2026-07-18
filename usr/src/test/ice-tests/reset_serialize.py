@@ -139,11 +139,14 @@ def main() -> None:
         "ice_prepare_for_reset(ice_t *ice)\n{",
         "\nstatic void\nice_rebuild",
     )
-    assert "ice_rx_stop_reset(ice)" in prepare
+    # The bounded wait is now the only rx stop: mac_stop, the reset path and
+    # detach all share it, so no teardown path can wedge on a lost loan.
+    assert "ice_rx_stop(ice)" in prepare
     rx = RX_SOURCE.read_text(encoding="utf-8")
-    stopreset = rx[rx.index("ice_rx_stop_reset(ice_t *ice)\n{"):]
-    assert "cv_timedwait(&irr->irxr_cv" in stopreset
-    assert "drv_usectohz(ICE_RX_RESET_LOAN_WAIT_US)" in stopreset
+    stop = rx[rx.index("ice_rx_stop(ice_t *ice)\n{"):]
+    assert "cv_timedwait(&irr->irxr_cv" in stop
+    assert "drv_usectohz(ICE_RX_LOAN_WAIT_US)" in stop
+    assert "cv_wait(&irr->irxr_cv" not in rx
 
     # The reset taskq is torn down after the interrupt handlers are removed and
     # before the rings and VSI the rebuild touches are freed; its lock goes too.
