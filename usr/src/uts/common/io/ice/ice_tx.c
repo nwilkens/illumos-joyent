@@ -16,14 +16,14 @@
 /*
  * Transmit ring DMA allocation and Tx queue-context programming.
  *
- * This milestone builds the per-ring state and hands the LAN Tx queue context
+ * This file builds the per-ring state and hands the LAN Tx queue context
  * to the Intel common code: the descriptor ring is allocated as physically
  * contiguous DMA, the sparse ice_tlan_ctx is filled and bit-packed into the
  * Add Tx LAN Queues command buffer, and ice_ena_vsi_txq() programs and enables
  * the queue in one admin-queue round trip (there is no separate per-queue Tx
  * enable register).  The scheduler element TEID the firmware returns is saved;
  * ice_dis_vsi_txq() requires it at teardown.  The packet datapath (descriptor
- * fill, doorbell, completion reclaim) is a later milestone.
+ * fill, doorbell, completion reclaim) follows below.
  */
 
 #include <sys/strsubr.h>
@@ -41,7 +41,7 @@
  * There is no common-code helper for this; the driver writes QINT_TQCTL
  * directly.  Exposed via a prototype in ice.h so the attach path can wire the
  * vectors as its own step (ICE_ATTACH_QUEUE_INTR), after the queues have been
- * programmed and enabled (ICE_ATTACH_QUEUES_ENA).
+ * programmed and enabled as part of ICE_ATTACH_RINGS.
  */
 void
 ice_map_txq_vector(ice_t *ice, ice_tx_ring_t *itr)
@@ -353,13 +353,13 @@ ice_tx_ring_unprogram(ice_t *ice, ice_tx_ring_t *itr)
 /*
  * Tx packet datapath.
  *
- * A frame arrives as an mblk_t chain of arbitrary fragments.  For each
- * fragment we either DMA-bind it (large fragments, up to ICE_TX_MAX_COOKIE
- * cookies for the whole packet) or copy it into a pre-mapped pool buffer
- * (small fragments, or when binding would exceed the descriptor budget).  A
- * whole small packet is copied into a single small-pool buffer.  Each bound
- * cookie or copy buffer becomes one ice_tx_desc on the ring; the final
- * descriptor of the packet carries EOP|RS so hardware reports completion.
+ * A frame arrives as an mblk_t chain of arbitrary fragments.  A whole packet
+ * up to ICE_TX_SMALL_PKT is copied into a single pre-mapped small-pool buffer;
+ * otherwise every fragment is DMA-bound, up to ICE_TX_MAX_COOKIE cookies for
+ * the whole packet, falling back to one full-packet copy if a bind fails or
+ * the packet would exceed that budget.  Each bound cookie or copy buffer
+ * becomes one ice_tx_desc on the ring; the final descriptor of the packet
+ * carries EOP|RS so hardware reports completion.
  *
  * The control blocks (TCBs) consumed by a packet are parked in itxr_tcbs[] at
  * the same slots as the descriptors they describe.  Because a packet always
@@ -416,7 +416,7 @@ ice_tcb_alloc(ice_tx_ring_t *itr)
  * Release whatever a TCB holds (copy buffer, DMA binding, retained mblk) and
  * return it to the ring's free list.  The bind handles are allocated lazily in
  * ice_tx_bind_fragment() and freed here so the append-only datapath does not
- * have to touch the M6a alloc/teardown paths.
+ * have to touch the attach-time ring alloc/teardown paths.
  */
 static void
 ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
@@ -749,6 +749,25 @@ ice_tx_lso_copy(ice_tx_ring_t *itr, mblk_t **mpp, size_t *offp, size_t len,
 }
 
 /*
+ * Push only the descriptors this packet wrote, splitting at ring wrap.  Slot 0
+ * of the ring sits at offset 0 of itxr_dma, so offsets are just slot * size.
+ */
+static void
+ice_tx_sync_descs(ice_tx_ring_t *itr, uint16_t start, uint_t n)
+{
+	ddi_dma_handle_t h = itr->itxr_dma.idb_dma_handle;
+	const size_t dsz = sizeof (struct ice_tx_desc);
+	uint_t head = MIN(n, (uint_t)(itr->itxr_size - start));
+
+	(void) ddi_dma_sync(h, (off_t)start * dsz, head * dsz,
+	    DDI_DMA_SYNC_FORDEV);
+	if (n > head) {
+		(void) ddi_dma_sync(h, 0, (n - head) * dsz,
+		    DDI_DMA_SYNC_FORDEV);
+	}
+}
+
+/*
  * Write one DATA descriptor.  buf_addr is the fragment's IOVA; bufsz its
  * length (capped at ICE_TX_MAX_BUFSZ -- the caller guarantees fragments fit,
  * since copy buffers are frame-sized and bound cookies obey the bind attrs).
@@ -909,9 +928,10 @@ ice_tx_context(ice_t *ice, mblk_t *mp, ice_tx_ctx_t *ctx)
 }
 
 /*
- * Build the TCB chain for a packet.  Fragments large enough to bind are bound;
- * everything else (and any fragment that would push the packet past the
- * ICE_TX_MAX_COOKIE descriptor budget) forces a single full-packet copy.
+ * Build the TCB chain for a packet.  A whole packet up to ICE_TX_SMALL_PKT is
+ * copied into one small-pool buffer; anything larger has each of its fragments
+ * bound.  A bind failure, or a fragment that would push the packet past the
+ * ICE_TX_MAX_COOKIE descriptor budget, forces a single full-packet copy.
  * Returns the number of TCBs produced (0 on resource exhaustion) and fills
  * tcbs[]/ndesc.
  */
@@ -923,6 +943,26 @@ ice_tx_build_tcbs(ice_tx_ring_t *itr, mblk_t *mp, size_t msglen,
 	mblk_t *cmp;
 	uint_t ntcb = 0;
 	uint_t ndesc = 0;
+
+	/*
+	 * Binding a small frame costs a handle alloc/bind/unbind/free per
+	 * fragment, far more than copying it into a pre-mapped buffer.
+	 */
+	if (msglen <= ICE_TX_SMALL_PKT) {
+		tcbs[0] = ice_tx_copy_packet(itr, mp, msglen, &res);
+		if (tcbs[0] != NULL) {
+			*ntcbp = 1;
+			*ndescp = 1;
+			return (ICE_TX_BUILD_OK);
+		}
+		if (res == ICE_TX_BUILD_DROP)
+			return (res);
+		/*
+		 * NORES: the pool is momentarily empty.  Fall through and bind
+		 * rather than block, so the small pool cannot become a new
+		 * back-pressure choke point.
+		 */
+	}
 
 	for (cmp = mp; cmp != NULL; cmp = cmp->b_cont) {
 		ice_tx_ctrl_block_t *tcb;
@@ -1339,8 +1379,7 @@ ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs, uint_t ntcb,
 	    CPU_TO_LE64(((uint64_t)(ICE_TX_DESC_CMD_EOP | ICE_TX_DESC_CMD_RS) <<
 	    ICE_TXD_QW1_CMD_S));
 
-	(void) ddi_dma_sync(itr->itxr_dma.idb_dma_handle, 0, 0,
-	    DDI_DMA_SYNC_FORDEV);
+	ice_tx_sync_descs(itr, itr->itxr_tail, written);
 	if (ice_check_dma_handle(itr->itxr_dma.idb_dma_handle) != DDI_FM_OK) {
 		/*
 		 * Fatal DMA error before the doorbell.  Roll the ring back to
@@ -1368,7 +1407,6 @@ ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs, uint_t ntcb,
 	itr->itxr_avail -= ndesc;
 
 	wr32(hw, QTX_COMM_DBELL(itr->itxr_index), tail);
-	ice_flush(hw);
 
 	/*
 	 * The descriptors are already parked, so a faulted doorbell write only
@@ -1541,6 +1579,14 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 		itr->itxr_stats.ictxs_blocked.value.ui64++;
 		if (ctx.itc_use_ctx)
 			itr->itxr_stats.ictxs_lso_nores.value.ui64++;
+		/*
+		 * TCBs are guarded by itxr_tcb_lock, not this one, so a
+		 * completion may have returned the resources we just failed to
+		 * get before itxr_blocked was armed.  Re-run reclaim with the
+		 * flag set: a fully drained ring gets no further completion
+		 * interrupt and would otherwise stay blocked at MAC forever.
+		 */
+		(void) ice_tx_recycle(itr);
 		mutex_exit(&itr->itxr_lock);
 		return (B_FALSE);
 	}
@@ -1673,13 +1719,37 @@ ice_tx_start(ice_t *ice)
 }
 
 /*
- * Quiesce a ring on mac_stop and release every control block it still holds.
- * ice_queues_disable() has already disabled the hardware queue, so no in-flight
- * descriptor will complete or be read; a parked control block whose completion
- * will never arrive is freed directly rather than leaked.
+ * Close every ring to new transmits and wait out the calls already inside
+ * ice_ring_tx().  Releases nothing: the reset path must be able to stop the
+ * software from touching a ring without giving up DMA that hardware can still
+ * reach, since the PFR is not issued until ice_rebuild().
  */
 void
-ice_tx_stop(ice_t *ice)
+ice_tx_quiesce(ice_t *ice)
+{
+	uint_t i;
+
+	for (i = 0; i < ice->ice_num_txr; i++) {
+		ice_tx_ring_t *itr = &ice->ice_txr[i];
+
+		mutex_enter(&itr->itxr_lock);
+		itr->itxr_quiesce = B_TRUE;
+		while (itr->itxr_tx_active > 0)
+			cv_wait(&itr->itxr_cv, &itr->itxr_lock);
+		mutex_exit(&itr->itxr_lock);
+	}
+}
+
+/*
+ * Release every control block the rings still hold and reset the software
+ * ring state.  The caller must have quiesced the rings and must have put the
+ * hardware queues beyond reach of the mappings released here, either by a
+ * completed queue disable or by a completed reset; a parked control block
+ * whose completion will never arrive is freed directly rather than leaked.
+ * Idempotent: a second pass walks an all-NULL itxr_tcbs[].
+ */
+void
+ice_tx_reclaim(ice_t *ice)
 {
 	uint_t i;
 	uint16_t slot;
@@ -1688,12 +1758,6 @@ ice_tx_stop(ice_t *ice)
 		ice_tx_ring_t *itr = &ice->ice_txr[i];
 
 		mutex_enter(&itr->itxr_lock);
-		itr->itxr_quiesce = B_TRUE;
-
-		/* Wait for in-flight transmits to drain before freeing TCBs. */
-		while (itr->itxr_tx_active > 0)
-			cv_wait(&itr->itxr_cv, &itr->itxr_lock);
-
 		for (slot = 0; slot < itr->itxr_size; slot++) {
 			if (itr->itxr_tcbs[slot] == NULL)
 				continue;
@@ -1709,6 +1773,19 @@ ice_tx_stop(ice_t *ice)
 		itr->itxr_blocked = B_FALSE;
 		mutex_exit(&itr->itxr_lock);
 	}
+}
+
+/*
+ * Quiesce the rings on mac_stop and release everything they hold.
+ * ice_queues_disable() has already disabled the hardware queues, so the
+ * reclaim is safe immediately.  The reset path drives the two halves
+ * separately, around the reset barrier.
+ */
+void
+ice_tx_stop(ice_t *ice)
+{
+	ice_tx_quiesce(ice);
+	ice_tx_reclaim(ice);
 }
 
 /*

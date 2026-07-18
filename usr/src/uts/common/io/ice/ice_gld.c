@@ -375,6 +375,35 @@ ice_loopback_mode_set(ice_t *ice, uint32_t mode)
 	return (ret);
 }
 
+/*
+ * Restore internal MAC loopback after a reset.  Both halves are cleared: the
+ * VSI switch flags are re-derived from ice_vsi_ctx_fill()'s SRC_PRUNE default
+ * and the PF reset drops the firmware loopback setting.  A failure downgrades
+ * to ICE_LB_NONE so netlb(4I) never reports a loopback the hardware is not in;
+ * taking the instance terminally offline over a transient diagnostic mode
+ * would be worse than the bug.  Called from ice_rebuild() under
+ * ice_rebuild_lock.
+ */
+void
+ice_loopback_replay(ice_t *ice)
+{
+	uint32_t mode;
+
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+
+	mutex_enter(&ice->ice_loopback_lock);
+	mutex_enter(&ice->ice_lse_lock);
+	mode = ice->ice_loopback_mode;
+	mutex_exit(&ice->ice_lse_lock);
+
+	if (mode == ICE_LB_INTERNAL_MAC && ice_loopback_enable(ice) != 0) {
+		ice_error(ice, "!loopback not restored after reset; "
+		    "reverting to normal mode");
+		ice_link_loopback_update(ice, ICE_LB_NONE);
+	}
+	mutex_exit(&ice->ice_loopback_lock);
+}
+
 void
 ice_loopback_fini(ice_t *ice)
 {
@@ -564,7 +593,7 @@ ice_m_stop(void *arg)
 /*
  * Apply or clear unicast + multicast promiscuous mode in both directions.
  * Factored so the reset rebuild can replay it; broadcast is already forwarded
- * by the default filters installed in M5.
+ * by the default filters installed in ice_add_mac_filters().
  */
 int
 ice_promisc_apply(ice_t *ice, boolean_t on)
@@ -725,7 +754,14 @@ ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 	 * The remaining statistics come from the physical-port MAC counters.
 	 * GLDv3 conflates port and interface statistics; as with i40e we report
 	 * the port's view, which aggregates every VSI on the function.
+	 *
+	 * ice_rebuild_lock is the outermost lock: hold it across the counter
+	 * reads so they cannot straddle a reset rebuild, which shuts the
+	 * control queue down and clears the scheduler tables while
+	 * ice_stats_update_port() is dereferencing port_info and indexing the
+	 * GLPRT_* registers by its lport.
 	 */
+	mutex_enter(&ice->ice_rebuild_lock);
 	mutex_enter(&ice->ice_stat_lock);
 
 	switch (stat) {
@@ -793,6 +829,7 @@ ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 		break;
 	}
 	mutex_exit(&ice->ice_stat_lock);
+	mutex_exit(&ice->ice_rebuild_lock);
 
 	if (ret == 0 &&
 	    ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {

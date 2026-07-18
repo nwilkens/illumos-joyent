@@ -17,9 +17,8 @@
  * Control-plane setup for the PF's data VSI: create the VSI, program the
  * default unicast and broadcast MAC filters through the switch, and configure
  * RSS (hash key, redirection table, and the hashed flow types), all through
- * the Intel common code under core/.  The transmit and receive rings, queue
- * contexts, and MAC registration are a later milestone; without them the VSI
- * receives no traffic yet.
+ * the Intel common code under core/.  Ring DMA and queue-context programming
+ * live in ice_tx.c and ice_rx.c; MAC registration in ice_gld.c.
  *
  * Identifier values that originate in firmware are validated before the driver
  * uses them as an index: the VSI handle is trusted only after ice_is_vsi_valid,
@@ -256,6 +255,7 @@ ice_vsi_setup(ice_t *ice)
 {
 	struct ice_hw *hw = &ice->ice_hw;
 	ice_vsi_t *vsi = &ice->ice_pf_vsi;
+	struct ice_vsi_ctx *cached;
 	struct ice_vsi_ctx ctx;
 	uint16_t max_lanqs[ICE_MAX_TRAFFIC_CLASS];
 	int status;
@@ -294,6 +294,22 @@ ice_vsi_setup(ice_t *ice)
 		ice_vsi_teardown(ice);
 		return (ICE_ERR_PARAM);
 	}
+
+	/*
+	 * ice_add_vsi() refreshes only vsi_num on a context that survived the
+	 * reset, so the cached copy would keep pre-reset switch flags firmware
+	 * no longer has.  ice_vsi_loopback_set() reads that cache as
+	 * authoritative and would then no-op against stale flags.  Copy the
+	 * info section only: the cached context owns queue-context pointers
+	 * the common code allocated.
+	 */
+	cached = ice_get_vsi_ctx(hw, vsi->vi_handle);
+	if (cached == NULL) {
+		ice_error(ice, "PF VSI context missing after add");
+		ice_vsi_teardown(ice);
+		return (ICE_ERR_DOES_NOT_EXIST);
+	}
+	cached->info = ctx.info;
 
 	/*
 	 * Reserve scheduler nodes for the planned tx queue count.  max_lanqs is
@@ -482,6 +498,23 @@ ice_vsi_rebuild(ice_t *ice)
 		return (status);
 
 	/*
+	 * The reset cleared the switch rules in hardware but not the common
+	 * code's record of them, and this rebuild frees no common-code state.
+	 * Without draining that record the replay below collides with the
+	 * pre-reset entries: broadcast returns ICE_ERR_ALREADY_EXISTS and the
+	 * station unicast is silently skipped.  ice_replay_pre_init() moves the
+	 * entries onto the replay lists; the ice_rm_all_sw_replay_rule_info()
+	 * at "done" discards them on every path out.  It can fail after having
+	 * already moved them, so its own error path goes through "done" too.
+	 */
+	status = ice_replay_pre_init(hw, hw->switch_info);
+	if (status != ICE_SUCCESS) {
+		ice_error(ice, "failed to prepare the filter replay: %d",
+		    status);
+		goto done;
+	}
+
+	/*
 	 * Replay every tracked MAC filter.  Build the list under the lock but
 	 * issue the blocking admin-queue command with it dropped, matching
 	 * ice_vsi_teardown().
@@ -509,7 +542,7 @@ ice_vsi_rebuild(ice_t *ice)
 		if (status != ICE_SUCCESS) {
 			ice_error(ice, "failed to replay MAC filters: %d",
 			    status);
-			return (status);
+			goto done;
 		}
 	} else {
 		mutex_exit(&vsi->vi_mac_lock);
@@ -517,11 +550,17 @@ ice_vsi_rebuild(ice_t *ice)
 
 	status = ice_rss_setup(ice);
 	if (status != ICE_SUCCESS)
-		return (status);
+		goto done;
 
 	/* Restore promiscuous mode if it was enabled before the reset. */
 	if (ice->ice_promisc_on && ice_promisc_apply(ice, B_TRUE) != 0)
-		return (ICE_ERR_CFG);
+		status = ICE_ERR_CFG;
 
-	return (ICE_SUCCESS);
+done:
+	/*
+	 * Nothing else reclaims the entries ice_replay_pre_init() set aside, so
+	 * drop them on the failure path too.
+	 */
+	ice_rm_all_sw_replay_rule_info(hw);
+	return (status);
 }

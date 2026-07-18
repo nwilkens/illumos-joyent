@@ -139,7 +139,8 @@ typedef enum ice_state {
 	ICE_STATE_ERROR		= 1 << 2,	/* datapath fail-closed */
 	ICE_STATE_STARTED	= 1 << 3,
 	ICE_STATE_PFR_REQ	= 1 << 4,	/* fatal cause; PFR owed */
-	ICE_STATE_RESET_FAILED	= 1 << 5	/* rebuild failed; terminal */
+	ICE_STATE_RESET_FAILED	= 1 << 5,	/* rebuild failed; terminal */
+	ICE_STATE_MDD_PENDING	= 1 << 6	/* MDD latched; decode owed */
 } ice_state_t;
 
 /* ice_lse_flags bits (protected by ice_lse_lock). */
@@ -180,8 +181,8 @@ typedef struct ice_mac_filter {
 /*
  * The PF data VSI.  vi_handle is the driver-chosen software index into
  * hw->vsi_ctx[]; vi_hw_num is the firmware-assigned hardware VSI number,
- * stored only after it is range-checked.  Rings and queue enable arrive with
- * the data path; this milestone programs the control plane only.
+ * stored only after it is range-checked.  vi_nrxq/vi_ntxq record the queue
+ * counts this VSI was configured with.
  */
 typedef struct ice_vsi {
 	boolean_t		vi_added;
@@ -320,6 +321,7 @@ typedef struct ice_rx_ring {
 	uint32_t		irxr_index;	/* absolute HW rx queue index */
 	uint32_t		irxr_vec;	/* MSI-X vector index */
 	boolean_t		irxr_shutdown;
+	boolean_t		irxr_started;	/* irxr_lock */
 	boolean_t		irxr_intr_poll;	/* mac is polling this ring */
 
 	kmutex_t		irxr_lock;
@@ -433,6 +435,7 @@ typedef struct ice {
 
 	/* OICR deferred async work; thread context, serialized via ice_lock. */
 	ddi_taskq_t		*ice_oicr_taskq;
+	ddi_periodic_t		ice_admin_periodic;
 	boolean_t		ice_oicr_pending;	/* ice_lock */
 	uint32_t		ice_oicr_cause;		/* ice_lock */
 	uint8_t			*ice_aqbuf;		/* ARQ scratch buffer */
@@ -443,12 +446,18 @@ typedef struct ice {
 	 * rebuild against a mac start/stop.  The rebuild runs on its own
 	 * single-thread taskq so it never starves the OICR worker's ARQ drain;
 	 * ice_reset_pending coalesces dispatches under ice_lock, mirroring
-	 * ice_oicr_pending.  ice_detaching turns a queued rebuild into a no-op
-	 * once detach begins.
+	 * ice_oicr_pending.  ice_attaching and ice_detaching turn a queued
+	 * rebuild into a no-op while the instance is not fully constructed:
+	 * the rebuild frees and reinitializes scheduler and control-queue
+	 * state that the attach thread is still building on, and it reports
+	 * link state through a MAC handle detach is about to invalidate.  The
+	 * hardware latches are one-shot, so whoever clears one of these flags
+	 * must requeue a rebuild owed while it was set.
 	 */
 	ddi_taskq_t		*ice_reset_taskq;
 	boolean_t		ice_reset_pending;	/* ice_lock */
 	kmutex_t		ice_rebuild_lock;
+	boolean_t		ice_attaching;		/* ice_rebuild_lock */
 	boolean_t		ice_detaching;		/* ice_rebuild_lock */
 
 	/*
@@ -474,7 +483,7 @@ typedef struct ice {
 	uint32_t		ice_mtu;
 	boolean_t		ice_tx_lso_enable;
 	boolean_t		ice_promisc_on;		/* replay on reset */
-	ice_vsi_t		ice_pf_vsi;		/* control plane (M5) */
+	ice_vsi_t		ice_pf_vsi;		/* the PF's data VSI */
 
 	/*
 	 * Datapath rings.  Counts derive from the VSI queue configuration.
@@ -505,6 +514,7 @@ typedef struct ice {
 	uint_t			ice_small_buf_alloc;
 
 	/* DDP firmware. */
+	/* Attach-only: MAC caches mi_capab at mac_register(). */
 	boolean_t		ice_safe_mode;
 	enum ice_ddp_state	ice_ddp_state;
 
@@ -524,7 +534,7 @@ typedef struct ice {
 	kstat_t			*ice_pf_kstat;
 	kstat_t			*ice_vsi_kstat;
 
-	mac_handle_t		ice_mac_hdl;		/* set in M6b */
+	mac_handle_t		ice_mac_hdl;	/* set by mac_register() */
 } ice_t;
 
 /*
@@ -537,6 +547,7 @@ extern void ice_update_mtu(ice_t *);
 extern int ice_queues_program(ice_t *);
 extern void ice_queues_disable(ice_t *);
 extern void ice_reset_task(void *);
+extern void ice_reset_redispatch(ice_t *);
 #ifdef DEBUG
 extern void ice_test_request_reset(ice_t *);
 #endif
@@ -547,10 +558,13 @@ extern void ice_test_request_reset(ice_t *);
 extern uint_t ice_intr_msix(caddr_t, caddr_t);
 extern boolean_t ice_intr_enable(ice_t *);
 extern void ice_intr_disable(ice_t *);
-extern void ice_intr_oicr_setup(ice_t *);
+extern void ice_intr_oicr_setup(ice_t *, boolean_t);
 extern void ice_intr_oicr_disable(ice_t *);
 extern boolean_t ice_set_link_events(ice_t *);
 extern void ice_link_status_update(ice_t *);
+extern void ice_oicr_resync(ice_t *);
+extern void ice_admin_periodic_start(ice_t *);
+extern void ice_admin_periodic_stop(ice_t *);
 extern void ice_setup_link(ice_t *);
 extern void ice_phy_caps_update(ice_t *);
 extern void ice_reset_dispatch(ice_t *);
@@ -613,6 +627,8 @@ extern void ice_cfg_itr(ice_t *, uint32_t);
  */
 extern mblk_t *ice_ring_tx(void *, mblk_t *);
 extern void ice_tx_start(ice_t *);
+extern void ice_tx_quiesce(ice_t *);
+extern void ice_tx_reclaim(ice_t *);
 extern void ice_tx_stop(ice_t *);
 extern void ice_tx_ring_intr(ice_tx_ring_t *);
 extern int ice_ring_tx_stat(mac_ring_driver_t, uint_t, uint64_t *);
@@ -622,6 +638,8 @@ extern int ice_ring_tx_stat(mac_ring_driver_t, uint_t, uint64_t *);
  */
 extern void ice_rx_recycle(caddr_t);
 extern boolean_t ice_rx_start(ice_t *);
+extern boolean_t ice_rx_quiesce(ice_t *);
+extern void ice_rx_reclaim(ice_t *);
 extern boolean_t ice_rx_stop(ice_t *);
 extern boolean_t ice_rx_drain(ice_t *);
 extern boolean_t ice_rx_rings_resume(ice_t *);
@@ -651,6 +669,7 @@ extern void ice_stats_update_port(ice_t *);
 extern void ice_stats_update_vsi(ice_t *);
 extern int ice_vsi_loopback_set(ice_t *, boolean_t);
 extern void ice_link_loopback_update(ice_t *, uint32_t);
+extern void ice_loopback_replay(ice_t *);
 extern void ice_loopback_fini(ice_t *);
 
 #ifdef __cplusplus

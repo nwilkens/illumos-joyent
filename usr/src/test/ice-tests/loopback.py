@@ -85,6 +85,33 @@ def main() -> None:
     assert "mutex_enter(&ice->ice_rebuild_lock)" in wrapper
     assert "ice_loopback_mode_set_locked(ice, mode)" in wrapper
 
+    # A rebuild must restore loopback, or stop claiming it.  ice_vsi_setup()
+    # recreates the VSI from ice_vsi_ctx_fill()'s SRC_PRUNE default and the PF
+    # reset drops the firmware loopback setting, so both halves are lost.
+    lb_replay = function(
+        gld,
+        "ice_loopback_replay(ice_t *ice)\n{",
+        "\nvoid\nice_loopback_fini",
+    )
+    assert "ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock))" in lb_replay
+    lb_enter = lb_replay.index("mutex_enter(&ice->ice_loopback_lock)")
+    lse_enter = lb_replay.index("mutex_enter(&ice->ice_lse_lock)", lb_enter)
+    lse_exit = lb_replay.index("mutex_exit(&ice->ice_lse_lock)", lse_enter)
+    apply_at = lb_replay.index("ice_loopback_enable(ice)", lse_exit)
+    fallback = lb_replay.index(
+        "ice_link_loopback_update(ice, ICE_LB_NONE)", apply_at)
+    lb_exit = lb_replay.rindex("mutex_exit(&ice->ice_loopback_lock)")
+    assert lb_enter < lse_enter < lse_exit < apply_at < fallback < lb_exit
+    # ice_lse_lock must not be held across a blocking admin-queue command:
+    # ice_link_status_update_impl() waits on ice_lse_cv under that lock.
+    assert "ice_loopback_enable" not in lb_replay[lse_enter:lse_exit]
+    assert "ice_aq_" not in lb_replay[lse_enter:lse_exit]
+    # A failed replay downgrades; it must not take the instance offline.
+    assert "ice_reset_set_failed" not in lb_replay
+    assert "ICE_STATE_RESET_FAILED" not in lb_replay
+    assert "ice_loopback_replay" in (
+        REPO / "usr/src/uts/common/io/ice/ice.h").read_text(encoding="utf-8")
+
     vsi = VSI_SOURCE.read_text(encoding="utf-8")
     vsi_set = function(
         vsi,
@@ -107,7 +134,72 @@ def main() -> None:
     cache = vsi_set.index("cached->info.sw_flags = flags", update)
     assert update < cache
 
+    # ice_add_vsi() refreshes only vsi_num on a context that survived a reset,
+    # so the cached copy keeps pre-reset switch flags and ice_vsi_loopback_set()
+    # -- which reads that cache as authoritative -- would silently no-op.
+    setup = function(
+        vsi,
+        "ice_vsi_setup(ice_t *ice)\n{",
+        "\nstatic int\nice_add_mac_filters",
+    )
+    add_at = setup.index("ice_add_vsi(hw, vsi->vi_handle, &ctx, NULL)")
+    resync = setup.index("->info = ctx.info", add_at)
+    assert "ice_get_vsi_ctx(hw, vsi->vi_handle)" in setup[add_at:resync]
+    # The info section only: a struct-wide copy would clobber and leak the
+    # lan_q_ctx[]/rdma_q_ctx[] pointers the common code allocated.
+    assert "= ctx;" not in setup
+
+    # The fresh-VSI switch and VLAN defaults are unchanged: loopback stays an
+    # overlay applied by ice_vsi_loopback_set(), and the tx VLAN mode is
+    # hardware-validated.
+    fill = function(
+        vsi,
+        "ice_vsi_ctx_fill(ice_t *ice, struct ice_vsi_ctx *ctx)\n{",
+        "\n/*\n * Permit or reject local loopback",
+    )
+    assert "ctx->info.sw_flags = ICE_AQ_VSI_SW_FLAG_SRC_PRUNE;" in fill
+    assert ("ctx->info.inner_vlan_flags = "
+            "ICE_AQ_VSI_INNER_VLAN_TX_MODE_ALL;") in fill
+    assert "ICE_AQ_VSI_SW_FLAG_ALLOW_LB" not in fill
+    assert "ice_loopback_mode" not in fill
+
     attach = ATTACH_SOURCE.read_text(encoding="utf-8")
+
+    # The replay sits after the VSI rebuild (which recreates the VSI with
+    # SRC_PRUNE and resyncs the cached context) and after the reset barrier
+    # (both admin-queue commands soft-fail while reset_ongoing is set), but
+    # before the link refresh, which decides LINK_STATE_UP from the mode.
+    rebuild = function(
+        attach,
+        "ice_rebuild(ice_t *ice)\n{",
+        "\nvoid\nice_reset_task",
+    )
+    # Exactly one call, so an extra replay before the barrier (where both
+    # admin-queue commands soft-fail) cannot hide behind the correct one.
+    assert rebuild.count("ice_loopback_replay(ice)") == 1
+    reset_done = rebuild.index("hw->reset_ongoing = false")
+    vsi_at = rebuild.index("ice_vsi_rebuild(ice)")
+    replay_at = rebuild.index("ice_loopback_replay(ice)")
+    link_at = rebuild.index("ice_link_status_update(ice)")
+    publish_at = rebuild.index("ice_link_state_publish(ice)")
+    assert reset_done < vsi_at < replay_at < link_at < publish_at
+
+    # The terminal path must stop reporting a loopback the reset destroyed,
+    # before the fail-closed link-down report.
+    tail = rebuild[rebuild.index("reset_failed:"):]
+    clear_at = tail.index("ice_link_loopback_update(ice, ICE_LB_NONE)")
+    assert clear_at < tail.index("ice_reset_set_failed(ice)")
+
+    # ...but ice_reset_set_failed() itself must not clear the mode: it is the
+    # shared terminal helper and must stay usable from a pre-reset caller,
+    # where the hardware may genuinely still be looped back.
+    failed = function(
+        attach,
+        "ice_reset_set_failed(ice_t *ice)\n{",
+        "\nstatic void\nice_prepare_for_reset",
+    )
+    assert "ice_link_loopback_update" not in failed
+
     assert "mutex_init(&ice->ice_loopback_lock, NULL, MUTEX_DRIVER, NULL)" in attach
     assert "mutex_destroy(&ice->ice_loopback_lock)" in attach
     detach_start = attach.index(

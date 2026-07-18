@@ -18,7 +18,8 @@
  * cause" (OICR) vector that carries admin-queue async events, link-status
  * changes, and error causes, and the taskq that drains the admin receive
  * queue off the interrupt.  Link state is read through the common code and
- * cached in the softc; it is reported to MAC once mac_register lands.
+ * cached in the softc; it is reported to MAC once the handle from
+ * mac_register() exists.
  */
 
 #include <sys/atomic.h>
@@ -41,6 +42,9 @@
  */
 #define	ICE_ARQ_MAX_ELEMS	2048
 
+/* Admin poll interval; FreeBSD's ice_admin_timer uses the same hz/2. */
+#define	ICE_ADMIN_PERIOD_NS	500000000ULL
+
 /*
  * Causes enabled in PFINT_OICR_ENA.  Link changes and the error causes; the
  * generic INTEVENT bit (0) is reserved in this register and is delivered via
@@ -61,9 +65,14 @@
 	(PFINT_OICR_ECC_ERR_M | PFINT_OICR_PCI_EXCEPTION_M |	\
 	PFINT_OICR_HMC_ERR_M | PFINT_OICR_PE_CRITERR_M)
 
-/* Causes the OICR worker logs and acts on (see ice_oicr_fatal). */
+/*
+ * Causes the OICR worker logs and acts on (see ice_oicr_fatal).  MAL_DETECT is
+ * deliberately absent: it is carried as ICE_STATE_MDD_PENDING instead, because
+ * this snapshot is consumed unconditionally by the worker and would be lost if
+ * the lifetime gate swallowed that run.
+ */
 #define	ICE_OICR_CAUSE_MASK	\
-	(ICE_OICR_FATAL_MASK | PFINT_OICR_GRST_M | PFINT_OICR_MAL_DETECT_M)
+	(ICE_OICR_FATAL_MASK | PFINT_OICR_GRST_M)
 
 static void
 ice_link_state_set(ice_t *ice, link_state_t state)
@@ -71,7 +80,7 @@ ice_link_state_set(ice_t *ice, link_state_t state)
 	ASSERT(MUTEX_HELD(&ice->ice_lse_lock));
 
 	/*
-	 * Link state is cached only until MAC is registered (M6); mac_link_
+	 * Link state is cached until mac_register() completes; mac_link_
 	 * update() must not be called with a NULL handle.
 	 */
 	if (ice->ice_mac_hdl == NULL)
@@ -371,10 +380,70 @@ ice_reset_dispatch(ice_t *ice)
 }
 
 /*
- * Taskq worker: drain the admin receive queue and act on link-status events.
- * The loop is bounded both by the firmware-reported pending count and by a
- * hard element cap.
+ * Atomically clear a state bit and report whether it had been set.  A plain
+ * read-then-atomic_and_32 would wipe a cause the ISR set between the two,
+ * which is exactly the loss this carries state to avoid.  Mirrors FreeBSD's
+ * ice_testandclear_state() (ice_lib.c:8339 uses it for MDD).
  */
+static boolean_t
+ice_state_testclear(ice_t *ice, uint32_t bit)
+{
+	uint32_t old;
+
+	do {
+		old = ice->ice_state;
+		if ((old & bit) == 0)
+			return (B_FALSE);
+	} while (atomic_cas_32(&ice->ice_state, old, old & ~bit) != old);
+
+	return (B_TRUE);
+}
+
+/*
+ * Convert a raw PFINT_OICR snapshot into the persistent state the deferred
+ * worker acts on.  Shared by the ISR and by the attach-time harvest in
+ * ice_intr_oicr_setup() so the two cannot drift.  FreeBSD's ice_msix_admin()
+ * does the same conversion inline (if_ice_iflib.c:1331, 1361, 1375, 1387) and
+ * never carries the raw value across the deferral boundary.
+ */
+static void
+ice_oicr_causes_latch(ice_t *ice, uint32_t oicr)
+{
+	struct ice_hw *hw = &ice->ice_hw;
+	uint32_t state = 0;
+
+	if ((oicr & PFINT_OICR_GRST_M) != 0) {
+		/*
+		 * A reset is being performed on the function.  Make concurrent
+		 * admin-queue commands soft-fail instead of hanging on
+		 * resetting hardware, and fail the datapath closed.
+		 */
+		hw->reset_ongoing = true;
+		state |= ICE_STATE_RESET_PENDING | ICE_STATE_ERROR;
+	}
+
+	if ((oicr & ICE_OICR_FATAL_MASK) != 0) {
+		/*
+		 * ECC/PCIe/HMC/PE-critical errors leave the function on
+		 * untrustworthy state.  Fail the datapath closed and request a
+		 * PF reset rebuild.
+		 */
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
+		state |= ICE_STATE_ERROR | ICE_STATE_PFR_REQ;
+	}
+
+	/*
+	 * MDD owes a register decode, not a reset: only ice_oicr_mdd() can tell
+	 * whether this function or another one was the offender, so it gets its
+	 * own persistent bit rather than riding ICE_OICR_CAUSE_MASK.
+	 */
+	if ((oicr & PFINT_OICR_MAL_DETECT_M) != 0)
+		state |= ICE_STATE_MDD_PENDING;
+
+	if (state != 0)
+		atomic_or_32(&ice->ice_state, state);
+}
+
 /*
  * Decode a malicious-driver-detection event.  Clear the global detection
  * registers so the cause does not re-fire, and if this function is the offender
@@ -426,7 +495,7 @@ ice_oicr_mdd(ice_t *ice)
  * and stops touching hardware; reset rebuild, when requested, runs separately.
  */
 static void
-ice_oicr_fatal(ice_t *ice, uint32_t cause)
+ice_oicr_fatal(ice_t *ice, uint32_t cause, boolean_t mdd)
 {
 	boolean_t fault = (cause & (ICE_OICR_FATAL_MASK |
 	    PFINT_OICR_GRST_M)) != 0;
@@ -441,7 +510,7 @@ ice_oicr_fatal(ice_t *ice, uint32_t cause)
 		ice_error(ice, "PE critical error detected; datapath halted");
 	if ((cause & PFINT_OICR_GRST_M) != 0)
 		ice_error(ice, "global reset detected; datapath halted");
-	if ((cause & PFINT_OICR_MAL_DETECT_M) != 0 && ice_oicr_mdd(ice))
+	if (mdd && ice_oicr_mdd(ice))
 		fault = B_TRUE;
 
 	/*
@@ -456,6 +525,12 @@ ice_oicr_fatal(ice_t *ice, uint32_t cause)
 	}
 }
 
+/*
+ * Taskq worker: decode the causes latched as persistent state, drain the admin
+ * receive queue, and refresh link.  Driven both by the OICR and by the admin
+ * periodic, so every step must be safe to repeat.  The drain loop is bounded
+ * both by the firmware-reported pending count and by a hard element cap.
+ */
 static void
 ice_oicr_task(void *arg)
 {
@@ -466,6 +541,7 @@ ice_oicr_task(void *arg)
 	uint16_t pending;
 	uint_t guard = 0;
 	uint32_t cause;
+	boolean_t mdd;
 	int rc;
 
 	mutex_enter(&ice->ice_lock);
@@ -474,20 +550,67 @@ ice_oicr_task(void *arg)
 	ice->ice_oicr_cause = 0;
 	mutex_exit(&ice->ice_lock);
 
-	if (cause != 0)
-		ice_oicr_fatal(ice, cause);
+	/*
+	 * ice_rebuild_lock is the outermost lock and is taken only after
+	 * ice_lock is dropped: everything below rides the admin queue or
+	 * dereferences hw->port_info, which a reset rebuild shuts down and
+	 * reinitializes.  Testing the reset state outside it would be a
+	 * check-then-use race, since ice_prepare_for_reset sets reset_ongoing
+	 * after the test would have passed.  ice_reset_dispatch only sets a
+	 * flag and hands the rebuild to the reset taskq, which waits on this
+	 * lock, so there is no self-deadlock.
+	 */
+	mutex_enter(&ice->ice_rebuild_lock);
+
+	/*
+	 * Gate before ice_oicr_fatal(): it reports the link down through the
+	 * MAC handle, which detach is about to invalidate and attach has not
+	 * yet created.  The datapath is already fenced by ICE_STATE_ERROR set
+	 * in the ISR, so dropping the log line for a cause that lands outside
+	 * the instance's lifetime is the right trade.  No work owed by that
+	 * cause is dropped with it: every cause is carried as persistent state,
+	 * so ice_reset_redispatch() requeues an owed rebuild when the gate
+	 * lifts and the MDD decode below is retried on the next admin periodic.
+	 *
+	 * ICE_STATE_RESET_FAILED joins the gate because the admin periodic
+	 * keeps firing on a terminally failed instance whose control queue
+	 * ice_rebuild() has already shut down: without it every tick fails a
+	 * drain and a link update and logs both at CE_WARN, forever.  FreeBSD
+	 * skips control-queue work on the same bit (if_ice_iflib.c:2449).
+	 */
+	if (ice->ice_attaching || ice->ice_detaching ||
+	    (ice->ice_state & ICE_STATE_RESET_FAILED) != 0) {
+		mutex_exit(&ice->ice_rebuild_lock);
+		return;
+	}
+
+	/*
+	 * Test and clear before the decode, as FreeBSD's ice_handle_mdd_event()
+	 * does (ice_lib.c:8339), so an MDD arriving during the decode gets its
+	 * own later pass instead of being merged into this one.  It sits below
+	 * the gate above -- which is the point of the persistent bit -- and
+	 * above the reset skip below, because PF_MDET_* has reset source CORER
+	 * and a PFR rebuild does not clear it: leaving it latched would
+	 * misattribute another function's next event to us.  FreeBSD's admin
+	 * task orders it the same way (if_ice_iflib.c:2447 precedes the
+	 * control-queue skip at :2449).
+	 */
+	mdd = ice_state_testclear(ice, ICE_STATE_MDD_PENDING);
+
+	if (cause != 0 || mdd)
+		ice_oicr_fatal(ice, cause, mdd);
 
 	/*
 	 * A reset in progress or owed leaves the admin queue unusable or about
-	 * to be rebuilt; skip the drain.  When a rebuild is owed, hand it to
-	 * the dedicated reset taskq: it can run for seconds and shares this
-	 * worker's single ice_aqbuf, so it must never run here.
+	 * to be rebuilt; skip the drain.  An owed rebuild is handed to the
+	 * dedicated reset taskq -- it can run for seconds and shares this
+	 * worker's single ice_aqbuf, so it must never run here -- unless the
+	 * instance is terminally failed, which ice_reset_redispatch() honours.
 	 */
 	if (hw->reset_ongoing || (ice->ice_state &
 	    (ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ)) != 0) {
-		if ((ice->ice_state &
-		    (ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ)) != 0)
-			ice_reset_dispatch(ice);
+		ice_reset_redispatch(ice);
+		mutex_exit(&ice->ice_rebuild_lock);
 		return;
 	}
 
@@ -521,6 +644,18 @@ ice_oicr_task(void *arg)
 		ice_error(ice, "admin receive queue drain cap hit; pending %u",
 		    pending);
 	}
+
+	/*
+	 * Refresh link unconditionally, not just when the drain saw a
+	 * get_link_status message.  Every cause this driver acts on is a
+	 * one-shot latch, and ice_intr_oicr_setup() read-clears PFINT_OICR, so
+	 * an event delivered while the OICR was masked leaves its message in
+	 * the ring with no interrupt pending.  FreeBSD polls the same state
+	 * from its admin timer for this reason (if_ice_iflib.c:2477).
+	 */
+	ice_link_status_update_impl(ice, NULL);
+
+	mutex_exit(&ice->ice_rebuild_lock);
 }
 
 static void
@@ -535,6 +670,57 @@ ice_intr_oicr_enable(ice_t *ice)
 	ice_flush(hw);
 }
 
+/*
+ * Admin periodic: drives the OICR worker from outside the ISR so every cause
+ * is polled rather than trusted to a one-shot interrupt.  Mirrors FreeBSD's
+ * ice_admin_timer (if_ice_iflib.c:2289), which runs at hz/2 whether or not the
+ * interface is up, and each run covers what its admin task covers
+ * (if_ice_iflib.c:2440-2477): an owed reset is redispatched, ICE_STATE_MDD_
+ * PENDING is decoded, the control queue is drained, and link state is
+ * refreshed unconditionally.  Without it a cause lost to a masked OICR or to
+ * the attach/detach gate is never re-delivered: the port stays down, or an
+ * owed reset or MDD decode never runs, for the life of the instance.
+ */
+static void
+ice_admin_periodic(void *arg)
+{
+	ice_t *ice = arg;
+
+	if (ice->ice_detaching || ice->ice_attaching)
+		return;
+
+	ice_oicr_resync(ice);
+}
+
+void
+ice_admin_periodic_start(ice_t *ice)
+{
+	ice->ice_admin_periodic = ddi_periodic_add(ice_admin_periodic, ice,
+	    ICE_ADMIN_PERIOD_NS, DDI_IPL_0);
+}
+
+void
+ice_admin_periodic_stop(ice_t *ice)
+{
+	if (ice->ice_admin_periodic != NULL) {
+		ddi_periodic_delete(ice->ice_admin_periodic);
+		ice->ice_admin_periodic = NULL;
+	}
+}
+
+/*
+ * Drain the admin receive queue once from outside the ISR.  Used by the admin
+ * periodic above and by attach, which must consume anything stranded before
+ * the OICR was armed.
+ */
+void
+ice_oicr_resync(ice_t *ice)
+{
+	if (ddi_taskq_dispatch(ice->ice_oicr_taskq, ice_oicr_task, ice,
+	    DDI_NOSLEEP) != DDI_SUCCESS)
+		ice_error(ice, "failed to dispatch admin queue resync");
+}
+
 void
 ice_intr_oicr_disable(ice_t *ice)
 {
@@ -546,15 +732,39 @@ ice_intr_oicr_disable(ice_t *ice)
 	ice_flush(hw);
 }
 
+/*
+ * Route and arm the OICR.  The mandatory read of PFINT_OICR below is
+ * read-clear, so it destroys every cause latched since the register was last
+ * reset.  When harvest is set those causes are converted to persistent state
+ * first: on the attach path they were latched on this driver's watch, the
+ * window is hundreds of milliseconds of firmware interaction, and nothing else
+ * re-derives them.  The rebuild path must NOT harvest -- it has just performed
+ * the owed rebuild and cleared the reset-owed bits, so re-latching would
+ * dispatch the same rebuild in a loop.
+ */
 void
-ice_intr_oicr_setup(ice_t *ice)
+ice_intr_oicr_setup(ice_t *ice, boolean_t harvest)
 {
 	struct ice_hw *hw = &ice->ice_hw;
-	uint32_t reg;
+	uint32_t reg, oicr;
 
 	/* Mask all causes and clear any stale status (the read clears it). */
 	wr32(hw, PFINT_OICR_ENA, 0);
-	(void) rd32(hw, PFINT_OICR);
+	oicr = rd32(hw, PFINT_OICR);
+
+	if (harvest) {
+		/*
+		 * A severed bus reads all ones, which would synthesise a
+		 * phantom GRST plus MDD plus every fatal cause.
+		 */
+		if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) !=
+		    DDI_FM_OK) {
+			ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
+			atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
+		} else {
+			ice_oicr_causes_latch(ice, oicr);
+		}
+	}
 
 	/* Route the FW/admin control-queue cause to vector 0, OTHER ITR. */
 	reg = ((ICE_OICR_VECTOR << PFINT_FW_CTL_MSIX_INDX_S) &
@@ -590,26 +800,7 @@ ice_intr_oicr(ice_t *ice)
 		return (DDI_INTR_CLAIMED);
 	}
 
-	if (oicr & PFINT_OICR_GRST_M) {
-		/*
-		 * A reset is being performed on the function.  Make concurrent
-		 * admin-queue commands soft-fail instead of hanging on
-		 * resetting hardware, and fail the datapath closed.
-		 */
-		hw->reset_ongoing = true;
-		atomic_or_32(&ice->ice_state,
-		    ICE_STATE_RESET_PENDING | ICE_STATE_ERROR);
-	}
-	if ((oicr & ICE_OICR_FATAL_MASK) != 0) {
-		/*
-		 * ECC/PCIe/HMC/PE-critical errors leave the function on
-		 * untrustworthy state.  Fail the datapath closed and request a
-		 * PF reset rebuild.
-		 */
-		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
-		atomic_or_32(&ice->ice_state,
-		    ICE_STATE_ERROR | ICE_STATE_PFR_REQ);
-	}
+	ice_oicr_causes_latch(ice, oicr);
 
 	/*
 	 * PFINT_FW_CTL and PFINT_OICR share this dedicated admin vector.  The
@@ -617,8 +808,7 @@ ice_intr_oicr(ice_t *ice)
 	 * interrupt, so PFINT_OICR cannot reliably say whether the ARQ fired.
 	 * Check it on every admin interrupt, as FreeBSD does.  The pending flag
 	 * coalesces a burst into one single-threaded, bounded drain and packet
-	 * queue interrupts use separate vectors.  Latch any fatal/reset causes
-	 * in the same critical section for the worker to log and act on.
+	 * queue interrupts use separate vectors.
 	 */
 	mutex_enter(&ice->ice_lock);
 	ice->ice_oicr_cause |= oicr & ICE_OICR_CAUSE_MASK;

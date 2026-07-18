@@ -174,6 +174,13 @@ ice_pf_kstat_update(kstat_t *ksp, int rw)
 	if (rw == KSTAT_WRITE)
 		return (EACCES);
 
+	/*
+	 * ice_rebuild_lock is the outermost lock: a reset rebuild shuts the
+	 * control queue down and clears the scheduler tables, so the counter
+	 * reads (which deref hw->port_info and index registers by its lport)
+	 * must not straddle it.
+	 */
+	mutex_enter(&ice->ice_rebuild_lock);
 	mutex_enter(&ice->ice_stat_lock);
 	ice_stats_update_port(ice);
 
@@ -202,6 +209,7 @@ ice_pf_kstat_update(kstat_t *ksp, int rw)
 
 	ice_stats_check_acc(ice);
 	mutex_exit(&ice->ice_stat_lock);
+	mutex_exit(&ice->ice_rebuild_lock);
 	return (0);
 }
 
@@ -215,6 +223,12 @@ ice_vsi_kstat_update(kstat_t *ksp, int rw)
 	if (rw == KSTAT_WRITE)
 		return (EACCES);
 
+	/*
+	 * ice_rebuild_lock is the outermost lock: a reset rebuild recreates the
+	 * PF VSI, so the VSI handle lookup and the register reads it feeds must
+	 * not straddle it.
+	 */
+	mutex_enter(&ice->ice_rebuild_lock);
 	mutex_enter(&ice->ice_stat_lock);
 	ice_stats_update_vsi(ice);
 
@@ -233,6 +247,7 @@ ice_vsi_kstat_update(kstat_t *ksp, int rw)
 
 	ice_stats_check_acc(ice);
 	mutex_exit(&ice->ice_stat_lock);
+	mutex_exit(&ice->ice_rebuild_lock);
 	return (0);
 }
 

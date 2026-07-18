@@ -6,8 +6,10 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[4]
-GLD_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_gld.c"
-DDP_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_ddp.c"
+GLUE_DIR = REPO / "usr/src/uts/common/io/ice"
+GLD_SOURCE = GLUE_DIR / "ice_gld.c"
+DDP_SOURCE = GLUE_DIR / "ice_ddp.c"
+ICE_SOURCE = GLUE_DIR / "ice.c"
 
 
 def function(source: str, signature: str, following: str) -> str:
@@ -48,6 +50,34 @@ def main() -> None:
     )
     assert "irr->irxr_ice->ice_safe_mode" in hck
     assert hck.index("irr->irxr_ice->ice_safe_mode") < hck.index("HCK_IPV4_HDRCKSUM_OK")
+
+    # Safe mode is a MAC-contract decision, not a hardware fact: it must be
+    # made before mac_register() caches mi_capab.  A mid-life transition cannot
+    # withdraw the TX offloads the stack is already using, so the rebuild must
+    # not attempt one.
+    ice = ICE_SOURCE.read_text(encoding="utf-8")
+    rebuild = function(ice, "ice_rebuild(ice_t *ice)\n{", "\nvoid\nice_reset_task")
+    assert "ice_set_safe_mode_caps" not in rebuild
+    assert "ice_safe_mode = B_TRUE" not in rebuild
+    assert "ice_ddp_load" not in rebuild
+
+    # A failed DDP reload must reach the terminal path rather than fall
+    # through and keep serving traffic with no parser profiles.
+    ddp_replay = function(
+        rebuild, "if (!ice->ice_safe_mode)", "if (ice_vsi_rebuild(ice)")
+    assert "ice_is_init_pkg_successful" in ddp_replay
+    assert "goto reset_failed" in ddp_replay
+    # A missing package copy must not silently skip the reload either.
+    assert "hw->pkg_copy == NULL" in ddp_replay
+
+    # Exactly one writer of the flag, and it is the attach-only DDP path.
+    writers = sorted(p.name for p in GLUE_DIR.glob("*.c")
+                     if "ice_safe_mode = " in p.read_text(encoding="utf-8"))
+    assert writers == ["ice_ddp.c"], writers
+
+    # If a mid-life transition is ever reintroduced, it must also renegotiate
+    # with MAC -- which mac_capab_update() explicitly cannot do safely.
+    assert ("ice_safe_mode = " not in ice) or ("mac_capab_update" in ice)
 
     print("PASS: ice safe mode offload invariants")
 

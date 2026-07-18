@@ -20,6 +20,15 @@ python3 usr/src/test/ice-tests/rss.py
 python3 usr/src/test/ice-tests/reset_oicr.py
 python3 usr/src/test/ice-tests/reset_rebuild.py
 python3 usr/src/test/ice-tests/reset_serialize.py
+python3 usr/src/test/ice-tests/tx_bind_threshold.py
+python3 usr/src/test/ice-tests/tx_blocked.py
+python3 usr/src/test/ice-tests/tx_doorbell.py
+python3 usr/src/test/ice-tests/vlan_rx.py
+python3 usr/src/test/ice-tests/pool_locks.py
+python3 usr/src/test/ice-tests/jumbo_copy.py
+python3 usr/src/test/ice-tests/loan_wait.py
+python3 usr/src/test/ice-tests/safe_mode.py
+python3 usr/src/test/ice-tests/stale_comments.py
 ```
 
 `rx_checksum.py` verifies that receive checksum metadata is captured before
@@ -129,6 +138,63 @@ taskq is destroyed after the interrupt handlers are removed and before the rings
 and VSI are freed; detach marks the device detaching under the rebuild lock
 before unconfigure; and `ice_reset_dispatch` mirrors the `oicr_pending`
 single-flight coalescing.
+
+`tx_bind_threshold.py` verifies the bind-versus-copy decision: a whole packet
+up to `ICE_TX_SMALL_PKT` is copied into one small-pool buffer before any
+fragment is bound and claims exactly one TCB and one descriptor; an
+undeliverable frame is not retried through the bind loop; and a bind failure or
+a packet exceeding the `ICE_TX_MAX_COOKIE` budget degrades to a full-packet
+copy rather than a drop.
+
+`tx_blocked.py` verifies the transmit back-pressure handshake: `itxr_blocked`
+is armed under the ring lock and reclaim is re-driven after arming and before
+the lock is dropped, so a fully drained ring that will raise no further
+completion interrupt cannot stay blocked at MAC; the chain is returned for MAC
+to retry; and both exits of the recycle path own the wakeup.
+
+`tx_doorbell.py` verifies the descriptor-sync and doorbell sequence: only the
+descriptors the packet wrote are synced, split at ring wrap with
+descriptor-sized offsets; the sync precedes the tail advance and the doorbell;
+the doorbell write is FM-checked; there is no per-packet MMIO readback or
+whole-ring sync; and the control paths keep their flush while recycle keeps its
+`DDI_DMA_SYNC_FORKERNEL` sync.
+
+`vlan_rx.py` verifies that a hardware-stripped VLAN tag is reinserted into the
+frame: the tag and its status bit are read only after the consumer barrier, the
+donated address pair is bounds-checked before `b_rptr` advances, a failed
+tag-header allocation discards the frame instead of delivering it, checksum
+metadata lands on the head MAC actually receives, and the 802.1Q header is
+emitted in network byte order.
+
+`pool_locks.py` verifies that both transmit copy-buffer pool locks are created
+once at the negotiated interrupt priority before first use, destroyed exactly
+once after the pools are torn down, and never held across the `ice_buf_fini`
+unwind inside `ice_buf_init`.
+
+`jumbo_copy.py` verifies that the transmit copy pool can hold any MTU-legal
+frame: the general pool buffer is page-rounded from `ICE_MAX_FRAME_SIZE`, a
+whole frame still fits one transmit descriptor, the copy fallback draws from
+the small pool then the general pool without depending on LSO, and the former
+receive-sized pool constant is too small for a jumbo frame.
+
+`loan_wait.py` verifies that receive teardown never waits unbounded on loaned
+buffers: one absolute deadline is computed before the ring loop, the wait is a
+`cv_timedwait`, a ring that times out is left fully intact and is neither freed
+nor reposted, every control-block free is guarded by the loan count or pool
+ownership, a surviving pool is not clobbered on restart, and a single bounded
+stop serves both the unplumb and reset callers.
+
+`safe_mode.py` verifies that safe mode withholds the hardware offloads the DDP
+package would have provided: the checksum and LSO capabilities are refused
+outright rather than advertised with no flags, each guard precedes its
+assignment, and the receive path reports no verified checksum when the
+descriptor status bits carry no verdict.
+
+`stale_comments.py` verifies that the glue comments describe the driver as it
+is actually built: no development milestone labels survive in any glue source,
+every `ICE_ATTACH_*` token appearing anywhere in the glue -- in code or in a
+comment -- names a progress bit the `ice_attach_state_t` enum actually defines,
+and the genuine multi-function limitation on the instance list stays recorded.
 
 ## On-hardware datapath acceptance
 
