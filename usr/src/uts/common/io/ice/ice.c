@@ -844,6 +844,8 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	else if (mtu > ICE_MAX_MTU)
 		mtu = ICE_MAX_MTU;
 	ice->ice_mtu = mtu;
+	ice->ice_tx_lso_enable = ddi_prop_get_int(DDI_DEV_T_ANY,
+	    ice->ice_dip, DDI_PROP_DONTPASS, "tx_lso_enable", 0) != 0;
 	ice_update_mtu(ice);
 
 	if (!ice_tx_rings_alloc(ice))

@@ -107,7 +107,7 @@ ice_pkt_dma_attr(ice_t *ice, ddi_dma_attr_t *attrp)
 	attrp->dma_attr_addr_lo = 0;
 	attrp->dma_attr_addr_hi = UINT64_MAX;
 
-	attrp->dma_attr_count_max = ICE_TX_MAX_BUFSZ;
+	attrp->dma_attr_count_max = ICE_TX_MAX_BUFSZ - 1;
 
 	attrp->dma_attr_align = ICE_DMA_ALIGNMENT;
 	attrp->dma_attr_seg = UINT64_MAX;
@@ -280,6 +280,38 @@ ice_buf_free(ice_t *ice, ice_dma_buffer_t *buf)
 }
 
 ice_dma_buffer_t *
+ice_lso_buf_alloc(ice_t *ice)
+{
+	ice_dma_buffer_t *buf;
+
+	mutex_enter(&ice->ice_buf_lock);
+	if (ice->ice_lso_buf_alloc == 0) {
+		mutex_exit(&ice->ice_buf_lock);
+		return (NULL);
+	}
+
+	buf = ice->ice_dma_lso_bufs[--ice->ice_lso_buf_alloc];
+	ice->ice_dma_lso_bufs[ice->ice_lso_buf_alloc] = NULL;
+	mutex_exit(&ice->ice_buf_lock);
+
+	return (buf);
+}
+
+void
+ice_lso_buf_free(ice_t *ice, ice_dma_buffer_t *buf)
+{
+	if (buf == NULL)
+		return;
+
+	ASSERT3U(buf->idb_len, ==, ICE_TX_LSO_BUFSZ);
+
+	mutex_enter(&ice->ice_buf_lock);
+	ASSERT3U(ice->ice_lso_buf_alloc, <, ice->ice_lso_buf_sz);
+	ice->ice_dma_lso_bufs[ice->ice_lso_buf_alloc++] = buf;
+	mutex_exit(&ice->ice_buf_lock);
+}
+
+ice_dma_buffer_t *
 ice_small_buf_alloc(ice_t *ice)
 {
 	ice_dma_buffer_t *buf;
@@ -348,6 +380,36 @@ ice_buf_init(ice_t *ice)
 	ice->ice_buf_alloc = n;
 	mutex_exit(&ice->ice_buf_lock);
 
+	if (ice->ice_tx_lso_enable) {
+		VERIFY3U(ICE_TX_LSO_BUFSZ, >=, ICE_MAX_FRAME_SIZE);
+		VERIFY3U(ICE_TX_LSO_BUFSZ, <=, ICE_TX_MAX_BUFSZ);
+
+		/*
+		 * LSO fallback copies must close an arbitrary MSS window with
+		 * one descriptor.  A page-rounded maximum frame covers every
+		 * supported MSS while retaining a single DMA cookie.
+		 */
+		mutex_enter(&ice->ice_buf_lock);
+		ice->ice_dma_lso_bufs = kmem_zalloc(n *
+		    sizeof (ice_dma_buffer_t *), KM_SLEEP);
+		ice->ice_lso_bufs = kmem_zalloc(n *
+		    sizeof (ice_dma_buffer_t), KM_SLEEP);
+		ice->ice_lso_buf_sz = n;
+		for (i = 0; i < n; i++) {
+			if (!ice_dma_alloc(ice, &ice->ice_lso_bufs[i], &attr,
+			    &acc, B_TRUE, ICE_TX_LSO_BUFSZ, B_FALSE)) {
+				mutex_exit(&ice->ice_buf_lock);
+				ice_error(ice,
+				    "failed to allocate tx LSO copy buffers");
+				ice_buf_fini(ice);
+				return (B_FALSE);
+			}
+			ice->ice_dma_lso_bufs[i] = &ice->ice_lso_bufs[i];
+		}
+		ice->ice_lso_buf_alloc = n;
+		mutex_exit(&ice->ice_buf_lock);
+	}
+
 	mutex_enter(&ice->ice_small_buf_lock);
 	ice->ice_dma_small_bufs = kmem_zalloc(n * sizeof (ice_dma_buffer_t *),
 	    KM_SLEEP);
@@ -396,6 +458,19 @@ ice_buf_fini(ice_t *ice)
 	mutex_exit(&ice->ice_small_buf_lock);
 
 	mutex_enter(&ice->ice_buf_lock);
+	if (ice->ice_lso_bufs != NULL) {
+		for (i = 0; i < ice->ice_lso_buf_sz; i++)
+			ice_dma_free(&ice->ice_lso_bufs[i]);
+		kmem_free(ice->ice_dma_lso_bufs,
+		    ice->ice_lso_buf_sz * sizeof (ice_dma_buffer_t *));
+		kmem_free(ice->ice_lso_bufs,
+		    ice->ice_lso_buf_sz * sizeof (ice_dma_buffer_t));
+		ice->ice_dma_lso_bufs = NULL;
+		ice->ice_lso_bufs = NULL;
+	}
+	ice->ice_lso_buf_alloc = 0;
+	ice->ice_lso_buf_sz = 0;
+
 	if (ice->ice_bufs != NULL) {
 		for (i = 0; i < ice->ice_buf_sz; i++)
 			ice_dma_free(&ice->ice_bufs[i]);

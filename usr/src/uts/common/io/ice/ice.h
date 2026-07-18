@@ -18,6 +18,8 @@
 
 #include <sys/types.h>
 #include <sys/inttypes.h>
+#include <sys/param.h>
+#include <sys/sysmacros.h>
 #include <sys/debug.h>
 #include <sys/conf.h>
 #include <sys/ddi.h>
@@ -88,7 +90,19 @@ CTASSERT(ICE_MAX_FRAME_SIZE <= UINT16_MAX);
 #define	ICE_TX_MAX_BUFSZ	0x00003fff	/* per-descriptor max (16K-1) */
 #define	ICE_TX_MAX_COOKIE	8		/* descs per non-LSO packet */
 #define	ICE_TX_LSO_MAX_COOKIE	32		/* descs per LSO packet */
+#define	ICE_TX_MAX_LSO_DESC	32		/* data descs per LSO packet */
+/* The refetched header is the eighth descriptor in each hardware segment. */
+#define	ICE_TX_LSO_SEG_DESCS	7		/* payload descs per segment */
+#define	ICE_TX_LSO_MIN_MSS	64
+#define	ICE_LSO_MAXLEN		(64 * 1024)
+#define	ICE_TX_LSO_BUFSZ	P2ROUNDUP(ICE_MAX_FRAME_SIZE, PAGESIZE)
 #define	ICE_TX_SMALL_PKT	512		/* small-copy threshold */
+
+CTASSERT(sizeof (struct ice_tx_ctx_desc) == sizeof (struct ice_tx_desc));
+CTASSERT(ICE_LSO_MAXLEN <= (ICE_TXD_CTX_QW1_TSO_LEN_M >>
+    ICE_TXD_CTX_QW1_TSO_LEN_S));
+CTASSERT(ICE_TXD_CTX_MAX_MSS <= (ICE_TXD_CTX_QW1_MSS_M >>
+    ICE_TXD_CTX_QW1_MSS_S));
 
 #define	ICE_DEF_TX_RING_SIZE	1024
 #define	ICE_DEF_RX_RING_SIZE	1024
@@ -183,9 +197,18 @@ typedef enum ice_tcb_type {
 	ITCB_NOT_USED,
 	ITCB_SMALL_COPY,
 	ITCB_COPY,
+	ITCB_LSO_COPY,
 	ITCB_BIND,
 	ITCB_LSO_BIND
 } ice_tcb_type_t;
+
+typedef struct ice_tx_ctx_t {
+	uint64_t		itc_data_cmd;
+	uint64_t		itc_data_off;
+	boolean_t		itc_use_ctx;
+	uint32_t		itc_mss;
+	uint32_t		itc_tsolen;
+} ice_tx_ctx_t;
 
 struct ice_tx_ring;
 typedef struct ice_tx_ctrl_block {
@@ -209,6 +232,10 @@ typedef struct ice_txq_stat {
 	kstat_named_t		ictxs_no_pkt_cache;
 	kstat_named_t		ictxs_drops;
 	kstat_named_t		ictxs_blocked;
+	kstat_named_t		ictxs_lso_packets;
+	kstat_named_t		ictxs_lso_drops;
+	kstat_named_t		ictxs_lso_pullups;
+	kstat_named_t		ictxs_lso_nores;
 } ice_txq_stat_t;
 
 typedef struct ice_tx_ring {
@@ -410,6 +437,7 @@ typedef struct ice {
 	uint32_t		ice_loopback_mode;
 
 	uint32_t		ice_mtu;
+	boolean_t		ice_tx_lso_enable;
 	ice_vsi_t		ice_pf_vsi;		/* control plane (M5) */
 
 	/*
@@ -430,6 +458,10 @@ typedef struct ice {
 	ice_dma_buffer_t	**ice_dma_bufs;	/* free stack */
 	uint_t			ice_buf_sz;
 	uint_t			ice_buf_alloc;
+	ice_dma_buffer_t	*ice_lso_bufs;
+	ice_dma_buffer_t	**ice_dma_lso_bufs;
+	uint_t			ice_lso_buf_sz;
+	uint_t			ice_lso_buf_alloc;
 	kmutex_t		ice_small_buf_lock;
 	ice_dma_buffer_t	*ice_small_bufs;
 	ice_dma_buffer_t	**ice_dma_small_bufs;
@@ -507,6 +539,8 @@ extern void ice_dma_free(ice_dma_buffer_t *);
 extern int ice_check_dma_handle(ddi_dma_handle_t);
 extern ice_dma_buffer_t *ice_buf_alloc(ice_t *);
 extern void ice_buf_free(ice_t *, ice_dma_buffer_t *);
+extern ice_dma_buffer_t *ice_lso_buf_alloc(ice_t *);
+extern void ice_lso_buf_free(ice_t *, ice_dma_buffer_t *);
 extern ice_dma_buffer_t *ice_small_buf_alloc(ice_t *);
 extern void ice_small_buf_free(ice_t *, ice_dma_buffer_t *);
 extern boolean_t ice_buf_init(ice_t *);

@@ -58,9 +58,58 @@ ice_map_txq_vector(ice_t *ice, ice_tx_ring_t *itr)
 	ice_flush(hw);
 }
 
+static boolean_t
+ice_tx_kstat_init(ice_t *ice, ice_tx_ring_t *itr)
+{
+	ice_txq_stat_t *txs = &itr->itxr_stats;
+	char name[KSTAT_STRLEN];
+
+	(void) snprintf(name, sizeof (name), "tx_ring_%u", itr->itxr_index);
+	itr->itxr_kstat = kstat_create(ICE_MODULE_NAME, ice->ice_instance, name,
+	    "net", KSTAT_TYPE_NAMED,
+	    sizeof (ice_txq_stat_t) / sizeof (kstat_named_t),
+	    KSTAT_FLAG_VIRTUAL);
+	if (itr->itxr_kstat == NULL)
+		return (B_FALSE);
+
+	itr->itxr_kstat->ks_data = txs;
+	kstat_named_init(&txs->ictxs_bytes, "tx_bytes", KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_packets, "tx_packets", KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_bind_bytes, "tx_bind_bytes",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_bind_frags, "tx_bind_frags",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_copy_bytes, "tx_copy_bytes",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_copy_frags, "tx_copy_frags",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_bind_fails, "tx_bind_fails",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_no_pkt_cache, "tx_no_pkt_cache",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_drops, "tx_drops", KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_blocked, "tx_blocked", KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_lso_packets, "tx_lso_packets",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_lso_drops, "tx_lso_drops",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_lso_pullups, "tx_lso_pullups",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_lso_nores, "tx_lso_nores",
+	    KSTAT_DATA_UINT64);
+	kstat_install(itr->itxr_kstat);
+
+	return (B_TRUE);
+}
+
 static void
 ice_tx_ring_fini(ice_t *ice, ice_tx_ring_t *itr)
 {
+	if (itr->itxr_kstat != NULL) {
+		kstat_delete(itr->itxr_kstat);
+		itr->itxr_kstat = NULL;
+	}
+
 	ice_dma_free(&itr->itxr_dma);
 	itr->itxr_descs = NULL;
 
@@ -155,6 +204,10 @@ ice_tx_ring_alloc(ice_t *ice, ice_tx_ring_t *itr, uint_t index)
 	}
 	itr->itxr_tcb_nfree = itr->itxr_size;
 	itr->itxr_avail = itr->itxr_size;
+	if (!ice_tx_kstat_init(ice, itr)) {
+		ice_error(ice, "failed to create tx ring %u kstat", index);
+		goto fail;
+	}
 
 	return (B_TRUE);
 
@@ -315,8 +368,9 @@ ice_tx_ring_unprogram(ice_t *ice, ice_tx_ring_t *itr)
  * hardware rewrites the last descriptor's DTYPE to DESC_DONE, which is the
  * signal that the packet (and every descriptor before it) is complete.
  *
- * No checksum or LSO offload in this milestone: every descriptor is a single
- * DATA descriptor and the ring carries one frame per packet.
+ * LSO packets prepend one context descriptor.  Their headers are copied into
+ * a dedicated single-cookie buffer, and payload descriptors are constrained
+ * so each hardware segment stays within the controller's fetch limit.
  */
 
 /* QW1 dtype mask, fully shifted, to read the completion writeback. */
@@ -330,7 +384,8 @@ ice_tx_ring_unprogram(ice_t *ice, ice_tx_ring_t *itr)
 typedef enum ice_tx_build {
 	ICE_TX_BUILD_OK,
 	ICE_TX_BUILD_NORES,
-	ICE_TX_BUILD_DROP
+	ICE_TX_BUILD_DROP,
+	ICE_TX_BUILD_PULLUP
 } ice_tx_build_t;
 
 static inline uint16_t
@@ -380,6 +435,10 @@ ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
 		break;
 	case ITCB_COPY:
 		ice_buf_free(ice, tcb->itcb_buf);
+		tcb->itcb_buf = NULL;
+		break;
+	case ITCB_LSO_COPY:
+		ice_lso_buf_free(ice, tcb->itcb_buf);
 		tcb->itcb_buf = NULL;
 		break;
 	case ITCB_BIND:
@@ -456,6 +515,63 @@ ice_tx_bind_fragment(ice_tx_ring_t *itr, mblk_t *mp, uint_t *ncookiesp)
 }
 
 /*
+ * LSO binds may span more cookies than ordinary frames.  The separate handle
+ * prevents a failed LSO bind from disturbing the ordinary bind lifecycle.
+ */
+static ice_tx_ctrl_block_t *
+ice_tx_bind_lso_fragment(ice_tx_ring_t *itr, caddr_t addr, size_t len,
+    uint_t *ncookiesp)
+{
+	ice_t *ice = itr->itxr_ice;
+	ice_tx_ctrl_block_t *tcb;
+	ddi_dma_attr_t attr;
+	uint_t ncookies;
+	int ret;
+
+	if (len == 0 || len > ICE_LSO_MAXLEN)
+		return (NULL);
+
+	tcb = ice_tcb_alloc(itr);
+	if (tcb == NULL)
+		return (NULL);
+
+	ice_pkt_txbind_lso_attr(ice, &attr);
+	if (ddi_dma_alloc_handle(ice->ice_dip, &attr, DDI_DMA_DONTWAIT, NULL,
+	    &tcb->itcb_lso_dmah) != DDI_SUCCESS) {
+		ice_tcb_free(itr, tcb);
+		return (NULL);
+	}
+
+	ret = ddi_dma_addr_bind_handle(tcb->itcb_lso_dmah, NULL, addr, len,
+	    DDI_DMA_WRITE | DDI_DMA_STREAMING, DDI_DMA_DONTWAIT, NULL, NULL,
+	    NULL);
+	if (ret != DDI_DMA_MAPPED) {
+		ddi_dma_free_handle(&tcb->itcb_lso_dmah);
+		tcb->itcb_lso_dmah = NULL;
+		ice_tcb_free(itr, tcb);
+		itr->itxr_stats.ictxs_bind_fails.value.ui64++;
+		return (NULL);
+	}
+
+	ncookies = ddi_dma_ncookies(tcb->itcb_lso_dmah);
+	if (ncookies == 0 || ncookies > ICE_TX_LSO_MAX_COOKIE) {
+		(void) ddi_dma_unbind_handle(tcb->itcb_lso_dmah);
+		ddi_dma_free_handle(&tcb->itcb_lso_dmah);
+		tcb->itcb_lso_dmah = NULL;
+		ice_tcb_free(itr, tcb);
+		return (NULL);
+	}
+
+	tcb->itcb_type = ITCB_LSO_BIND;
+	tcb->itcb_len = (uint32_t)len;
+	itr->itxr_stats.ictxs_bind_bytes.value.ui64 += len;
+	itr->itxr_stats.ictxs_bind_frags.value.ui64++;
+
+	*ncookiesp = ncookies;
+	return (tcb);
+}
+
+/*
  * Copy the entire packet into a single pool buffer.  Used for small packets
  * and as the fallback when a fragment cannot be (or is not worth) bound.  The
  * small pool is tried first; if it cannot hold the frame, the full-size pool
@@ -519,6 +635,120 @@ ice_tx_copy_packet(ice_tx_ring_t *itr, mblk_t *mp, size_t msglen,
 }
 
 /*
+ * Copy from an mblk cursor while advancing it.  Header and fallback copies use
+ * the same cursor so malformed chains cannot make the payload walk revisit or
+ * skip bytes.
+ */
+static boolean_t
+ice_tx_mblk_copy(mblk_t **mpp, size_t *offp, caddr_t dst, size_t len)
+{
+	mblk_t *mp = *mpp;
+	size_t off = *offp;
+
+	while (len > 0) {
+		size_t mlen, ncopy;
+
+		if (mp == NULL || mp->b_wptr < mp->b_rptr)
+			return (B_FALSE);
+
+		mlen = MBLKL(mp);
+		if (off > mlen)
+			return (B_FALSE);
+		if (off == mlen) {
+			mp = mp->b_cont;
+			off = 0;
+			continue;
+		}
+
+		ncopy = MIN(len, mlen - off);
+		bcopy(mp->b_rptr + off, dst, ncopy);
+		dst += ncopy;
+		off += ncopy;
+		len -= ncopy;
+
+		if (off == mlen) {
+			mp = mp->b_cont;
+			off = 0;
+		}
+	}
+
+	*mpp = mp;
+	*offp = off;
+	return (B_TRUE);
+}
+
+static boolean_t
+ice_tx_mblk_advance(mblk_t **mpp, size_t *offp, size_t len)
+{
+	mblk_t *mp = *mpp;
+	size_t off = *offp;
+
+	while (len > 0) {
+		size_t mlen, nadvance;
+
+		if (mp == NULL || mp->b_wptr < mp->b_rptr)
+			return (B_FALSE);
+
+		mlen = MBLKL(mp);
+		if (off > mlen)
+			return (B_FALSE);
+		if (off == mlen) {
+			mp = mp->b_cont;
+			off = 0;
+			continue;
+		}
+
+		nadvance = MIN(len, mlen - off);
+		off += nadvance;
+		len -= nadvance;
+		if (off == mlen) {
+			mp = mp->b_cont;
+			off = 0;
+		}
+	}
+
+	*mpp = mp;
+	*offp = off;
+	return (B_TRUE);
+}
+
+static ice_tx_ctrl_block_t *
+ice_tx_lso_copy(ice_tx_ring_t *itr, mblk_t **mpp, size_t *offp, size_t len,
+    ice_tx_build_t *resp)
+{
+	ice_t *ice = itr->itxr_ice;
+	ice_tx_ctrl_block_t *tcb;
+
+	tcb = ice_tcb_alloc(itr);
+	if (tcb == NULL) {
+		*resp = ICE_TX_BUILD_NORES;
+		return (NULL);
+	}
+
+	tcb->itcb_buf = ice_lso_buf_alloc(ice);
+	if (tcb->itcb_buf == NULL) {
+		ice_tcb_free(itr, tcb);
+		*resp = ICE_TX_BUILD_NORES;
+		return (NULL);
+	}
+	tcb->itcb_type = ITCB_LSO_COPY;
+
+	if (len == 0 || len > tcb->itcb_buf->idb_len ||
+	    !ice_tx_mblk_copy(mpp, offp, tcb->itcb_buf->idb_va, len)) {
+		ice_tcb_free(itr, tcb);
+		*resp = ICE_TX_BUILD_DROP;
+		return (NULL);
+	}
+
+	tcb->itcb_len = (uint32_t)len;
+	itr->itxr_stats.ictxs_copy_bytes.value.ui64 += len;
+	itr->itxr_stats.ictxs_copy_frags.value.ui64++;
+	*resp = ICE_TX_BUILD_OK;
+
+	return (tcb);
+}
+
+/*
  * Write one DATA descriptor.  buf_addr is the fragment's IOVA; bufsz its
  * length (capped at ICE_TX_MAX_BUFSZ -- the caller guarantees fragments fit,
  * since copy buffers are frame-sized and bound cookies obey the bind attrs).
@@ -541,81 +771,141 @@ ice_tx_write_desc(ice_tx_ring_t *itr, uint16_t slot, uint64_t pa,
 	desc->cmd_type_offset_bsz = CPU_TO_LE64(qw1);
 }
 
+static void
+ice_tx_write_ctx_desc(ice_tx_ring_t *itr, uint16_t slot, uint32_t mss,
+    uint32_t tsolen)
+{
+	struct ice_tx_ctx_desc *desc;
+	uint64_t qw1;
+
+	desc = (struct ice_tx_ctx_desc *)&itr->itxr_descs[slot];
+	qw1 = ((uint64_t)ICE_TX_DESC_DTYPE_CTX <<
+	    ICE_TXD_CTX_QW1_DTYPE_S) |
+	    ((uint64_t)ICE_TX_CTX_DESC_TSO << ICE_TXD_CTX_QW1_CMD_S) |
+	    ((uint64_t)tsolen << ICE_TXD_CTX_QW1_TSO_LEN_S) |
+	    ((uint64_t)mss << ICE_TXD_CTX_QW1_MSS_S);
+
+	desc->tunneling_params = 0;
+	desc->l2tag2 = 0;
+	desc->rsvd = 0;
+	desc->qw1 = CPU_TO_LE64(qw1);
+}
+
 /*
- * Translate a frame's requested checksum offloads into the data-descriptor
- * command and offset fields the hardware reads on every descriptor of the
- * packet.  The header lengths come from mac_ether_offload_info().  Returns
- * B_FALSE only when an offload was asked for but the headers could not be
- * parsed, in which case the caller drops the frame rather than emit a bad
- * descriptor.
+ * Translate requested offloads into data-descriptor fields and, when needed,
+ * the TSO context.  Invalid metadata is dropped because trusting it can make
+ * the hardware read beyond the packet or wedge the transmit queue.
  */
-static boolean_t
-ice_tx_offload(mblk_t *mp, uint64_t *cmdp, uint64_t *offp)
+static ice_tx_build_t
+ice_tx_context(ice_t *ice, mblk_t *mp, ice_tx_ctx_t *ctx)
 {
 	mac_ether_offload_info_t meo;
-	uint32_t chkflags;
-	uint64_t cmd = 0, off = 0;
+	uint32_t chkflags, lsoflags, mss = 0;
+	size_t hdrlen, tsolen;
 	const uint32_t l23 = MEOI_L2INFO_SET | MEOI_L3INFO_SET;
 
-	*cmdp = 0;
-	*offp = 0;
+	bzero(ctx, sizeof (*ctx));
 
 	mac_hcksum_get(mp, NULL, NULL, NULL, NULL, &chkflags);
-	if (chkflags == 0)
-		return (B_TRUE);
+	mac_lso_get(mp, &mss, &lsoflags);
+	if (chkflags == 0 && lsoflags == 0)
+		return (ICE_TX_BUILD_OK);
 
 	mac_ether_offload_info(mp, &meo);
+	ctx->itc_use_ctx = (lsoflags & HW_LSO) != 0;
 
 	if ((chkflags & HCK_IPV4_HDRCKSUM) != 0) {
 		if ((meo.meoi_flags & l23) != l23 ||
 		    meo.meoi_l3proto != ETHERTYPE_IP)
-			return (B_FALSE);
-		cmd |= ICE_TX_DESC_CMD_IIPT_IPV4_CSUM;
-		off |= (uint64_t)(meo.meoi_l2hlen >> 1) <<
+			return (ICE_TX_BUILD_DROP);
+		ctx->itc_data_cmd |= ICE_TX_DESC_CMD_IIPT_IPV4_CSUM;
+		ctx->itc_data_off |= (uint64_t)(meo.meoi_l2hlen >> 1) <<
 		    ICE_TX_DESC_LEN_MACLEN_S;
-		off |= (uint64_t)(meo.meoi_l3hlen >> 2) <<
+		ctx->itc_data_off |= (uint64_t)(meo.meoi_l3hlen >> 2) <<
 		    ICE_TX_DESC_LEN_IPLEN_S;
 	}
 
 	if ((chkflags & HCK_PARTIALCKSUM) != 0) {
 		if ((meo.meoi_flags & MEOI_L4INFO_SET) == 0)
-			return (B_FALSE);
+			return (ICE_TX_BUILD_DROP);
 
 		if ((chkflags & HCK_IPV4_HDRCKSUM) == 0) {
 			if ((meo.meoi_flags & l23) != l23)
-				return (B_FALSE);
+				return (ICE_TX_BUILD_DROP);
 			if (meo.meoi_l3proto == ETHERTYPE_IP)
-				cmd |= ICE_TX_DESC_CMD_IIPT_IPV4;
+				ctx->itc_data_cmd |= ICE_TX_DESC_CMD_IIPT_IPV4;
 			else if (meo.meoi_l3proto == ETHERTYPE_IPV6)
-				cmd |= ICE_TX_DESC_CMD_IIPT_IPV6;
+				ctx->itc_data_cmd |= ICE_TX_DESC_CMD_IIPT_IPV6;
 			else
-				return (B_FALSE);
-			off |= (uint64_t)(meo.meoi_l2hlen >> 1) <<
+				return (ICE_TX_BUILD_DROP);
+			ctx->itc_data_off |=
+			    (uint64_t)(meo.meoi_l2hlen >> 1) <<
 			    ICE_TX_DESC_LEN_MACLEN_S;
-			off |= (uint64_t)(meo.meoi_l3hlen >> 2) <<
+			ctx->itc_data_off |=
+			    (uint64_t)(meo.meoi_l3hlen >> 2) <<
 			    ICE_TX_DESC_LEN_IPLEN_S;
 		}
 
 		switch (meo.meoi_l4proto) {
 		case IPPROTO_TCP:
-			cmd |= ICE_TX_DESC_CMD_L4T_EOFT_TCP;
+			ctx->itc_data_cmd |= ICE_TX_DESC_CMD_L4T_EOFT_TCP;
 			break;
 		case IPPROTO_UDP:
-			cmd |= ICE_TX_DESC_CMD_L4T_EOFT_UDP;
+			ctx->itc_data_cmd |= ICE_TX_DESC_CMD_L4T_EOFT_UDP;
 			break;
 		case IPPROTO_SCTP:
-			cmd |= ICE_TX_DESC_CMD_L4T_EOFT_SCTP;
+			ctx->itc_data_cmd |= ICE_TX_DESC_CMD_L4T_EOFT_SCTP;
 			break;
 		default:
-			return (B_FALSE);
+			return (ICE_TX_BUILD_DROP);
 		}
-		off |= (uint64_t)(meo.meoi_l4hlen >> 2) <<
+		ctx->itc_data_off |= (uint64_t)(meo.meoi_l4hlen >> 2) <<
 		    ICE_TX_DESC_LEN_L4_LEN_S;
 	}
 
-	*cmdp = cmd;
-	*offp = off;
-	return (B_TRUE);
+	if ((lsoflags & HW_LSO) == 0)
+		return (ICE_TX_BUILD_OK);
+
+	if ((chkflags & HCK_PARTIALCKSUM) == 0 ||
+	    (meo.meoi_l3proto == ETHERTYPE_IP &&
+	    (chkflags & HCK_IPV4_HDRCKSUM) == 0))
+		return (ICE_TX_BUILD_DROP);
+
+	if ((meo.meoi_flags & (l23 | MEOI_L4INFO_SET)) !=
+	    (l23 | MEOI_L4INFO_SET) ||
+	    (meo.meoi_l3proto != ETHERTYPE_IP &&
+	    meo.meoi_l3proto != ETHERTYPE_IPV6) ||
+	    meo.meoi_l4proto != IPPROTO_TCP ||
+	    meo.meoi_l2hlen > ICE_TXD_MACLEN_MAX ||
+	    meo.meoi_l3hlen > ICE_TXD_IPLEN_MAX ||
+	    meo.meoi_l4hlen > ICE_TXD_L4LEN_MAX ||
+	    (meo.meoi_l2hlen & 1) != 0 ||
+	    (meo.meoi_l3hlen & 3) != 0 ||
+	    (meo.meoi_l4hlen & 3) != 0)
+		return (ICE_TX_BUILD_DROP);
+
+	hdrlen = meo.meoi_l2hlen + meo.meoi_l3hlen + meo.meoi_l4hlen;
+	if (hdrlen == 0 || hdrlen >= meo.meoi_len ||
+	    meo.meoi_len != msgdsize(mp))
+		return (ICE_TX_BUILD_DROP);
+	tsolen = meo.meoi_len - hdrlen;
+	if (tsolen > ICE_LSO_MAXLEN)
+		return (ICE_TX_BUILD_DROP);
+
+	if (mss < ICE_TX_LSO_MIN_MSS) {
+		if (meo.meoi_len > ice->ice_mtu)
+			return (ICE_TX_BUILD_DROP);
+		ctx->itc_use_ctx = B_FALSE;
+		return (ICE_TX_BUILD_OK);
+	}
+	if (mss > ICE_TXD_CTX_MAX_MSS)
+		return (ICE_TX_BUILD_DROP);
+
+	ctx->itc_mss = mss;
+	ctx->itc_tsolen = (uint32_t)tsolen;
+	ASSERT3U(ctx->itc_mss, <=, ICE_TXD_CTX_MAX_MSS);
+
+	return (ICE_TX_BUILD_OK);
 }
 
 /*
@@ -673,6 +963,253 @@ force_copy:
 	return (ICE_TX_BUILD_OK);
 }
 
+static void
+ice_tx_free_tcbs(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs,
+    uint_t ntcb)
+{
+	while (ntcb > 0)
+		ice_tcb_free(itr, tcbs[--ntcb]);
+}
+
+/*
+ * Model the controller's sliding MSS window for one data descriptor.  A
+ * descriptor that crosses an MSS boundary is counted once in both segments.
+ */
+static boolean_t
+ice_tx_lso_desc_fits(size_t len, uint32_t mss, size_t *segbytesp,
+    uint_t *segdescsp)
+{
+	size_t segbytes = *segbytesp;
+	uint_t segdescs = *segdescsp;
+
+	if (len == 0)
+		return (B_FALSE);
+
+	while (len > 0) {
+		size_t nbytes;
+
+		if (++segdescs > ICE_TX_LSO_SEG_DESCS)
+			return (B_FALSE);
+
+		nbytes = MIN(len, mss - segbytes);
+		segbytes += nbytes;
+		len -= nbytes;
+		if (segbytes == mss) {
+			segbytes = 0;
+			segdescs = 0;
+		}
+	}
+
+	*segbytesp = segbytes;
+	*segdescsp = segdescs;
+	return (B_TRUE);
+}
+
+/*
+ * Build an LSO header and payload without changing ring accounting.  Bindings
+ * that would leave an unfinished segment at the descriptor limit are replaced
+ * by one copy descriptor that spans enough MSS boundaries to restore margin.
+ */
+static ice_tx_build_t
+ice_tx_lso_build(ice_tx_ring_t *itr, mblk_t *mp,
+    const ice_tx_ctx_t *ctx, ice_tx_ctrl_block_t **tcbs, uint_t *ntcbp,
+    uint_t *ndescp, boolean_t allow_pullup)
+{
+	mac_ether_offload_info_t meo;
+	ice_tx_build_t res;
+	ice_tx_ctrl_block_t *tcb;
+	mblk_t *cmp = mp;
+	size_t coff = 0;
+	size_t hdrlen, remaining;
+	size_t segbytes = 0;
+	uint_t segdescs = 0;
+	uint_t ntcb = 0, ndesc = 0;
+	const uint32_t meoflags = MEOI_L2INFO_SET | MEOI_L3INFO_SET |
+	    MEOI_L4INFO_SET;
+
+	mac_ether_offload_info(mp, &meo);
+	hdrlen = meo.meoi_l2hlen + meo.meoi_l3hlen + meo.meoi_l4hlen;
+	if ((meo.meoi_flags & meoflags) != meoflags ||
+	    meo.meoi_l4proto != IPPROTO_TCP || hdrlen == 0 ||
+	    hdrlen >= meo.meoi_len || meo.meoi_len != msgdsize(mp) ||
+	    ctx->itc_tsolen != meo.meoi_len - hdrlen ||
+	    hdrlen > ICE_TX_LSO_BUFSZ)
+		return (ICE_TX_BUILD_DROP);
+
+	/*
+	 * Keeping headers separate prevents the controller from charging one
+	 * descriptor once for the header and again for the first payload
+	 * segment.
+	 */
+	tcb = ice_tx_lso_copy(itr, &cmp, &coff, hdrlen, &res);
+	if (tcb == NULL)
+		return (res);
+	tcbs[ntcb++] = tcb;
+	ndesc++;
+	remaining = ctx->itc_tsolen;
+
+	while (remaining > 0) {
+		size_t mlen, fraglen;
+		size_t tsegbytes;
+		uint_t tsegdescs;
+		uint_t ncookies = 0;
+		uint_t c;
+		boolean_t fits = B_TRUE;
+
+		while (cmp != NULL) {
+			if (cmp->b_wptr < cmp->b_rptr)
+				goto drop;
+			mlen = MBLKL(cmp);
+			if (coff > mlen)
+				goto drop;
+			if (coff != mlen)
+				break;
+			cmp = cmp->b_cont;
+			coff = 0;
+		}
+		if (cmp == NULL)
+			goto drop;
+
+		fraglen = MIN(remaining, mlen - coff);
+		tcb = ice_tx_bind_lso_fragment(itr,
+		    (caddr_t)(cmp->b_rptr + coff), fraglen, &ncookies);
+		if (tcb == NULL) {
+			if (allow_pullup)
+				goto pullup;
+			goto force_copy;
+		}
+
+		if (ndesc + ncookies > ICE_TX_MAX_LSO_DESC) {
+			ice_tcb_free(itr, tcb);
+			if (allow_pullup)
+				goto pullup;
+			goto force_copy;
+		}
+
+		tsegbytes = segbytes;
+		tsegdescs = segdescs;
+		for (c = 0; c < ncookies; c++) {
+			const ddi_dma_cookie_t *ck;
+			boolean_t more;
+
+			ck = ddi_dma_cookie_get(tcb->itcb_lso_dmah, c);
+			if (ck->dmac_size == 0 ||
+			    ck->dmac_size > ICE_TX_MAX_BUFSZ ||
+			    !ice_tx_lso_desc_fits(ck->dmac_size, ctx->itc_mss,
+			    &tsegbytes, &tsegdescs)) {
+				fits = B_FALSE;
+				break;
+			}
+
+			more = c + 1 < ncookies || remaining > fraglen;
+			if (more && tsegbytes != 0 &&
+			    tsegdescs == ICE_TX_LSO_SEG_DESCS) {
+				fits = B_FALSE;
+				break;
+			}
+		}
+
+		if (!fits) {
+			ice_tcb_free(itr, tcb);
+			goto force_copy;
+		}
+
+		if (!ice_tx_mblk_advance(&cmp, &coff, fraglen)) {
+			ice_tcb_free(itr, tcb);
+			goto drop;
+		}
+		ASSERT3U(ntcb, <, ICE_TX_MAX_LSO_DESC + 1);
+		tcbs[ntcb++] = tcb;
+		ndesc += ncookies;
+		remaining -= fraglen;
+		segbytes = tsegbytes;
+		segdescs = tsegdescs;
+		continue;
+
+force_copy:
+		/*
+		 * One frame-sized descriptor can cross every supported MSS, so
+		 * it reduces total descriptors and closes a crowded segment.
+		 */
+		if (ndesc == ICE_TX_MAX_LSO_DESC) {
+			if (allow_pullup)
+				goto pullup;
+			goto drop;
+		}
+		fraglen = MIN(remaining, (size_t)ICE_TX_LSO_BUFSZ);
+		tcb = ice_tx_lso_copy(itr, &cmp, &coff, fraglen, &res);
+		if (tcb == NULL)
+			goto fail;
+
+		tsegbytes = segbytes;
+		tsegdescs = segdescs;
+		if (!ice_tx_lso_desc_fits(fraglen, ctx->itc_mss,
+		    &tsegbytes, &tsegdescs) ||
+		    (remaining > fraglen && tsegbytes != 0 &&
+		    tsegdescs == ICE_TX_LSO_SEG_DESCS)) {
+			ice_tcb_free(itr, tcb);
+			goto drop;
+		}
+
+		ASSERT3U(ntcb, <, ICE_TX_MAX_LSO_DESC + 1);
+		tcbs[ntcb++] = tcb;
+		ndesc++;
+		remaining -= fraglen;
+		segbytes = tsegbytes;
+		segdescs = tsegdescs;
+	}
+
+	ASSERT3U(ndesc, <=, ICE_TX_MAX_LSO_DESC);
+	*ntcbp = ntcb;
+	*ndescp = ndesc;
+	return (ICE_TX_BUILD_OK);
+
+pullup:
+	res = ICE_TX_BUILD_PULLUP;
+	goto fail;
+drop:
+	res = ICE_TX_BUILD_DROP;
+fail:
+	ice_tx_free_tcbs(itr, tcbs, ntcb);
+	return (res);
+}
+
+/*
+ * Fragmentation can make a valid LSO packet impossible to describe safely.
+ * Pulling it up once gives the bind path one terminal retry while preserving
+ * the original message for MAC back-pressure if allocation fails.
+ */
+static ice_tx_build_t
+ice_tx_lso_chain(ice_tx_ring_t *itr, mblk_t *mp, const ice_tx_ctx_t *ctx,
+    ice_tx_ctrl_block_t **tcbs, uint_t *ntcbp, uint_t *ndescp,
+    mblk_t **txmpp)
+{
+	ice_tx_build_t res;
+	mblk_t *pullup;
+
+	*txmpp = mp;
+	res = ice_tx_lso_build(itr, mp, ctx, tcbs, ntcbp, ndescp, B_TRUE);
+	if (res != ICE_TX_BUILD_PULLUP)
+		return (res);
+
+	pullup = msgpullup(mp, -1);
+	if (pullup == NULL)
+		return (ICE_TX_BUILD_NORES);
+	itr->itxr_stats.ictxs_lso_pullups.value.ui64++;
+
+	res = ice_tx_lso_build(itr, pullup, ctx, tcbs, ntcbp, ndescp,
+	    B_FALSE);
+	if (res == ICE_TX_BUILD_OK) {
+		*txmpp = pullup;
+		return (res);
+	}
+
+	freemsg(pullup);
+	if (res == ICE_TX_BUILD_PULLUP)
+		res = ICE_TX_BUILD_NORES;
+	return (res);
+}
+
 /*
  * Sync a TCB's data buffer toward the device.  Copy buffers sync the pool
  * buffer; bound fragments sync the bind handle.
@@ -685,6 +1222,7 @@ ice_tx_sync_tcb(ice_t *ice, ice_tx_ctrl_block_t *tcb)
 	switch (tcb->itcb_type) {
 	case ITCB_SMALL_COPY:
 	case ITCB_COPY:
+	case ITCB_LSO_COPY:
 		h = tcb->itcb_buf->idb_dma_handle;
 		break;
 	case ITCB_BIND:
@@ -714,7 +1252,7 @@ ice_tx_sync_tcb(ice_t *ice, ice_tx_ctrl_block_t *tcb)
  */
 static boolean_t
 ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs, uint_t ntcb,
-    uint_t ndesc, mblk_t *mp, uint64_t ocmd, uint64_t ooff)
+    uint_t ndesc, mblk_t *mp, const ice_tx_ctx_t *ctx)
 {
 	ice_t *ice = itr->itxr_ice;
 	struct ice_hw *hw = &ice->ice_hw;
@@ -733,6 +1271,16 @@ ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs, uint_t ntcb,
 			return (B_FALSE);
 	}
 
+	if (ctx->itc_use_ctx) {
+		uint16_t ctxslot = tail;
+
+		ice_tx_write_ctx_desc(itr, ctxslot, ctx->itc_mss,
+		    ctx->itc_tsolen);
+		itr->itxr_tcbs[ctxslot] = NULL;
+		tail = ice_tx_ring_next(itr, tail);
+		written++;
+	}
+
 	for (i = 0; i < ntcb; i++) {
 		ice_tx_ctrl_block_t *tcb = tcbs[i];
 		uint16_t first = tail;
@@ -746,16 +1294,31 @@ ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs, uint_t ntcb,
 				    ddi_dma_cookie_get(tcb->itcb_dmah, c);
 
 				ice_tx_write_desc(itr, tail,
-				    ck->dmac_laddress, ck->dmac_size, ocmd,
-				    ooff);
+				    ck->dmac_laddress, ck->dmac_size,
+				    ctx->itc_data_cmd, ctx->itc_data_off);
+				last = tail;
+				tail = ice_tx_ring_next(itr, tail);
+				written++;
+			}
+		} else if (tcb->itcb_type == ITCB_LSO_BIND) {
+			uint_t nc = ddi_dma_ncookies(tcb->itcb_lso_dmah);
+			uint_t c;
+
+			for (c = 0; c < nc; c++) {
+				const ddi_dma_cookie_t *ck =
+				    ddi_dma_cookie_get(tcb->itcb_lso_dmah, c);
+
+				ice_tx_write_desc(itr, tail,
+				    ck->dmac_laddress, ck->dmac_size,
+				    ctx->itc_data_cmd, ctx->itc_data_off);
 				last = tail;
 				tail = ice_tx_ring_next(itr, tail);
 				written++;
 			}
 		} else {
 			ice_tx_write_desc(itr, tail,
-			    ICE_DMA_PA(tcb->itcb_buf), tcb->itcb_len, ocmd,
-			    ooff);
+			    ICE_DMA_PA(tcb->itcb_buf), tcb->itcb_len,
+			    ctx->itc_data_cmd, ctx->itc_data_off);
 			last = tail;
 			tail = ice_tx_ring_next(itr, tail);
 			written++;
@@ -934,22 +1497,40 @@ ice_tx_recycle(ice_tx_ring_t *itr)
 static boolean_t
 ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 {
-	ice_tx_ctrl_block_t *tcbs[ICE_TX_MAX_COOKIE];
+	ice_t *ice = itr->itxr_ice;
+	ice_tx_ctrl_block_t *tcbs[ICE_TX_MAX_LSO_DESC + 1];
+	ice_tx_ctx_t ctx;
 	ice_tx_build_t res;
+	mblk_t *txmp = mp;
 	size_t msglen;
-	uint64_t ocmd, ooff;
 	uint_t ntcb = 0, ndesc = 0;
-	uint_t i;
 
 	msglen = msgdsize(mp);
 
-	if (!ice_tx_offload(mp, &ocmd, &ooff)) {
+	res = ice_tx_context(ice, mp, &ctx);
+	if (res == ICE_TX_BUILD_OK && ctx.itc_use_ctx &&
+	    !ice->ice_tx_lso_enable)
+		res = ICE_TX_BUILD_DROP;
+	if (res != ICE_TX_BUILD_OK) {
 		freemsg(mp);
 		itr->itxr_stats.ictxs_drops.value.ui64++;
+		if (ctx.itc_use_ctx)
+			itr->itxr_stats.ictxs_lso_drops.value.ui64++;
 		return (B_TRUE);
 	}
 
-	res = ice_tx_build_tcbs(itr, mp, msglen, tcbs, &ntcb, &ndesc);
+	if (ctx.itc_use_ctx) {
+		res = ice_tx_lso_chain(itr, mp, &ctx, tcbs, &ntcb, &ndesc,
+		    &txmp);
+		if (res == ICE_TX_BUILD_OK) {
+			ASSERT3U(ndesc, <=, ICE_TX_MAX_LSO_DESC);
+			ndesc++;
+		}
+	} else {
+		res = ice_tx_build_tcbs(itr, mp, msglen, tcbs, &ntcb,
+		    &ndesc);
+	}
+
 	if (res == ICE_TX_BUILD_NORES) {
 		/*
 		 * No TCBs/buffers right now.  Arm back-pressure so this ring's
@@ -958,6 +1539,8 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 		mutex_enter(&itr->itxr_lock);
 		itr->itxr_blocked = B_TRUE;
 		itr->itxr_stats.ictxs_blocked.value.ui64++;
+		if (ctx.itc_use_ctx)
+			itr->itxr_stats.ictxs_lso_nores.value.ui64++;
 		mutex_exit(&itr->itxr_lock);
 		return (B_FALSE);
 	}
@@ -965,8 +1548,11 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 		/* Undeliverable (too large to copy, unbindable); drop it. */
 		freemsg(mp);
 		itr->itxr_stats.ictxs_drops.value.ui64++;
+		if (ctx.itc_use_ctx)
+			itr->itxr_stats.ictxs_lso_drops.value.ui64++;
 		return (B_TRUE);
 	}
+	ASSERT3U(res, ==, ICE_TX_BUILD_OK);
 
 	mutex_enter(&itr->itxr_lock);
 
@@ -975,28 +1561,38 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 		if (itr->itxr_avail <= ndesc) {
 			itr->itxr_blocked = B_TRUE;
 			itr->itxr_stats.ictxs_blocked.value.ui64++;
+			if (ctx.itc_use_ctx)
+				itr->itxr_stats.ictxs_lso_nores.value.ui64++;
 			mutex_exit(&itr->itxr_lock);
-			for (i = 0; i < ntcb; i++)
-				ice_tcb_free(itr, tcbs[i]);
+			ice_tx_free_tcbs(itr, tcbs, ntcb);
+			if (txmp != mp)
+				freemsg(txmp);
 			return (B_FALSE);
 		}
 	}
 
-	if (!ice_tx_emit(itr, tcbs, ntcb, ndesc, mp, ocmd, ooff)) {
+	if (!ice_tx_emit(itr, tcbs, ntcb, ndesc, txmp, &ctx)) {
 		mutex_exit(&itr->itxr_lock);
 		/*
 		 * Fatal DMA error: the device is wedged.  Drop the frame; the
 		 * emitted slots are torn back to a consistent state by emit.
 		 */
-		for (i = 0; i < ntcb; i++)
-			ice_tcb_free(itr, tcbs[i]);
-		freemsg(mp);
+		ice_tx_free_tcbs(itr, tcbs, ntcb);
+		freemsg(txmp);
+		if (txmp != mp)
+			freemsg(mp);
 		itr->itxr_stats.ictxs_drops.value.ui64++;
+		if (ctx.itc_use_ctx)
+			itr->itxr_stats.ictxs_lso_drops.value.ui64++;
 		return (B_TRUE);
 	}
+	if (txmp != mp)
+		freemsg(mp);
 
 	itr->itxr_stats.ictxs_bytes.value.ui64 += msglen;
 	itr->itxr_stats.ictxs_packets.value.ui64++;
+	if (ctx.itc_use_ctx)
+		itr->itxr_stats.ictxs_lso_packets.value.ui64++;
 
 	mutex_exit(&itr->itxr_lock);
 

@@ -15,6 +15,7 @@ python3 usr/src/test/ice-tests/vsi_tx_vlan.py
 python3 usr/src/test/ice-tests/loopback.py
 python3 usr/src/test/ice-tests/hw_stats.py
 python3 usr/src/test/ice-tests/link_speed_caps.py
+python3 usr/src/test/ice-tests/lso.py
 ```
 
 `rx_checksum.py` verifies that receive checksum metadata is captured before
@@ -83,3 +84,10 @@ private-kstat failures retain the established unaffected-service policy.
 set with automatic FEC, media insertion reapplies that configuration, and the
 cached supported and advertised speed/FEC values reach the GLDv3 statistics
 and read-only property callbacks.
+
+`lso.py` verifies the dark-by-default LSO capability gate, context descriptor
+encoding, hostile-metadata checks, per-segment and per-packet descriptor
+limits, LSO bind emission, frame-sized copy fallback, DMA cookie-size guard,
+and compile-time descriptor-layout checks. The `tx_lso_enable` integer driver
+property remains zero by default and should be set in `/kernel/drv/ice.conf`
+only for hardware validation.

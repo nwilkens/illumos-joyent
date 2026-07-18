@@ -29,7 +29,8 @@
  * entry, tracked on the VSI's vi_macs list).  Link state is reported from cache
  * ice_intr.c maintains; the MAC path never blocks on hardware.
  *
- * Hardware checksum offload is advertised (MAC_CAPAB_HCKSUM); LSO is not yet.
+ * Hardware checksum offload is advertised.  LSO remains dark unless the
+ * operator enables the validation property before attach.
  */
 
 #include <sys/mac_provider.h>
@@ -812,8 +813,19 @@ ice_m_getcapab(void *arg, mac_capab_t capab, void *cap_data)
 		break;
 	}
 
-	/* LSO is not advertised yet. */
-	case MAC_CAPAB_LSO:
+	case MAC_CAPAB_LSO: {
+		mac_capab_lso_t *cap_lso = cap_data;
+
+		if (!ice->ice_tx_lso_enable)
+			return (B_FALSE);
+
+		cap_lso->lso_flags = LSO_TX_BASIC_TCP_IPV4 |
+		    LSO_TX_BASIC_TCP_IPV6;
+		cap_lso->lso_basic_tcp_ipv4.lso_max = ICE_LSO_MAXLEN;
+		cap_lso->lso_basic_tcp_ipv6.lso_max = ICE_LSO_MAXLEN;
+		break;
+	}
+
 	default:
 		return (B_FALSE);
 	}
