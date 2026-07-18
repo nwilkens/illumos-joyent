@@ -25,6 +25,7 @@
 
 #include <sys/atomic.h>
 #include <sys/cmn_err.h>
+#include <sys/cpuvar.h>
 #include <sys/varargs.h>
 
 #include "ice.h"
@@ -44,6 +45,7 @@
 
 static int ice_attach(dev_info_t *, ddi_attach_cmd_t);
 static int ice_detach(dev_info_t *, ddi_detach_cmd_t);
+static uint32_t ice_prop_get_num_queues(ice_t *);
 
 static void *ice_state_p;
 
@@ -413,7 +415,9 @@ static boolean_t
 ice_alloc_intrs(ice_t *ice)
 {
 	dev_info_t *dip = ice->ice_dip;
-	uint32_t nvec = ice->ice_hw.func_caps.common_cap.num_msix_vectors;
+	struct ice_hw *hw = &ice->ice_hw;
+	uint32_t nvec = hw->func_caps.common_cap.num_msix_vectors;
+	uint32_t qcap, cpus, vcap, nprop, nreq;
 	int types, nintrs, navail, actual, request, rc;
 
 	if (ddi_intr_get_supported_types(dip, &types) != DDI_SUCCESS ||
@@ -436,19 +440,28 @@ ice_alloc_intrs(ice_t *ice)
 		return (B_FALSE);
 	}
 
+	qcap = MIN(hw->func_caps.common_cap.num_rxq,
+	    hw->func_caps.common_cap.num_txq);
 	/*
-	 * Exactly ICE_INTR_MSIX_MIN vectors (one other-cause, one queue) are
-	 * requested at this milestone; per-queue vectors are added with the
-	 * data path.  Both navail and the firmware count were already confirmed
-	 * to meet this minimum above.
+	 * Attach can observe one CPU before the rest of the boot CPUs are
+	 * online.
 	 */
-	request = ICE_INTR_MSIX_MIN;
+	cpus = (ncpus >= 2) ? (uint32_t)ncpus :
+	    ((boot_max_ncpus == -1) ? (uint32_t)max_ncpus :
+	    (uint32_t)boot_max_ncpus);
+	vcap = (nvec > 1) ? (uint32_t)nvec - 1 : 1;
+	nprop = ice_prop_get_num_queues(ice);
+	nreq = MIN(MIN(MIN(qcap, cpus),
+	    MIN(vcap, (uint32_t)ICE_MAX_INTR_QUEUES)), nprop);
+	nreq = (nreq < 1) ? 1 : (1u << ice_ilog2(nreq));
+	request = (int)(1 + nreq);
+	if (request < ICE_INTR_MSIX_MIN)
+		request = ICE_INTR_MSIX_MIN;
 	if (nvec < (uint32_t)request) {
 		ice_error(ice, "firmware reports too few MSI-X vectors: %u",
 		    nvec);
 		return (B_FALSE);
 	}
-
 	ice->ice_intr_size = request * sizeof (ddi_intr_handle_t);
 	ice->ice_intr_handles = kmem_zalloc(ice->ice_intr_size, KM_SLEEP);
 
@@ -472,6 +485,8 @@ ice_alloc_intrs(ice_t *ice)
 		ice_free_intrs(ice);
 		return (B_FALSE);
 	}
+	ice->ice_nqueues = (uint16_t)MIN(nreq,
+	    1u << ice_ilog2((uint32_t)actual - 1));
 
 	if (ddi_intr_get_pri(ice->ice_intr_handles[0], &ice->ice_intr_pri) !=
 	    DDI_SUCCESS ||
@@ -674,6 +689,11 @@ ice_unconfigure(ice_t *ice)
 	}
 
 	if (ice->ice_attach_progress & ICE_ATTACH_HW_INIT) {
+		/*
+		 * ice_deinit_hw() also releases the DDP package copy.  It runs
+		 * after interrupt teardown because DDP now precedes interrupt
+		 * allocation during attach.
+		 */
 		ice_deinit_hw(&ice->ice_hw);
 		/*
 		 * Quiesce the function with a PF reset so a later re-attach
@@ -700,6 +720,19 @@ ice_unconfigure(ice_t *ice)
 	mutex_destroy(&ice->ice_loopback_lock);
 	mutex_destroy(&ice->ice_lock);
 	ice->ice_attach_progress = 0;
+}
+
+static uint32_t
+ice_prop_get_num_queues(ice_t *ice)
+{
+	int value;
+
+	value = ddi_prop_get_int(DDI_DEV_T_ANY, ice->ice_dip, 0, "num_queues",
+	    ICE_MAX_INTR_QUEUES);
+	value = MIN(MAX(value, 1), ICE_MAX_INTR_QUEUES);
+
+	/* A power-of-two count keeps the VSI TC encoding exact. */
+	return (1u << ice_ilog2((uint32_t)value));
 }
 
 static int
@@ -771,6 +804,14 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		goto fail;
 	}
 
+	/*
+	 * Load DDP before sizing queues and vectors because safe mode rewrites
+	 * the queue and MSI-X capabilities that ice_alloc_intrs() consumes.
+	 */
+	if (!ice_ddp_load(ice))
+		goto fail;
+	ice->ice_attach_progress |= ICE_ATTACH_DDP;
+
 	if (!ice_alloc_intrs(ice))
 		goto fail;
 	ice->ice_attach_progress |= ICE_ATTACH_ALLOC_INTR;
@@ -811,16 +852,6 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	/* Enable the PHY; firmware will not bring the link up on its own. */
 	ice_setup_link(ice);
 	ice_phy_caps_update(ice);
-
-	/*
-	 * Load the DDP package before the VSI: a missing or rejected package
-	 * drops the device into safe mode, which zeroes the rss_table_size that
-	 * ice_rss_setup() reads (the queue and vector counts are fixed and
-	 * unaffected).
-	 */
-	if (!ice_ddp_load(ice))
-		goto fail;
-	ice->ice_attach_progress |= ICE_ATTACH_DDP;
 
 	if (!ice_vsi_init(ice))
 		goto fail;

@@ -55,6 +55,10 @@ extern "C" {
  * link events, and errors); queue vectors begin at 1.
  */
 #define	ICE_INTR_MSIX_MIN	2
+#define	ICE_MAX_INTR_QUEUES	8
+
+CTASSERT((ICE_MAX_INTR_QUEUES & (ICE_MAX_INTR_QUEUES - 1)) == 0);
+CTASSERT(ICE_INTR_MSIX_MIN == 2);
 
 /*
  * Generous hardware sanity ceilings.  Capability counts arrive from firmware
@@ -137,11 +141,11 @@ typedef enum ice_attach_state {
 	ICE_ATTACH_PCI_CONFIG	= 1 << 1,
 	ICE_ATTACH_REGS_MAP	= 1 << 2,
 	ICE_ATTACH_HW_INIT	= 1 << 3,
-	ICE_ATTACH_ALLOC_INTR	= 1 << 4,
-	ICE_ATTACH_ADD_INTR	= 1 << 5,
-	ICE_ATTACH_OICR_TASKQ	= 1 << 6,
-	ICE_ATTACH_ENABLE_INTR	= 1 << 7,
-	ICE_ATTACH_DDP		= 1 << 8,	/* DDP loaded or safe mode */
+	ICE_ATTACH_DDP		= 1 << 4,	/* DDP loaded or safe mode */
+	ICE_ATTACH_ALLOC_INTR	= 1 << 5,
+	ICE_ATTACH_ADD_INTR	= 1 << 6,
+	ICE_ATTACH_OICR_TASKQ	= 1 << 7,
+	ICE_ATTACH_ENABLE_INTR	= 1 << 8,
 	ICE_ATTACH_VSI		= 1 << 9,
 	ICE_ATTACH_RINGS	= 1 << 10,	/* ring DMA allocated */
 	ICE_ATTACH_QUEUE_INTR	= 1 << 11,	/* queue->vector wired */
@@ -410,6 +414,7 @@ typedef struct ice {
 	int			ice_intr_count;
 	size_t			ice_intr_size;
 	ddi_intr_handle_t	*ice_intr_handles;
+	uint16_t		ice_nqueues;
 
 	/* OICR deferred async work; thread context, serialized via ice_lock. */
 	ddi_taskq_t		*ice_oicr_taskq;

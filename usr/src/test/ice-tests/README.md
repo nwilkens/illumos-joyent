@@ -16,6 +16,7 @@ python3 usr/src/test/ice-tests/loopback.py
 python3 usr/src/test/ice-tests/hw_stats.py
 python3 usr/src/test/ice-tests/link_speed_caps.py
 python3 usr/src/test/ice-tests/lso.py
+python3 usr/src/test/ice-tests/rss.py
 ```
 
 `rx_checksum.py` verifies that receive checksum metadata is captured before
@@ -91,3 +92,8 @@ limits, LSO bind emission, frame-sized copy fallback, DMA cookie-size guard,
 and compile-time descriptor-layout checks. The `tx_lso_enable` integer driver
 property remains zero by default and should be set in `/kernel/drv/ice.conf`
 only for hardware validation.
+
+`rss.py` verifies that interrupt allocation selects a power-of-two data-queue
+count within the property, CPU, firmware queue, MSI-X vector, and driver caps;
+that the granted vector count controls the final queue count; and that the VSI,
+RSS LUT, and GLDv3 receive-ring interrupt handle use that multiqueue layout.

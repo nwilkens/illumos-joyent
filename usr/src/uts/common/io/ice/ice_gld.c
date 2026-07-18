@@ -178,6 +178,10 @@ ice_fill_rx_ring(void *arg, mac_ring_type_t rtype, const int group_index,
 	infop->mri_intr.mi_handle = (mac_intr_handle_t)rxr;
 	infop->mri_intr.mi_enable = ice_ring_rx_intr_enable;
 	infop->mri_intr.mi_disable = ice_ring_rx_intr_disable;
+	if ((ice->ice_intr_type & DDI_INTR_TYPE_MSIX) != 0) {
+		infop->mri_intr.mi_ddi_handle =
+		    ice->ice_intr_handles[rxr->irxr_vec];
+	}
 }
 
 static void

@@ -141,12 +141,24 @@ ice_vsi_teardown(ice_t *ice)
  * on TC0 with a per-VSI RSS LUT and Toeplitz hashing.  The buffer is sent in
  * full, so it must start zeroed.
  */
-static void
+static int
 ice_vsi_ctx_fill(ice_t *ice, struct ice_vsi_ctx *ctx)
 {
 	struct ice_hw *hw = &ice->ice_hw;
 	ice_vsi_t *vsi = &ice->ice_pf_vsi;
 	uint16_t nq = vsi->vi_nrxq;
+
+	/*
+	 * Reject stale queue sizing here because an internal capability
+	 * mismatch must fail attach without panicking the machine.
+	 */
+	if (nq == 0 || nq > MIN(hw->func_caps.common_cap.num_rxq,
+	    hw->func_caps.common_cap.num_txq)) {
+		ice_error(ice, "invalid PF VSI queue count %u (rx %u, tx %u)",
+		    nq, hw->func_caps.common_cap.num_rxq,
+		    hw->func_caps.common_cap.num_txq);
+		return (ICE_ERR_CFG);
+	}
 
 	bzero(ctx, sizeof (*ctx));
 
@@ -176,11 +188,13 @@ ice_vsi_ctx_fill(ice_t *ice, struct ice_vsi_ctx *ctx)
 	ctx->info.q_mapping[1] = CPU_TO_LE16(nq);
 	ctx->info.tc_mapping[0] = CPU_TO_LE16(
 	    (0 << ICE_AQ_VSI_TC_Q_OFFSET_S) |
-	    ((uint16_t)ice_ilog2(nq) << ICE_AQ_VSI_TC_Q_NUM_S));
+	    ((uint16_t)ice_fls(nq - 1) << ICE_AQ_VSI_TC_Q_NUM_S));
 
 	/* A PF VSI uses the PF-wide RSS LUT instance. */
 	ctx->info.q_opt_rss = (ICE_AQ_VSI_Q_OPT_RSS_LUT_PF &
 	    ICE_AQ_VSI_Q_OPT_RSS_LUT_M) | ICE_AQ_VSI_Q_OPT_RSS_TPLZ;
+
+	return (ICE_SUCCESS);
 }
 
 /*
@@ -248,15 +262,12 @@ ice_vsi_setup(ice_t *ice)
 
 	vsi->vi_handle = ICE_PF_VSI_HANDLE;
 
-	/*
-	 * One rx and one tx queue for this milestone; the data path grows
-	 * these later.  The count must be a power of two for the VSI context
-	 * and the scheduler.
-	 */
-	vsi->vi_nrxq = 1;
-	vsi->vi_ntxq = 1;
+	vsi->vi_nrxq = ice->ice_nqueues;
+	vsi->vi_ntxq = ice->ice_nqueues;
 
-	ice_vsi_ctx_fill(ice, &ctx);
+	status = ice_vsi_ctx_fill(ice, &ctx);
+	if (status != ICE_SUCCESS)
+		return (status);
 
 	status = ice_add_vsi(hw, vsi->vi_handle, &ctx, NULL);
 	if (status != ICE_SUCCESS) {
