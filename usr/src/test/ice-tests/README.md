@@ -95,5 +95,29 @@ only for hardware validation.
 
 `rss.py` verifies that interrupt allocation selects a power-of-two data-queue
 count within the property, CPU, firmware queue, MSI-X vector, and driver caps;
-that the granted vector count controls the final queue count; and that the VSI,
-RSS LUT, and GLDv3 receive-ring interrupt handle use that multiqueue layout.
+that the granted vector count controls the final queue count; that the 1:1
+ring-to-vector invariant is asserted at sizing and the MSI-X vector accounting
+is logged; that the queue ISR dispatches by vector index rather than scanning
+rings; and that the VSI, RSS LUT, and GLDv3 receive-ring interrupt handle use
+that multiqueue layout.
+
+## On-hardware datapath acceptance
+
+`datapath_accept.sh` is not a source check: it runs on a host with a live
+`ice0` and a physical peer, and is the reproducible functional regression suite
+for the datapath. Run it on the device under test with the peer already serving
+`iperf -s` on the peer address, once per MTU:
+
+```
+datapath_accept.sh 192.0.2.2 1500
+datapath_accept.sh 192.0.2.2 9000
+```
+
+It asserts the module is bound; the test address plumbs at the requested MTU
+and the link comes up; FMA access/DMA/dropped-ereport counters are zero before
+and after traffic; small and near-MTU ICMP reach the peer; a four-stream
+`iperf` run moves traffic and advances the PF byte counters; MAC and CRC error
+counters stay zero; and three plumb/unplumb cycles each bring the link back
+with FMA still clean. Exit status is zero only if every check passes. Run it
+from both hosts to cover both traffic directions. Validated on boston<->hunter
+at MTU 1500 (9.36 Gbps) and 9000 (9.59 Gbps), all checks green.
