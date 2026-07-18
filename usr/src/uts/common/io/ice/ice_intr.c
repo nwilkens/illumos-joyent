@@ -475,20 +475,20 @@ static uint_t
 ice_intr_queue(ice_t *ice, uint_t vector)
 {
 	struct ice_hw *hw = &ice->ice_hw;
-	uint_t i;
+	uint_t idx = vector - 1;
 
 	/*
-	 * A queue vector services the rx and tx rings mapped to it.  Rx
-	 * delivery is suppressed while mac polls the ring (ice_rx_ring_intr).
+	 * Data queue i (rx and tx) is wired to vector i + 1 (ice_rx.c,
+	 * ice_tx.c) and ice_nqueues never exceeds ice_intr_count - 1, so the
+	 * firing vector maps directly to ring index vector - 1.  Indexing
+	 * instead of scanning every ring keeps each ISR off the other queues'
+	 * cache lines.  Vector 0 (OICR) never reaches here.  Rx delivery is
+	 * suppressed while mac polls the ring (ice_rx_ring_intr).
 	 */
-	for (i = 0; i < ice->ice_num_rxr; i++) {
-		if (ice->ice_rxr[i].irxr_vec == vector)
-			ice_rx_ring_intr(&ice->ice_rxr[i]);
-	}
-	for (i = 0; i < ice->ice_num_txr; i++) {
-		if (ice->ice_txr[i].itxr_vec == vector)
-			ice_tx_ring_intr(&ice->ice_txr[i]);
-	}
+	if (idx < ice->ice_num_rxr)
+		ice_rx_ring_intr(&ice->ice_rxr[idx]);
+	if (idx < ice->ice_num_txr)
+		ice_tx_ring_intr(&ice->ice_txr[idx]);
 
 	wr32(hw, GLINT_DYN_CTL(vector),
 	    GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |
@@ -507,6 +507,14 @@ ice_intr_msix(caddr_t arg1, caddr_t arg2)
 
 	if (vector == ICE_OICR_VECTOR)
 		return (ice_intr_oicr(ice));
+
+	/*
+	 * Only ice_intr_count handlers are registered, so vector is always in
+	 * range; guard defensively so a stray vector cannot re-arm
+	 * GLINT_DYN_CTL() for a vector this function does not own.
+	 */
+	if (vector >= (uint_t)ice->ice_intr_count)
+		return (DDI_INTR_CLAIMED);
 
 	return (ice_intr_queue(ice, vector));
 }

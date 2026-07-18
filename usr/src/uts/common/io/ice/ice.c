@@ -488,6 +488,14 @@ ice_alloc_intrs(ice_t *ice)
 	ice->ice_nqueues = (uint16_t)MIN(nreq,
 	    1u << ice_ilog2((uint32_t)actual - 1));
 
+	/*
+	 * The direct vector->ring ISR dispatch (ice_intr_queue) and the 1:1
+	 * ring-to-vector map (irxr_vec/itxr_vec = 1 + index) require every data
+	 * queue to own a distinct vector.  Enforce it at the source so a future
+	 * sizing change cannot silently fold rings onto a shared vector.
+	 */
+	ASSERT3U((uint_t)ice->ice_nqueues, <=, (uint_t)ice->ice_intr_count - 1);
+
 	if (ddi_intr_get_pri(ice->ice_intr_handles[0], &ice->ice_intr_pri) !=
 	    DDI_SUCCESS ||
 	    ddi_intr_get_cap(ice->ice_intr_handles[0], &ice->ice_intr_cap) !=

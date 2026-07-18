@@ -11,6 +11,7 @@ HEADER = REPO / "usr/src/uts/common/io/ice/ice.h"
 ATTACH_SOURCE = REPO / "usr/src/uts/common/io/ice/ice.c"
 VSI_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_vsi.c"
 GLD_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_gld.c"
+INTR_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_intr.c"
 
 
 def function(source: str, signature: str, following: str) -> str:
@@ -79,6 +80,13 @@ def main() -> None:
         allocator,
         re.DOTALL,
     )
+    # The direct-index ISR dispatch requires a 1:1 ring<->vector map; the
+    # sizing site must assert it so a future vector-cap change fails loudly.
+    assert re.search(
+        r"ASSERT3U\(\(uint_t\)ice->ice_nqueues,\s*<=,"
+        r"\s*\(uint_t\)ice->ice_intr_count - 1\)",
+        allocator,
+    )
 
     vsi_source = VSI_SOURCE.read_text(encoding="utf-8")
     setup = function(
@@ -128,6 +136,28 @@ def main() -> None:
         r"ice->ice_intr_handles\[rxr->irxr_vec\];\s*\}",
         rx_ring,
     )
+
+    intr_source = INTR_SOURCE.read_text(encoding="utf-8")
+    queue_isr = function(
+        intr_source,
+        "ice_intr_queue(ice_t *ice, uint_t vector)\n{",
+        "\nuint_t\nice_intr_msix",
+    )
+    assert "uint_t idx = vector - 1;" in queue_isr
+    assert "ice->ice_rxr[idx]" in queue_isr
+    assert "ice->ice_txr[idx]" in queue_isr
+    assert "idx < ice->ice_num_rxr" in queue_isr
+    assert "idx < ice->ice_num_txr" in queue_isr
+    assert "irxr_vec == vector" not in queue_isr
+    assert "itxr_vec == vector" not in queue_isr
+    assert "for (i = 0; i < ice->ice_num_rxr" not in queue_isr
+
+    dispatch = function(
+        intr_source,
+        "ice_intr_msix(caddr_t arg1, caddr_t arg2)\n{",
+        "\nboolean_t\nice_intr_enable",
+    )
+    assert "vector >= (uint_t)ice->ice_intr_count" in dispatch
 
     print("PASS: ice multiqueue and RSS source invariants")
 
