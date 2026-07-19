@@ -105,6 +105,8 @@ ice_rx_kstat_init(ice_t *ice, ice_rx_ring_t *irr)
 	kstat_named_init(&rxs->icrxs_copy_nomem, "rx_copy_nomem",
 	    KSTAT_DATA_UINT64);
 	kstat_named_init(&rxs->icrxs_no_rcb, "rx_no_rcb", KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_intr_limit, "rx_intr_limit",
+	    KSTAT_DATA_UINT64);
 	kstat_install(irr->irxr_kstat);
 
 	return (B_TRUE);
@@ -252,15 +254,7 @@ ice_cfg_itr(ice_t *ice, uint32_t vector)
 	wr32(hw, GLINT_ITR(ICE_ITR_IDX_0, vector),
 	    interval & GLINT_ITR_INTERVAL_M);
 
-	/*
-	 * Arm the vector with ITR_INDEX_NONE: a real ITR index here would
-	 * reload that slot's interval from this register's (zero) interval
-	 * field, undoing the throttle just programmed.
-	 */
-	wr32(hw, GLINT_DYN_CTL(vector),
-	    GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |
-	    ((ICE_ITR_INDEX_NONE << GLINT_DYN_CTL_ITR_INDX_S) &
-	    GLINT_DYN_CTL_ITR_INDX_M));
+	wr32(hw, GLINT_DYN_CTL(vector), ICE_GLINT_DYN_CTL_REARM);
 	ice_flush(hw);
 }
 
@@ -419,7 +413,7 @@ ice_rx_ring_unprogram(ice_t *ice, ice_rx_ring_t *irr)
  */
 #define	ICE_RX_LOAN_WAIT_US	5000000
 
-static mblk_t *ice_ring_rx(ice_rx_ring_t *, int);
+static mblk_t *ice_ring_rx(ice_rx_ring_t *, int, boolean_t *);
 
 /*
  * Attach a desballoc(9F) loaner mblk to a control block if it lacks one.  The
@@ -1098,20 +1092,28 @@ assemble_fail:
  * Drain the rx ring, returning a b_next chain of received frames.  Segments
  * within a frame are linked with b_cont by ice_ring_rx_frame().
  *
- * poll_bytes > 0 caps the bytes delivered (mac polling); poll_bytes == 0 means
- * deliver everything ready (interrupt context).  Refilled slots advance the
- * tail doorbell so hardware can reuse them.
+ * poll_bytes > 0 caps the bytes delivered (mac polling); otherwise the drain
+ * is interrupt context, capped at ice_rx_limit_per_intr consumed frames so a
+ * flooded ring cannot hold the ring lock and interrupt context for an
+ * unbounded burst.  A capped drain that left ready frames behind is reported
+ * through *limitp so the ISR can schedule a software interrupt for them; see
+ * ice_intr_queue() for why a plain re-arm cannot service that residue.
+ * Refilled slots advance the tail doorbell so hardware can reuse them.
  */
 static mblk_t *
-ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes)
+ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp)
 {
 	ice_t *ice = irr->irxr_ice;
 	struct ice_hw *hw = &ice->ice_hw;
 	mblk_t *mp_head = NULL, *mp_tail = NULL;
+	const uint32_t cap = (poll_bytes <= 0) ?
+	    ice->ice_rx_limit_per_intr : UINT32_MAX;
 	uint32_t bytes = 0;
-	uint_t npkts = 0, nposted = 0;
+	uint_t npkts = 0, nposted = 0, frames = 0;
 
 	ASSERT(MUTEX_HELD(&irr->irxr_lock));
+
+	*limitp = B_FALSE;
 
 	if ((ice->ice_state & ICE_STATE_ERROR) != 0)
 		return (NULL);
@@ -1124,12 +1126,41 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes)
 
 		if (poll_bytes > 0 && bytes >= (uint32_t)poll_bytes)
 			break;
+		if (frames >= cap) {
+			union ice_32b_rx_flex_desc *desc =
+			    &irr->irxr_descs[irr->irxr_head];
+
+			/*
+			 * Peek the next descriptor's DD bit before declaring
+			 * residue: a burst of exactly cap frames would
+			 * otherwise schedule a software interrupt into an
+			 * empty ring and overcount the kstat.
+			 */
+			(void) ddi_dma_sync(irr->irxr_desc_dma.idb_dma_handle,
+			    (off_t)((uintptr_t)desc -
+			    (uintptr_t)irr->irxr_descs),
+			    sizeof (*desc), DDI_DMA_SYNC_FORKERNEL);
+			if ((LE16_TO_CPU(desc->wb.status_error0) &
+			    BIT(ICE_RX_FLEX_DESC_STATUS0_DD_S)) != 0) {
+				irr->irxr_stats.icrxs_intr_limit.value.ui64++;
+				*limitp = B_TRUE;
+			}
+			break;
+		}
 		if (poll_bytes > 0 && bytes > 0)
 			total_len = (uint32_t)poll_bytes - bytes;
 
 		mp = ice_ring_rx_frame(irr, &total_len, &defer);
 		if (defer)
 			break;
+
+		/*
+		 * A non-deferred return consumed descriptors whether or not a
+		 * frame was delivered, so discarded frames count against the
+		 * interrupt limit: a garbage flood does as much descriptor
+		 * work as good traffic.
+		 */
+		frames++;
 
 		if (irr->irxr_head >= frame_head)
 			nposted += irr->irxr_head - frame_head;
@@ -1195,45 +1226,58 @@ mblk_t *
 ice_ring_rx_poll(void *arg, int poll_bytes)
 {
 	ice_rx_ring_t *irr = arg;
+	boolean_t limit;
 	mblk_t *mp;
 
-	ASSERT3S(poll_bytes, >, 0);
+	/*
+	 * A bandwidth-capped SRS at its drop threshold polls with a zero
+	 * budget (mac_rx_srs_poll_ring() clamps negative budgets to it), so
+	 * this is not an assertable contract: nothing was asked for, deliver
+	 * nothing.
+	 */
+	if (poll_bytes <= 0)
+		return (NULL);
 
 	mutex_enter(&irr->irxr_lock);
 	if (irr->irxr_shutdown) {
 		mutex_exit(&irr->irxr_lock);
 		return (NULL);
 	}
-	mp = ice_ring_rx(irr, poll_bytes);
+	mp = ice_ring_rx(irr, poll_bytes, &limit);
 	mutex_exit(&irr->irxr_lock);
 
 	return (mp);
 }
 
 /*
- * Interrupt-context service for one rx ring: drain everything ready and push
- * the chain to mac.  Called from the MSI-X handler after it maps the firing
- * vector back to this ring.
+ * Interrupt-context service for one rx ring: drain up to
+ * ice_rx_limit_per_intr frames and push the chain to mac.  Called from the
+ * MSI-X handler after it maps the firing vector back to this ring.  Returns
+ * B_TRUE when the drain stopped at the limit with frames still ready, so the
+ * caller's re-arm can schedule a software interrupt for the residue.
  */
-void
+boolean_t
 ice_rx_ring_intr(ice_rx_ring_t *irr)
 {
 	ice_t *ice = irr->irxr_ice;
 	mblk_t *mp;
 	uint64_t gen;
+	boolean_t limit;
 
 	mutex_enter(&irr->irxr_lock);
 	if (irr->irxr_shutdown || irr->irxr_intr_poll) {
 		mutex_exit(&irr->irxr_lock);
-		return;
+		return (B_FALSE);
 	}
-	mp = ice_ring_rx(irr, 0);
+	mp = ice_ring_rx(irr, 0, &limit);
 	gen = irr->irxr_rxgen;
 	mutex_exit(&irr->irxr_lock);
 
 	if (mp != NULL) {
 		mac_rx_ring(ice->ice_mac_hdl, irr->irxr_macrxring, mp, gen);
 	}
+
+	return (limit);
 }
 
 /*
@@ -1255,11 +1299,7 @@ ice_ring_rx_intr_enable(mac_intr_handle_t intrh)
 	reg |= QINT_RQCTL_CAUSE_ENA_M;
 	wr32(hw, QINT_RQCTL(irr->irxr_index), reg);
 
-	/* Re-arm the vector (ITR_INDEX_NONE keeps the configured throttle). */
-	wr32(hw, GLINT_DYN_CTL(irr->irxr_vec),
-	    GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |
-	    ((ICE_ITR_INDEX_NONE << GLINT_DYN_CTL_ITR_INDX_S) &
-	    GLINT_DYN_CTL_ITR_INDX_M));
+	wr32(hw, GLINT_DYN_CTL(irr->irxr_vec), ICE_GLINT_DYN_CTL_REARM);
 	ice_flush(hw);
 	mutex_exit(&irr->irxr_lock);
 

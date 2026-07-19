@@ -833,6 +833,7 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	struct ice_hw *hw;
 	struct ice_osdep *osdep;
 	int mtu;
+	int limit;
 	int instance;
 
 	if (cmd != DDI_ATTACH)
@@ -994,6 +995,13 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	ice->ice_mtu = mtu;
 	ice->ice_tx_lso_enable = ddi_prop_get_int(DDI_DEV_T_ANY,
 	    ice->ice_dip, DDI_PROP_DONTPASS, "tx_lso_enable", 0) != 0;
+	limit = ddi_prop_get_int(DDI_DEV_T_ANY, ice->ice_dip,
+	    DDI_PROP_DONTPASS, "rx_limit_per_intr", ICE_DEF_RX_LIMIT_PER_INTR);
+	if (limit < ICE_MIN_RX_LIMIT_PER_INTR)
+		limit = ICE_MIN_RX_LIMIT_PER_INTR;
+	else if (limit > ICE_MAX_RX_LIMIT_PER_INTR)
+		limit = ICE_MAX_RX_LIMIT_PER_INTR;
+	ice->ice_rx_limit_per_intr = limit;
 	ice_update_mtu(ice);
 
 	if (!ice_tx_rings_alloc(ice))

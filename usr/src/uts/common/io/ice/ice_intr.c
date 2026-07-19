@@ -663,10 +663,7 @@ ice_intr_oicr_enable(ice_t *ice)
 {
 	struct ice_hw *hw = &ice->ice_hw;
 
-	wr32(hw, GLINT_DYN_CTL(ICE_OICR_VECTOR),
-	    GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |
-	    ((ICE_ITR_INDEX_NONE << GLINT_DYN_CTL_ITR_INDX_S) &
-	    GLINT_DYN_CTL_ITR_INDX_M));
+	wr32(hw, GLINT_DYN_CTL(ICE_OICR_VECTOR), ICE_GLINT_DYN_CTL_REARM);
 	ice_flush(hw);
 }
 
@@ -835,6 +832,7 @@ ice_intr_queue(ice_t *ice, uint_t vector)
 {
 	struct ice_hw *hw = &ice->ice_hw;
 	uint_t idx = vector - 1;
+	uint32_t dyn_ctl = ICE_GLINT_DYN_CTL_REARM;
 
 	/*
 	 * Data queue i (rx and tx) is wired to vector i + 1 (ice_rx.c,
@@ -844,15 +842,28 @@ ice_intr_queue(ice_t *ice, uint_t vector)
 	 * cache lines.  Vector 0 (OICR) never reaches here.  Rx delivery is
 	 * suppressed while mac polls the ring (ice_rx_ring_intr).
 	 */
-	if (idx < ice->ice_num_rxr)
-		ice_rx_ring_intr(&ice->ice_rxr[idx]);
+	if (idx < ice->ice_num_rxr &&
+	    ice_rx_ring_intr(&ice->ice_rxr[idx])) {
+		/*
+		 * The rx drain yielded at ice_rx_limit_per_intr with frames
+		 * still ready.  Hardware consumed their events when it wrote
+		 * the descriptors back, so a plain re-arm would strand the
+		 * residue until new traffic arrives (datasheet 9.1.2.6
+		 * prescribes a software interrupt for this).  SW_ITR_INDX
+		 * selects the queues' ITR slot rather than No-ITR so the
+		 * refire train is paced, not immediate.  If mac switches the
+		 * ring to poll mode first, the refire finds irxr_intr_poll
+		 * set and no-ops.
+		 */
+		dyn_ctl |= GLINT_DYN_CTL_SWINT_TRIG_M |
+		    GLINT_DYN_CTL_SW_ITR_INDX_ENA_M |
+		    ((ICE_ITR_IDX_0 << GLINT_DYN_CTL_SW_ITR_INDX_S) &
+		    GLINT_DYN_CTL_SW_ITR_INDX_M);
+	}
 	if (idx < ice->ice_num_txr)
 		ice_tx_ring_intr(&ice->ice_txr[idx]);
 
-	wr32(hw, GLINT_DYN_CTL(vector),
-	    GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |
-	    ((ICE_ITR_INDEX_NONE << GLINT_DYN_CTL_ITR_INDX_S) &
-	    GLINT_DYN_CTL_ITR_INDX_M));
+	wr32(hw, GLINT_DYN_CTL(vector), dyn_ctl);
 	ice_flush(hw);
 
 	return (DDI_INTR_CLAIMED);

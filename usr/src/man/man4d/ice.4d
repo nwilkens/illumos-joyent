@@ -109,6 +109,15 @@ The MTU may also be changed at runtime with
 .Xr dladm 8 .
 The default is
 .Sy 1500 .
+.It Sy rx_limit_per_intr
+The maximum number of frames processed per receive ring in a single interrupt
+before the driver yields interrupt context and schedules a throttled software
+interrupt to process the remainder.
+The value is clamped to the range
+.Bq 16 , 4096 .
+The default is
+.Sy 256
+and is not generally expected to need tuning.
 .El
 .Sh FILES
 .Bl -tag -width Pa

@@ -29,6 +29,8 @@ python3 usr/src/test/ice-tests/jumbo_copy.py
 python3 usr/src/test/ice-tests/loan_wait.py
 python3 usr/src/test/ice-tests/safe_mode.py
 python3 usr/src/test/ice-tests/stale_comments.py
+python3 usr/src/test/ice-tests/rx_intr_limit.py
+python3 usr/src/test/ice-tests/rx_intr_rearm.py
 ```
 
 `rx_checksum.py` verifies that receive checksum metadata is captured before
@@ -195,6 +197,23 @@ is actually built: no development milestone labels survive in any glue source,
 every `ICE_ATTACH_*` token appearing anywhere in the glue -- in code or in a
 comment -- names a progress bit the `ice_attach_state_t` enum actually defines,
 and the genuine multi-function limitation on the instance list stays recorded.
+
+`rx_intr_limit.py` verifies the rx per-interrupt frame cap: the
+`rx_limit_per_intr` property is read with both clamps and assigned before the
+rx rings are allocated; the cap is hoisted once and disarmed for byte-budgeted
+polls while covering nonpositive budgets; every consumed frame counts against
+it, including discards; a limit hit is declared -- kstat and verdict both --
+only after a DD peek confirms the next descriptor is actually ready, so an
+exact-cap burst cannot schedule a software interrupt into an empty ring; a
+zero-budget poll (reachable from a bandwidth-capped SRS) delivers nothing
+rather than asserting; and the shipped `ice.conf` documents the default.
+
+`rx_intr_rearm.py` verifies the limit-hit residual-drain contract from
+datasheet section 9.1.2.6: the rx drain's limit verdict gates the software
+interrupt, `SW_ITR_INDX` is programmed with its enable and throttled by the
+queues' ITR slot (never No-ITR, which would refire unthrottled), the SWINT
+bits fold into the single `GLINT_DYN_CTL` re-arm write, and the base word is
+the shared `ICE_GLINT_DYN_CTL_REARM` definition.
 
 ## On-hardware datapath acceptance
 

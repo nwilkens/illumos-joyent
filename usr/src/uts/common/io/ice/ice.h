@@ -133,6 +133,27 @@ CTASSERT(ICE_TXD_CTX_MAX_MSS <= (ICE_TXD_CTX_QW1_MSS_M >>
 #define	ICE_ITR_DEFAULT_US	50		/* rx interrupt throttle */
 #define	ICE_Q_ENA_MAX_WAIT	50		/* QENA_STAT poll, 20us each */
 
+/*
+ * Frames consumed per rx ring per interrupt invocation before the drain
+ * yields the ring lock and interrupt context.  Residue is serviced by an
+ * ITR-paced software interrupt (ice_intr.c); the values match i40e's
+ * rx_limit_per_intr property.
+ */
+#define	ICE_DEF_RX_LIMIT_PER_INTR	256
+#define	ICE_MIN_RX_LIMIT_PER_INTR	16
+#define	ICE_MAX_RX_LIMIT_PER_INTR	4096
+
+/*
+ * The standard vector re-arm word: enable, clear the pending bit, and leave
+ * the programmed ITR intervals alone (a real ITR index in this write would
+ * reload that slot's interval from the write's zero interval field).  One
+ * definition so every re-arm site stays in lockstep.
+ */
+#define	ICE_GLINT_DYN_CTL_REARM						\
+	(GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |		\
+	((ICE_ITR_INDEX_NONE << GLINT_DYN_CTL_ITR_INDX_S) &		\
+	GLINT_DYN_CTL_ITR_INDX_M))
+
 typedef enum ice_state {
 	ICE_STATE_ATTACHED	= 1 << 0,
 	ICE_STATE_RESET_PENDING	= 1 << 1,	/* GRST seen; rebuild owed */
@@ -314,6 +335,7 @@ typedef struct ice_rxq_stat {
 	kstat_named_t		icrxs_desc_error;
 	kstat_named_t		icrxs_copy_nomem;
 	kstat_named_t		icrxs_no_rcb;
+	kstat_named_t		icrxs_intr_limit;
 } ice_rxq_stat_t;
 
 typedef struct ice_rx_ring {
@@ -496,6 +518,7 @@ typedef struct ice {
 
 	uint32_t		ice_tx_ring_size;
 	uint32_t		ice_rx_ring_size;
+	uint32_t		ice_rx_limit_per_intr;
 
 	/* Shared TX copy-buffer pools. */
 	kmutex_t		ice_buf_lock;
@@ -643,7 +666,7 @@ extern void ice_rx_reclaim(ice_t *);
 extern boolean_t ice_rx_stop(ice_t *);
 extern boolean_t ice_rx_drain(ice_t *);
 extern boolean_t ice_rx_rings_resume(ice_t *);
-extern void ice_rx_ring_intr(ice_rx_ring_t *);
+extern boolean_t ice_rx_ring_intr(ice_rx_ring_t *);
 extern mblk_t *ice_ring_rx_poll(void *, int);
 extern int ice_ring_rx_start(mac_ring_driver_t, uint64_t);
 extern void ice_ring_rx_stop(mac_ring_driver_t);
