@@ -102,9 +102,57 @@ ice_tx_kstat_init(ice_t *ice, ice_tx_ring_t *itr)
 	return (B_TRUE);
 }
 
+/*
+ * Preallocate the per-TCB bind handles: allocating one per fragment per packet
+ * costs a kmem_cache_alloc, a mutex pair and an insert into the single
+ * per-devinfo FM handle cache on every transmit.  A handle is fixed to its
+ * attributes at allocation, so the two sgllens need two handles.  The LSO
+ * handle is unreachable when LSO is off: ice_tx_one() drops such a packet
+ * before the bind path.
+ */
+static boolean_t
+ice_tcb_handles_alloc(ice_t *ice, ice_tx_ctrl_block_t *itcb)
+{
+	ddi_dma_attr_t attr;
+
+	ice_pkt_txbind_attr(ice, &attr);
+	if (ddi_dma_alloc_handle(ice->ice_dip, &attr, DDI_DMA_DONTWAIT, NULL,
+	    &itcb->itcb_dmah) != DDI_SUCCESS) {
+		itcb->itcb_dmah = NULL;
+		return (B_FALSE);
+	}
+
+	if (!ice->ice_tx_lso_enable)
+		return (B_TRUE);
+
+	ice_pkt_txbind_lso_attr(ice, &attr);
+	if (ddi_dma_alloc_handle(ice->ice_dip, &attr, DDI_DMA_DONTWAIT, NULL,
+	    &itcb->itcb_lso_dmah) != DDI_SUCCESS) {
+		itcb->itcb_lso_dmah = NULL;
+		return (B_FALSE);
+	}
+
+	return (B_TRUE);
+}
+
+static void
+ice_tcb_handles_free(ice_tx_ctrl_block_t *itcb)
+{
+	if (itcb->itcb_dmah != NULL) {
+		ddi_dma_free_handle(&itcb->itcb_dmah);
+		itcb->itcb_dmah = NULL;
+	}
+	if (itcb->itcb_lso_dmah != NULL) {
+		ddi_dma_free_handle(&itcb->itcb_lso_dmah);
+		itcb->itcb_lso_dmah = NULL;
+	}
+}
+
 static void
 ice_tx_ring_fini(ice_t *ice, ice_tx_ring_t *itr)
 {
+	uint16_t i;
+
 	if (itr->itxr_kstat != NULL) {
 		kstat_delete(itr->itxr_kstat);
 		itr->itxr_kstat = NULL;
@@ -113,6 +161,10 @@ ice_tx_ring_fini(ice_t *ice, ice_tx_ring_t *itr)
 	ice_dma_free(&itr->itxr_dma);
 	itr->itxr_descs = NULL;
 
+	if (itr->itxr_rsq != NULL) {
+		kmem_free(itr->itxr_rsq, itr->itxr_size * sizeof (uint16_t));
+		itr->itxr_rsq = NULL;
+	}
 	if (itr->itxr_tcb_free_list != NULL) {
 		kmem_free(itr->itxr_tcb_free_list,
 		    itr->itxr_size * sizeof (ice_tx_ctrl_block_t *));
@@ -126,8 +178,10 @@ ice_tx_ring_fini(ice_t *ice, ice_tx_ring_t *itr)
 	if (itr->itxr_tcb_area != NULL) {
 		/*
 		 * The ring is quiesced and reclaimed before teardown, so every
-		 * TCB is back in the pool holding nothing; free the backing.
+		 * TCB is back in the pool with its handles unbound.
 		 */
+		for (i = 0; i < itr->itxr_size; i++)
+			ice_tcb_handles_free(&itr->itxr_tcb_area[i]);
 		kmem_free(itr->itxr_tcb_area,
 		    itr->itxr_size * sizeof (ice_tx_ctrl_block_t));
 		itr->itxr_tcb_area = NULL;
@@ -189,6 +243,8 @@ ice_tx_ring_alloc(ice_t *ice, ice_tx_ring_t *itr, uint_t index)
 	    sizeof (ice_tx_ctrl_block_t *), KM_SLEEP);
 	itr->itxr_tcb_free_list = kmem_zalloc(itr->itxr_size *
 	    sizeof (ice_tx_ctrl_block_t *), KM_SLEEP);
+	itr->itxr_rsq = kmem_zalloc(itr->itxr_size * sizeof (uint16_t),
+	    KM_SLEEP);
 
 	/*
 	 * The by-slot parked array starts all-NULL (it is kmem_zalloc'd above):
@@ -200,10 +256,17 @@ ice_tx_ring_alloc(ice_t *ice, ice_tx_ring_t *itr, uint_t index)
 
 		itcb->itcb_ring = itr;
 		itcb->itcb_type = ITCB_NOT_USED;
+		if (!ice_tcb_handles_alloc(ice, itcb)) {
+			ice_error(ice, "failed to allocate tx ring %u bind "
+			    "handles", index);
+			goto fail;
+		}
 		itr->itxr_tcb_free_list[i] = itcb;
 	}
 	itr->itxr_tcb_nfree = itr->itxr_size;
 	itr->itxr_avail = itr->itxr_size;
+	itr->itxr_rs_pidx = 0;
+	itr->itxr_rs_cidx = 0;
 	if (!ice_tx_kstat_init(ice, itr)) {
 		ice_error(ice, "failed to create tx ring %u kstat", index);
 		goto fail;
@@ -310,6 +373,7 @@ ice_tx_ring_program(ice_t *ice, ice_tx_ring_t *itr)
 	 * count reserved by ice_cfg_vsi_lan().
 	 */
 	mutex_enter(&ice->ice_lock);
+	itr->itxr_programmed = B_TRUE;
 	status = ice_ena_vsi_txq(hw->port_info, vsi->vi_handle, 0,
 	    (uint16_t)itr->itxr_index, 1, qg, qg_size, NULL);
 	if (status == ICE_SUCCESS)
@@ -327,7 +391,13 @@ ice_tx_ring_program(ice_t *ice, ice_tx_ring_t *itr)
 	return (ICE_SUCCESS);
 }
 
-void
+/*
+ * Disable a tx queue through the scheduler.  ICE_ERR_RESET_ONGOING means
+ * ice_sq_send_cmd() never sent the command: expected on the reset path, where
+ * the reset itself stops the queue, so it is not warned about, but it is still
+ * a failed disable.
+ */
+int
 ice_tx_ring_unprogram(ice_t *ice, ice_tx_ring_t *itr)
 {
 	struct ice_hw *hw = &ice->ice_hw;
@@ -344,10 +414,27 @@ ice_tx_ring_unprogram(ice_t *ice, ice_tx_ring_t *itr)
 	    &q_handle, &q_id, &q_teid, ICE_NO_RESET, 0, NULL);
 	mutex_exit(&ice->ice_lock);
 
-	if (status != ICE_SUCCESS) {
-		ice_error(ice, "!ice_dis_vsi_txq failed for tx queue %u: %d",
+	if (status == ICE_SUCCESS) {
+		itr->itxr_programmed = B_FALSE;
+		return (ICE_SUCCESS);
+	}
+
+	/*
+	 * No scheduler node matched.  On a ring this driver never programmed
+	 * that is success.  On one it did, the node is missing because
+	 * ice_ena_vsi_txq() failed after its Add Tx Queues command had already
+	 * enabled the queue, so the queue can still master and the caller must
+	 * not release anything it can reach.
+	 */
+	if (status == ICE_ERR_DOES_NOT_EXIST && !itr->itxr_programmed)
+		return (ICE_SUCCESS);
+
+	if (status != ICE_ERR_RESET_ONGOING) {
+		ice_error(ice, "ice_dis_vsi_txq failed for tx queue %u: %d",
 		    itr->itxr_index, status);
 	}
+
+	return (status);
 }
 
 /*
@@ -366,7 +453,9 @@ ice_tx_ring_unprogram(ice_t *ice, ice_tx_ring_t *itr)
  * uses at least as many descriptors as TCBs, reserving descriptor space also
  * reserves TCB-slot space.  Reclaim walks from itxr_head: with RS set,
  * hardware rewrites the last descriptor's DTYPE to DESC_DONE, which is the
- * signal that the packet (and every descriptor before it) is complete.
+ * signal that the packet (and every descriptor before it) is complete.  Emit
+ * records that slot in itxr_rsq, so reclaim probes one descriptor per packet
+ * rather than scanning the in-flight window.
  *
  * LSO packets prepend one context descriptor.  Their headers are copied into
  * a dedicated single-cookie buffer, and payload descriptors are constrained
@@ -414,9 +503,8 @@ ice_tcb_alloc(ice_tx_ring_t *itr)
 
 /*
  * Release whatever a TCB holds (copy buffer, DMA binding, retained mblk) and
- * return it to the ring's free list.  The bind handles are allocated lazily in
- * ice_tx_bind_fragment() and freed here so the append-only datapath does not
- * have to touch the attach-time ring alloc/teardown paths.
+ * return it to the ring's free list.  The bind handles are preallocated per
+ * TCB and outlive it, so only the binding is dropped here.
  */
 static void
 ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
@@ -443,13 +531,9 @@ ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
 		break;
 	case ITCB_BIND:
 		(void) ddi_dma_unbind_handle(tcb->itcb_dmah);
-		ddi_dma_free_handle(&tcb->itcb_dmah);
-		tcb->itcb_dmah = NULL;
 		break;
 	case ITCB_LSO_BIND:
 		(void) ddi_dma_unbind_handle(tcb->itcb_lso_dmah);
-		ddi_dma_free_handle(&tcb->itcb_lso_dmah);
-		tcb->itcb_lso_dmah = NULL;
 		break;
 	}
 
@@ -469,15 +553,13 @@ ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
 /*
  * DMA-bind a single mblk fragment.  Returns the bound TCB with the binding
  * left in place; the cookies are walked at descriptor-fill time and the
- * handle is unbound/freed when the TCB is recycled.  *ncookiesp is the cookie
+ * handle is unbound when the TCB is recycled.  *ncookiesp is the cookie
  * count, which is also the number of descriptors this fragment will consume.
  */
 static ice_tx_ctrl_block_t *
 ice_tx_bind_fragment(ice_tx_ring_t *itr, mblk_t *mp, uint_t *ncookiesp)
 {
-	ice_t *ice = itr->itxr_ice;
 	ice_tx_ctrl_block_t *tcb;
-	ddi_dma_attr_t attr;
 	uint_t ncookies;
 	int ret;
 
@@ -485,19 +567,10 @@ ice_tx_bind_fragment(ice_tx_ring_t *itr, mblk_t *mp, uint_t *ncookiesp)
 	if (tcb == NULL)
 		return (NULL);
 
-	ice_pkt_txbind_attr(ice, &attr);
-	if (ddi_dma_alloc_handle(ice->ice_dip, &attr, DDI_DMA_DONTWAIT, NULL,
-	    &tcb->itcb_dmah) != DDI_SUCCESS) {
-		ice_tcb_free(itr, tcb);
-		return (NULL);
-	}
-
 	ret = ddi_dma_addr_bind_handle(tcb->itcb_dmah, NULL,
 	    (caddr_t)mp->b_rptr, MBLKL(mp), DDI_DMA_WRITE | DDI_DMA_STREAMING,
 	    DDI_DMA_DONTWAIT, NULL, NULL, NULL);
 	if (ret != DDI_DMA_MAPPED) {
-		ddi_dma_free_handle(&tcb->itcb_dmah);
-		tcb->itcb_dmah = NULL;
 		ice_tcb_free(itr, tcb);
 		itr->itxr_stats.ictxs_bind_fails.value.ui64++;
 		return (NULL);
@@ -515,16 +588,15 @@ ice_tx_bind_fragment(ice_tx_ring_t *itr, mblk_t *mp, uint_t *ncookiesp)
 }
 
 /*
- * LSO binds may span more cookies than ordinary frames.  The separate handle
- * prevents a failed LSO bind from disturbing the ordinary bind lifecycle.
+ * LSO binds may span more cookies than ordinary frames, so they use the
+ * handle carrying the wider sgllen.  That handle exists only when LSO was
+ * enabled at ring allocation, which is also the only way this path runs.
  */
 static ice_tx_ctrl_block_t *
 ice_tx_bind_lso_fragment(ice_tx_ring_t *itr, caddr_t addr, size_t len,
     uint_t *ncookiesp)
 {
-	ice_t *ice = itr->itxr_ice;
 	ice_tx_ctrl_block_t *tcb;
-	ddi_dma_attr_t attr;
 	uint_t ncookies;
 	int ret;
 
@@ -535,9 +607,7 @@ ice_tx_bind_lso_fragment(ice_tx_ring_t *itr, caddr_t addr, size_t len,
 	if (tcb == NULL)
 		return (NULL);
 
-	ice_pkt_txbind_lso_attr(ice, &attr);
-	if (ddi_dma_alloc_handle(ice->ice_dip, &attr, DDI_DMA_DONTWAIT, NULL,
-	    &tcb->itcb_lso_dmah) != DDI_SUCCESS) {
+	if (tcb->itcb_lso_dmah == NULL) {
 		ice_tcb_free(itr, tcb);
 		return (NULL);
 	}
@@ -546,8 +616,6 @@ ice_tx_bind_lso_fragment(ice_tx_ring_t *itr, caddr_t addr, size_t len,
 	    DDI_DMA_WRITE | DDI_DMA_STREAMING, DDI_DMA_DONTWAIT, NULL, NULL,
 	    NULL);
 	if (ret != DDI_DMA_MAPPED) {
-		ddi_dma_free_handle(&tcb->itcb_lso_dmah);
-		tcb->itcb_lso_dmah = NULL;
 		ice_tcb_free(itr, tcb);
 		itr->itxr_stats.ictxs_bind_fails.value.ui64++;
 		return (NULL);
@@ -556,8 +624,6 @@ ice_tx_bind_lso_fragment(ice_tx_ring_t *itr, caddr_t addr, size_t len,
 	ncookies = ddi_dma_ncookies(tcb->itcb_lso_dmah);
 	if (ncookies == 0 || ncookies > ICE_TX_LSO_MAX_COOKIE) {
 		(void) ddi_dma_unbind_handle(tcb->itcb_lso_dmah);
-		ddi_dma_free_handle(&tcb->itcb_lso_dmah);
-		tcb->itcb_lso_dmah = NULL;
 		ice_tcb_free(itr, tcb);
 		return (NULL);
 	}
@@ -626,6 +692,16 @@ ice_tx_copy_packet(ice_tx_ring_t *itr, mblk_t *mp, size_t msglen,
 		dst += clen;
 	}
 	tcb->itcb_len = msglen;
+
+	/*
+	 * Pool buffers are zeroed once at allocation and then reused, so an
+	 * unzeroed pad would put the tail of an earlier frame on the wire.
+	 */
+	if (msglen < ICE_TX_MIN_LEN) {
+		bzero(tcb->itcb_buf->idb_va + msglen,
+		    ICE_TX_MIN_LEN - msglen);
+		tcb->itcb_len = ICE_TX_MIN_LEN;
+	}
 
 	itr->itxr_stats.ictxs_copy_bytes.value.ui64 += msglen;
 	itr->itxr_stats.ictxs_copy_frags.value.ui64++;
@@ -771,6 +847,8 @@ ice_tx_sync_descs(ice_tx_ring_t *itr, uint16_t start, uint_t n)
  * Write one DATA descriptor.  buf_addr is the fragment's IOVA; bufsz its
  * length (capped at ICE_TX_MAX_BUFSZ -- the caller guarantees fragments fit,
  * since copy buffers are frame-sized and bound cookies obey the bind attrs).
+ * Each field is masked to its own width so no caller value can reach a
+ * neighbouring field.
  */
 static void
 ice_tx_write_desc(ice_tx_ring_t *itr, uint16_t slot, uint64_t pa,
@@ -780,11 +858,14 @@ ice_tx_write_desc(ice_tx_ring_t *itr, uint16_t slot, uint64_t pa,
 	uint64_t qw1;
 
 	ASSERT3U(len, <=, ICE_TX_MAX_BUFSZ);
+	ASSERT0(cmd & ~(ICE_TXD_QW1_CMD_M >> ICE_TXD_QW1_CMD_S));
+	ASSERT0(off & ~(ICE_TXD_QW1_OFFSET_M >> ICE_TXD_QW1_OFFSET_S));
 
 	qw1 = ((uint64_t)ICE_TX_DESC_DTYPE_DATA << ICE_TXD_QW1_DTYPE_S) |
-	    (cmd << ICE_TXD_QW1_CMD_S) |
-	    (off << ICE_TXD_QW1_OFFSET_S) |
-	    ((uint64_t)len << ICE_TXD_QW1_TX_BUF_SZ_S);
+	    ((cmd << ICE_TXD_QW1_CMD_S) & ICE_TXD_QW1_CMD_M) |
+	    ((off << ICE_TXD_QW1_OFFSET_S) & ICE_TXD_QW1_OFFSET_M) |
+	    (((uint64_t)len << ICE_TXD_QW1_TX_BUF_SZ_S) &
+	    ICE_TXD_QW1_TX_BUF_SZ_M);
 
 	desc->buf_addr = CPU_TO_LE64(pa);
 	desc->cmd_type_offset_bsz = CPU_TO_LE64(qw1);
@@ -832,6 +913,17 @@ ice_tx_context(ice_t *ice, mblk_t *mp, ice_tx_ctx_t *ctx)
 
 	mac_ether_offload_info(mp, &meo);
 	ctx->itc_use_ctx = (lsoflags & HW_LSO) != 0;
+
+	/*
+	 * meoi_l3hlen spans the whole IPv6 extension header chain.  Bound
+	 * all three lengths before composition: an overlong value runs out
+	 * of OFFSET into the buffer size field, and the device then reads
+	 * past the fragment.
+	 */
+	if (meo.meoi_l2hlen > ICE_TXD_MACLEN_MAX ||
+	    meo.meoi_l3hlen > ICE_TXD_IPLEN_MAX ||
+	    meo.meoi_l4hlen > ICE_TXD_L4LEN_MAX)
+		return (ICE_TX_BUILD_DROP);
 
 	if ((chkflags & HCK_IPV4_HDRCKSUM) != 0) {
 		if ((meo.meoi_flags & l23) != l23 ||
@@ -895,17 +987,14 @@ ice_tx_context(ice_t *ice, mblk_t *mp, ice_tx_ctx_t *ctx)
 	    (meo.meoi_l3proto != ETHERTYPE_IP &&
 	    meo.meoi_l3proto != ETHERTYPE_IPV6) ||
 	    meo.meoi_l4proto != IPPROTO_TCP ||
-	    meo.meoi_l2hlen > ICE_TXD_MACLEN_MAX ||
-	    meo.meoi_l3hlen > ICE_TXD_IPLEN_MAX ||
-	    meo.meoi_l4hlen > ICE_TXD_L4LEN_MAX ||
 	    (meo.meoi_l2hlen & 1) != 0 ||
 	    (meo.meoi_l3hlen & 3) != 0 ||
 	    (meo.meoi_l4hlen & 3) != 0)
 		return (ICE_TX_BUILD_DROP);
 
 	hdrlen = meo.meoi_l2hlen + meo.meoi_l3hlen + meo.meoi_l4hlen;
-	if (hdrlen == 0 || hdrlen >= meo.meoi_len ||
-	    meo.meoi_len != msgdsize(mp))
+	if (hdrlen == 0 || hdrlen > ICE_TX_LSO_MAX_HDRLEN ||
+	    hdrlen >= meo.meoi_len || meo.meoi_len != msgdsize(mp))
 		return (ICE_TX_BUILD_DROP);
 	tsolen = meo.meoi_len - hdrlen;
 	if (tsolen > ICE_LSO_MAXLEN)
@@ -945,8 +1034,8 @@ ice_tx_build_tcbs(ice_tx_ring_t *itr, mblk_t *mp, size_t msglen,
 	uint_t ndesc = 0;
 
 	/*
-	 * Binding a small frame costs a handle alloc/bind/unbind/free per
-	 * fragment, far more than copying it into a pre-mapped buffer.
+	 * Binding a small frame costs a bind and an unbind per fragment, more
+	 * than copying it into a pre-mapped buffer.
 	 */
 	if (msglen <= ICE_TX_SMALL_PKT) {
 		tcbs[0] = ice_tx_copy_packet(itr, mp, msglen, &res);
@@ -955,7 +1044,11 @@ ice_tx_build_tcbs(ice_tx_ring_t *itr, mblk_t *mp, size_t msglen,
 			*ndescp = 1;
 			return (ICE_TX_BUILD_OK);
 		}
-		if (res == ICE_TX_BUILD_DROP)
+		/*
+		 * Only the copy path can pad a runt without exposing stale
+		 * pool bytes, so back-pressure rather than bind it short.
+		 */
+		if (res == ICE_TX_BUILD_DROP || msglen < ICE_TX_MIN_LEN)
 			return (res);
 		/*
 		 * NORES: the pool is momentarily empty.  Fall through and bind
@@ -990,7 +1083,11 @@ ice_tx_build_tcbs(ice_tx_ring_t *itr, mblk_t *mp, size_t msglen,
 	return (ICE_TX_BUILD_OK);
 
 force_copy:
-	/* Undo any partial bind work and copy the whole frame instead. */
+	/*
+	 * Undo any partial bind work and copy the whole frame instead.  Count
+	 * the demotion: it is the only signal that binds are failing.
+	 */
+	itr->itxr_stats.ictxs_no_pkt_cache.value.ui64++;
 	while (ntcb > 0)
 		ice_tcb_free(itr, tcbs[--ntcb]);
 
@@ -1073,7 +1170,7 @@ ice_tx_lso_build(ice_tx_ring_t *itr, mblk_t *mp,
 	    meo.meoi_l4proto != IPPROTO_TCP || hdrlen == 0 ||
 	    hdrlen >= meo.meoi_len || meo.meoi_len != msgdsize(mp) ||
 	    ctx->itc_tsolen != meo.meoi_len - hdrlen ||
-	    hdrlen > ICE_TX_LSO_BUFSZ)
+	    hdrlen > ICE_TX_LSO_MAX_HDRLEN)
 		return (ICE_TX_BUILD_DROP);
 
 	/*
@@ -1403,6 +1500,16 @@ ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs, uint_t ntcb,
 	/* The last TCB retains the mblk; freed when this packet recycles. */
 	tcbs[ntcb - 1]->itcb_mp = mp;
 
+	/*
+	 * The emit gate leaves at least one descriptor free, so at most
+	 * itxr_size - 1 packets are outstanding and a queue of itxr_size slots
+	 * can never lap its consumer.
+	 */
+	VERIFY3U(ice_tx_ring_next(itr, itr->itxr_rs_pidx), !=,
+	    itr->itxr_rs_cidx);
+	itr->itxr_rsq[itr->itxr_rs_pidx] = last;
+	itr->itxr_rs_pidx = ice_tx_ring_next(itr, itr->itxr_rs_pidx);
+
 	itr->itxr_tail = tail;
 	itr->itxr_avail -= ndesc;
 
@@ -1421,30 +1528,40 @@ ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs, uint_t ntcb,
 	return (B_TRUE);
 }
 
+/*
+ * The report-status queue points at scattered slots, so each probe syncs only
+ * the descriptor it reads.  Slot 0 sits at offset 0 of itxr_dma.
+ */
 static boolean_t
 ice_tx_desc_done(const ice_tx_ring_t *itr, uint16_t slot)
 {
-	uint64_t qw1 = LE64_TO_CPU(itr->itxr_descs[slot].cmd_type_offset_bsz);
+	const size_t dsz = sizeof (struct ice_tx_desc);
+	uint64_t qw1;
+
+	(void) ddi_dma_sync(itr->itxr_dma.idb_dma_handle, (off_t)slot * dsz,
+	    dsz, DDI_DMA_SYNC_FORKERNEL);
+	qw1 = LE64_TO_CPU(itr->itxr_descs[slot].cmd_type_offset_bsz);
 
 	return ((qw1 & ICE_TX_QW1_DTYPE_DONE_M) ==
 	    ((uint64_t)ICE_TX_DESC_DTYPE_DESC_DONE << ICE_TXD_QW1_DTYPE_S));
 }
 
 /*
- * Reclaim descriptors that hardware has completed.  With RS set on the last
- * descriptor of each packet, hardware rewrites that descriptor's DTYPE to
- * DESC_DONE; only that EOP descriptor is ever marked done.  Packets complete
- * in order, so the first done descriptor at or after itxr_head bounds the
- * oldest completed packet.  We free each packet's TCBs and slots, clear
- * back-pressure, and notify MAC when space frees up.  Returns descriptors
- * reclaimed.
+ * Reclaim descriptors that hardware has completed.  itxr_rsq holds, in
+ * transmit order, the slot of each in-flight packet's RS descriptor, and only
+ * that descriptor is ever rewritten to DESC_DONE.  Packets complete in order,
+ * so probing one slot per outstanding packet finds the completed run at a cost
+ * proportional to the packets freed rather than to the in-flight window.  We
+ * free each completed packet's TCBs and slots, clear back-pressure, and notify
+ * MAC when space frees up.  Returns descriptors reclaimed.
  */
 static uint_t
 ice_tx_recycle(ice_tx_ring_t *itr)
 {
 	ice_t *ice = itr->itxr_ice;
-	uint16_t head, inflight;
+	uint16_t head, rs_cidx;
 	uint_t nrecycled = 0;
+	uint_t i;
 
 	ASSERT(MUTEX_HELD(&itr->itxr_lock));
 
@@ -1453,6 +1570,7 @@ ice_tx_recycle(ice_tx_ring_t *itr)
 		 * Nothing in flight, but a blocked ring whose last completion
 		 * drained here must still wake mac or it stays blocked.
 		 */
+		ASSERT3U(itr->itxr_rs_cidx, ==, itr->itxr_rs_pidx);
 		if (itr->itxr_blocked) {
 			itr->itxr_blocked = B_FALSE;
 			mac_tx_ring_update(ice->ice_mac_hdl,
@@ -1461,67 +1579,62 @@ ice_tx_recycle(ice_tx_ring_t *itr)
 		return (0);
 	}
 
-	(void) ddi_dma_sync(itr->itxr_dma.idb_dma_handle, 0, 0,
-	    DDI_DMA_SYNC_FORKERNEL);
+	/*
+	 * Measure the completed run before releasing anything: a DMA fault the
+	 * probes surface must be caught before a control block is freed on the
+	 * strength of what was read.
+	 */
+	head = itr->itxr_head;
+	rs_cidx = itr->itxr_rs_cidx;
+	while (rs_cidx != itr->itxr_rs_pidx) {
+		uint16_t eop = itr->itxr_rsq[rs_cidx];
+		uint16_t span;
+
+		if (!ice_tx_desc_done(itr, eop))
+			break;
+
+		if (eop >= head)
+			span = (uint16_t)(eop - head);
+		else
+			span = (uint16_t)(itr->itxr_size - head + eop);
+
+		nrecycled += (uint_t)span + 1;
+		head = ice_tx_ring_next(itr, eop);
+		rs_cidx = ice_tx_ring_next(itr, rs_cidx);
+	}
+
 	if (ice_check_dma_handle(itr->itxr_dma.idb_dma_handle) != DDI_FM_OK) {
 		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
 		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
 		return (0);
 	}
 
+	if (nrecycled == 0)
+		return (0);
+
+	ASSERT3U(nrecycled, <=, (uint_t)(itr->itxr_size - itr->itxr_avail));
+
 	head = itr->itxr_head;
-	inflight = itr->itxr_size - itr->itxr_avail;
+	for (i = 0; i < nrecycled; i++) {
+		ice_tx_ctrl_block_t *tcb = itr->itxr_tcbs[head];
 
-	/*
-	 * Only the last (EOP|RS) descriptor of a packet is ever rewritten to
-	 * DESC_DONE.  Packets complete in order, so the first DONE descriptor
-	 * at or after head marks the tail of the oldest completed packet; every
-	 * descriptor up to and including it is reclaimable.  Scan for that EOP,
-	 * then free the span; repeat until no further EOP is done.
-	 */
-	while (nrecycled < inflight) {
-		uint16_t span = 0;
-		uint16_t s = head;
-		boolean_t done = B_FALSE;
+		itr->itxr_tcbs[head] = NULL;
+		if (tcb != NULL)
+			ice_tcb_free(itr, tcb);
 
-		/* Find the next completed EOP still in flight. */
-		while (nrecycled + span < inflight) {
-			span++;
-			if (ice_tx_desc_done(itr, s)) {
-				done = B_TRUE;
-				break;
-			}
-			s = ice_tx_ring_next(itr, s);
-		}
+		itr->itxr_descs[head].buf_addr = 0;
+		itr->itxr_descs[head].cmd_type_offset_bsz = 0;
 
-		if (!done)
-			break;
-
-		/* Reclaim head .. EOP inclusive (span descriptors). */
-		while (span-- > 0) {
-			ice_tx_ctrl_block_t *tcb = itr->itxr_tcbs[head];
-
-			itr->itxr_tcbs[head] = NULL;
-			if (tcb != NULL)
-				ice_tcb_free(itr, tcb);
-
-			itr->itxr_descs[head].buf_addr = 0;
-			itr->itxr_descs[head].cmd_type_offset_bsz = 0;
-
-			head = ice_tx_ring_next(itr, head);
-			nrecycled++;
-		}
+		head = ice_tx_ring_next(itr, head);
 	}
 
-	if (nrecycled > 0) {
-		itr->itxr_head = head;
-		itr->itxr_avail += nrecycled;
+	itr->itxr_head = head;
+	itr->itxr_rs_cidx = rs_cidx;
+	itr->itxr_avail += nrecycled;
 
-		if (itr->itxr_blocked) {
-			itr->itxr_blocked = B_FALSE;
-			mac_tx_ring_update(ice->ice_mac_hdl,
-			    itr->itxr_mactxring);
-		}
+	if (itr->itxr_blocked) {
+		itr->itxr_blocked = B_FALSE;
+		mac_tx_ring_update(ice->ice_mac_hdl, itr->itxr_mactxring);
 	}
 
 	return (nrecycled);
@@ -1712,6 +1825,8 @@ ice_tx_start(ice_t *ice)
 		itr->itxr_head = 0;
 		itr->itxr_tail = 0;
 		itr->itxr_avail = itr->itxr_size;
+		itr->itxr_rs_pidx = 0;
+		itr->itxr_rs_cidx = 0;
 		itr->itxr_quiesce = B_FALSE;
 		itr->itxr_blocked = B_FALSE;
 		mutex_exit(&itr->itxr_lock);
@@ -1770,16 +1885,18 @@ ice_tx_reclaim(ice_t *ice)
 		itr->itxr_head = 0;
 		itr->itxr_tail = 0;
 		itr->itxr_avail = itr->itxr_size;
+		itr->itxr_rs_pidx = 0;
+		itr->itxr_rs_cidx = 0;
 		itr->itxr_blocked = B_FALSE;
 		mutex_exit(&itr->itxr_lock);
 	}
 }
 
 /*
- * Quiesce the rings on mac_stop and release everything they hold.
- * ice_queues_disable() has already disabled the hardware queues, so the
- * reclaim is safe immediately.  The reset path drives the two halves
- * separately, around the reset barrier.
+ * Quiesce the rings on mac_stop and release everything they hold.  Reached only
+ * once ice_queues_disable() has confirmed every tx queue is disabled; a disable
+ * that did not complete quiesces without reclaiming and lets the reset barrier
+ * release the mappings instead.
  */
 void
 ice_tx_stop(ice_t *ice)

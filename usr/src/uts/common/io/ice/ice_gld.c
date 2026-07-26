@@ -118,9 +118,9 @@ ice_gld_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)
 		status = ice_remove_mac(hw, &m_list);
 
 	if (status != ICE_SUCCESS) {
-		ice_error(ice, "!failed to %s MAC filter: %d",
+		ice_error(ice, "failed to %s MAC filter: %d",
 		    add ? "add" : "remove", status);
-		return (EIO);
+		return (ice_status_to_errno(ice, status));
 	}
 
 	mutex_enter(&vsi->vi_mac_lock);
@@ -268,7 +268,7 @@ ice_loopback_enable(ice_t *ice)
 
 	status = ice_vsi_loopback_set(ice, B_TRUE);
 	if (status != ICE_SUCCESS) {
-		ice_error(ice, "!failed to permit VSI loopback: %d", status);
+		ice_error(ice, "failed to permit VSI loopback: %d", status);
 		return (EIO);
 	}
 
@@ -278,10 +278,10 @@ ice_loopback_enable(ice_t *ice)
 
 	rollback = ice_vsi_loopback_set(ice, B_FALSE);
 	if (rollback != ICE_SUCCESS) {
-		ice_error(ice, "!failed to roll back VSI loopback: %d",
+		ice_error(ice, "failed to roll back VSI loopback: %d",
 		    rollback);
 	}
-	ice_error(ice, "!failed to enable MAC loopback: %d", status);
+	ice_error(ice, "failed to enable MAC loopback: %d", status);
 	return (EIO);
 }
 
@@ -292,7 +292,7 @@ ice_loopback_disable(ice_t *ice)
 
 	status = ice_aq_set_mac_loopback(&ice->ice_hw, false, NULL);
 	if (status != ICE_SUCCESS) {
-		ice_error(ice, "!failed to disable MAC loopback: %d", status);
+		ice_error(ice, "failed to disable MAC loopback: %d", status);
 		return (EIO);
 	}
 
@@ -302,9 +302,9 @@ ice_loopback_disable(ice_t *ice)
 
 	rollback = ice_aq_set_mac_loopback(&ice->ice_hw, true, NULL);
 	if (rollback != ICE_SUCCESS) {
-		ice_error(ice, "!failed to restore MAC loopback: %d", rollback);
+		ice_error(ice, "failed to restore MAC loopback: %d", rollback);
 	}
-	ice_error(ice, "!failed to revoke VSI loopback: %d", status);
+	ice_error(ice, "failed to revoke VSI loopback: %d", status);
 	return (EIO);
 }
 
@@ -340,7 +340,7 @@ ice_loopback_mode_set_locked(ice_t *ice, uint32_t mode)
 			rollback = ice_loopback_enable(ice);
 		}
 		if (rollback != 0) {
-			ice_error(ice, "!failed to restore loopback after "
+			ice_error(ice, "failed to restore loopback after "
 			    "register access fault");
 		}
 		mutex_exit(&ice->ice_loopback_lock);
@@ -397,7 +397,7 @@ ice_loopback_replay(ice_t *ice)
 	mutex_exit(&ice->ice_lse_lock);
 
 	if (mode == ICE_LB_INTERNAL_MAC && ice_loopback_enable(ice) != 0) {
-		ice_error(ice, "!loopback not restored after reset; "
+		ice_error(ice, "loopback not restored after reset; "
 		    "reverting to normal mode");
 		ice_link_loopback_update(ice, ICE_LB_NONE);
 	}
@@ -513,10 +513,17 @@ ice_m_ioctl(void *arg, queue_t *q, mblk_t *mp)
 int
 ice_start_datapath(ice_t *ice)
 {
+	/*
+	 * Re-arm the queue interrupt causes first: ice_m_stop() cleared
+	 * CAUSE_ENA to dissociate them for the queue disable, and nothing else
+	 * restores it.  Idempotent, and inert until a queue is enabled below.
+	 */
+	ice_queues_intr_map(ice);
+
 	if (ice_queues_program(ice) != ICE_SUCCESS)
 		return (EIO);
 	if (!ice_rx_start(ice)) {
-		ice_queues_disable(ice);
+		(void) ice_queues_disable(ice);
 		return (EIO);
 	}
 	ice_tx_start(ice);
@@ -568,24 +575,45 @@ static void
 ice_m_stop(void *arg)
 {
 	ice_t *ice = arg;
+	boolean_t disabled;
 
 	mutex_enter(&ice->ice_rebuild_lock);
 
 	/*
-	 * Mark the device stopped, then disable the queues so hardware stops
-	 * touching descriptors and buffers.  Reclaim the tx control blocks and
-	 * the rx pool (the latter waits for any loaned buffers to return).
+	 * Mark the device stopped, dissociate the queues from their interrupt
+	 * causes, then disable the queues so hardware stops touching
+	 * descriptors and buffers.
 	 */
 	atomic_and_32(&ice->ice_state, ~ICE_STATE_STARTED);
-	ice_queues_disable(ice);
-	ice_tx_stop(ice);
-	/*
-	 * mac stop cannot fail and cannot wait forever.  A loan the stack never
-	 * returns leaves ice_rx_stop() short of a full drain; it deliberately
-	 * leaves that ring's pool intact rather than freeing buffers still held
-	 * upstream, and ice_rx_start() re-checks before reusing it.
-	 */
-	(void) ice_rx_stop(ice);
+	ice_queues_intr_dissociate(ice);
+	disabled = ice_queues_disable(ice);
+
+	if (disabled) {
+		ice_tx_stop(ice);
+		/*
+		 * mac stop cannot fail and cannot wait forever.  A loan the
+		 * stack never returns leaves ice_rx_stop() short of a full
+		 * drain; it deliberately leaves that ring's pool intact rather
+		 * than freeing buffers still held upstream, and ice_rx_start()
+		 * re-checks before reusing it.
+		 */
+		(void) ice_rx_stop(ice);
+	} else {
+		/*
+		 * A queue that did not confirm the disable can still master
+		 * into the rings, so nothing may be released (datasheet
+		 * 10.4.3.1.2 step 9).  mac stop cannot fail, but it can
+		 * decline to reclaim: quiesce the software side only and
+		 * request a PF reset, which is the barrier ice_rebuild()
+		 * reclaims behind, as the reset path already does.
+		 */
+		ice_tx_quiesce(ice);
+		(void) ice_rx_quiesce(ice);
+		atomic_or_32(&ice->ice_state,
+		    ICE_STATE_ERROR | ICE_STATE_PFR_REQ);
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
+		ice_reset_redispatch(ice);
+	}
 
 	mutex_exit(&ice->ice_rebuild_lock);
 }
@@ -601,7 +629,10 @@ ice_promisc_apply(ice_t *ice, boolean_t on)
 	struct ice_hw *hw = &ice->ice_hw;
 	ice_vsi_t *vsi = &ice->ice_pf_vsi;
 	ice_declare_bitmap(mask, ICE_PROMISC_MAX);
-	int status;
+	boolean_t prev;
+	int rollback, status, ret;
+
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
 
 	ice_zero_bitmap(mask, ICE_PROMISC_MAX);
 	ice_set_bit(ICE_PROMISC_UCAST_RX, mask);
@@ -609,18 +640,54 @@ ice_promisc_apply(ice_t *ice, boolean_t on)
 	ice_set_bit(ICE_PROMISC_MCAST_RX, mask);
 	ice_set_bit(ICE_PROMISC_MCAST_TX, mask);
 
-	if (on)
-		status = ice_set_vsi_promisc(hw, vsi->vi_handle, mask, 0);
-	else
-		status = ice_clear_vsi_promisc(hw, vsi->vi_handle, mask, 0);
+	/*
+	 * The common code commits one switch rule per bit and leaves the
+	 * earlier ones live when a later one fails, so the intent is recorded
+	 * before the call: a partial set that could not be undone must still
+	 * be replayed by ice_vsi_rebuild().
+	 */
+	prev = ice->ice_promisc_on;
+	ice->ice_promisc_on = on;
 
-	if (status != ICE_SUCCESS) {
-		ice_error(ice, "!failed to %s promiscuous mode: %d",
-		    on ? "enable" : "disable", status);
-		return (EIO);
+	if (!on) {
+		status = ice_clear_vsi_promisc(hw, vsi->vi_handle, mask, 0);
+		if (status != ICE_SUCCESS) {
+			ice_error(ice, "failed to disable promiscuous "
+			    "mode: %d", status);
+			ice->ice_promisc_on = prev;
+			return (ice_status_to_errno(ice, status));
+		}
+		return (0);
 	}
 
-	return (0);
+	status = ice_set_vsi_promisc(hw, vsi->vi_handle, mask, 0);
+	if (status == ICE_SUCCESS)
+		return (0);
+
+	ice_error(ice, "failed to enable promiscuous mode: %d", status);
+
+	/*
+	 * The rollback below issues admin queue commands that overwrite
+	 * sq_last_status, so decode this failure before it runs.
+	 */
+	ret = ice_status_to_errno(ice, status);
+
+	/*
+	 * ice_set_vsi_promisc() restarts at ICE_PROMISC_UCAST_RX on every call
+	 * and aborts on the first non-zero status, so a retry would return
+	 * ICE_ERR_ALREADY_EXISTS for a rule this attempt installed and never
+	 * reach the one that failed.  Clear the whole mask so the next attempt
+	 * starts from a clean state.
+	 */
+	rollback = ice_clear_vsi_promisc(hw, vsi->vi_handle, mask, 0);
+	if (rollback != ICE_SUCCESS) {
+		ice_error(ice, "failed to roll back promiscuous mode: %d",
+		    rollback);
+	} else {
+		ice->ice_promisc_on = prev;
+	}
+
+	return (ret);
 }
 
 static int
@@ -638,8 +705,6 @@ ice_m_promisc(void *arg, boolean_t on)
 	 */
 	mutex_enter(&ice->ice_rebuild_lock);
 	ret = ice_promisc_apply(ice, on);
-	if (ret == 0)
-		ice->ice_promisc_on = on;
 	mutex_exit(&ice->ice_rebuild_lock);
 
 	return (ret);
@@ -1362,7 +1427,7 @@ ice_mac_unregister(ice_t *ice)
 
 	status = mac_unregister(ice->ice_mac_hdl);
 	if (status != 0) {
-		ice_error(ice, "!failed to unregister from MAC: %d", status);
+		ice_error(ice, "failed to unregister from MAC: %d", status);
 		return (status);
 	}
 

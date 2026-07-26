@@ -53,6 +53,7 @@ static void
 ice_rx_ring_free(ice_rx_ring_t *irr)
 {
 	ASSERT0(irr->irxr_nloaned);
+	ASSERT(!irr->irxr_intr_busy);
 	ice_rx_free_rcbs(irr);
 
 	if (irr->irxr_kstat != NULL) {
@@ -71,6 +72,7 @@ ice_rx_ring_free(ice_rx_ring_t *irr)
 		irr->irxr_descs = NULL;
 	}
 
+	cv_destroy(&irr->irxr_intr_cv);
 	cv_destroy(&irr->irxr_cv);
 	mutex_destroy(&irr->irxr_lock);
 }
@@ -141,6 +143,7 @@ ice_rx_ring_alloc(ice_t *ice, ice_rx_ring_t *irr, uint_t index)
 	mutex_init(&irr->irxr_lock, NULL, MUTEX_DRIVER,
 	    DDI_INTR_PRI(ice->ice_intr_pri));
 	cv_init(&irr->irxr_cv, NULL, CV_DRIVER, NULL);
+	cv_init(&irr->irxr_intr_cv, NULL, CV_DRIVER, NULL);
 
 	desc_len = (size_t)irr->irxr_size *
 	    sizeof (union ice_32b_rx_flex_desc);
@@ -151,6 +154,7 @@ ice_rx_ring_alloc(ice_t *ice, ice_rx_ring_t *irr, uint_t index)
 	    B_FALSE, desc_len, B_TRUE)) {
 		ice_error(ice, "failed to allocate rx descriptor ring for "
 		    "queue %u", index);
+		cv_destroy(&irr->irxr_intr_cv);
 		cv_destroy(&irr->irxr_cv);
 		mutex_destroy(&irr->irxr_lock);
 		return (B_FALSE);
@@ -172,6 +176,7 @@ ice_rx_ring_alloc(ice_t *ice, ice_rx_ring_t *irr, uint_t index)
 		irr->irxr_rcbs = NULL;
 		ice_dma_free(&irr->irxr_desc_dma);
 		irr->irxr_descs = NULL;
+		cv_destroy(&irr->irxr_intr_cv);
 		cv_destroy(&irr->irxr_cv);
 		mutex_destroy(&irr->irxr_lock);
 		return (B_FALSE);
@@ -346,11 +351,14 @@ ice_rx_ring_program(ice_t *ice, ice_rx_ring_t *irr)
 }
 
 /*
- * Disable an rx queue and clear its context.  Best effort: teardown proceeds
- * even if the queue does not acknowledge the disable, so the result is not
- * propagated.
+ * Disable an rx queue.  The queue's interrupt cause must already have been
+ * dissociated (ice_queues_intr_dissociate()).  Returns ICE_SUCCESS only once
+ * QENA_STAT reads clear, which is the point at which the queue's memory may be
+ * released (datasheet 10.4.3.1.2 step 9); the staging registers are cleared
+ * only then, since clearing them under a queue that is still enabled is
+ * undefined.
  */
-void
+int
 ice_rx_ring_unprogram(ice_t *ice, ice_rx_ring_t *irr)
 {
 	struct ice_hw *hw = &ice->ice_hw;
@@ -371,9 +379,12 @@ ice_rx_ring_unprogram(ice_t *ice, ice_rx_ring_t *irr)
 	if ((reg & QRX_CTRL_QENA_STAT_M) != 0) {
 		ice_error(ice, "rx queue %u failed to disable",
 		    irr->irxr_index);
+		return (ICE_ERR_CFG);
 	}
 
 	(void) ice_clear_rxq_ctx(hw, irr->irxr_index);
+
+	return (ICE_SUCCESS);
 }
 
 /*
@@ -1255,6 +1266,12 @@ ice_ring_rx_poll(void *arg, int poll_bytes)
  * MSI-X handler after it maps the firing vector back to this ring.  Returns
  * B_TRUE when the drain stopped at the limit with frames still ready, so the
  * caller's re-arm can schedule a software interrupt for the residue.
+ *
+ * irxr_intr_busy is held across mac_rx_ring(), which runs without the ring
+ * lock and dereferences the mac_ring_t and mac_impl_t that mac_unregister()
+ * frees.  A chain that was copied rather than loaned leaves no loan for
+ * ice_rx_drain() to block on, so the teardown paths wait this flag out
+ * instead.
  */
 boolean_t
 ice_rx_ring_intr(ice_rx_ring_t *irr)
@@ -1271,10 +1288,17 @@ ice_rx_ring_intr(ice_rx_ring_t *irr)
 	}
 	mp = ice_ring_rx(irr, 0, &limit);
 	gen = irr->irxr_rxgen;
+	if (mp != NULL)
+		irr->irxr_intr_busy = B_TRUE;
 	mutex_exit(&irr->irxr_lock);
 
 	if (mp != NULL) {
 		mac_rx_ring(ice->ice_mac_hdl, irr->irxr_macrxring, mp, gen);
+
+		mutex_enter(&irr->irxr_lock);
+		irr->irxr_intr_busy = B_FALSE;
+		cv_broadcast(&irr->irxr_intr_cv);
+		mutex_exit(&irr->irxr_lock);
 	}
 
 	return (limit);
@@ -1399,13 +1423,17 @@ ice_ring_rx_start(mac_ring_driver_t rh, uint64_t gen_num)
 	/*
 	 * MAC unwinds a failed mr_start without calling mi_stop, so nothing
 	 * else would record why the plumb failed.  The next mac start clears
-	 * this and reallocates the pool.
+	 * this and reallocates the pool.  ICE_STATE_STARTED has to come back
+	 * off too: ice_m_start() set it before MAC drove the per-ring starts,
+	 * and a rebuild that saw it left set would re-enable and re-post every
+	 * queue behind a plumb that never completed.
 	 */
 	if (ret != 0) {
 		ice_t *ice = irr->irxr_ice;
 
+		atomic_and_32(&ice->ice_state, ~ICE_STATE_STARTED);
 		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
-		ice_error(ice, "!rx ring %u could not be opened; buffers are "
+		ice_error(ice, "rx ring %u could not be opened; buffers are "
 		    "still outstanding up the stack", irr->irxr_index);
 	}
 
@@ -1415,7 +1443,8 @@ ice_ring_rx_start(mac_ring_driver_t rh, uint64_t gen_num)
 /*
  * mac(9E) ring stop: close the ring to new traffic.  Buffers and loans are
  * reclaimed by ice_rx_stop() at the softc level; this only marks the ring
- * quiescent so the datapath stops touching it.
+ * quiescent so the datapath stops touching it.  The flag stops new deliveries;
+ * the wait covers an interrupt already inside mac_rx_ring().
  */
 void
 ice_ring_rx_stop(mac_ring_driver_t rh)
@@ -1425,6 +1454,8 @@ ice_ring_rx_stop(mac_ring_driver_t rh)
 	mutex_enter(&irr->irxr_lock);
 	irr->irxr_shutdown = B_TRUE;
 	irr->irxr_started = B_FALSE;
+	while (irr->irxr_intr_busy)
+		cv_wait(&irr->irxr_intr_cv, &irr->irxr_lock);
 	mutex_exit(&irr->irxr_lock);
 }
 
@@ -1536,6 +1567,13 @@ ice_rx_quiesce(ice_t *ice)
 
 		mutex_enter(&irr->irxr_lock);
 
+		/*
+		 * An interrupt already inside mac_rx_ring() holds no ring lock
+		 * and owns no loan, so nothing else here waits it out.
+		 */
+		while (irr->irxr_intr_busy)
+			cv_wait(&irr->irxr_intr_cv, &irr->irxr_lock);
+
 		while (irr->irxr_nloaned > 0) {
 			if (cv_timedwait(&irr->irxr_cv, &irr->irxr_lock,
 			    deadline) == -1)
@@ -1575,10 +1613,11 @@ ice_rx_reclaim(ice_t *ice)
 }
 
 /*
- * Tear down every rx ring's control blocks on mac_stop.
- * ice_queues_disable() has already disabled the hardware queues, so the
- * reclaim is safe immediately.  The reset path drives the two halves
- * separately, around the reset barrier.
+ * Tear down every rx ring's control blocks on mac_stop.  Reached only once
+ * ice_queues_disable() has confirmed QENA_STAT is clear on every rx queue,
+ * which is what makes releasing the pool safe (datasheet 10.4.3.1.2 step 9);
+ * a disable that did not complete quiesces without reclaiming and lets the
+ * reset barrier release the buffers instead.
  */
 boolean_t
 ice_rx_stop(ice_t *ice)

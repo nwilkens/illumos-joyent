@@ -98,6 +98,8 @@ CTASSERT(ICE_MAX_FRAME_SIZE <= UINT16_MAX);
 /* The refetched header is the eighth descriptor in each hardware segment. */
 #define	ICE_TX_LSO_SEG_DESCS	7		/* payload descs per segment */
 #define	ICE_TX_LSO_MIN_MSS	64
+/* Datasheet 10.5.8.4.1: TSO header (L2+L3+L4) maximum, in bytes. */
+#define	ICE_TX_LSO_MAX_HDRLEN	512
 #define	ICE_LSO_MAXLEN		(64 * 1024)
 #define	ICE_TX_LSO_BUFSZ	P2ROUNDUP(ICE_MAX_FRAME_SIZE, PAGESIZE)
 /*
@@ -106,8 +108,12 @@ CTASSERT(ICE_MAX_FRAME_SIZE <= UINT16_MAX);
  */
 #define	ICE_TX_COPY_BUFSZ	P2ROUNDUP(ICE_MAX_FRAME_SIZE, PAGESIZE)
 #define	ICE_TX_SMALL_PKT	512		/* small-copy threshold */
+/* GLCOMM_MIN_MAX_PKT.MIHDL reset value; a shorter frame is a TCLAN MDD. */
+#define	ICE_TX_MIN_LEN		17
 
 CTASSERT(sizeof (struct ice_tx_ctx_desc) == sizeof (struct ice_tx_desc));
+/* Runts take the copy path; the pad fits the smallest pool buffer. */
+CTASSERT(ICE_TX_MIN_LEN <= ICE_TX_SMALL_PKT);
 /*
  * ICE_TX_COPY_BUFSZ is page-rounded, so it is >= ICE_MAX_FRAME_SIZE by
  * construction and is not a constant expression a CTASSERT can read.  Assert
@@ -284,6 +290,12 @@ typedef struct ice_tx_ring {
 	uint32_t		itxr_index;	/* absolute HW tx queue index */
 	uint32_t		itxr_vec;	/* MSI-X vector index */
 	uint32_t		itxr_q_teid;	/* core: from ice_ena_vsi_txq */
+	/*
+	 * Set before the Add Tx Queues command and cleared only by a confirmed
+	 * disable, so a queue the command enabled before a later step of
+	 * ice_ena_vsi_txq() failed is still treated as live.
+	 */
+	boolean_t		itxr_programmed;
 
 	kmutex_t		itxr_lock;
 	kcondvar_t		itxr_cv;	/* stop waits for tx drain */
@@ -299,6 +311,10 @@ typedef struct ice_tx_ring {
 	uint16_t		itxr_avail;
 	uint16_t		itxr_head;
 	uint16_t		itxr_tail;
+	/* Slot of each in-flight packet's RS descriptor, in transmit order. */
+	uint16_t		*itxr_rsq;	/* [itxr_size] */
+	uint16_t		itxr_rs_pidx;
+	uint16_t		itxr_rs_cidx;
 
 	ice_tx_ctrl_block_t	*itxr_tcb_area;	/* [itxr_size] backing */
 	ice_tx_ctrl_block_t	**itxr_tcbs;	/* [itxr_size], by slot */
@@ -345,9 +361,11 @@ typedef struct ice_rx_ring {
 	boolean_t		irxr_shutdown;
 	boolean_t		irxr_started;	/* irxr_lock */
 	boolean_t		irxr_intr_poll;	/* mac is polling this ring */
+	boolean_t		irxr_intr_busy;	/* ISR is in mac_rx_ring */
 
 	kmutex_t		irxr_lock;
 	kcondvar_t		irxr_cv;	/* teardown waits on loans */
+	kcondvar_t		irxr_intr_cv;	/* stop waits on the ISR */
 	mac_ring_handle_t	irxr_macrxring;
 	uint64_t		irxr_rxgen;
 
@@ -566,9 +584,12 @@ typedef struct ice {
 /*PRINTFLIKE2*/
 extern void ice_error(ice_t *, const char *, ...);
 extern int ice_check_acc_handle(ddi_acc_handle_t);
+extern int ice_status_to_errno(ice_t *, int);
 extern void ice_update_mtu(ice_t *);
 extern int ice_queues_program(ice_t *);
-extern void ice_queues_disable(ice_t *);
+extern boolean_t ice_queues_disable(ice_t *);
+extern void ice_queues_intr_map(ice_t *);
+extern void ice_queues_intr_dissociate(ice_t *);
 extern void ice_reset_task(void *);
 extern void ice_reset_redispatch(ice_t *);
 #ifdef DEBUG
@@ -632,7 +653,7 @@ extern void ice_buf_fini(ice_t *);
 extern boolean_t ice_tx_rings_alloc(ice_t *);
 extern void ice_tx_rings_free(ice_t *);
 extern int ice_tx_ring_program(ice_t *, ice_tx_ring_t *);
-extern void ice_tx_ring_unprogram(ice_t *, ice_tx_ring_t *);
+extern int ice_tx_ring_unprogram(ice_t *, ice_tx_ring_t *);
 extern void ice_map_txq_vector(ice_t *, ice_tx_ring_t *);
 
 /*
@@ -641,7 +662,7 @@ extern void ice_map_txq_vector(ice_t *, ice_tx_ring_t *);
 extern boolean_t ice_rx_rings_alloc(ice_t *);
 extern void ice_rx_rings_free(ice_t *);
 extern int ice_rx_ring_program(ice_t *, ice_rx_ring_t *);
-extern void ice_rx_ring_unprogram(ice_t *, ice_rx_ring_t *);
+extern int ice_rx_ring_unprogram(ice_t *, ice_rx_ring_t *);
 extern void ice_map_rxq_vector(ice_t *, ice_rx_ring_t *);
 extern void ice_cfg_itr(ice_t *, uint32_t);
 

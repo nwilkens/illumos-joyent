@@ -60,11 +60,32 @@ def main() -> None:
     assert "mutex_exit(&ice->ice_rebuild_lock)" in promisc
 
     # ice_promisc_apply must NOT take the lock: ice_vsi_rebuild calls it while
-    # already holding ice_rebuild_lock.
+    # already holding ice_rebuild_lock.  It asserts the lock instead, and owns
+    # ice_promisc_on so a partial apply is still replayed by the rebuild.
     apply = function(
         gld, "ice_promisc_apply(ice_t *ice, boolean_t on)\n{", "\nstatic int\nice_m_promisc"
     )
-    assert "ice_rebuild_lock" not in apply
+    assert "mutex_enter(&ice->ice_rebuild_lock)" not in apply
+    assert "mutex_exit(&ice->ice_rebuild_lock)" not in apply
+    assert "ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));" in apply
+    assert apply.index("ice->ice_promisc_on = on;") < apply.index(
+        "ice_set_vsi_promisc(hw, vsi->vi_handle, mask, 0)"
+    )
+
+    # A failed enable rolls the same mask back so a retry is not rejected with
+    # ICE_ERR_ALREADY_EXISTS, and the errno is decoded before the rollback
+    # overwrites sq_last_status.
+    assert apply.count("ice_clear_vsi_promisc(hw, vsi->vi_handle, mask, 0)") == 2
+    assert apply.index("ret = ice_status_to_errno(ice, status);") < apply.index(
+        "rollback = ice_clear_vsi_promisc("
+    )
+
+    setmac_locked = function(
+        gld,
+        "ice_gld_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)\n{",
+        "\n/*\n * ice_rebuild_lock is the outermost",
+    )
+    assert "return (ice_status_to_errno(ice, status));" in setmac_locked
 
     lbset = function(
         gld,

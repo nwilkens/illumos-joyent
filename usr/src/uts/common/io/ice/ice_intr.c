@@ -74,6 +74,8 @@
 #define	ICE_OICR_CAUSE_MASK	\
 	(ICE_OICR_FATAL_MASK | PFINT_OICR_GRST_M)
 
+static void ice_intr_oicr_enable(ice_t *);
+
 static void
 ice_link_state_set(ice_t *ice, link_state_t state)
 {
@@ -655,6 +657,17 @@ ice_oicr_task(void *arg)
 	 */
 	ice_link_status_update_impl(ice, NULL);
 
+	/*
+	 * Belt and braces for a re-arm the ISR lost to a faulted register
+	 * write: the vector is self-disarming, so one dropped write is
+	 * otherwise permanent.  Both early returns above skip this, and
+	 * ice_rebuild_lock is held here, so it cannot land between
+	 * ice_prepare_for_reset()'s disable and ice_rebuild()'s re-arm.
+	 * FreeBSD re-enables the same vector from its admin task
+	 * (if_ice_iflib.c:2497).
+	 */
+	ice_intr_oicr_enable(ice);
+
 	mutex_exit(&ice->ice_rebuild_lock);
 }
 
@@ -792,9 +805,13 @@ ice_intr_oicr(ice_t *ice)
 	oicr = rd32(hw, PFINT_OICR);
 
 	if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {
+		/*
+		 * oicr is untrustworthy here (a severed bus reads all ones),
+		 * so latch nothing; the vector still has to be re-armed.
+		 */
 		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
 		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
-		return (DDI_INTR_CLAIMED);
+		goto rearm;
 	}
 
 	ice_oicr_causes_latch(ice, oicr);
@@ -823,6 +840,12 @@ ice_intr_oicr(ice_t *ice)
 		ice_error(ice, "OICR taskq dispatch failed");
 	}
 
+rearm:
+	/*
+	 * The vector auto-clears INTENA on assertion (datasheet 9.1.1.3), so
+	 * a path that returns without re-arming leaves the OICR dead for the
+	 * life of the instance.  Every exit routes through here.
+	 */
 	ice_intr_oicr_enable(ice);
 	return (DDI_INTR_CLAIMED);
 }

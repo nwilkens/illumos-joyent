@@ -188,6 +188,41 @@ ice_check_acc_handle(ddi_acc_handle_t h)
 	return (de.fme_status);
 }
 
+/*
+ * Translate a common-code status into an errno.  mac(9E) recovers from ENOSPC
+ * on the unicast add path by falling back to promiscuous mode plus software
+ * classification; collapsing every failure to EIO forfeits that.  Firmware
+ * reports a filter it could not allocate as ICE_AQ_RC_ENOSPC (E810 datasheet
+ * Table 7-78, Add Switch Rules Response), which the common code records in
+ * hw->adminq.sq_last_status while returning ICE_ERR_AQ_ERROR.  The next admin
+ * queue command overwrites sq_last_status, so callers must decode a failure
+ * before issuing anything else.
+ */
+int
+ice_status_to_errno(ice_t *ice, int status)
+{
+	switch (status) {
+	case ICE_SUCCESS:
+		return (0);
+	case ICE_ERR_NO_MEMORY:
+		return (ENOMEM);
+	case ICE_ERR_RESET_ONGOING:
+		return (EAGAIN);
+	case ICE_ERR_AQ_ERROR:
+		break;
+	default:
+		return (EIO);
+	}
+
+	switch (ice->ice_hw.adminq.sq_last_status) {
+	case ICE_AQ_RC_ENOSPC:
+	case ICE_AQ_RC_ENOMEM:
+		return (ENOSPC);
+	default:
+		return (EIO);
+	}
+}
+
 static int
 ice_fm_error_cb(dev_info_t *dip, ddi_fm_error_t *err, const void *arg __unused)
 {
@@ -594,18 +629,24 @@ ice_queues_program(ice_t *ice)
 	for (i = 0; i < ice->ice_num_txr; i++) {
 		status = ice_tx_ring_program(ice, &ice->ice_txr[i]);
 		if (status != ICE_SUCCESS) {
-			while (i-- > 0)
-				ice_tx_ring_unprogram(ice, &ice->ice_txr[i]);
+			while (i-- > 0) {
+				(void) ice_tx_ring_unprogram(ice,
+				    &ice->ice_txr[i]);
+			}
 			return (status);
 		}
 	}
 	for (i = 0; i < ice->ice_num_rxr; i++) {
 		status = ice_rx_ring_program(ice, &ice->ice_rxr[i]);
 		if (status != ICE_SUCCESS) {
-			while (i-- > 0)
-				ice_rx_ring_unprogram(ice, &ice->ice_rxr[i]);
-			for (j = 0; j < ice->ice_num_txr; j++)
-				ice_tx_ring_unprogram(ice, &ice->ice_txr[j]);
+			while (i-- > 0) {
+				(void) ice_rx_ring_unprogram(ice,
+				    &ice->ice_rxr[i]);
+			}
+			for (j = 0; j < ice->ice_num_txr; j++) {
+				(void) ice_tx_ring_unprogram(ice,
+				    &ice->ice_txr[j]);
+			}
 			return (status);
 		}
 	}
@@ -613,18 +654,31 @@ ice_queues_program(ice_t *ice)
 	return (ICE_SUCCESS);
 }
 
-void
+/*
+ * Disable every tx/rx queue.  Every ring is attempted even after a failure, so
+ * a queue that can be stopped is stopped.  Returns B_FALSE if any queue did not
+ * confirm the disable: its DMA may still be live, so the caller must not
+ * release anything the hardware can still reach.
+ */
+boolean_t
 ice_queues_disable(ice_t *ice)
 {
+	boolean_t ok = B_TRUE;
 	uint_t i;
 
-	for (i = 0; i < ice->ice_num_txr; i++)
-		ice_tx_ring_unprogram(ice, &ice->ice_txr[i]);
-	for (i = 0; i < ice->ice_num_rxr; i++)
-		ice_rx_ring_unprogram(ice, &ice->ice_rxr[i]);
+	for (i = 0; i < ice->ice_num_txr; i++) {
+		if (ice_tx_ring_unprogram(ice, &ice->ice_txr[i]) != ICE_SUCCESS)
+			ok = B_FALSE;
+	}
+	for (i = 0; i < ice->ice_num_rxr; i++) {
+		if (ice_rx_ring_unprogram(ice, &ice->ice_rxr[i]) != ICE_SUCCESS)
+			ok = B_FALSE;
+	}
+
+	return (ok);
 }
 
-static void
+void
 ice_queues_intr_map(ice_t *ice)
 {
 	uint_t i;
@@ -650,6 +704,46 @@ ice_queues_intr_unmap(ice_t *ice)
 	ice_flush(hw);
 }
 
+/*
+ * Dissociate every queue's interrupt cause from its vector before the queues
+ * are disabled: clear CAUSE_ENA, then trigger a software interrupt on the
+ * vector so a cause already in flight is retired (datasheet 9.1.3.1.2).  A
+ * queue disable issued without this is not guaranteed to complete.  The MSI-X
+ * and ITR routing is left in place, unlike ice_queues_intr_unmap(), so
+ * ice_queues_intr_map() is what re-arms the cause on the next start.
+ */
+void
+ice_queues_intr_dissociate(ice_t *ice)
+{
+	struct ice_hw *hw = &ice->ice_hw;
+	uint32_t reg;
+	uint_t i;
+
+	for (i = 0; i < ice->ice_num_txr; i++) {
+		ice_tx_ring_t *itr = &ice->ice_txr[i];
+
+		reg = rd32(hw, QINT_TQCTL(itr->itxr_index));
+		reg &= ~QINT_TQCTL_CAUSE_ENA_M;
+		wr32(hw, QINT_TQCTL(itr->itxr_index), reg);
+		ice_flush(hw);
+		wr32(hw, GLINT_DYN_CTL(itr->itxr_vec),
+		    GLINT_DYN_CTL_SWINT_TRIG_M | GLINT_DYN_CTL_INTENA_MSK_M);
+	}
+
+	for (i = 0; i < ice->ice_num_rxr; i++) {
+		ice_rx_ring_t *irr = &ice->ice_rxr[i];
+
+		reg = rd32(hw, QINT_RQCTL(irr->irxr_index));
+		reg &= ~QINT_RQCTL_CAUSE_ENA_M;
+		wr32(hw, QINT_RQCTL(irr->irxr_index), reg);
+		ice_flush(hw);
+		wr32(hw, GLINT_DYN_CTL(irr->irxr_vec),
+		    GLINT_DYN_CTL_SWINT_TRIG_M | GLINT_DYN_CTL_INTENA_MSK_M);
+	}
+
+	ice_flush(hw);
+}
+
 static void
 ice_unconfigure(ice_t *ice)
 {
@@ -662,10 +756,53 @@ ice_unconfigure(ice_t *ice)
 		ice_stats_fini(ice);
 
 	/*
+	 * Fence the interrupt handlers before anything they touch is released,
+	 * and before the queue stop below.  Masking (ice_intr_disable) only
+	 * stops new deliveries; removing the handler is what waits out one
+	 * already running on another CPU.  ice_detach() has already called
+	 * mac_unregister(), so ice_mac_hdl is NULL: a tx completion landing
+	 * here would reach mac_tx_ring_update() through ice_tx_ring_intr() and
+	 * dereference it.  The queue ISR also walks the ring arrays, so the
+	 * handlers must be gone before the rings are freed and before the OICR
+	 * taskq the OICR handler dispatches onto is destroyed.  Nothing below
+	 * needs interrupts: the admin queue commands are polled.
+	 */
+	if (ice->ice_attach_progress & ICE_ATTACH_ENABLE_INTR) {
+		ice_intr_disable(ice);
+		ice_intr_oicr_disable(ice);
+		wr32(&ice->ice_hw, PFINT_OICR_ENA, 0);
+		ice_flush(&ice->ice_hw);
+	}
+
+	if (ice->ice_attach_progress & ICE_ATTACH_ADD_INTR)
+		ice_rem_intr_handlers(ice);
+
+	/*
+	 * Stop the queues before anything they can master into is released.
+	 * mac stop normally did this, but it declines to when a disable does
+	 * not complete, and the PF reset it then requests is swallowed by the
+	 * detaching gate.  ICE_ATTACH_QUEUE_INTR implies the rings, the VSI
+	 * and the control queue ice_dis_vsi_txq() rides are all still up.  A
+	 * queue that still will not stop gets the reset barrier here, since
+	 * nothing below can wait for it; reset_ongoing then keeps the admin
+	 * queue teardown further down from waiting out commands the reset ate.
+	 *
+	 * The cause dissociation ice_m_stop() performs is pointless now that
+	 * the handlers are gone, and the PFR is a stronger barrier than it
+	 * would provide.
+	 */
+	if (ice->ice_attach_progress & ICE_ATTACH_QUEUE_INTR) {
+		if (!ice_queues_disable(ice)) {
+			(void) ice_reset(&ice->ice_hw, ICE_RESET_PFR);
+			ice->ice_hw.reset_ongoing = true;
+		}
+		ice_tx_reclaim(ice);
+	}
+
+	/*
 	 * The MAC handle (a higher progress bit) is unregistered by ice_detach
-	 * before this runs, so the datapath is already quiesced: mac_stop drove
-	 * ice_rx_stop()/ice_tx_stop(), draining loans and reclaiming TCBs.  The
-	 * shared copy-buffer pools can now be freed.
+	 * before this runs and the queues are stopped above, so nothing can
+	 * reach the shared copy-buffer pools any more.
 	 */
 	if (ice->ice_attach_progress & ICE_ATTACH_BUFS)
 		ice_buf_fini(ice);
@@ -677,24 +814,6 @@ ice_unconfigure(ice_t *ice)
 	 */
 	if (ice->ice_attach_progress & ICE_ATTACH_QUEUE_INTR)
 		ice_queues_intr_unmap(ice);
-
-	/*
-	 * Fence the interrupt handlers before freeing anything they touch.
-	 * Masking (ice_intr_disable) only stops new deliveries; removing the
-	 * handler is what waits out one already running on another CPU.  The
-	 * queue ISR dereferences the ring arrays, so the handlers must be
-	 * removed before the rings are freed and before the OICR taskq, which
-	 * the OICR handler dispatches onto, is destroyed.
-	 */
-	if (ice->ice_attach_progress & ICE_ATTACH_ENABLE_INTR) {
-		ice_intr_disable(ice);
-		ice_intr_oicr_disable(ice);
-		wr32(&ice->ice_hw, PFINT_OICR_ENA, 0);
-		ice_flush(&ice->ice_hw);
-	}
-
-	if (ice->ice_attach_progress & ICE_ATTACH_ADD_INTR)
-		ice_rem_intr_handlers(ice);
 
 	/*
 	 * Stop the admin periodic before the taskq it dispatches into.
@@ -1217,7 +1336,7 @@ ice_prepare_for_reset(ice_t *ice)
 	 */
 	if ((ice->ice_state & ICE_STATE_STARTED) != 0) {
 		ice_queues_intr_unmap(ice);
-		ice_queues_disable(ice);
+		(void) ice_queues_disable(ice);
 		ice_tx_quiesce(ice);
 		(void) ice_rx_quiesce(ice);
 	}
