@@ -23,5 +23,6 @@
 /proto
 /webrev
 /.vscode
+/.$EXTEND
 /on-closed-bin*.tar.bz2
 /illumos.sh
