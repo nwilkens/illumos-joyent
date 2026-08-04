@@ -27,9 +27,13 @@ timeout = 60
 post =
 outputdir = /var/tmp/test_results
 
-[/opt/os-tests/tests/poll]
+[/opt/os-tests/tests/poll_test]
 user = root
-tests = ['poll_test', 'epoll_test']
+
+[/opt/os-tests/tests/epoll_test]
+user = root
+
+[/opt/os-tests/tests/poll_close_test]
 
 [/opt/os-tests/tests/eventfd.32]
 [/opt/os-tests/tests/eventfd.64]
