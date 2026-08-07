@@ -13150,7 +13150,11 @@ s usr/share/man/man3c/btowc_l.3c=btowc.3c
 f usr/share/man/man3c/byteorder.3c 0444 root bin
 s usr/share/man/man3c/bzero.3c=bstring.3c
 f usr/share/man/man3c/c16rtomb.3c 0444 root bin
+s usr/share/man/man3c/c16rtomb_l.3c=c16rtomb.3c
 s usr/share/man/man3c/c32rtomb.3c=c16rtomb.3c
+s usr/share/man/man3c/c32rtomb_l.3c=c16rtomb.3c
+s usr/share/man/man3c/c8rtomb.3c=c16rtomb.3c
+s usr/share/man/man3c/c8rtomb_l.3c=c16rtomb.3c
 f usr/share/man/man3c/call_once.3c 0444 root bin
 s usr/share/man/man3c/calloc.3c=malloc.3c
 s usr/share/man/man3c/canonicalize_file_name.3c=realpath.3c
@@ -13620,7 +13624,11 @@ s usr/share/man/man3c/mblen_l.3c=mblen.3c
 f usr/share/man/man3c/mbrlen.3c 0444 root bin
 s usr/share/man/man3c/mbrlen_l.3c=mbrlen.3c
 f usr/share/man/man3c/mbrtoc16.3c 0444 root bin
+s usr/share/man/man3c/mbrtoc16_l.3c=mbrtoc16.3c
 s usr/share/man/man3c/mbrtoc32.3c=mbrtoc16.3c
+s usr/share/man/man3c/mbrtoc32_l.3c=mbrtoc16.3c
+s usr/share/man/man3c/mbrtoc8.3c=mbrtoc16.3c
+s usr/share/man/man3c/mbrtoc8_l.3c=mbrtoc16.3c
 s usr/share/man/man3c/mbrtowc.3c=mbrtoc16.3c
 s usr/share/man/man3c/mbrtowc_l.3c=mbrtoc16.3c
 f usr/share/man/man3c/mbsinit.3c 0444 root bin
