@@ -1022,9 +1022,14 @@ ice_set_link_events(ice_t *ice)
 	 * Also wake on media insert/remove and unqualified-module plug so the
 	 * cached link/transceiver state stays current and a media-available
 	 * transition can re-drive the PHY enable.
+	 *
+	 * The complement is confined to the events the hardware defines: the
+	 * datasheet assigns bits 1 through 12 and requires every other bit of
+	 * this mask to be zero.
 	 */
-	mask = (uint16_t)~(ICE_AQ_LINK_EVENT_UPDOWN |
-	    ICE_AQ_LINK_EVENT_MEDIA_NA | ICE_AQ_LINK_EVENT_MODULE_QUAL_FAIL);
+	mask = (uint16_t)(ICE_AQ_LINK_EVENT_MASK_DEFINED &
+	    ~(ICE_AQ_LINK_EVENT_UPDOWN | ICE_AQ_LINK_EVENT_MEDIA_NA |
+	    ICE_AQ_LINK_EVENT_MODULE_QUAL_FAIL));
 
 	mutex_enter(&ice->ice_lse_lock);
 	ice->ice_lse_flags |= ICE_LSE_F_ENABLE;

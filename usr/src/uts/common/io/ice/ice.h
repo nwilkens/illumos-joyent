@@ -82,6 +82,21 @@ CTASSERT(ICE_MAX_MTU + sizeof (struct ether_vlan_header) + ETHERFCSL ==
     ICE_MAX_FRAME_SIZE);
 CTASSERT(ICE_MAX_FRAME_SIZE <= UINT16_MAX);
 
+/*
+ * Every link event the Set Event Mask command (0x0613) defines.  The datasheet
+ * assigns bits 1 through 12 and requires the rest of the mask to be zero, so a
+ * complement taken to build a mask has to be confined to these.
+ */
+#define	ICE_AQ_LINK_EVENT_MASK_DEFINED					\
+	(ICE_AQ_LINK_EVENT_UPDOWN | ICE_AQ_LINK_EVENT_MEDIA_NA |	\
+	ICE_AQ_LINK_EVENT_LINK_FAULT | ICE_AQ_LINK_EVENT_PHY_TEMP_ALARM | \
+	ICE_AQ_LINK_EVENT_EXCESSIVE_ERRORS |				\
+	ICE_AQ_LINK_EVENT_SIGNAL_DETECT | ICE_AQ_LINK_EVENT_AN_COMPLETED | \
+	ICE_AQ_LINK_EVENT_MODULE_QUAL_FAIL |				\
+	ICE_AQ_LINK_EVENT_PORT_TX_SUSPENDED |				\
+	ICE_AQ_LINK_EVENT_TOPO_CONFLICT | ICE_AQ_LINK_EVENT_MEDIA_CONFLICT | \
+	ICE_AQ_LINK_EVENT_PHY_FW_LOAD_FAIL)
+
 /* Standard netlb(4I) modes supported by ice_m_ioctl(). */
 #define	ICE_LB_NONE		0
 #define	ICE_LB_INTERNAL_MAC	1
