@@ -48,6 +48,11 @@ def callback_fragments(gld_source: Path, vsi_source: Path) -> list[str]:
     else:
         fragments.append(extract(vsi_source.read_text(encoding="utf-8"),
             r"^void\nice_fltr_entry_init\([\s\S]*?^}", vsi_source))
+    # Recovery helpers did not exist in older source used as negative controls.
+    for name in ("ice_gld_filters_blocked", "ice_gld_filter_recover"):
+        if re.search(rf"^{name}\(", source, re.MULTILINE):
+            fragments.append(extract(source,
+                rf"^static [\w *]+\n{name}\([\s\S]*?^}}", gld_source))
     # Compile each body unchanged; this does not assert its implementation text.
     for name in FUNCTIONS:
         fragments.append(extract(source,
@@ -69,7 +74,7 @@ def main() -> None:
         binary = work / "terminal_filters"
         compiler = shlex.split(os.environ.get("CC", "cc"))
         subprocess.run(compiler + [
-            "-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic",
+            "-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic", "-Wno-unused-function",
             "-I", str(work), str(TESTDIR / "terminal_filters.c"),
             "-o", str(binary),
         ], check=True)

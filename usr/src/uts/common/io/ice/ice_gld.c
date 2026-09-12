@@ -64,9 +64,44 @@ ice_gld_find_mac(ice_vsi_t *vsi, const uint8_t *addr)
 }
 
 /*
+ * MAC callbacks cannot introduce new ownership while filter recovery is owed.
+ * Replay calls ice_promisc_apply() directly, after the worker claims its reset
+ * requests, and must not confuse a later request with an unavailable callback.
+ */
+static boolean_t
+ice_gld_filters_blocked(ice_t *ice)
+{
+	const uint32_t blocked = ICE_STATE_RESET_FAILED | ICE_STATE_PFR_REQ |
+	    ICE_STATE_RESET_PENDING;
+
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+
+	return ((ice->ice_state & blocked) != 0);
+}
+
+/*
+ * A failed switch operation may already have changed hardware or common-code
+ * bookkeeping.  Block software traffic and arrange a reset to clear that
+ * uncertain state before replaying accepted ownership.  This is deferred
+ * filter cleanup, not an acknowledgment that hardware or DMA has stopped.
+ */
+static void
+ice_gld_filter_recover(ice_t *ice)
+{
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+
+	atomic_or_32(&ice->ice_state, ICE_STATE_ERROR | ICE_STATE_PFR_REQ);
+	ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
+	ice_link_report(ice, LINK_STATE_DOWN);
+	ice_reset_redispatch(ice);
+}
+
+/*
  * Add or remove a unicast/multicast MAC filter on the PF data VSI through the
- * switch.  The vi_macs list is the authoritative software record; the admin
- * queue command runs with the list lock dropped because it can block.
+ * switch.  vi_macs records addresses to replay or retire, not MAC reference
+ * counts or hardware readback.  Failed removals retire ownership and request
+ * recovery because MAC client teardown cannot retain it.  The blocking admin
+ * queue command runs with the list lock dropped.
  */
 static int
 ice_gld_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)
@@ -80,7 +115,7 @@ ice_gld_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)
 
 	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
 
-	if (add && (ice->ice_state & ICE_STATE_RESET_FAILED) != 0)
+	if (add && ice_gld_filters_blocked(ice))
 		return (EIO);
 
 	mutex_enter(&vsi->vi_mac_lock);
@@ -97,12 +132,11 @@ ice_gld_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)
 	mutex_exit(&vsi->vi_mac_lock);
 
 	/*
-	 * A terminal reset failure shuts down the control queue and prevents
-	 * restart or filter replay until reload.  Retire only the software
-	 * record in that state so MAC can release its address references.
-	 * Other failures must still propagate the hardware removal error.
+	 * Terminal failure cannot replay.  An owed reset will discard uncertain
+	 * hardware rules and replay the remaining addresses, so removals in
+	 * either state retire ownership without another switch command.
 	 */
-	if ((ice->ice_state & ICE_STATE_RESET_FAILED) == 0) {
+	if (!ice_gld_filters_blocked(ice)) {
 		INIT_LIST_HEAD(&m_list);
 		ice_fltr_entry_init(&e, vsi->vi_handle, addr);
 		LIST_ADD(&e.list_entry, &m_list);
@@ -113,10 +147,17 @@ ice_gld_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)
 			status = ice_remove_mac(hw, &m_list);
 
 		if (status != ICE_SUCCESS) {
+			int error = ice_status_to_errno(ice, status);
+
 			ice_error(ice, "failed to %s MAC filter: %d",
 			    add ? "add" : "remove", status);
-			return (ice_status_to_errno(ice, status));
+			ice_gld_filter_recover(ice);
+			if (add)
+				return (error);
 		}
+	} else if (add) {
+		/* A reset request may have arrived while checking the list. */
+		return (EIO);
 	}
 
 	mutex_enter(&vsi->vi_mac_lock);
@@ -648,29 +689,25 @@ ice_promisc_apply(ice_t *ice, boolean_t on)
 	ice_set_bit(ICE_PROMISC_MCAST_RX, mask);
 	ice_set_bit(ICE_PROMISC_MCAST_TX, mask);
 
-	/*
-	 * The common code commits one switch rule per bit and leaves the
-	 * earlier ones live when a later one fails, so the intent is recorded
-	 * before the call: a partial set that could not be undone must still
-	 * be replayed by ice_vsi_rebuild().
-	 */
+	/* The accepted policy is separate from partial switch programming. */
 	prev = ice->ice_promisc_on;
-	ice->ice_promisc_on = on;
 
 	if (!on) {
 		status = ice_clear_vsi_promisc(hw, vsi->vi_handle, mask, 0);
+		ice->ice_promisc_on = B_FALSE;
 		if (status != ICE_SUCCESS) {
 			ice_error(ice, "failed to disable promiscuous "
 			    "mode: %d", status);
-			ice->ice_promisc_on = prev;
-			return (ice_status_to_errno(ice, status));
+			ice_gld_filter_recover(ice);
 		}
 		return (0);
 	}
 
 	status = ice_set_vsi_promisc(hw, vsi->vi_handle, mask, 0);
-	if (status == ICE_SUCCESS)
+	if (status == ICE_SUCCESS) {
+		ice->ice_promisc_on = B_TRUE;
 		return (0);
+	}
 
 	ice_error(ice, "failed to enable promiscuous mode: %d", status);
 
@@ -681,19 +718,22 @@ ice_promisc_apply(ice_t *ice, boolean_t on)
 	ret = ice_status_to_errno(ice, status);
 
 	/*
-	 * ice_set_vsi_promisc() restarts at ICE_PROMISC_UCAST_RX on every call
-	 * and aborts on the first non-zero status, so a retry would return
-	 * ICE_ERR_ALREADY_EXISTS for a rule this attempt installed and never
-	 * reach the one that failed.  Clear the whole mask so the next attempt
-	 * starts from a clean state.
+	 * The setter applies individual rules and stops on the first error.
+	 * Clear the whole mask to remove recorded rules installed before that
+	 * failure.  Reset below also clears any unrecorded hardware state.
 	 */
 	rollback = ice_clear_vsi_promisc(hw, vsi->vi_handle, mask, 0);
+	ice->ice_promisc_on = prev;
 	if (rollback != ICE_SUCCESS) {
 		ice_error(ice, "failed to roll back promiscuous mode: %d",
 		    rollback);
-	} else {
-		ice->ice_promisc_on = prev;
 	}
+	/*
+	 * Even a successful rollback only removes recorded rules.  A failed
+	 * admin queue completion can leave an unrecorded hardware rule, so
+	 * reset before allowing another callback to enable traffic.
+	 */
+	ice_gld_filter_recover(ice);
 
 	return (ret);
 }
@@ -712,7 +752,15 @@ ice_m_promisc(void *arg, boolean_t on)
 	 * already holding the lock.
 	 */
 	mutex_enter(&ice->ice_rebuild_lock);
-	ret = ice_promisc_apply(ice, on);
+	if (ice_gld_filters_blocked(ice)) {
+		ret = on ? EIO : 0;
+		if (!on)
+			ice->ice_promisc_on = B_FALSE;
+	} else if (on == ice->ice_promisc_on) {
+		ret = 0;
+	} else {
+		ret = ice_promisc_apply(ice, on);
+	}
 	mutex_exit(&ice->ice_rebuild_lock);
 
 	return (ret);

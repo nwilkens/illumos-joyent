@@ -5,24 +5,29 @@ architecture, performance, and test issues, their priorities, and acceptance
 criteria. The driver [lifecycle contract](../../uts/common/io/ice/LIFECYCLE.md)
 records the lock, callback, DMA, and recovery boundaries exercised here.
 
-## Terminal filter callback regression
-
-Run the portable C regression with Python 3 and a C99 compiler (`CC` defaults
-to `cc`):
+## Filter callback and recovery regression
 
 ```
 python3 usr/src/test/ice-tests/terminal_filters.py
 ```
 
-The runner extracts the actual filter callbacks from `ice_gld.c` and the state
-enum from `ice.h`, then compiles them unchanged with the boundary stubs in
-`terminal_filters.c`. Six scenarios exercise normal firmware errors and
-terminal unicast, multicast, and promiscuous cleanup. Assertions check return
-values, software ownership, command counts, and lock boundaries. This test
-does not load the driver or establish hardware isolation.
+The runner extracts the actual filter callbacks from `ice_gld.c`, the shared
+request constructor from `ice_vsi.c`, and the state enum from `ice.h`, then
+compiles their bodies unchanged with boundary stubs in `terminal_filters.c`.
+Thirty scenarios cover accepted ownership, failed unicast/multicast commands,
+promiscuous rollback and retirement, owed/terminal recovery, duplicate/missing
+entries, and reset requests arriving during the address-list check. Assertions
+check errno, allocations, command counts, recovery dispatch, and lock boundaries.
+A successful recorded-rule rollback still requests reset because an AQ error
+can leave an unrecorded hardware rule. Direct replay must program an accepted
+enabled policy even when its boolean is unchanged.
 
-Use `--source /path/to/ice_gld.c` to check an earlier implementation against
-the same regression. The reviewed baseline fails terminal unicast removal.
+Use `--source /path/to/ice_gld.c` and `--vsi-source /path/to/ice_vsi.c` for paired
+source revisions. The pre-recovery source at `79bd14d475` compiles with this
+fixture and fails at runtime because a failed add does not request recovery.
+This test does not load the driver or establish hardware isolation. The
+[filter contract](../../uts/common/io/ice/FILTERS.md) records these ownership
+and recovery rules.
 
 ## Shared MAC filter request regression
 
@@ -45,12 +50,20 @@ removal without firmware calls. Seven attach failures verify that the existing
 attach owner still destroys partial VSI state, lists, and locks, including
 retiring desired records after RSS setup fails.
 
-The original constructors and the shared constructor both pass the `requests`
-scenario; deleting TX direction fails its request check at runtime. Select paired
-baseline files with `--gld-source` and `--vsi-source`, and a single scenario with
-`--scenario`. Before the ownership fix, each `rebuild_*` scenario fails because
-setup drains the desired list. The test controls imported-core and firmware
-boundaries; it does not verify firmware encoding or device programming.
+The `recovery_replay` scenario executes actual VSI rebuild after failed add,
+failed multicast removal, failed promiscuous enable/rollback, and failed
+promiscuous disable. Only accepted, unretired addresses are replayed; an
+unaccepted or retired promiscuous policy is not restored. Later successful
+recovery admits new ownership again. Core calls are controlled boundaries;
+this checks the driver's replay decisions, not hardware cleanup.
+
+The `requests` scenario checks constructor equivalence and current callback
+policy. Select paired source files with `--gld-source` and `--vsi-source`, and
+a single scenario with `--scenario`. Before the VSI setup ownership fix, each
+`rebuild_*` scenario fails because setup drains the desired list. Mutations
+that omit TX direction or replay an unowned promiscuous policy fail request
+checks at runtime. Firmware encoding and device programming remain outside
+these controlled tests.
 
 ## Detach lifecycle regression
 

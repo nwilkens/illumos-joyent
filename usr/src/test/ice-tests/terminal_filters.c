@@ -31,6 +31,8 @@
 #define	B_TRUE		1
 #define	KM_SLEEP	0
 #define	ICE_SUCCESS	0
+#define	DDI_SERVICE_LOST	1
+#define	LINK_STATE_DOWN	0
 #define	ASSERT(x)	assert(x)
 #define	MUTEX_HELD(m)	(*(m) != 0)
 #define	bzero(p, n)	((void) memset((p), 0, (n)))
@@ -63,7 +65,9 @@ struct ice_port_info {
 };
 struct ice_hw {
 	ice_t *owner;
-	int result;
+	int result, clear_result, last_status;
+	boolean_t override_clear;
+	unsigned int promisc_sets, promisc_clears;
 	unsigned int calls;
 	struct ice_port_info *port_info;
 	void *switch_info;
@@ -75,6 +79,8 @@ struct ice {
 	uint32_t ice_state;
 	boolean_t ice_promisc_on;
 	unsigned int ice_nqueues;
+	void *ice_dip;
+	unsigned int recoveries, service_lost, link_down;
 };
 
 struct LIST_HEAD_TYPE {
@@ -119,6 +125,8 @@ static struct {
 	struct ice_fltr_list_entry entries[8];
 } requests[8];
 static unsigned int nrequests;
+static ice_t *latch_ice;
+static uint32_t latch_state;
 
 
 static void
@@ -133,6 +141,11 @@ mutex_exit(kmutex_t *lock)
 {
 	assert(MUTEX_HELD(lock));
 	*lock = 0;
+	if (latch_ice != NULL &&
+	    lock == &latch_ice->ice_pf_vsi.vi_mac_lock) {
+		latch_ice->ice_state |= latch_state;
+		latch_ice = NULL;
+	}
 }
 
 static ice_mac_filter_t *
@@ -203,9 +216,8 @@ ice_error(ice_t *ice, const char *format, ...)
 static int
 ice_status_to_errno(ice_t *ice, int status)
 {
-	(void) ice;
 	assert(status != ICE_SUCCESS);
-	return (EIO);
+	return (ice->ice_hw.last_status == -2 ? ENOSPC : EIO);
 }
 
 static int
@@ -215,6 +227,7 @@ aq_result(struct ice_hw *hw)
 		assert(MUTEX_HELD(&hw->owner->ice_rebuild_lock));
 	assert(!MUTEX_HELD(&hw->owner->ice_pf_vsi.vi_mac_lock));
 	hw->calls++;
+	hw->last_status = hw->result;
 	return (hw->result);
 }
 
@@ -252,6 +265,7 @@ ice_set_vsi_promisc(struct ice_hw *hw, uint16_t vsi, uint32_t mask,
     uint16_t vlan)
 {
 	assert(vsi == 0 && mask == 0xf && vlan == 0);
+	hw->promisc_sets++;
 	return (aq_result(hw));
 }
 
@@ -259,10 +273,57 @@ static int
 ice_clear_vsi_promisc(struct ice_hw *hw, uint16_t vsi, uint32_t mask,
     uint16_t vlan)
 {
-	return (ice_set_vsi_promisc(hw, vsi, mask, vlan));
+	int status;
+
+	assert(vsi == 0 && mask == 0xf && vlan == 0);
+	hw->promisc_clears++;
+	status = aq_result(hw);
+	if (hw->override_clear)
+		status = hw->clear_result;
+	hw->last_status = status;
+	return (status);
 }
 
+static void atomic_or_32(uint32_t *, uint32_t);
+static void ddi_fm_service_impact(void *, int);
+static void ice_link_report(ice_t *, int);
+static void ice_reset_redispatch(ice_t *);
+
 #include "ice_filter_callbacks.h"
+
+static void
+atomic_or_32(uint32_t *state, uint32_t bits)
+{
+	*state |= bits;
+}
+
+static void
+ddi_fm_service_impact(void *dip, int impact)
+{
+	ice_t *ice = dip;
+
+	assert(impact == DDI_SERVICE_LOST);
+	assert(MUTEX_HELD(&ice->ice_rebuild_lock));
+	ice->service_lost++;
+}
+
+static void
+ice_link_report(ice_t *ice, int state)
+{
+	assert(state == LINK_STATE_DOWN);
+	assert(MUTEX_HELD(&ice->ice_rebuild_lock));
+	ice->link_down++;
+}
+
+static void
+ice_reset_redispatch(ice_t *ice)
+{
+	assert(MUTEX_HELD(&ice->ice_rebuild_lock));
+	assert(!MUTEX_HELD(&ice->ice_pf_vsi.vi_mac_lock));
+	assert((ice->ice_state & (ICE_STATE_ERROR | ICE_STATE_PFR_REQ)) ==
+	    (ICE_STATE_ERROR | ICE_STATE_PFR_REQ));
+	ice->recoveries++;
+}
 
 #define	CHECK(expr) do {						\
 	if (!(expr)) {							\
@@ -281,7 +342,9 @@ init(ice_t *ice)
 	CHECK(allocations == 0);
 	(void) memset(ice, 0, sizeof (*ice));
 	ice->ice_hw.owner = ice;
+	ice->ice_dip = ice;
 	nrequests = 0;
+	latch_ice = NULL;
 	require_rebuild_lock = B_TRUE;
 }
 
@@ -296,6 +359,15 @@ finish(ice_t *ice)
 }
 
 static void
+check_recovery(ice_t *ice)
+{
+	CHECK((ice->ice_state & (ICE_STATE_ERROR | ICE_STATE_PFR_REQ)) ==
+	    (ICE_STATE_ERROR | ICE_STATE_PFR_REQ));
+	CHECK(ice->recoveries == 1 && ice->service_lost == 1);
+	CHECK(ice->link_down == 1);
+}
+
+static void
 normal_filters(void)
 {
 	ice_t ice;
@@ -303,22 +375,80 @@ normal_filters(void)
 	init(&ice);
 	CHECK(ice_group_remove_mac(&ice, unicast) == ENOENT);
 	CHECK(ice.ice_hw.calls == 0);
-	ice.ice_hw.result = -1;
-	CHECK(ice_group_add_mac(&ice, unicast) == EIO);
+	CHECK(ice_group_add_mac(&ice, unicast) == 0);
+	CHECK(ice_group_add_mac(&ice, unicast) == 0);
+	CHECK(allocations == 1 && ice.ice_hw.calls == 1);
+	CHECK(ice_group_remove_mac(&ice, unicast) == 0);
+	CHECK(ice.ice_hw.calls == 2 && ice.recoveries == 0);
+	finish(&ice);
+}
+
+static void
+failed_filter_add(boolean_t multi)
+{
+	ice_t ice;
+	int ret;
+
+	init(&ice);
+	ice.ice_hw.result = -2;
+	ret = multi ? ice_m_multicst(&ice, B_TRUE, multicast) :
+	    ice_group_add_mac(&ice, unicast);
+	CHECK(ret == ENOSPC);
 	CHECK(allocations == 0 && ice.ice_hw.calls == 1);
+	check_recovery(&ice);
 	ice.ice_hw.result = ICE_SUCCESS;
+	CHECK(ice_group_add_mac(&ice, unicast) == EIO);
+	CHECK(ice_m_multicst(&ice, B_TRUE, multicast) == EIO);
+	CHECK(ice.ice_hw.calls == 1 && ice.recoveries == 1);
+	finish(&ice);
+}
+
+static void
+failed_filter_remove(boolean_t multi)
+{
+	ice_t ice;
+	int ret;
+
+	init(&ice);
 	CHECK(ice_group_add_mac(&ice, unicast) == 0);
-	CHECK(ice_group_add_mac(&ice, unicast) == 0);
-	CHECK(allocations == 1 && ice.ice_hw.calls == 2);
+	CHECK(ice_m_multicst(&ice, B_TRUE, multicast) == 0);
+	/* An ordinary datapath error alone does not suppress the AQ attempt. */
 	ice.ice_state = ICE_STATE_ERROR;
 	ice.ice_hw.result = -1;
-	CHECK(ice_group_remove_mac(&ice, unicast) == EIO);
+	ret = multi ? ice_m_multicst(&ice, B_FALSE, multicast) :
+	    ice_group_remove_mac(&ice, unicast);
+	CHECK(ret == 0);
 	CHECK(allocations == 1 && ice.ice_hw.calls == 3);
-	CHECK(memcmp(ice.ice_pf_vsi.vi_macs.head->imf_addr,
-	    unicast, ETHERADDRL) == 0);
-	ice.ice_hw.result = ICE_SUCCESS;
-	CHECK(ice_group_remove_mac(&ice, unicast) == 0);
-	CHECK(ice.ice_hw.calls == 4);
+	check_recovery(&ice);
+	ret = multi ? ice_m_multicst(&ice, B_FALSE, multicast) :
+	    ice_group_remove_mac(&ice, unicast);
+	CHECK(ret == ENOENT);
+	ret = multi ? ice_group_remove_mac(&ice, unicast) :
+	    ice_m_multicst(&ice, B_FALSE, multicast);
+	CHECK(ret == 0 && ice.ice_hw.calls == 3);
+	CHECK(ice.recoveries == 1);
+	finish(&ice);
+}
+
+static void
+late_filter_request(uint32_t state, boolean_t multi, boolean_t add)
+{
+	ice_t ice;
+	int ret;
+
+	init(&ice);
+	if (!add) {
+		ret = multi ? ice_m_multicst(&ice, B_TRUE, multicast) :
+		    ice_group_add_mac(&ice, unicast);
+		CHECK(ret == 0);
+	}
+	latch_ice = &ice;
+	latch_state = state;
+	ret = multi ? ice_m_multicst(&ice, add, multicast) :
+	    ice_gld_set_mac(&ice, unicast, add);
+	CHECK(latch_ice == NULL && ice.ice_state == state);
+	CHECK(ret == (add ? EIO : 0));
+	CHECK(allocations == 0 && ice.ice_hw.calls == (add ? 0U : 1U));
 	finish(&ice);
 }
 
@@ -343,6 +473,8 @@ terminal_filters(uint32_t state)
 	CHECK(ice_m_multicst(&ice, B_FALSE, multicast) == 0);
 	CHECK(ice_m_multicst(&ice, B_TRUE, multicast) == EIO);
 	CHECK(ice.ice_hw.calls == 2);
+	CHECK(ice.recoveries == 0 && ice.service_lost == 0);
+	CHECK(ice.link_down == 0);
 	finish(&ice);
 }
 
@@ -352,13 +484,73 @@ normal_promisc(void)
 	ice_t ice;
 
 	init(&ice);
+	CHECK(ice_m_promisc(&ice, B_FALSE) == 0);
+	CHECK(ice.ice_hw.calls == 0);
+	CHECK(ice_m_promisc(&ice, B_TRUE) == 0);
 	CHECK(ice_m_promisc(&ice, B_TRUE) == 0);
 	CHECK(ice.ice_promisc_on && ice.ice_hw.calls == 1);
+	CHECK(ice_m_promisc(&ice, B_FALSE) == 0);
+	CHECK(ice_m_promisc(&ice, B_FALSE) == 0);
+	CHECK(!ice.ice_promisc_on && ice.ice_hw.calls == 2);
+	CHECK(ice.recoveries == 0);
+	finish(&ice);
+}
+
+static void
+failed_promisc_disable(void)
+{
+	ice_t ice;
+
+	init(&ice);
+	CHECK(ice_m_promisc(&ice, B_TRUE) == 0);
 	ice.ice_state = ICE_STATE_ERROR;
 	ice.ice_hw.result = -1;
-	CHECK(ice_m_promisc(&ice, B_FALSE) == EIO);
-	CHECK(ice.ice_promisc_on && ice.ice_hw.calls == 2);
-	ice.ice_hw.result = ICE_SUCCESS;
+	CHECK(ice_m_promisc(&ice, B_FALSE) == 0);
+	CHECK(!ice.ice_promisc_on && ice.ice_hw.calls == 2);
+	check_recovery(&ice);
+	CHECK(ice_m_promisc(&ice, B_FALSE) == 0);
+	CHECK(ice_m_promisc(&ice, B_TRUE) == EIO);
+	CHECK(!ice.ice_promisc_on && ice.ice_hw.calls == 2);
+	finish(&ice);
+}
+
+static void
+failed_promisc_enable(boolean_t rollback_fails)
+{
+	ice_t ice;
+
+	init(&ice);
+	ice.ice_hw.result = -2;
+	ice.ice_hw.override_clear = B_TRUE;
+	ice.ice_hw.clear_result = rollback_fails ? -1 : ICE_SUCCESS;
+	CHECK(ice_m_promisc(&ice, B_TRUE) == ENOSPC);
+	CHECK(ice.ice_hw.last_status == ice.ice_hw.clear_result);
+	CHECK(!ice.ice_promisc_on && ice.ice_hw.calls == 2);
+	CHECK(ice.ice_hw.promisc_sets == 1 && ice.ice_hw.promisc_clears == 1);
+	/* A clear cannot disprove an unrecorded rule after an AQ error. */
+	check_recovery(&ice);
+	CHECK(ice_m_promisc(&ice, B_TRUE) == EIO);
+	CHECK(ice_m_promisc(&ice, B_FALSE) == 0);
+	CHECK(ice.ice_hw.calls == 2 && !ice.ice_promisc_on);
+	finish(&ice);
+}
+
+static void
+promisc_replay(void)
+{
+	ice_t ice;
+
+	init(&ice);
+	CHECK(ice_m_promisc(&ice, B_TRUE) == 0);
+	/* Replay must program even when the remembered policy is unchanged. */
+	mutex_enter(&ice.ice_rebuild_lock);
+	CHECK(ice_promisc_apply(&ice, B_TRUE) == 0);
+	CHECK(ice.ice_hw.calls == 2 && ice.ice_promisc_on);
+	/* A later request does not suppress the current worker's replay. */
+	ice.ice_state = ICE_STATE_ERROR | ICE_STATE_PFR_REQ;
+	CHECK(ice_promisc_apply(&ice, B_TRUE) == 0);
+	mutex_exit(&ice.ice_rebuild_lock);
+	CHECK(ice.ice_hw.calls == 3 && ice.ice_promisc_on);
 	CHECK(ice_m_promisc(&ice, B_FALSE) == 0);
 	CHECK(!ice.ice_promisc_on && ice.ice_hw.calls == 3);
 	finish(&ice);
@@ -380,18 +572,46 @@ terminal_promisc(uint32_t state)
 	CHECK(ice_m_promisc(&ice, B_FALSE) == 0);
 	CHECK(ice_m_promisc(&ice, B_TRUE) == EIO);
 	CHECK(!ice.ice_promisc_on && ice.ice_hw.calls == 1);
+	CHECK(ice.recoveries == 0 && ice.service_lost == 0);
+	CHECK(ice.link_down == 0);
 	finish(&ice);
 }
 
 int
 main(void)
 {
+	const uint32_t blocked[] = {
+		ICE_STATE_RESET_FAILED,
+		ICE_STATE_RESET_FAILED | ICE_STATE_ERROR,
+		ICE_STATE_PFR_REQ,
+		ICE_STATE_PFR_REQ | ICE_STATE_ERROR,
+		ICE_STATE_RESET_PENDING,
+		ICE_STATE_RESET_PENDING | ICE_STATE_ERROR
+	};
+	size_t i;
+
 	normal_filters();
+	failed_filter_add(B_FALSE);
+	failed_filter_add(B_TRUE);
+	failed_filter_remove(B_FALSE);
+	failed_filter_remove(B_TRUE);
 	normal_promisc();
-	terminal_filters(ICE_STATE_RESET_FAILED);
-	terminal_filters(ICE_STATE_RESET_FAILED | ICE_STATE_ERROR);
-	terminal_promisc(ICE_STATE_RESET_FAILED);
-	terminal_promisc(ICE_STATE_RESET_FAILED | ICE_STATE_ERROR);
-	(void) puts("terminal filter callbacks: PASS (6 scenarios)");
+	failed_promisc_disable();
+	failed_promisc_enable(B_FALSE);
+	failed_promisc_enable(B_TRUE);
+	promisc_replay();
+	late_filter_request(ICE_STATE_PFR_REQ, B_FALSE, B_TRUE);
+	late_filter_request(ICE_STATE_PFR_REQ, B_TRUE, B_TRUE);
+	late_filter_request(ICE_STATE_PFR_REQ, B_FALSE, B_FALSE);
+	late_filter_request(ICE_STATE_PFR_REQ, B_TRUE, B_FALSE);
+	late_filter_request(ICE_STATE_RESET_PENDING, B_FALSE, B_TRUE);
+	late_filter_request(ICE_STATE_RESET_PENDING, B_TRUE, B_TRUE);
+	late_filter_request(ICE_STATE_RESET_PENDING, B_FALSE, B_FALSE);
+	late_filter_request(ICE_STATE_RESET_PENDING, B_TRUE, B_FALSE);
+	for (i = 0; i < sizeof (blocked) / sizeof (blocked[0]); i++) {
+		terminal_filters(blocked[i]);
+		terminal_promisc(blocked[i]);
+	}
+	(void) puts("filter callbacks: PASS (30 scenarios)");
 	return (EXIT_SUCCESS);
 }

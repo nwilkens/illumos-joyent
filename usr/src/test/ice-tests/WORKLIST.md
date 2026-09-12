@@ -23,7 +23,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | 7 | P2 | RX descriptor DMA faults are checked late or missed | Implemented; hardware fault injection pending |
 | 8 | P2 | Small-MSS LSO fallback retains the wrong checksum seed | Implemented; LSO disabled by default, hardware validation pending |
 | 9 | Maintenance | Duplicate MAC filter constructors | Implemented; request equivalence tested |
-| 10 | Architecture | Filter ownership and replay contract is incomplete | In progress; VSI failure ownership corrected |
+| 10 | Architecture | Filter ownership and replay contract is incomplete | Contract and recovery implemented; retained VSI stats guard pending |
 | 11 | Architecture | Lifecycle callers conflate several kinds of quiescence | Completed; explicit lifecycle contracts documented |
 | 12 | Documentation | Some comments promise stronger invariants than the code establishes | Completed; comments checked against current callers |
 | 13 | Test repair | `tx_bind_threshold.py` has a stale exact-text assertion | Implemented with executable copy/bind regression |
@@ -40,17 +40,26 @@ teardown drops its reference anyway, and `mac_fini_macaddr()` later verifies
 that no users remain. Promiscuous disable has the same ownership consequence
 when MAC uses promiscuous classification instead of a unicast filter.
 
-The fix handles only `ICE_STATE_RESET_FAILED`, under `ice_rebuild_lock`:
+The initial item 1 fix handled only `ICE_STATE_RESET_FAILED`, under `ice_rebuild_lock`:
 
 - Tracked unicast and multicast removals retire the software record and return
   success without a firmware command. Missing records still return `ENOENT`.
 - Promiscuous disable clears the desired state and succeeds without firmware.
 - New filter and promiscuous enables return `EIO`, including duplicate adds.
-- Ordinary `ICE_STATE_ERROR` retains the existing firmware/error behavior.
+- At that point ordinary ERROR retained the firmware/error behavior; item 10
+  below extends recovery.
 
 This is valid because terminal failure blocks both start and reset replay
 until driver reload. Imported common-code bookkeeping remains owned by common
 teardown. It does **not** establish DMA isolation or fix items 2 and 3.
+
+Item 10 now extends callback retirement to owed resets and uncertain command
+results. Failed adds request recovery without accepting ownership; failed
+removals retire ownership, request reset, and succeed. Plain ERROR still does
+not itself suppress the firmware attempt. The six-scenario result below is
+the original item 1 evidence; the expanded regression now has 30 scenarios.
+Terminal failure continues to queue no future reset and missing removals
+continue to return ENOENT.
 
 Validation: `terminal_filters.py` compiles and executes the actual C callbacks
 with controlled admin-queue results. It covers normal and terminal unicast,
@@ -276,10 +285,12 @@ This refactor does not establish hardware programming or rollback success.
 
 ## 10. Filter ownership contract
 
-Document ownership across MAC users, `vi_macs` desired state, imported-core
-bookkeeping, and hardware rules. Define how failures create divergence and how
-replay/teardown resolves it. Item 1 defines terminal retirement only; partial
-programming, rollback, and normal replay still need a complete contract.
+[FILTERS.md](../../uts/common/io/ice/FILTERS.md) defines MAC references, the
+accepted driver replay set, imported bookkeeping, and hardware state as
+separate ownership domains. Duplicate/missing behavior, attach failure,
+partial commands, recovery, terminal retirement, replay, and final teardown
+are explicit. The list includes attach defaults and is not a per-client
+reference count or hardware readback.
 
 VSI setup no longer releases its caller's desired filters on validation or
 scheduler failure. Attach's existing failure label owns full teardown; rebuild
@@ -294,6 +305,33 @@ calls. Tests verify terminal unicast/multicast retirement without firmware
 commands, seven attach failure points (including RSS after filters exist), and
 unchanged successful request/replay behavior. Hardware programming remains
 outside this controlled host test.
+
+Callback command failures now latch ERROR and request PF reset to clear
+uncertain switch state. A failed add returns the original errno without
+tracking ownership. Failed unicast/multicast removal retires the address and
+returns success, because MAC client teardown cannot retain that owner.
+Promiscuous enable failure keeps the previous accepted policy and attempts
+rollback; even successful recorded-rule cleanup requests reset because it
+cannot disprove an unrecorded AQ-error rule. Disable failure retires the
+accepted policy and requests recovery. Owed reset blocks adds and enables;
+removes retire software state without another switch command. A reset request
+arriving during the list lookup cannot turn a skipped ADD into success.
+Terminal retirement preserves ENOENT and does not dispatch future reset work.
+
+Validation: 30 actual callback scenarios and four actual VSI recovery/replay
+sequences pass, alongside all prior request/setup/attach cases. Eleven
+negative controls compiled successfully and failed the intended runtime
+checks, including the old production source, late-request ADD tracking,
+retained removal ownership, failed-enable replay, skipped reset after
+successful rollback, late errno decoding, and unconditional promiscuous
+replay. Production and both C fixtures pass `cstyle -cp`; reset serialization
+source checks pass. A native module build follows the atomic commit.
+
+Hardware acceptance remains partial switch/AQ failure injection followed by
+client retirement and successful/terminal reset, verifying the post-reset
+receive set and detach. Returning retirement success is not immediate
+hardware deletion or a DMA barrier.
+
 
 ## 11. Lifecycle contract
 

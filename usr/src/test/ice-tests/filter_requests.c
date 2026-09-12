@@ -367,6 +367,67 @@ attach_failures(void)
 	}
 }
 
+static void
+recovery_replay(void)
+{
+	const uint8_t rejected[ETHERADDRL] = { 2, 0, 0, 0, 0, 2 };
+	ice_t ice;
+	struct ice_port_info port;
+	unsigned int before, sets, scenario;
+
+	for (scenario = 0; scenario < 4; scenario++) {
+		init(&ice);
+		ice.ice_hw.port_info = &port;
+		ice.ice_nqueues = 1;
+		setup_failure = SETUP_OK;
+		replay_prepares = replay_finishes = 0;
+		CHECK(ice_group_add_mac(&ice, unicast) == 0);
+		CHECK(ice_m_multicst(&ice, B_TRUE, multicast) == 0);
+		if (scenario == 0) {
+			ice.ice_hw.result = -1;
+			CHECK(ice_group_add_mac(&ice, rejected) == EIO);
+			/* Retire another client while that reset is owed. */
+			CHECK(ice_group_remove_mac(&ice, unicast) == 0);
+		} else if (scenario == 1) {
+			ice.ice_hw.result = -1;
+			CHECK(ice_m_multicst(&ice, B_FALSE, multicast) == 0);
+		} else if (scenario == 2) {
+			ice.ice_hw.result = -1;
+			CHECK(ice_m_promisc(&ice, B_TRUE) == EIO);
+		} else {
+			CHECK(ice_m_promisc(&ice, B_TRUE) == 0);
+			ice.ice_hw.result = -1;
+			CHECK(ice_m_promisc(&ice, B_FALSE) == 0);
+		}
+		check_recovery(&ice);
+		CHECK(!ice.ice_promisc_on);
+		before = nrequests;
+		sets = ice.ice_hw.promisc_sets;
+		ice.ice_hw.result = ICE_SUCCESS;
+		/* The worker claims its cause before reconstructing the VSI. */
+		ice.ice_state = ICE_STATE_ERROR;
+		mutex_enter(&ice.ice_rebuild_lock);
+		CHECK(ice_vsi_rebuild(&ice) == ICE_SUCCESS);
+		mutex_exit(&ice.ice_rebuild_lock);
+		CHECK(replay_prepares == 1 && replay_finishes == 1);
+		CHECK(nrequests == before + 1 && requests[before].add);
+		CHECK(requests[before].count == (scenario < 2 ? 1U : 2U));
+		if (scenario != 0)
+			(void) request_entry(before, unicast);
+		if (scenario != 1)
+			(void) request_entry(before, multicast);
+		CHECK(ice.ice_hw.promisc_sets == sets);
+		CHECK(!ice.ice_promisc_on);
+		/* A completed reset admits later ownership again. */
+		ice.ice_state = 0;
+		CHECK(ice_group_add_mac(&ice, rejected) == 0);
+		mutex_enter(&ice.ice_rebuild_lock);
+		ice_vsi_teardown(&ice);
+		mutex_exit(&ice.ice_rebuild_lock);
+		finish(&ice);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -385,6 +446,8 @@ main(int argc, char **argv)
 		rebuild_failure(SETUP_SCHEDULER);
 	} else if (strcmp(argv[1], "attach_failures") == 0) {
 		attach_failures();
+	} else if (strcmp(argv[1], "recovery_replay") == 0) {
+		recovery_replay();
 	} else {
 		CHECK(!"unknown scenario");
 	}
