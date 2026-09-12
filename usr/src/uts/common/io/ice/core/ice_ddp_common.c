@@ -832,6 +832,13 @@ ice_init_pkg_info(struct ice_hw *hw, struct ice_pkg_hdr *pkg_hdr)
 			return ICE_DDP_PKG_INVALID_FILE;
 		}
 
+		/* illumos: the section must hold the struct read below. */
+		if (LE16_TO_CPU(state.buf->section_entry[state.sect_idx].size) <
+		    sizeof(*meta)) {
+			ice_debug(hw, ICE_DBG_INIT, "ice metadata section too small\n");
+			return ICE_DDP_PKG_INVALID_FILE;
+		}
+
 		hw->pkg_ver = meta->ver;
 		ice_memcpy(hw->pkg_name, meta->name, sizeof(meta->name),
 			   ICE_NONDMA_TO_NONDMA);

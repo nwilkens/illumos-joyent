@@ -12,6 +12,7 @@ TESTS = (
     "runner_checks.py",
     "admin_interrupt.py",
     "detach_quiesce.py",
+    "ddp_sections.py",
     "dma_lifetime.py",
     "filter_requests.py",
     "fma_dma.py",
