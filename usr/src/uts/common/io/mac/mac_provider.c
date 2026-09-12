@@ -2057,7 +2057,7 @@ mac_mmc_parse_l3(mac_mblk_cursor_t *cursor, uint16_t l3_sap, uint8_t *ipprotop,
 		return (true);
 	}
 	if (l3_sap == ETHERTYPE_IPV6) {
-		uint16_t ip_len = sizeof (ip6_t);
+		size_t ip_len = sizeof (ip6_t);
 		uint8_t ipproto;
 		mac_ether_offload_flags_t frag_flags = 0;
 
@@ -2121,11 +2121,12 @@ mac_mmc_parse_l3(mac_mblk_cursor_t *cursor, uint16_t l3_sap, uint8_t *ipprotop,
 				eh_len = ((uint16_t)len_val + 1) * 8;
 			}
 			/*
-			 * Protect against overflow in the case of a very
-			 * contrived packet.
+			 * The reported L3 length is a uint16_t.  A chain of
+			 * maximal extension headers can exceed it; that is a
+			 * parse failure, not a success with wrapped output.
 			 */
-			if (sum_overflows_u16(ip_len, eh_len)) {
-				return (-1);
+			if (ip_len + eh_len > UINT16_MAX) {
+				return (false);
 			}
 
 			ipproto = next_hdr;
@@ -2139,7 +2140,7 @@ mac_mmc_parse_l3(mac_mblk_cursor_t *cursor, uint16_t l3_sap, uint8_t *ipprotop,
 			*fragp = frag_flags;
 		}
 		if (hdr_sizep != NULL) {
-			*hdr_sizep = ip_len;
+			*hdr_sizep = (uint16_t)ip_len;
 		}
 		return (true);
 	}
@@ -2274,9 +2275,9 @@ mac_partial_offload_info(mblk_t *mp, size_t off, mac_ether_offload_info_t *meoi)
 	}
 
 	if ((meoi->meoi_flags & MEOI_L3INFO_SET) == 0) {
-		uint8_t ipproto;
-		uint16_t l3_sz;
-		mac_ether_offload_flags_t frag_flags;
+		uint8_t ipproto = 0;
+		uint16_t l3_sz = 0;
+		mac_ether_offload_flags_t frag_flags = 0;
 
 		if (!mac_mmc_parse_l3(&cursor, meoi->meoi_l3proto, &ipproto,
 		    &frag_flags, &l3_sz)) {

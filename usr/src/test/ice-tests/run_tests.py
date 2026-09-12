@@ -26,6 +26,7 @@ TESTS = (
     "lso.py",
     "lso_context.py",
     "mac_filter.py",
+    "mac_ipv6_eh.py",
     "pool_locks.py",
     "reset_loan_escalation.py",
     "reset_oicr.py",
