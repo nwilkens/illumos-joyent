@@ -54,7 +54,12 @@ static const struct {
 	{ ICE_FLOW_HASH_IPV6, ICE_FLOW_SEG_HDR_IPV6 }
 };
 
-static void
+/*
+ * Initialize a caller-owned, unlinked MAC filter entry.  This shared request
+ * shape is used by GLD, attach, reset replay, and teardown.  No allocation,
+ * locking, or firmware I/O occurs here; callers own insertion and submission.
+ */
+void
 ice_fltr_entry_init(struct ice_fltr_list_entry *e, uint16_t handle,
     const uint8_t *addr)
 {

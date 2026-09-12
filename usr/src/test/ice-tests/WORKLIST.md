@@ -22,7 +22,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | 6 | P2 | Link refresh reports UP while the datapath remains failed | Open |
 | 7 | P2 | RX descriptor DMA faults are checked late or missed | Implemented; hardware fault injection pending |
 | 8 | P2 | Small-MSS LSO fallback retains the wrong checksum seed | Implemented; LSO disabled by default, hardware validation pending |
-| 9 | Maintenance | Duplicate MAC filter constructors | Open |
+| 9 | Maintenance | Duplicate MAC filter constructors | Implemented; request equivalence tested |
 | 10 | Architecture | Filter ownership and replay contract is incomplete | Open |
 | 11 | Architecture | Lifecycle callers conflate several kinds of quiescence | Open |
 | 12 | Documentation | Some comments promise stronger invariants than the code establishes | Open |
@@ -242,10 +242,19 @@ default pending its existing hardware acceptance work.
 
 ## 9. Shared filter construction
 
-`ice_gld_fltr_init()` in [ice_gld.c](../../uts/common/io/ice/ice_gld.c) and
-`ice_fltr_entry_init()` in [ice_vsi.c](../../uts/common/io/ice/ice_vsi.c)
-duplicate the firmware filter constructor. Introduce one small internal helper
-and verify identical add, remove, attach, and replay requests.
+The identical `ice_gld_fltr_init()` and `ice_fltr_entry_init()` constructors
+are consolidated in the existing `ice_vsi.c` helper. GLD calls it through one
+internal declaration in `ice.h`; attach, replay, and teardown retain their
+existing calls. The helper initializes only caller-owned, unlinked storage.
+It allocates nothing, takes no lock, performs no firmware operation, and does
+not change caller ownership, locking, request ordering, or failure handling.
+
+`filter_requests.py` runs the actual callers with captured imported-core
+requests. Baseline and consolidated code preserve unicast/multicast/broadcast
+fields across GLD add/remove, attach, replay, teardown, and attach rollback.
+A mutated constructor missing `ICE_FLTR_TX` fails at runtime. The existing
+terminal cleanup regressions and the updated constructor-wiring check pass.
+This refactor does not establish hardware programming or rollback success.
 
 ## 10. Filter ownership contract
 

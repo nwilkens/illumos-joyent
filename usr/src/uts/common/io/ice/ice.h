@@ -637,6 +637,9 @@ extern void ice_link_report(ice_t *, link_state_t);
 /*
  * ice_vsi.c
  */
+struct ice_fltr_list_entry;
+extern void ice_fltr_entry_init(struct ice_fltr_list_entry *, uint16_t,
+    const uint8_t *);
 extern boolean_t ice_vsi_init(ice_t *);
 extern void ice_vsi_fini(ice_t *);
 extern int ice_vsi_rebuild(ice_t *);

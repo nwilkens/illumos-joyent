@@ -46,24 +46,6 @@
 #include "ice_common.h"
 #include "ice_switch.h"
 
-/*
- * Build a switch MAC filter list entry for the PF data VSI.  Mirrors the helper
- * in ice_vsi.c so the unicast/multicast paths produce filters the common code
- * and ice_vsi_teardown() agree on.
- */
-static void
-ice_gld_fltr_init(struct ice_fltr_list_entry *e, uint16_t handle,
-    const uint8_t *addr)
-{
-	bzero(e, sizeof (*e));
-	e->fltr_info.flag = ICE_FLTR_TX;
-	e->fltr_info.lkup_type = ICE_SW_LKUP_MAC;
-	e->fltr_info.fltr_act = ICE_FWD_TO_VSI;
-	e->fltr_info.vsi_handle = handle;
-	e->fltr_info.src_id = ICE_SRC_ID_VSI;
-	bcopy(addr, e->fltr_info.l_data.mac.mac_addr, ETHERADDRL);
-}
-
 static ice_mac_filter_t *
 ice_gld_find_mac(ice_vsi_t *vsi, const uint8_t *addr)
 {
@@ -121,7 +103,7 @@ ice_gld_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)
 	 */
 	if ((ice->ice_state & ICE_STATE_RESET_FAILED) == 0) {
 		INIT_LIST_HEAD(&m_list);
-		ice_gld_fltr_init(&e, vsi->vi_handle, addr);
+		ice_fltr_entry_init(&e, vsi->vi_handle, addr);
 		LIST_ADD(&e.list_entry, &m_list);
 
 		if (add)

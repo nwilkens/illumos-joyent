@@ -53,12 +53,18 @@ typedef struct ice_vsi {
 	uint16_t vi_handle;
 	kmutex_t vi_mac_lock;
 	list_t vi_macs;
+	boolean_t vi_added;
 } ice_vsi_t;
 typedef struct ice ice_t;
+struct ice_port_info {
+	struct { uint8_t perm_addr[ETHERADDRL]; } mac;
+};
 struct ice_hw {
 	ice_t *owner;
 	int result;
 	unsigned int calls;
+	struct ice_port_info *port_info;
+	void *switch_info;
 };
 struct ice {
 	struct ice_hw ice_hw;
@@ -73,6 +79,7 @@ struct LIST_HEAD_TYPE {
 };
 struct ice_fltr_list_entry {
 	struct LIST_HEAD_TYPE list_entry;
+	int status;
 	struct {
 		int flag, lkup_type, fltr_act, src_id;
 		uint16_t vsi_handle;
@@ -84,10 +91,14 @@ struct ice_fltr_list_entry {
 	} fltr_info;
 };
 enum {
-	ICE_FLTR_TX, ICE_SW_LKUP_MAC, ICE_FWD_TO_VSI, ICE_SRC_ID_VSI
+	ICE_FLTR_TX = 2, ICE_SW_LKUP_MAC = 1,
+	ICE_FWD_TO_VSI = 0, ICE_SRC_ID_VSI = 1
 };
 #define	INIT_LIST_HEAD(h)	((h)->entry = NULL)
-#define	LIST_ADD(e, h)		((h)->entry = (e))
+#define	LIST_ADD(e, h) do {		\
+	(e)->entry = (h)->entry;		\
+	(h)->entry = (e);		\
+} while (0)
 
 enum {
 	ICE_PROMISC_UCAST_RX, ICE_PROMISC_UCAST_TX,
@@ -98,6 +109,14 @@ enum {
 #define	ice_set_bit(bit, n)		((n) |= 1U << (bit))
 
 static unsigned int allocations;
+static boolean_t require_rebuild_lock = B_TRUE;
+static struct {
+	boolean_t add;
+	unsigned int count;
+	struct ice_fltr_list_entry entries[8];
+} requests[8];
+static unsigned int nrequests;
+
 
 static void
 mutex_enter(kmutex_t *lock)
@@ -189,24 +208,40 @@ ice_status_to_errno(ice_t *ice, int status)
 static int
 aq_result(struct ice_hw *hw)
 {
-	assert(MUTEX_HELD(&hw->owner->ice_rebuild_lock));
+	if (require_rebuild_lock)
+		assert(MUTEX_HELD(&hw->owner->ice_rebuild_lock));
 	assert(!MUTEX_HELD(&hw->owner->ice_pf_vsi.vi_mac_lock));
 	hw->calls++;
 	return (hw->result);
 }
 
 static int
+filter_request(struct ice_hw *hw, struct LIST_HEAD_TYPE *list, boolean_t add)
+{
+	struct LIST_HEAD_TYPE *node;
+	unsigned int count = 0;
+
+	assert(list->entry != NULL && nrequests < 8);
+	for (node = list->entry; node != NULL; node = node->entry) {
+		assert(count < 8);
+		requests[nrequests].entries[count++] =
+		    *(struct ice_fltr_list_entry *)(void *)node;
+	}
+	requests[nrequests].add = add;
+	requests[nrequests++].count = count;
+	return (aq_result(hw));
+}
+
+static int
 ice_add_mac(struct ice_hw *hw, struct LIST_HEAD_TYPE *list)
 {
-	assert(list->entry != NULL);
-	return (aq_result(hw));
+	return (filter_request(hw, list, B_TRUE));
 }
 
 static int
 ice_remove_mac(struct ice_hw *hw, struct LIST_HEAD_TYPE *list)
 {
-	assert(list->entry != NULL);
-	return (aq_result(hw));
+	return (filter_request(hw, list, B_FALSE));
 }
 
 static int
@@ -243,6 +278,8 @@ init(ice_t *ice)
 	CHECK(allocations == 0);
 	(void) memset(ice, 0, sizeof (*ice));
 	ice->ice_hw.owner = ice;
+	nrequests = 0;
+	require_rebuild_lock = B_TRUE;
 }
 
 static void

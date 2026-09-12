@@ -23,6 +23,25 @@ does not load the driver or establish hardware isolation.
 Use `--source /path/to/ice_gld.c` to check an earlier implementation against
 the same regression. The reviewed baseline fails terminal unicast removal.
 
+## Shared MAC filter request regression
+
+```
+python3 usr/src/test/ice-tests/filter_requests.py
+```
+
+The runner compiles the actual GLD filter callbacks and VSI attach, replay,
+and teardown functions. It reuses the terminal-filter fixtures and captures
+requests at the imported-core boundary. Unicast, multicast, and broadcast
+requests retain the same TX direction, MAC lookup, VSI forwarding/source,
+software handle, and address fields across add, remove, attach, replay, and
+teardown. An attach-failure case verifies the same rollback request and no
+new desired-state ownership. Replay preserves the existing desired list.
+
+The original constructors and the shared constructor both pass; deleting the
+TX direction assignment fails the request check at runtime. Select paired
+baseline files with `--gld-source` and `--vsi-source`. The test models the
+request boundary and does not verify firmware encoding or device programming.
+
 ## Detach lifecycle regression
 
 ```

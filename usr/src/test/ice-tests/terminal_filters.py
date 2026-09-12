@@ -16,7 +16,6 @@ TESTDIR = Path(__file__).resolve().parent
 REPO = TESTDIR.parents[3]
 DRIVER = REPO / "usr/src/uts/common/io/ice"
 FUNCTIONS = (
-    "ice_gld_fltr_init",
     "ice_gld_find_mac",
     "ice_gld_set_mac_locked",
     "ice_gld_set_mac",
@@ -36,23 +35,32 @@ def extract(source: str, pattern: str, path: Path) -> str:
     return f"#line {line} {json.dumps(str(path))}\n{match.group()}\n"
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", type=Path, default=DRIVER / "ice_gld.c")
-    args = parser.parse_args()
-    source = args.source.read_text(encoding="utf-8")
+def callback_fragments(gld_source: Path, vsi_source: Path) -> list[str]:
+    source = gld_source.read_text(encoding="utf-8")
     header = DRIVER / "ice.h"
     fragments = [extract(header.read_text(encoding="utf-8"),
                          r"^typedef enum ice_state \{[\s\S]*?^} ice_state_t;",
                          header)]
-    # illumos style places only the function's final brace in column zero.
+    # Older GLD revisions have a local constructor; current callbacks share VSI's.
+    if re.search(r"^ice_gld_fltr_init\(", source, re.MULTILINE):
+        fragments.append(extract(source,
+            r"^static void\nice_gld_fltr_init\([\s\S]*?^}", gld_source))
+    else:
+        fragments.append(extract(vsi_source.read_text(encoding="utf-8"),
+            r"^void\nice_fltr_entry_init\([\s\S]*?^}", vsi_source))
     # Compile each body unchanged; this does not assert its implementation text.
     for name in FUNCTIONS:
-        fragments.append(extract(
-            source,
-            rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}",
-            args.source,
-        ))
+        fragments.append(extract(source,
+            rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}", gld_source))
+    return fragments
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", type=Path, default=DRIVER / "ice_gld.c")
+    parser.add_argument("--vsi-source", type=Path, default=DRIVER / "ice_vsi.c")
+    args = parser.parse_args()
+    fragments = callback_fragments(args.source, args.vsi_source)
 
     with tempfile.TemporaryDirectory(prefix="ice-terminal-filters-") as tmp:
         work = Path(tmp)
