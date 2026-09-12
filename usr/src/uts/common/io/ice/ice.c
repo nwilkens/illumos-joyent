@@ -1416,13 +1416,59 @@ ice_prepare_for_reset(ice_t *ice)
 }
 
 /*
+ * Claim the requests this worker will service without erasing a concurrently
+ * latched cause.  The returned mask selects the reset type; requests arriving
+ * after the successful CAS remain owed to the next worker.
+ */
+static uint32_t
+ice_reset_take_requests(ice_t *ice)
+{
+	const uint32_t mask = ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ;
+	uint32_t old, requests;
+
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+
+	do {
+		old = ice->ice_state;
+		requests = old & mask;
+		if (requests == 0)
+			return (0);
+	} while (atomic_cas_32(&ice->ice_state, old,
+	    (old & ~requests) | ICE_STATE_ERROR) != old);
+
+	return (requests);
+}
+
+/*
+ * The completed rebuild can reopen the datapath only when no later reset is
+ * owed.  A CAS keeps a new request's fail-closed state intact if it races the
+ * final transition.  The worker will redispatch that request on exit.
+ */
+static boolean_t
+ice_reset_complete(ice_t *ice)
+{
+	uint32_t old;
+
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+
+	do {
+		old = ice->ice_state;
+		if ((old & (ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ)) != 0)
+			return (B_FALSE);
+	} while (atomic_cas_32(&ice->ice_state, old,
+	    old & ~ICE_STATE_ERROR) != old);
+
+	return (B_TRUE);
+}
+
+/*
  * Reinitialize the function after a reset and restore the datapath.  Modeled
  * on the FreeBSD ice driver's ice_rebuild().  Runs under ice_rebuild_lock.
  * Each failing step jumps to reset_failed, which fails closed until the driver
  * is reloaded.
  */
 static void
-ice_rebuild(ice_t *ice)
+ice_rebuild(ice_t *ice, uint32_t requests)
 {
 	struct ice_hw *hw = &ice->ice_hw;
 	int rc;
@@ -1436,7 +1482,7 @@ ice_rebuild(ice_t *ice)
 	 * and otherwise drives a real PF reset, which is what the fatal-cause
 	 * and test-hook PFR_REQ paths need.
 	 */
-	if ((ice->ice_state & ICE_STATE_RESET_PENDING) != 0)
+	if ((requests & ICE_STATE_RESET_PENDING) != 0)
 		rc = ice_check_reset(hw);
 	else
 		rc = ice_reset(hw, ICE_RESET_PFR);
@@ -1549,20 +1595,10 @@ ice_rebuild(ice_t *ice)
 	ice_loopback_replay(ice);
 
 	/*
-	 * Clear the reset-owed bits before re-enabling the OICR below: the owed
-	 * rebuild has been performed by the steps above, so a link-change cause
-	 * arriving right after the OICR is re-armed must not observe a stale
-	 * RESET_PENDING/PFR_REQ and dispatch a redundant rebuild.  The
-	 * fail-closed bit stays set until the datapath is confirmed restored.
-	 */
-	atomic_and_32(&ice->ice_state,
-	    ~(ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ));
-
-	/*
-	 * Re-route and re-arm the interrupts a reset clears.  Deliberately a
-	 * discard, not a harvest: the owed rebuild has just been performed and
-	 * the reset-owed bits cleared above, so re-latching the causes that
-	 * requested it would dispatch this rebuild again in a loop.
+	 * Re-route and re-arm the interrupts a reset clears.  Discard the
+	 * hardware causes that requested this rebuild; the worker already
+	 * consumed their software request bits.  Leave later software requests
+	 * intact for its next pass.
 	 */
 	ice_intr_oicr_setup(ice, B_FALSE);
 	if (!ice_set_link_events(ice))
@@ -1574,11 +1610,9 @@ ice_rebuild(ice_t *ice)
 	ice_setup_link(ice);
 	ice_phy_caps_update(ice);
 
-	/*
-	 * The rebuild steps succeeded: clear the fail-closed bit before
-	 * restoring the datapath.
-	 */
-	atomic_and_32(&ice->ice_state, ~ICE_STATE_ERROR);
+	/* A later request keeps the datapath closed until its own rebuild. */
+	if (!ice_reset_complete(ice))
+		return;
 
 	if ((ice->ice_state & ICE_STATE_STARTED) != 0 &&
 	    (ice_start_datapath(ice) != 0 || !ice_rx_rings_resume(ice))) {
@@ -1627,11 +1661,10 @@ reset_failed:
 	ice_link_loopback_update(ice, ICE_LB_NONE);
 
 	/*
-	 * Drop the owed-rebuild bits: an early failure leaves them latched, and
-	 * nothing consults them once the terminal bit is set (ice_m_start()
-	 * blocks on ICE_STATE_RESET_FAILED independently), so clearing them
-	 * keeps the terminal state quiescent instead of owing a rebuild that
-	 * ice_reset_task() would only discard.
+	 * Retire any later requests on terminal failure.  They cannot be
+	 * serviced until reload, and ice_m_start() blocks independently on
+	 * ICE_STATE_RESET_FAILED.  Ordinary success leaves later requests
+	 * untouched so the worker can redispatch them.
 	 */
 	atomic_and_32(&ice->ice_state,
 	    ~(ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ));
@@ -1646,32 +1679,31 @@ void
 ice_reset_task(void *arg)
 {
 	ice_t *ice = arg;
+	uint32_t requests;
 
+	/* The queued/running ownership flag stays set while this lock waits. */
+	mutex_enter(&ice->ice_rebuild_lock);
+	/*
+	 * Terminal failure cannot recover without reload.  The attaching and
+	 * detaching gates leave requests owed; the gate-lifting caller
+	 * redispatches them once the instance is usable again.
+	 */
+	if (ice->ice_attaching || ice->ice_detaching ||
+	    (ice->ice_state & ICE_STATE_RESET_FAILED) != 0)
+		goto done;
+
+	requests = ice_reset_take_requests(ice);
+	if (requests != 0) {
+		ice_prepare_for_reset(ice);
+		ice_rebuild(ice, requests);
+	}
+
+done:
 	mutex_enter(&ice->ice_lock);
 	ice->ice_reset_pending = B_FALSE;
 	mutex_exit(&ice->ice_lock);
-
-	/*
-	 * ice_rebuild_lock is the outermost lock and is taken only after
-	 * ice_lock is dropped.
-	 */
-	mutex_enter(&ice->ice_rebuild_lock);
-	/*
-	 * ICE_STATE_RESET_FAILED is terminal: ice_m_start() refuses to plumb
-	 * until the driver is reloaded, so a later rebuild must not bring the
-	 * rings and link back up underneath that refusal.  Testing it here is
-	 * race free because it is only ever set from this lock.  The attaching
-	 * and detaching gates keep the rebuild off a half-built or dying
-	 * instance; both leave any owed RESET_PENDING/PFR_REQ set, and
-	 * ice_reset_redispatch() requeues it when the gate lifts.
-	 */
-	if (ice->ice_attaching || ice->ice_detaching ||
-	    (ice->ice_state & ICE_STATE_RESET_FAILED) != 0) {
-		mutex_exit(&ice->ice_rebuild_lock);
-		return;
-	}
-	ice_prepare_for_reset(ice);
-	ice_rebuild(ice);
+	if (!ice->ice_attaching && !ice->ice_detaching)
+		ice_reset_redispatch(ice);
 	mutex_exit(&ice->ice_rebuild_lock);
 }
 

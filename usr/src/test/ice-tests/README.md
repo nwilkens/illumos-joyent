@@ -72,6 +72,22 @@ implementation. The reviewed baseline fails the small-MSS case. The test does
 not emulate the NIC or establish wire checksum correctness; LSO remains off
 by default until hardware validation is complete.
 
+## Reset request ownership regression
+
+Run `python3 usr/src/test/ice-tests/reset_requests.py` with Python 3 and a C99
+compiler (`CC` defaults to `cc`). It compiles the actual reset dispatch,
+worker, request claim/completion helpers, and full rebuild body. Hardware and
+taskq boundaries are controlled so the test can inject requests while the
+worker waits, after the reset barrier, at interrupt rearm, and during atomic
+completion. Assertions check reset counts and type, deferred work, request
+retention, datapath restart suppression, and terminal handling.
+
+Use `--source /path/to/ice.c --intr-source /path/to/ice_intr.c` for an earlier
+revision. The reviewed implementation fails duplicate-dispatch coalescing.
+Controls restoring the late request clear or unconditional stale-worker
+rebuild fail too. This portable test does not establish hardware reset timing
+or device recovery.
+
 ## Upstream integration baseline
 
 The 2026-09-11 integration merges TritonDataCenter/illumos-joyent master at

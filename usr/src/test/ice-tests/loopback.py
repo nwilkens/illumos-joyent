@@ -171,7 +171,7 @@ def main() -> None:
     # before the link refresh, which decides LINK_STATE_UP from the mode.
     rebuild = function(
         attach,
-        "ice_rebuild(ice_t *ice)\n{",
+        "ice_rebuild(ice_t *ice, uint32_t requests)\n{",
         "\nvoid\nice_reset_task",
     )
     # Exactly one call, so an extra replay before the barrier (where both

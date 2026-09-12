@@ -356,8 +356,9 @@ ice_link_status_update(ice_t *ice)
 
 /*
  * Coalesce a rebuild request and hand it to the dedicated reset taskq.
- * Mirrors the ice_oicr_pending idiom: at most one task is queued at a time,
- * and the flag re-arms when ice_reset_task clears it.  Runs in thread context
+ * The ownership flag spans queued, waiting, and running work.  The worker
+ * releases it after checking the lifecycle gates and servicing its requests,
+ * then redispatches any later requests.  Runs in thread context
  * only (the OICR worker or the DEBUG test hook), never at interrupt priority.
  */
 void

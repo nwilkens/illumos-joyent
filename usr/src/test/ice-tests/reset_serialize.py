@@ -152,7 +152,7 @@ def main() -> None:
     # lock, which would invert the documented order.
     attach_src = ATTACH_SOURCE.read_text(encoding="utf-8")
     assert "ice_stat_lock" not in function(
-        attach_src, "ice_rebuild(ice_t *ice)\n{", "\nvoid\nice_reset_task"
+        attach_src, "ice_rebuild(ice_t *ice, uint32_t requests)\n{", "\nvoid\nice_reset_task"
     )
 
     # The MAC handle is cleared under ice_lse_lock so a concurrent async link
@@ -165,16 +165,18 @@ def main() -> None:
 
     attach = ATTACH_SOURCE.read_text(encoding="utf-8")
 
-    # The taskq worker consumes the coalesced request, no-ops while detaching,
-    # and takes the rebuild lock only after dropping ice_lock (outermost rule).
+    # The worker claims requests under the lifecycle lock and retains its
+    # dispatch ownership until the rebuild finishes. reset_requests.py executes
+    # the claim, redispatch, and request-during-rebuild interleavings.
     task = function(attach, "ice_reset_task(void *arg)\n{", "\n#ifdef DEBUG")
     assert "ice->ice_attaching" in task
     assert "ice->ice_detaching" in task
     assert "ice_prepare_for_reset(ice)" in task
-    assert "ice_rebuild(ice)" in task
-    assert task.index("mutex_exit(&ice->ice_lock)") < task.index(
-        "mutex_enter(&ice->ice_rebuild_lock)"
-    )
+    assert "ice_rebuild(ice, requests)" in task
+    assert task.index("mutex_enter(&ice->ice_rebuild_lock)") < task.index(
+        "ice_reset_take_requests(ice)")
+    assert task.index("ice_rebuild(ice, requests)") < task.index(
+        "ice->ice_reset_pending = B_FALSE")
     # The prepare cannot fail, so the worker always proceeds into the rebuild.
     # An undrained rx loan is handled where it is recoverable -- ice_rx_start()
     # refuses the surviving pool and the rebuild fails soft -- not by taking the
@@ -182,7 +184,7 @@ def main() -> None:
     assert "if (!ice_prepare_for_reset(ice))" not in task
     assert "ice_reset_set_failed" not in task
     assert task.index("ice_prepare_for_reset(ice);") < task.index(
-        "ice_rebuild(ice)"
+        "ice_rebuild(ice, requests)"
     )
     # The terminal state has exactly one source: the rebuild's hardware and
     # firmware failure label.
@@ -190,7 +192,7 @@ def main() -> None:
 
     # The rebuild never tears the common code down, so ICE_ATTACH_HW_INIT stays
     # set for the life of the instance and detach owns the single teardown.
-    rebuild = function(attach, "ice_rebuild(ice_t *ice)\n{", "\nvoid\nice_reset_task")
+    rebuild = function(attach, "ice_rebuild(ice_t *ice, uint32_t requests)\n{", "\nvoid\nice_reset_task")
     assert "ICE_ATTACH_HW_INIT" not in rebuild
     unconf_hw = function(
         attach,
@@ -439,7 +441,7 @@ def main() -> None:
     # the clear at the end of the success path, so reset_failed drops the owed
     # bits itself rather than leaving a rebuild permanently owed.
     rebuild = function(
-        attach, "ice_rebuild(ice_t *ice)\n{", "\n/*\n * Reset taskq worker:"
+        attach, "ice_rebuild(ice_t *ice, uint32_t requests)\n{", "\n/*\n * Reset taskq worker:"
     )
     failed = rebuild[rebuild.index("\nreset_failed:"):]
     assert "~(ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ)" in failed

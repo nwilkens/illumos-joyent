@@ -503,8 +503,10 @@ typedef struct ice {
 	 * thread context and is the outermost driver lock: it serializes a
 	 * rebuild against a mac start/stop.  The rebuild runs on its own
 	 * single-thread taskq so it never starves the OICR worker's ARQ drain;
-	 * ice_reset_pending coalesces dispatches under ice_lock, mirroring
-	 * ice_oicr_pending.  ice_attaching and ice_detaching turn a queued
+	 * ice_reset_pending coalesces queued, waiting, and running work under
+	 * ice_lock.  The worker atomically consumes its reset request bits,
+	 * leaving later requests owed to its next pass.  ice_attaching and
+	 * ice_detaching turn a queued
 	 * rebuild into a no-op while the instance is not fully constructed:
 	 * the rebuild frees and reinitializes scheduler and control-queue
 	 * state that the attach thread is still building on, and it reports

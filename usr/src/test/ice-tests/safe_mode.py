@@ -56,7 +56,7 @@ def main() -> None:
     # withdraw the TX offloads the stack is already using, so the rebuild must
     # not attempt one.
     ice = ICE_SOURCE.read_text(encoding="utf-8")
-    rebuild = function(ice, "ice_rebuild(ice_t *ice)\n{", "\nvoid\nice_reset_task")
+    rebuild = function(ice, "ice_rebuild(ice_t *ice, uint32_t requests)\n{", "\nvoid\nice_reset_task")
     assert "ice_set_safe_mode_caps" not in rebuild
     assert "ice_safe_mode = B_TRUE" not in rebuild
     assert "ice_ddp_load" not in rebuild

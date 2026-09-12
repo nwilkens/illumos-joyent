@@ -18,7 +18,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | 2 | P1 | Detach releases DMA after an unchecked fallback reset | Implemented; hardware validation pending |
 | 3 | P1 | Pending TX notifications can outlive MAC unregister | Implemented; hardware validation pending |
 | 4 | P2 | RX alignment and VLAN header layout defeat IP fast paths | Implemented; hardware performance validation pending |
-| 5 | P2 | One reset request can cause two complete resets | Open |
+| 5 | P2 | One reset request can cause two complete resets | Implemented; hardware validation pending |
 | 6 | P2 | Link refresh reports UP while the datapath remains failed | Open |
 | 7 | P2 | RX descriptor DMA faults are checked late or missed | Implemented; hardware fault injection pending |
 | 8 | P2 | Small-MSS LSO fallback retains the wrong checksum seed | Implemented; LSO disabled by default, hardware validation pending |
@@ -156,14 +156,27 @@ is distinct from this software-path correction.
 
 ## 5. Duplicate reset work
 
-`ice_reset_task()` in [ice.c](../../uts/common/io/ice/ice.c) clears its pending
-flag before acquiring `ice_rebuild_lock`. Another worker can enqueue the same
-still-owed request. The queued worker does not recheck owed work after the
-first rebuild completes. Make request ownership coherent and recheck under
-the lifecycle lock.
+`ice_reset_pending` now covers queued, waiting, and running reset work.
+Under `ice_rebuild_lock`, the worker atomically claims the reset-owed bits and
+passes that mask to `ice_rebuild()` to choose a global-reset wait or PF reset.
+A stale callback with no owed request does not prepare or rebuild the device.
 
-Acceptance: execute that interleaving for one request and count exactly one
-reset, while preserving genuinely new reset requests.
+Successful rebuilds no longer clear all owed bits near interrupt rearm. A
+request arriving after the claim remains owed. Completion uses a CAS to leave
+its fail-closed state intact and skips restarting the datapath when another
+reset is pending. The worker releases its dispatch ownership at the end and
+requeues later requests. Attach/detach gates retain requests until their owner
+lifts the gate; terminal failure still retires unserviceable requests.
+
+Validation: `reset_requests.py` compiles the actual dispatch, worker, request
+claim/completion helpers, and full rebuild body. Controlled interleavings cover
+a duplicate dispatch while waiting for the lifecycle lock, a stale callback,
+requests after the hardware barrier and interrupt rearm, CAS retries, both
+reset types, attach/detach deferral, failed dispatch, and terminal failure. The
+reviewed source fails the duplicate-dispatch case. Controls that restore the
+late unconditional request clear or unconditional rebuilding also fail.
+Hardware/control-queue boundaries are stubs; reset timing and physical recovery
+still require device validation.
 
 ## 6. Operational link state
 

@@ -87,7 +87,7 @@ def main() -> None:
 
     rebuild = function(
         attach,
-        "ice_rebuild(ice_t *ice)\n{",
+        "ice_rebuild(ice_t *ice, uint32_t requests)\n{",
         "\nvoid\nice_reset_task",
     )
     # The rebuild reinitializes only what a reset clears.
@@ -173,17 +173,17 @@ def main() -> None:
     # A global/core reset can zero the MAC counters; drop both baselines.
     assert "ice_stat_port_loaded = B_FALSE" in rebuild
     assert "ice_stat_vsi_loaded = B_FALSE" in rebuild
-    # The reset-owed bits clear after the rebuild steps but before the OICR is
-    # re-enabled, so a fresh link-change OICR cannot observe a stale
-    # RESET_PENDING/PFR_REQ and dispatch a redundant rebuild.
-    owed = rebuild.index("~(ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ)")
-    assert rebuild.index("ice_init_all_ctrlq(hw)") < owed
-    assert rebuild.index("ice_vsi_rebuild") < owed
-    assert owed < rebuild.index("ice_intr_oicr_setup")
-    # The fail-closed bit clears only after the datapath-restoring steps.
-    err = rebuild.index("~ICE_STATE_ERROR")
-    assert rebuild.index("ice_vsi_rebuild") < err
-    assert rebuild.index("ice_queues_intr_map") < err
+    # The worker claims its request bits before rebuilding.  Success must
+    # retain any later requests and leave them for the worker's next pass.
+    # reset_requests.py executes the actual rebuild with requests arriving
+    # before rearm and during the final completion CAS.
+    success = rebuild[:rebuild.index("reset_failed:")]
+    assert "~(ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ)" not in success
+    assert "if ((requests & ICE_STATE_RESET_PENDING) != 0)" in rebuild
+    complete = rebuild.index("ice_reset_complete(ice)")
+    assert rebuild.index("ice_vsi_rebuild") < complete
+    assert rebuild.index("ice_queues_intr_map") < complete
+    assert complete < rebuild.index("ice_start_datapath(ice)")
     # A datapath restart failure is soft (recoverable), not terminal.
     assert "ice_start_datapath(ice)" in rebuild
     # The terminal path fails closed via the shared helper.
