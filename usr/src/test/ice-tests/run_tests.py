@@ -45,6 +45,7 @@ TESTS = (
     "tx_bind_threshold.py",
     "tx_blocked.py",
     "tx_doorbell.py",
+    "tx_frame_limit.py",
     "tx_quiesce.py",
     "vlan_rx.py",
     "vsi_replay.py",
