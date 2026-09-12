@@ -21,7 +21,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | 5 | P2 | One reset request can cause two complete resets | Open |
 | 6 | P2 | Link refresh reports UP while the datapath remains failed | Open |
 | 7 | P2 | RX descriptor DMA faults are checked late or missed | Implemented; hardware fault injection pending |
-| 8 | P2 | Small-MSS LSO fallback retains the wrong checksum seed | Open; LSO disabled by default |
+| 8 | P2 | Small-MSS LSO fallback retains the wrong checksum seed | Implemented; LSO disabled by default, hardware validation pending |
 | 9 | Maintenance | Duplicate MAC filter constructors | Open |
 | 10 | Architecture | Filter ownership and replay contract is incomplete | Open |
 | 11 | Architecture | Lifecycle callers conflate several kinds of quiescence | Open |
@@ -208,14 +208,24 @@ review's unconfirmed packet-corruption hypothesis.
 
 ## 8. Small-MSS LSO downgrade
 
-In [ice_tx.c](../../uts/common/io/ice/ice_tx.c), a below-minimum MSS request
-that fits the MTU can switch from TSO to ordinary transmission without repairing
-the TCP checksum seed. Native LSO prepares a seed excluding TCP length, while
-ordinary checksum offload requires that length. Reject unsupported requests
-or perform a complete software fallback. This remains a gate for enabling LSO.
+In [ice_tx.c](../../uts/common/io/ice/ice_tx.c), LSO requests with an MSS
+below the controller's 64-byte minimum now return `ICE_TX_BUILD_DROP`, even
+when the packet fits the MTU. The LSO marker stays set so `ice_tx_one()` counts
+an LSO drop and consumes the packet before building descriptors. TCP's native
+LSO checksum seed excludes TCP length, so simply turning off TSO is invalid;
+no software segmentation or checksum fallback is attempted.
 
-Acceptance: exercise below-minimum MSS requests and verify checksums on a wire
-capture, including IPv4/IPv6 and fallback failure cases.
+Validation: `lso_context.py` compiles and executes the actual offload-validation
+function with controlled MAC metadata. IPv4 and IPv6 cases cover MSS 0, 1,
+63, 64, 9668, and 9669; frame lengths below, at, and above the former MTU
+boundary; valid TSO context fields; ordinary checksum requests; and invalid
+metadata. The reviewed source fails the small-MSS rejection case. This
+portable test checks driver decisions, not checksums produced by hardware.
+
+Hardware acceptance still needed: verify that below-minimum MSS requests
+increment LSO drops without emitting a frame, and capture IPv4/IPv6 traffic at
+supported MSS boundaries to validate wire checksums. LSO remains disabled by
+default pending its existing hardware acceptance work.
 
 ## 9. Shared filter construction
 

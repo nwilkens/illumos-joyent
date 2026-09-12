@@ -897,7 +897,7 @@ ice_tx_write_ctx_desc(ice_tx_ring_t *itr, uint16_t slot, uint32_t mss,
  * the hardware read beyond the packet or wedge the transmit queue.
  */
 static ice_tx_build_t
-ice_tx_context(ice_t *ice, mblk_t *mp, ice_tx_ctx_t *ctx)
+ice_tx_context(mblk_t *mp, ice_tx_ctx_t *ctx)
 {
 	mac_ether_offload_info_t meo;
 	uint32_t chkflags, lsoflags, mss = 0;
@@ -1000,13 +1000,13 @@ ice_tx_context(ice_t *ice, mblk_t *mp, ice_tx_ctx_t *ctx)
 	if (tsolen > ICE_LSO_MAXLEN)
 		return (ICE_TX_BUILD_DROP);
 
-	if (mss < ICE_TX_LSO_MIN_MSS) {
-		if (meo.meoi_len > ice->ice_mtu)
-			return (ICE_TX_BUILD_DROP);
-		ctx->itc_use_ctx = B_FALSE;
-		return (ICE_TX_BUILD_OK);
-	}
-	if (mss > ICE_TXD_CTX_MAX_MSS)
+	/*
+	 * LSO's partial TCP checksum seed excludes the TCP length.  Even
+	 * an MTU-sized request cannot become an ordinary checksum-offloaded
+	 * packet without repairing that seed.  Reject unsupported MSS values
+	 * and leave the LSO marker set for the caller's drop accounting.
+	 */
+	if (mss < ICE_TX_LSO_MIN_MSS || mss > ICE_TXD_CTX_MAX_MSS)
 		return (ICE_TX_BUILD_DROP);
 
 	ctx->itc_mss = mss;
@@ -1662,7 +1662,7 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 
 	msglen = msgdsize(mp);
 
-	res = ice_tx_context(ice, mp, &ctx);
+	res = ice_tx_context(mp, &ctx);
 	if (res == ICE_TX_BUILD_OK && ctx.itc_use_ctx &&
 	    !ice->ice_tx_lso_enable)
 		res = ICE_TX_BUILD_DROP;

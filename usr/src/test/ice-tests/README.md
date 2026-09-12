@@ -57,6 +57,21 @@ Use `--source /path/to/ice_tx.c` for a baseline and `--case NAME` for one
 scenario. The baseline fails `empty_late`, `completed_late`, and
 `active_builder` at runtime.
 
+## LSO context regression
+
+Run `python3 usr/src/test/ice-tests/lso_context.py` with Python 3 and a C99
+compiler (`CC` defaults to `cc`). It extracts the actual `ice_tx_context()` and
+its metadata types and descriptor constants, then compiles the function
+unchanged with MAC metadata stubs. IPv4 and IPv6 cases exercise unsupported
+MSS rejection regardless of packet length, accepted MSS boundaries, TSO
+context fields, ordinary checksum requests, and invalid metadata. The LSO
+marker remains set on rejection for drop accounting.
+
+Use `--source /path/to/ice_tx.c` to run the same regression against an earlier
+implementation. The reviewed baseline fails the small-MSS case. The test does
+not emulate the NIC or establish wire checksum correctness; LSO remains off
+by default until hardware validation is complete.
+
 ## Upstream integration baseline
 
 The 2026-09-11 integration merges TritonDataCenter/illumos-joyent master at

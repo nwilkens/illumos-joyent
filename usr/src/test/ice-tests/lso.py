@@ -47,7 +47,7 @@ def main() -> None:
     tx = TX_SOURCE.read_text(encoding="utf-8")
     context = function(
         tx,
-        "ice_tx_context(ice_t *ice, mblk_t *mp, ice_tx_ctx_t *ctx)\n{",
+        "ice_tx_context(mblk_t *mp, ice_tx_ctx_t *ctx)\n{",
         "\n/*\n * Build the TCB chain",
     )
     assert "mac_lso_get(mp, &mss, &lsoflags)" in context
