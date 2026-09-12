@@ -2,7 +2,8 @@
 
 The [review working list](WORKLIST.md) tracks the open correctness,
 architecture, performance, and test issues, their priorities, and acceptance
-criteria.
+criteria. The driver [lifecycle contract](../../uts/common/io/ice/LIFECYCLE.md)
+records the lock, callback, DMA, and recovery boundaries exercised here.
 
 ## Terminal filter callback regression
 

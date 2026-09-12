@@ -24,7 +24,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | 8 | P2 | Small-MSS LSO fallback retains the wrong checksum seed | Implemented; LSO disabled by default, hardware validation pending |
 | 9 | Maintenance | Duplicate MAC filter constructors | Implemented; request equivalence tested |
 | 10 | Architecture | Filter ownership and replay contract is incomplete | In progress; VSI failure ownership corrected |
-| 11 | Architecture | Lifecycle callers conflate several kinds of quiescence | Open |
+| 11 | Architecture | Lifecycle callers conflate several kinds of quiescence | Completed; explicit lifecycle contracts documented |
 | 12 | Documentation | Some comments promise stronger invariants than the code establishes | Completed; comments checked against current callers |
 | 13 | Test repair | `tx_bind_threshold.py` has a stale exact-text assertion | Implemented with executable copy/bind regression |
 | 14 | Test coverage | Most checks inspect source strings instead of executing behavior | Open; first behavioral test added for item 1 |
@@ -297,10 +297,18 @@ outside this controlled host test.
 
 ## 11. Lifecycle contract
 
-Document submission quiescence, callback quiescence, DMA quiescence, reset-work
-ownership, operational readiness, and lock order separately. Give helpers
-explicit prerequisites and guarantees; use items 2, 3, 5, and 6 as concrete
-acceptance cases. Prefer small corrections to a broad lifecycle rewrite.
+[LIFECYCLE.md](../../uts/common/io/ice/LIFECYCLE.md) records lock order,
+submission and callback fences, RX loan ownership, hardware isolation,
+reclamation prerequisites, reset request ownership, operational readiness,
+and detach rollback. The helper table states what each operation establishes
+and what it requires from its caller. It explicitly distinguishes the bounded
+RX loan wait from the required completion of in-flight MAC upcalls.
+
+The contract is grounded in the implemented item 2, 3, 5, and 6 fixes and their
+actual-C regressions. Source review checked producer shutdown and taskq drain
+ordering, the shared notification lock, and MAC's deferred link notification.
+Those regressions, C style, and native module compilation provide software
+validation; hardware ordering and recovery remain separate acceptance work.
 
 ## 12. Comments and proven invariants
 
