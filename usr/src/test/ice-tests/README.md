@@ -37,6 +37,26 @@ while retaining the current FMA boundary; `--gld-source` selects the start
 callback. The test stubs hardware and atomics and does not prove live DMA or
 CPU memory ordering.
 
+## TX notification quiescence regression
+
+```
+python3 usr/src/test/ice-tests/tx_quiesce.py
+```
+
+The runner compiles the actual TX recycle, quiesce, and interrupt functions
+with small DMA/MAC boundary stubs. Five named scenarios cover empty and
+completed blocked rings after quiescence, both healthy wakeup paths, a builder
+rearming backpressure during the active-call drain, and a prior notification
+holding the ring lock while quiescence waits. The last two use pthread mutex
+and condition-variable handshakes without sleeps. Assertions check callback
+counts, retained descriptors/control blocks, and the completed quiescence gate.
+This validates software callback ownership; hardware DMA isolation remains a
+separate queue-disable/reset requirement.
+
+Use `--source /path/to/ice_tx.c` for a baseline and `--case NAME` for one
+scenario. The baseline fails `empty_late`, `completed_late`, and
+`active_builder` at runtime.
+
 ## Upstream integration baseline
 
 The 2026-09-11 integration merges TritonDataCenter/illumos-joyent master at

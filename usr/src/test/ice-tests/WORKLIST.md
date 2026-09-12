@@ -16,7 +16,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | --- | --- | --- | --- |
 | 1 | P1 | Terminal reset failure prevents filter retirement and can make unregister panic | Implemented; hardware validation pending |
 | 2 | P1 | Detach releases DMA after an unchecked fallback reset | Implemented; hardware validation pending |
-| 3 | P1 | Pending TX notifications can outlive MAC unregister | Open |
+| 3 | P1 | Pending TX notifications can outlive MAC unregister | Implemented; hardware validation pending |
 | 4 | P2 | RX alignment and VLAN header layout defeat IP fast paths | Open |
 | 5 | P2 | One reset request can cause two complete resets | Open |
 | 6 | P2 | Link refresh reports UP while the datapath remains failed | Open |
@@ -108,14 +108,24 @@ source review. Item 3 still covers the broader TX stop-time notification gate.
 
 ## 3. TX notification lifetime
 
-`ice_tx_quiesce()` in [ice_tx.c](../../uts/common/io/ice/ice_tx.c) stops
-submissions but leaves `itxr_blocked` armed. Interrupt recycling can still call
-`mac_tx_ring_update()`. `ice_detach()` unregisters MAC before interrupt removal
-provides a handler fence. Include notifications in the quiescence contract and
-drain in-flight callbacks before unregister.
+`ice_tx_recycle()` now returns before descriptor reads, frees, or MAC wakeups
+when `itxr_quiesce` is set. `ice_tx_quiesce()` takes the same ring lock held
+across each `mac_tx_ring_update()`, so its acquisition waits out an earlier
+notification. It then drains admitted transmit calls and clears
+`itxr_blocked`: a builder may have rearmed backpressure while the condition
+wait released the lock. Later completion interrupts cannot notify MAC or
+reclaim buffers from the quiesced ring.
 
-Acceptance: hold a blocked TX ring, fail queue stop, and release a delayed
-completion across detach. Verify that no MAC callback can cross unregister.
+Quiescence itself releases no DMA. Explicit reclaim still requires a
+successful queue-disable or reset barrier. `tx_quiesce.py` executes the real
+recycle/quiesce/interrupt functions and checks five scenarios, including
+pthread handshakes for a late builder and an in-flight MAC notification.
+The old implementation fails the late-empty, late-completed, and builder
+regressions at runtime; healthy wakeups remain covered.
+
+Hardware acceptance remains: hold a blocked TX ring, fail queue stop, and
+release a delayed completion across stop/detach. Verify no MAC callback after
+quiescence, no callback crossing unregister, and no premature DMA release.
 
 ## 4. RX header layout
 

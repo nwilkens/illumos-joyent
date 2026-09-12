@@ -1566,6 +1566,9 @@ ice_tx_recycle(ice_tx_ring_t *itr)
 
 	ASSERT(MUTEX_HELD(&itr->itxr_lock));
 
+	if (itr->itxr_quiesce)
+		return (0);
+
 	if (itr->itxr_avail == itr->itxr_size) {
 		/*
 		 * Nothing in flight, but a blocked ring whose last completion
@@ -1835,10 +1838,12 @@ ice_tx_start(ice_t *ice)
 }
 
 /*
- * Close every ring to new transmits and wait out the calls already inside
- * ice_ring_tx().  Releases nothing: the reset path must be able to stop the
- * software from touching a ring without giving up DMA that hardware can still
- * reach, since the PFR is not issued until ice_rebuild().
+ * Close every ring to transmits and completion notifications.  The ring lock
+ * waits out any prior MAC notification; recycle checks quiesce under that same
+ * lock, so no later interrupt can notify MAC or reclaim DMA.  An admitted
+ * ice_ring_tx() can still re-arm backpressure while the wait drops the lock,
+ * so clear it only after every such call has returned.  Releases nothing:
+ * hardware may still reach the DMA until queue disable or reset completes.
  */
 void
 ice_tx_quiesce(ice_t *ice)
@@ -1852,6 +1857,7 @@ ice_tx_quiesce(ice_t *ice)
 		itr->itxr_quiesce = B_TRUE;
 		while (itr->itxr_tx_active > 0)
 			cv_wait(&itr->itxr_cv, &itr->itxr_lock);
+		itr->itxr_blocked = B_FALSE;
 		mutex_exit(&itr->itxr_lock);
 	}
 }
