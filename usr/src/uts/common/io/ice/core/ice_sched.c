@@ -224,6 +224,17 @@ ice_sched_add_node(struct ice_port_info *pi, u8 layer,
 		}
 	}
 
+	/* illumos: the parent's children array is sized by max_children. */
+	if (parent->num_children >= hw->max_children[parent->tx_sched_layer]) {
+		ice_debug(hw, ICE_DBG_SCHED, "parent 0x%x has no child slot\n",
+			  LE32_TO_CPU(info->parent_teid));
+		if (node->children)
+			ice_free(hw, node->children);
+		if (!prealloc_node)
+			ice_free(hw, node);
+		return ICE_ERR_PARAM;
+	}
+
 	node->in_use = true;
 	node->parent = parent;
 	node->tx_sched_layer = layer;

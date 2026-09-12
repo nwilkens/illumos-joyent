@@ -843,9 +843,10 @@ ice_init_pkg_info(struct ice_hw *hw, struct ice_pkg_hdr *pkg_hdr)
 		ice_memcpy(hw->pkg_name, meta->name, sizeof(meta->name),
 			   ICE_NONDMA_TO_NONDMA);
 
-		ice_debug(hw, ICE_DBG_PKG, "Pkg: %d.%d.%d.%d, %s\n",
+		/* illumos: the name has no guaranteed terminator. */
+		ice_debug(hw, ICE_DBG_PKG, "Pkg: %d.%d.%d.%d, %.*s\n",
 			  meta->ver.major, meta->ver.minor, meta->ver.update,
-			  meta->ver.draft, meta->name);
+			  meta->ver.draft, (int)sizeof(meta->name), meta->name);
 
 		hw->ice_seg_fmt_ver = seg_hdr->seg_format_ver;
 		ice_memcpy(hw->ice_seg_id, seg_hdr->seg_id,
@@ -917,11 +918,13 @@ enum ice_ddp_state ice_get_pkg_info(struct ice_hw *hw)
 		if (pkg_info->pkg_info[i].is_in_nvm)
 			flags[place++] = 'N';
 
-		ice_debug(hw, ICE_DBG_PKG, "Pkg[%d]: %d.%d.%d.%d,%s,%s\n",
+		/* illumos: the firmware name has no guaranteed terminator. */
+		ice_debug(hw, ICE_DBG_PKG, "Pkg[%d]: %d.%d.%d.%d,%.*s,%s\n",
 			  i, pkg_info->pkg_info[i].ver.major,
 			  pkg_info->pkg_info[i].ver.minor,
 			  pkg_info->pkg_info[i].ver.update,
 			  pkg_info->pkg_info[i].ver.draft,
+			  (int)sizeof(pkg_info->pkg_info[i].name),
 			  pkg_info->pkg_info[i].name, flags);
 	}
 
