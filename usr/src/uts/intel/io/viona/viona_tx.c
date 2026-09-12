@@ -916,6 +916,22 @@ viona_tx(viona_link_t *link, viona_vring_t *ring)
 		}
 	}
 
+	/*
+	 * MAC does not bound a client's frame against the link SDU, and a
+	 * physical provider can treat an oversized frame as a fault that
+	 * disrupts every client sharing it.  Only an LSO request that survived
+	 * offload processing may exceed the MTU; the RX path applies the same
+	 * bound to inbound frames.
+	 */
+	if (pkt_len > sizeof (struct ether_vlan_header) + link->l_mtu) {
+		if ((DB_LSOFLAGS(mp_head) & HW_LSO) == 0) {
+			VIONA_PROBE3(tx_drop_over_mtu, viona_vring_t *, ring,
+			    mblk_t *, mp_head, uint32_t, pkt_len);
+			VIONA_RING_STAT_INCR(ring, tx_drop_over_mtu);
+			goto drop_fail;
+		}
+	}
+
 	if (dp != NULL) {
 		/*
 		 * Record the info required to record this descriptor in the

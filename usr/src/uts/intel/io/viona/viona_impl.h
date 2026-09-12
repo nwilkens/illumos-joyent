@@ -219,6 +219,7 @@ typedef struct viona_vring {
 		uint64_t	rs_too_short;
 		uint64_t	rs_tx_absent;
 		uint64_t	rs_tx_gso_fail;
+		uint64_t	rs_tx_drop_over_mtu;
 
 		uint64_t	rs_rx_hookdrop;
 		uint64_t	rs_tx_hookdrop;

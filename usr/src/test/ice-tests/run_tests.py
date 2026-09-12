@@ -50,6 +50,7 @@ TESTS = (
     "tx_doorbell.py",
     "tx_frame_limit.py",
     "tx_quiesce.py",
+    "viona_tx_guards.py",
     "vlan_rx.py",
     "vsi_replay.py",
     "vsi_stats.py",
