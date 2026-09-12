@@ -76,6 +76,18 @@
 
 static void ice_intr_oicr_enable(ice_t *);
 
+/* Preserve the carrier cache while exposing an unusable datapath as DOWN. */
+link_state_t
+ice_link_state_effective(ice_t *ice, link_state_t state)
+{
+	const uint32_t failed = ICE_STATE_ERROR | ICE_STATE_RESET_FAILED |
+	    ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ;
+
+	ASSERT(MUTEX_HELD(&ice->ice_lse_lock));
+
+	return ((ice->ice_state & failed) != 0 ? LINK_STATE_DOWN : state);
+}
+
 static void
 ice_link_state_set(ice_t *ice, link_state_t state)
 {
@@ -88,18 +100,18 @@ ice_link_state_set(ice_t *ice, link_state_t state)
 	if (ice->ice_mac_hdl == NULL)
 		return;
 
-	mac_link_update(ice->ice_mac_hdl, state);
+	mac_link_update(ice->ice_mac_hdl, ice_link_state_effective(ice, state));
 }
 
 /*
- * Set the cached link state and report it to MAC under ice_lse_lock.  The
- * reset path uses this to force the link down while the function is rebuilt.
+ * Report an operational transition without changing the carrier cache.  The
+ * reset path uses this to force the link down while the function is rebuilt;
+ * only a carrier query or loopback transition replaces the cached state.
  */
 void
 ice_link_report(ice_t *ice, link_state_t state)
 {
 	mutex_enter(&ice->ice_lse_lock);
-	ice->ice_link_state = state;
 	ice_link_state_set(ice, state);
 	mutex_exit(&ice->ice_lse_lock);
 }
@@ -522,7 +534,6 @@ ice_oicr_fatal(ice_t *ice, uint32_t cause, boolean_t mdd)
 	 */
 	if (fault) {
 		mutex_enter(&ice->ice_lse_lock);
-		ice->ice_link_state = LINK_STATE_DOWN;
 		ice_link_state_set(ice, LINK_STATE_DOWN);
 		mutex_exit(&ice->ice_lse_lock);
 	}

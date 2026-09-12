@@ -1165,25 +1165,18 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	mutex_exit(&ice_glock);
 
 	/*
-	 * Open the instance to rebuilds, and requeue one the gate discarded
-	 * during the attach window: the hardware latches are one-shot, so
-	 * nothing re-delivers a cause the gate already consumed.
+	 * Refresh carrier after registration and interrupt setup, before
+	 * opening the instance to rebuilds.  The lifecycle lock serializes
+	 * this admin-queue query and its publication with MAC start and reset.
+	 * The periodic refresh handles later events, including a link cause
+	 * whose notification was consumed while attach gated the worker.
 	 */
 	mutex_enter(&ice->ice_rebuild_lock);
+	ice_link_status_update(ice);
 	ice->ice_attaching = B_FALSE;
 	ice_reset_redispatch(ice);
 	mutex_exit(&ice->ice_rebuild_lock);
 
-	/*
-	 * Resync the link only now.  ice_setup_link() enables the PHY early in
-	 * attach and a DAC negotiates in well under the time the rest of attach
-	 * takes, so the up event lands while the gate above is still dropping
-	 * OICR work.  That latch is one-shot and there is no periodic to
-	 * re-read it, so without this poll the port stays down forever.  It
-	 * must follow both the gate lift and mac_register(), which is what
-	 * makes the result publishable.
-	 */
-	ice_link_status_update(ice);
 	ice_oicr_resync(ice);
 	ice_admin_periodic_start(ice);
 

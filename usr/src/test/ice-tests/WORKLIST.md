@@ -19,7 +19,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | 3 | P1 | Pending TX notifications can outlive MAC unregister | Implemented; hardware validation pending |
 | 4 | P2 | RX alignment and VLAN header layout defeat IP fast paths | Implemented; hardware performance validation pending |
 | 5 | P2 | One reset request can cause two complete resets | Implemented; hardware validation pending |
-| 6 | P2 | Link refresh reports UP while the datapath remains failed | Open |
+| 6 | P2 | Link refresh reports UP while the datapath remains failed | Implemented; hardware validation pending |
 | 7 | P2 | RX descriptor DMA faults are checked late or missed | Implemented; hardware fault injection pending |
 | 8 | P2 | Small-MSS LSO fallback retains the wrong checksum seed | Implemented; LSO disabled by default, hardware validation pending |
 | 9 | Maintenance | Duplicate MAC filter constructors | Implemented; request equivalence tested |
@@ -180,14 +180,32 @@ still require device validation.
 
 ## 6. Operational link state
 
-`ice_rebuild()` in [ice.c](../../uts/common/io/ice/ice.c) can leave
-`ICE_STATE_ERROR` and report DOWN after datapath restart fails. The periodic
-link refresh in [ice_intr.c](../../uts/common/io/ice/ice_intr.c) subsequently
-reports physical carrier as UP, although TX still discards traffic. Separate
-carrier from operational readiness and retain the DOWN override until recovery.
+MAC publication and `MAC_PROP_STATUS` now use one effective-state helper:
+`ICE_STATE_ERROR`, a terminal reset failure, or an owed reset forces DOWN.
+Physical and loopback updates retain their carrier cache, speed, and duplex;
+operational DOWN reports no longer overwrite that cache. A periodic physical
+UP therefore cannot make a failed datapath appear usable.
 
-Acceptance: fail a nonterminal datapath restart with carrier present, advance
-the admin periodic, and verify operational DOWN until a successful restart.
+`ice_m_start()` relatches ERROR if datapath start fails and publishes its result
+while holding `ice_rebuild_lock`. Successful start can republish the cached
+carrier without waiting for another event. The pre-start error clear stays
+before the attempt so it cannot erase a new failure arriving during startup.
+Initial registration publication and the final attach query now also hold the
+lifecycle lock; the final query precedes lifting the attach gate and reset
+redispatch, keeping the query and its publication out of concurrent recovery.
+
+Validation: `link_operational.py` executes the actual carrier/loopback updates,
+publication functions, MAC start, and property getter. It covers repeated
+carrier UP under each failure state, cache preservation, pre-registration
+caching, failed/successful start, a fresh startup fault, and loopback changes.
+The baseline fails operational DOWN. Controls removing the publication gate,
+failed-start ERROR latch, or effective property state each fail. The actual
+rebuild regression additionally verifies DOWN and nonterminal ERROR after
+both datapath-start and RX-resume failure; source checks cover attach locking.
+
+Hardware acceptance still needed: fail a datapath restart with carrier
+present, advance the admin periodic, and verify DOWN until a successful
+restart, including loopback and externally queried link status.
 
 ## 7. Descriptor DMA fault timing
 

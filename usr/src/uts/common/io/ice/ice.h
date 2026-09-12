@@ -523,8 +523,9 @@ typedef struct ice {
 	/*
 	 * Link-state cache.  The authoritative state lives in
 	 * ice_hw.port_info->phy.link_info, refreshed by the common code; these
-	 * are the decoded values MAC will consume once mac_register lands.
-	 * Guarded by ice_lse_lock.
+	 * are the decoded carrier values, including the loopback override.
+	 * MAC publication and MAC_PROP_STATUS apply the operational failure
+	 * state separately.  Guarded by ice_lse_lock.
 	 */
 	kmutex_t		ice_lse_lock;
 	kcondvar_t		ice_lse_cv;
@@ -723,6 +724,7 @@ extern int ice_ring_rx_intr_disable(mac_intr_handle_t);
 extern boolean_t ice_mac_register(ice_t *);
 extern int ice_mac_unregister(ice_t *);
 extern void ice_link_state_publish(ice_t *);
+extern link_state_t ice_link_state_effective(ice_t *, link_state_t);
 extern int ice_start_datapath(ice_t *);
 extern int ice_promisc_apply(ice_t *, boolean_t);
 

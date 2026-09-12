@@ -562,6 +562,9 @@ ice_m_start(void *arg)
 	atomic_and_32(&ice->ice_state, ~ICE_STATE_ERROR);
 
 	ret = ice_start_datapath(ice);
+	if (ret != 0)
+		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
+	ice_link_state_publish(ice);
 	mutex_exit(&ice->ice_rebuild_lock);
 
 	return (ret);
@@ -1128,6 +1131,7 @@ ice_m_getprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 	ice_t *ice = arg;
 	int ret = 0;
 	uint64_t speed;
+	link_state_t state;
 	uint16_t phy_speed = 0;
 	boolean_t advertised = B_FALSE;
 	uint8_t *u8;
@@ -1157,7 +1161,8 @@ ice_m_getprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 			ret = EOVERFLOW;
 			break;
 		}
-		bcopy(&ice->ice_link_state, pr_val, sizeof (link_state_t));
+		state = ice_link_state_effective(ice, ice->ice_link_state);
+		bcopy(&state, pr_val, sizeof (state));
 		break;
 	case MAC_PROP_AUTONEG:
 		if (pr_valsize < sizeof (uint8_t)) {
@@ -1413,7 +1418,10 @@ ice_mac_register(ice_t *ice)
 		return (B_FALSE);
 	}
 
+	/* A concurrent MAC start must finish before initial publication. */
+	mutex_enter(&ice->ice_rebuild_lock);
 	ice_link_state_publish(ice);
+	mutex_exit(&ice->ice_rebuild_lock);
 
 	return (B_TRUE);
 }

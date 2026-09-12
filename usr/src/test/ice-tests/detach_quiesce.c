@@ -87,6 +87,12 @@ atomic_and_32(uint32_t *p, uint32_t v)
 }
 
 static int ice_m_start(void *);
+static void
+ice_link_state_publish(ice_t *ice)
+{
+	(void) ice;
+}
+
 static int ice_start_datapath(ice_t *p)
 {
 	assert(!p->ice_detaching);

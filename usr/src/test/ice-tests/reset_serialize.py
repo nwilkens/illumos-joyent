@@ -324,19 +324,17 @@ def main() -> None:
     assert attach_fn.index("ice_set_link_events(ice)") < attach_fn.index(
         "ice_setup_link(ice)"
     )
-    # The link resync is the LAST thing attach does.  Hardware evidence
-    # (boston/hunter, E810-C, 2026-07-18): ice_setup_link() enables the PHY
-    # early and a 10G DAC negotiates inside the ~180ms the rest of attach
-    # takes, so the up event lands while the OICR is still masked or the
-    # attaching gate is still dropping work -- and ice_intr_oicr_setup()
-    # read-clears PFINT_OICR, stranding the ARQ message with no interrupt
-    # pending.  Nothing re-reads it, so the port stayed down forever.  The
-    # poll must follow the gate lift AND mac_register() to be publishable.
+    # Final carrier resync follows registration and interrupt setup, under
+    # the lifecycle lock and before lifting the attach gate.  This prevents
+    # querying or publishing across a concurrent start or reset rebuild.
     resync = attach_fn.rindex("ice_link_status_update(ice)")
     assert enable < resync
     assert attach_fn.index("ice_mac_register(ice)") < resync
-    assert attach_fn.index("ice->ice_attaching = B_FALSE") < resync
-    assert resync < attach_fn.index("ICE_STATE_ATTACHED")
+    clear = attach_fn.index("ice->ice_attaching = B_FALSE")
+    assert resync < clear < attach_fn.index("ICE_STATE_ATTACHED")
+    locked = attach_fn.rindex("mutex_enter(&ice->ice_rebuild_lock)", 0, clear)
+    unlocked = attach_fn.index("mutex_exit(&ice->ice_rebuild_lock)", clear)
+    assert locked < resync < clear < unlocked
 
     # Defense in depth for a cause latched before the enable: the attaching
     # gate is set before the reset taskq exists and cleared under the rebuild

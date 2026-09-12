@@ -107,6 +107,22 @@ Controls restoring the late request clear or unconditional stale-worker
 rebuild fail too. This portable test does not establish hardware reset timing
 or device recovery.
 
+## Operational link regression
+
+Run `python3 usr/src/test/ice-tests/link_operational.py` with Python 3 and a C99
+compiler (`CC` defaults to `cc`). It compiles the actual link publication,
+carrier/loopback updates, MAC start, and property getter. Failed operation
+must remain DOWN despite repeated carrier UP; a successful start republishes
+the retained carrier. Cases also cover null MAC handles, loopback, and a new
+fault during startup. `reset_requests.py` exercises the actual rebuild's
+nonterminal datapath-start and RX-resume failures.
+
+Use `--source /path/to/ice_intr.c --gld-source /path/to/ice_gld.c` for an earlier
+implementation. The baseline fails operational DOWN, as do incomplete fixes
+that omit the effective publication/property gate or failed-start ERROR latch.
+These tests substitute hardware and MAC boundaries; physical link, queue, and
+wire behavior still require hardware validation.
+
 ## Upstream integration baseline
 
 The 2026-09-11 integration merges TritonDataCenter/illumos-joyent master at

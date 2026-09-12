@@ -64,7 +64,8 @@ void ice_reset_task(void *);
 void ice_reset_dispatch(ice_t *);
 static ice_t device;
 static unsigned queued, prepared, pfrs, global_waits, starts, errors;
-static int fail_dispatch, fail_reset;
+static int fail_dispatch, fail_reset, start_result, resume_ok;
+static unsigned down_reports;
 static uint32_t at_lock, after_barrier, at_rearm, at_complete;
 static uint32_t at_consume;
 
@@ -240,7 +241,8 @@ static void ice_link_loopback_update(ice_t *ice, int mode)
 static void ice_link_report(ice_t *ice, int state)
 {
 	(void) ice;
-	(void) state;
+	assert(state == LINK_STATE_DOWN);
+	down_reports++;
 }
 static void ice_reset_set_failed(ice_t *ice)
 {
@@ -274,9 +276,9 @@ static int ice_start_datapath(ice_t *ice)
 {
 	(void) ice;
 	starts++;
-	return (0);
+	return (start_result);
 }
-static int ice_rx_rings_resume(ice_t *ice) { (void) ice; return (1); }
+static int ice_rx_rings_resume(ice_t *ice) { (void) ice; return (resume_ok); }
 
 #include "ice_reset_body.h"
 
@@ -286,7 +288,9 @@ reset(void)
 	(void) memset(&device, 0, sizeof (device));
 	device.ice_safe_mode = B_TRUE;
 	queued = prepared = pfrs = global_waits = starts = errors = 0;
-	fail_dispatch = fail_reset = 0;
+	fail_dispatch = fail_reset = start_result = 0;
+	resume_ok = 1;
+	down_reports = 0;
 	at_lock = after_barrier = at_rearm = at_complete = at_consume = 0;
 }
 
@@ -403,12 +407,31 @@ check_gates(void)
 	assert(global_waits == 1 && queued == 0);
 }
 
+static void
+check_restart_failure(void)
+{
+	unsigned phase;
+
+	for (phase = 0; phase < 2; phase++) {
+		reset();
+		device.ice_state = ICE_STATE_STARTED;
+		start_result = phase == 0 ? -1 : 0;
+		resume_ok = phase == 0;
+		request(ICE_STATE_PFR_REQ);
+		run_one();
+		assert(starts == 1 && down_reports == 1 && queued == 0);
+		assert((device.ice_state & ICE_STATE_ERROR) != 0);
+		assert((device.ice_state & ICE_STATE_RESET_FAILED) == 0);
+	}
+}
+
 int
 main(void)
 {
 	check_coalescing();
 	check_new_requests();
 	check_gates();
+	check_restart_failure();
 	(void) puts("PASS: ICE reset ownership and rebuild interleavings");
 	return (0);
 }
