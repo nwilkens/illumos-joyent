@@ -999,29 +999,29 @@ f kernel/exec/amd64/elfexec 0755 root sys
 f kernel/exec/amd64/intpexec 0755 root sys
 d kernel/firmware 0755 root sys
 d kernel/firmware/cxgbe 0755 root sys
-f kernel/firmware/cxgbe/t4fw-1.27.1.0.bin 0666 root bin
+f kernel/firmware/cxgbe/t4fw-1.27.1.0.bin 0644 root bin
 s kernel/firmware/cxgbe/t4fw.bin=t4fw-1.27.1.0.bin
-f kernel/firmware/cxgbe/t4fw_cfg.txt 0666 root bin
-f kernel/firmware/cxgbe/t5fw-1.27.5.0.bin 0666 root bin
+f kernel/firmware/cxgbe/t4fw_cfg.txt 0644 root bin
+f kernel/firmware/cxgbe/t5fw-1.27.5.0.bin 0644 root bin
 s kernel/firmware/cxgbe/t5fw.bin=t5fw-1.27.5.0.bin
-f kernel/firmware/cxgbe/t5fw_cfg.txt 0666 root bin
-f kernel/firmware/cxgbe/t6fw-1.27.5.0.bin 0666 root bin
+f kernel/firmware/cxgbe/t5fw_cfg.txt 0644 root bin
+f kernel/firmware/cxgbe/t6fw-1.27.5.0.bin 0644 root bin
 s kernel/firmware/cxgbe/t6fw.bin=t6fw-1.27.5.0.bin
-f kernel/firmware/cxgbe/t6fw_cfg.txt 0666 root bin
+f kernel/firmware/cxgbe/t6fw_cfg.txt 0644 root bin
 d kernel/firmware/iwn 0755 root sys
-f kernel/firmware/iwn/iwlwifi-100-5.ucode 0666 root sys
-f kernel/firmware/iwn/iwlwifi-1000-3.ucode 0666 root sys
-f kernel/firmware/iwn/iwlwifi-105-6.ucode 0666 root sys
-f kernel/firmware/iwn/iwlwifi-135-6.ucode 0666 root sys
-f kernel/firmware/iwn/iwlwifi-2000-6.ucode 0666 root sys
-f kernel/firmware/iwn/iwlwifi-2030-6.ucode 0666 root sys
-f kernel/firmware/iwn/iwlwifi-4965-2.ucode 0666 root sys
-f kernel/firmware/iwn/iwlwifi-5000-2.ucode 0666 root sys
-f kernel/firmware/iwn/iwlwifi-5150-2.ucode 0666 root sys
-f kernel/firmware/iwn/iwlwifi-6000-4.ucode 0666 root sys
-f kernel/firmware/iwn/iwlwifi-6000g2a-6.ucode 0666 root sys
-f kernel/firmware/iwn/iwlwifi-6000g2b-6.ucode 0666 root sys
-f kernel/firmware/iwn/iwlwifi-6050-5.ucode 0666 root sys
+f kernel/firmware/iwn/iwlwifi-100-5.ucode 0644 root sys
+f kernel/firmware/iwn/iwlwifi-1000-3.ucode 0644 root sys
+f kernel/firmware/iwn/iwlwifi-105-6.ucode 0644 root sys
+f kernel/firmware/iwn/iwlwifi-135-6.ucode 0644 root sys
+f kernel/firmware/iwn/iwlwifi-2000-6.ucode 0644 root sys
+f kernel/firmware/iwn/iwlwifi-2030-6.ucode 0644 root sys
+f kernel/firmware/iwn/iwlwifi-4965-2.ucode 0644 root sys
+f kernel/firmware/iwn/iwlwifi-5000-2.ucode 0644 root sys
+f kernel/firmware/iwn/iwlwifi-5150-2.ucode 0644 root sys
+f kernel/firmware/iwn/iwlwifi-6000-4.ucode 0644 root sys
+f kernel/firmware/iwn/iwlwifi-6000g2a-6.ucode 0644 root sys
+f kernel/firmware/iwn/iwlwifi-6000g2b-6.ucode 0644 root sys
+f kernel/firmware/iwn/iwlwifi-6050-5.ucode 0644 root sys
 d kernel/fs 0755 root sys
 d kernel/fs/amd64 0755 root sys
 f kernel/fs/amd64/autofs 0755 root sys
@@ -2526,9 +2526,11 @@ h platform/i86pc/ucode/GenuineIntel/000A06E1-80=platform/i86pc/ucode/GenuineInte
 f platform/i86pc/ucode/GenuineIntel/000A06F3-01 0444 root sys
 f platform/i86pc/ucode/GenuineIntel/000B0650-80 0444 root sys
 f platform/i86pc/ucode/GenuineIntel/000B0671-02 0444 root sys
+h platform/i86pc/ucode/GenuineIntel/000B0671-04=platform/i86pc/ucode/GenuineIntel/000B0671-02
 h platform/i86pc/ucode/GenuineIntel/000B0671-10=platform/i86pc/ucode/GenuineIntel/000B0671-02
 h platform/i86pc/ucode/GenuineIntel/000B0671-20=platform/i86pc/ucode/GenuineIntel/000B0671-02
 h platform/i86pc/ucode/GenuineIntel/000B0674-02=platform/i86pc/ucode/GenuineIntel/000B0671-02
+h platform/i86pc/ucode/GenuineIntel/000B0674-04=platform/i86pc/ucode/GenuineIntel/000B0671-02
 h platform/i86pc/ucode/GenuineIntel/000B0674-10=platform/i86pc/ucode/GenuineIntel/000B0671-02
 h platform/i86pc/ucode/GenuineIntel/000B0674-20=platform/i86pc/ucode/GenuineIntel/000B0671-02
 f platform/i86pc/ucode/GenuineIntel/000B06A2-20 0444 root sys
@@ -2564,12 +2566,15 @@ h platform/i86pc/ucode/GenuineIntel/000C0664-02=platform/i86pc/ucode/GenuineInte
 h platform/i86pc/ucode/GenuineIntel/000C0664-80=platform/i86pc/ucode/GenuineIntel/000C0652-02
 h platform/i86pc/ucode/GenuineIntel/000C06A2-02=platform/i86pc/ucode/GenuineIntel/000C0652-02
 h platform/i86pc/ucode/GenuineIntel/000C06A2-80=platform/i86pc/ucode/GenuineIntel/000C0652-02
-f platform/i86pc/ucode/GenuineIntel/000C06C1-10 0444 root sys
-h platform/i86pc/ucode/GenuineIntel/000C06C1-80=platform/i86pc/ucode/GenuineIntel/000C06C1-10
-h platform/i86pc/ucode/GenuineIntel/000C06C2-10=platform/i86pc/ucode/GenuineIntel/000C06C1-10
-h platform/i86pc/ucode/GenuineIntel/000C06C2-80=platform/i86pc/ucode/GenuineIntel/000C06C1-10
-h platform/i86pc/ucode/GenuineIntel/000C06C3-10=platform/i86pc/ucode/GenuineIntel/000C06C1-10
-h platform/i86pc/ucode/GenuineIntel/000C06C3-80=platform/i86pc/ucode/GenuineIntel/000C06C1-10
+f platform/i86pc/ucode/GenuineIntel/000C06C1-04 0444 root sys
+h platform/i86pc/ucode/GenuineIntel/000C06C1-10=platform/i86pc/ucode/GenuineIntel/000C06C1-04
+h platform/i86pc/ucode/GenuineIntel/000C06C1-80=platform/i86pc/ucode/GenuineIntel/000C06C1-04
+h platform/i86pc/ucode/GenuineIntel/000C06C2-04=platform/i86pc/ucode/GenuineIntel/000C06C1-04
+h platform/i86pc/ucode/GenuineIntel/000C06C2-10=platform/i86pc/ucode/GenuineIntel/000C06C1-04
+h platform/i86pc/ucode/GenuineIntel/000C06C2-80=platform/i86pc/ucode/GenuineIntel/000C06C1-04
+h platform/i86pc/ucode/GenuineIntel/000C06C3-04=platform/i86pc/ucode/GenuineIntel/000C06C1-04
+h platform/i86pc/ucode/GenuineIntel/000C06C3-10=platform/i86pc/ucode/GenuineIntel/000C06C1-04
+h platform/i86pc/ucode/GenuineIntel/000C06C3-80=platform/i86pc/ucode/GenuineIntel/000C06C1-04
 f platform/i86pc/ucode/GenuineIntel/000C06F1-01 0444 root sys
 h platform/i86pc/ucode/GenuineIntel/000C06F1-02=platform/i86pc/ucode/GenuineIntel/000C06F1-01
 h platform/i86pc/ucode/GenuineIntel/000C06F1-04=platform/i86pc/ucode/GenuineIntel/000C06F1-01
@@ -2578,6 +2583,17 @@ h platform/i86pc/ucode/GenuineIntel/000C06F2-01=platform/i86pc/ucode/GenuineInte
 h platform/i86pc/ucode/GenuineIntel/000C06F2-02=platform/i86pc/ucode/GenuineIntel/000C06F1-01
 h platform/i86pc/ucode/GenuineIntel/000C06F2-04=platform/i86pc/ucode/GenuineIntel/000C06F1-01
 h platform/i86pc/ucode/GenuineIntel/000C06F2-80=platform/i86pc/ucode/GenuineIntel/000C06F1-01
+f platform/i86pc/ucode/GenuineIntel/000D0650-40 0444 root sys
+h platform/i86pc/ucode/GenuineIntel/000D0650-80=platform/i86pc/ucode/GenuineIntel/000D0650-40
+h platform/i86pc/ucode/GenuineIntel/000D0651-40=platform/i86pc/ucode/GenuineIntel/000D0650-40
+h platform/i86pc/ucode/GenuineIntel/000D0651-80=platform/i86pc/ucode/GenuineIntel/000D0650-40
+h platform/i86pc/ucode/GenuineIntel/000D0670-02=platform/i86pc/ucode/GenuineIntel/000B0671-02
+h platform/i86pc/ucode/GenuineIntel/000D0670-04=platform/i86pc/ucode/GenuineIntel/000B0671-02
+h platform/i86pc/ucode/GenuineIntel/000D0670-10=platform/i86pc/ucode/GenuineIntel/000B0671-02
+h platform/i86pc/ucode/GenuineIntel/000D0670-20=platform/i86pc/ucode/GenuineIntel/000B0671-02
+h platform/i86pc/ucode/GenuineIntel/000E0652-04=platform/i86pc/ucode/GenuineIntel/000C06C1-04
+h platform/i86pc/ucode/GenuineIntel/000E0652-10=platform/i86pc/ucode/GenuineIntel/000C06C1-04
+h platform/i86pc/ucode/GenuineIntel/000E0652-80=platform/i86pc/ucode/GenuineIntel/000C06C1-04
 d proc 0755 root root
 d root 0755 root root
 f root/.bash_profile 0644 root root
@@ -4934,6 +4950,7 @@ f usr/include/sys/socketvar.h 0644 root bin
 f usr/include/sys/sockfilter.h 0644 root bin
 f usr/include/sys/sockio.h 0644 root bin
 f usr/include/sys/soundcard.h 0644 root bin
+f usr/include/sys/spawn.h 0644 root bin
 f usr/include/sys/spl.h 0644 root bin
 f usr/include/sys/squeue.h 0644 root bin
 f usr/include/sys/squeue_impl.h 0644 root bin
@@ -13149,7 +13166,11 @@ s usr/share/man/man3c/btowc_l.3c=btowc.3c
 f usr/share/man/man3c/byteorder.3c 0444 root bin
 s usr/share/man/man3c/bzero.3c=bstring.3c
 f usr/share/man/man3c/c16rtomb.3c 0444 root bin
+s usr/share/man/man3c/c16rtomb_l.3c=c16rtomb.3c
 s usr/share/man/man3c/c32rtomb.3c=c16rtomb.3c
+s usr/share/man/man3c/c32rtomb_l.3c=c16rtomb.3c
+s usr/share/man/man3c/c8rtomb.3c=c16rtomb.3c
+s usr/share/man/man3c/c8rtomb_l.3c=c16rtomb.3c
 f usr/share/man/man3c/call_once.3c 0444 root bin
 s usr/share/man/man3c/calloc.3c=malloc.3c
 s usr/share/man/man3c/canonicalize_file_name.3c=realpath.3c
@@ -13245,6 +13266,7 @@ f usr/share/man/man3c/door_server_create.3c 0444 root bin
 s usr/share/man/man3c/door_setparam.3c=door_getparam.3c
 f usr/share/man/man3c/door_ucred.3c 0444 root bin
 s usr/share/man/man3c/door_unbind.3c=door_bind.3c
+s usr/share/man/man3c/door_xcreate.3c=door_create.3c
 s usr/share/man/man3c/double_to_decimal.3c=floating_to_decimal.3c
 s usr/share/man/man3c/dprintf.3c=printf.3c
 f usr/share/man/man3c/drand48.3c 0444 root bin
@@ -13619,7 +13641,11 @@ s usr/share/man/man3c/mblen_l.3c=mblen.3c
 f usr/share/man/man3c/mbrlen.3c 0444 root bin
 s usr/share/man/man3c/mbrlen_l.3c=mbrlen.3c
 f usr/share/man/man3c/mbrtoc16.3c 0444 root bin
+s usr/share/man/man3c/mbrtoc16_l.3c=mbrtoc16.3c
 s usr/share/man/man3c/mbrtoc32.3c=mbrtoc16.3c
+s usr/share/man/man3c/mbrtoc32_l.3c=mbrtoc16.3c
+s usr/share/man/man3c/mbrtoc8.3c=mbrtoc16.3c
+s usr/share/man/man3c/mbrtoc8_l.3c=mbrtoc16.3c
 s usr/share/man/man3c/mbrtowc.3c=mbrtoc16.3c
 s usr/share/man/man3c/mbrtowc_l.3c=mbrtoc16.3c
 f usr/share/man/man3c/mbsinit.3c 0444 root bin
@@ -20917,6 +20943,7 @@ s usr/share/man/man9f/ddi_modclose.9f=ddi_modopen.9f
 f usr/share/man/man9f/ddi_model_convert_from.9f 0444 root bin
 f usr/share/man/man9f/ddi_modopen.9f 0444 root bin
 s usr/share/man/man9f/ddi_modsym.9f=ddi_modopen.9f
+f usr/share/man/man9f/ddi_ncpus_expected.9f 0444 root bin
 f usr/share/man/man9f/ddi_no_info.9f 0444 root bin
 f usr/share/man/man9f/ddi_node_name.9f 0444 root bin
 f usr/share/man/man9f/ddi_peek.9f 0444 root bin
@@ -21117,6 +21144,7 @@ s usr/share/man/man9f/inl.9f=inb.9f
 f usr/share/man/man9f/insq.9f 0444 root bin
 s usr/share/man/man9f/intro.9f=Intro.9f
 s usr/share/man/man9f/inw.9f=inb.9f
+f usr/share/man/man9f/kcopy.9f 0444 root bin
 s usr/share/man/man9f/kcred.9f=credentials.9f
 f usr/share/man/man9f/kiconv.9f 0444 root bin
 f usr/share/man/man9f/kiconv_close.9f 0444 root bin
@@ -21745,6 +21773,8 @@ s usr/share/man/man9f/uconv_u32tou16.9f=uconv_u16tou32.9f
 s usr/share/man/man9f/uconv_u32tou8.9f=uconv_u16tou32.9f
 s usr/share/man/man9f/uconv_u8tou16.9f=uconv_u16tou32.9f
 s usr/share/man/man9f/uconv_u8tou32.9f=uconv_u16tou32.9f
+f usr/share/man/man9f/uio_copyin.9f 0444 root bin
+s usr/share/man/man9f/uio_copyout.9f=uio_copyin.9f
 f usr/share/man/man9f/uiomove.9f 0444 root bin
 f usr/share/man/man9f/unbufcall.9f 0444 root bin
 s usr/share/man/man9f/unfreezestr.9f=freezestr.9f

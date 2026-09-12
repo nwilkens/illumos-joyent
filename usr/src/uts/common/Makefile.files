@@ -66,6 +66,7 @@ COMMON_CORE_OBJS +=			\
 		kstat_fr.o		\
 		lgrp.o			\
 		lgrp_topo.o		\
+		memlist_new.o		\
 		mmapobj.o		\
 		mutex.o			\
 		page_lock.o		\
@@ -336,6 +337,7 @@ GENUNIX_OBJS +=	\
 		sigsuspend.o	\
 		sigtimedwait.o	\
 		sleepq.o	\
+		spawn.o		\
 		sock_conf.o	\
 		space.o		\
 		sscanf.o	\
@@ -1078,7 +1080,7 @@ RTLS_OBJS +=	rtls.o
 #
 AOUTEXEC_OBJS +=aout.o
 
-ELFEXEC_OBJS +=	elf.o elf_notes.o old_notes.o core_shstrtab.o
+ELFEXEC_OBJS +=	elf.o elf_notes.o core_shstrtab.o
 
 INTPEXEC_OBJS +=intp.o
 
@@ -2166,7 +2168,7 @@ VIRTIO_OBJS = virtio_main.o virtio_legacy.o virtio_modern.o virtio_dma.o
 VIOBLK_OBJS = vioblk.o
 
 # Virtio network driver
-VIOIF_OBJS = vioif.o
+VIOIF_OBJS = vioif.o vioif_rx.o vioif_tx.o
 
 # Virtio SCSI driver
 VIOSCSI_OBJS = vioscsi.o

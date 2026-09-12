@@ -22,7 +22,7 @@
  * Copyright (c) 1991, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2012 by Delphix. All rights reserved.
  * Copyright 2019 Joyent, Inc.
- * Copyright 2021 Oxide Computer Company
+ * Copyright 2026 Oxide Computer Company
  */
 
 /*
@@ -207,6 +207,7 @@ static struct cpu_sys_stats_ks_data {
 	kstat_named_t sysfork;
 	kstat_named_t sysvfork;
 	kstat_named_t sysexec;
+	kstat_named_t sysspawn;
 	kstat_named_t readch;
 	kstat_named_t writech;
 	kstat_named_t rcvint;
@@ -266,6 +267,7 @@ static struct cpu_sys_stats_ks_data {
 	{ "sysfork",		KSTAT_DATA_UINT64 },
 	{ "sysvfork",		KSTAT_DATA_UINT64 },
 	{ "sysexec",		KSTAT_DATA_UINT64 },
+	{ "sysspawn",		KSTAT_DATA_UINT64 },
 	{ "readch",		KSTAT_DATA_UINT64 },
 	{ "writech",		KSTAT_DATA_UINT64 },
 	{ "rcvint",		KSTAT_DATA_UINT64 },
@@ -2236,6 +2238,7 @@ static struct {
 	kstat_named_t ci_curr_cstate;
 	kstat_named_t ci_cacheid;
 	kstat_named_t ci_sktstr;
+	kstat_named_t ci_apicid;
 #endif
 } cpu_info_template = {
 	{ "state",			KSTAT_DATA_CHAR },
@@ -2267,6 +2270,7 @@ static struct {
 	{ "current_cstate",		KSTAT_DATA_INT32 },
 	{ "cache_id",			KSTAT_DATA_INT32 },
 	{ "socket_type",		KSTAT_DATA_STRING },
+	{ "apic_id",			KSTAT_DATA_UINT32 },
 #endif
 };
 
@@ -2330,6 +2334,7 @@ cpu_info_kstat_update(kstat_t *ksp, int rw)
 	cpu_info_template.ci_cacheid.value.i32 = cpuid_get_cacheid(cp);
 	kstat_named_setstr(&cpu_info_template.ci_sktstr,
 	    cpuid_getsocketstr(cp));
+	cpu_info_template.ci_apicid.value.ui32 = cpuid_get_apicid(cp);
 #endif
 
 	return (0);
@@ -3362,6 +3367,7 @@ cpu_sys_stats_ks_update(kstat_t *ksp, int rw)
 	csskd->sysfork.value.ui64 = css->sysfork;
 	csskd->sysvfork.value.ui64 = css->sysvfork;
 	csskd->sysexec.value.ui64 = css->sysexec;
+	csskd->sysspawn.value.ui64 = css->sysspawn;
 	csskd->readch.value.ui64 = css->readch;
 	csskd->writech.value.ui64 = css->writech;
 	csskd->rcvint.value.ui64 = css->rcvint;

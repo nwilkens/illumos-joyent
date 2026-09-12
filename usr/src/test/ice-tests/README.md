@@ -1,5 +1,24 @@
 # ice driver source checks
 
+## Upstream integration baseline
+
+The 2026-09-11 integration merges TritonDataCenter/illumos-joyent master at
+`eab31c4851f56d244d91d2452beb2f209538fd5f` into the ICE branch previously at
+`21286590789bdbf8b6ab5b85c42863a06261b31e`. The merge preserves the ICE sources
+and build integration; `usr/src/uts/common/Makefile.files` combines the ICE
+object lists with the upstream changes without a manual resolution.
+
+The pre-merge source-check baseline is 29 of 30 scripts passing.
+`tx_bind_threshold.py` has a known stale exact-text assertion for the DROP
+condition; the current condition also handles minimum-length frame padding.
+Track this separately from any failure introduced by the integration.
+
+Run the source checks and a native module build against the merged source
+tree before beginning driver fixes. Source checks do not compile the driver;
+a module build does not validate the reviewed runtime failure paths.
+
+## Running the source checks
+
 These tests cover safety properties that can regress without requiring an
 E810 device. Run them from anywhere in the source tree with:
 

@@ -23,7 +23,7 @@
  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  * Copyright 2019 Joyent, Inc.
- * Copyright 2023 Oxide Computer Company
+ * Copyright 2026 Oxide Computer Company
  */
 
 /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
@@ -83,8 +83,8 @@ static	ulong_t	prmaprunflags(long);
 static	long	prmapsetflags(long);
 static	void	prsetrun(kthread_t *, prrun_t *);
 static	int	propenm(prnode_t *, caddr_t, caddr_t, int *, cred_t *);
-extern	void	oprgetstatus(kthread_t *, prstatus_t *, zone_t *);
-extern	void	oprgetpsinfo(proc_t *, prpsinfo_t *, kthread_t *);
+static	void	oprgetstatus(kthread_t *, prstatus_t *, zone_t *);
+static	void	oprgetpsinfo(proc_t *, prpsinfo_t *, kthread_t *);
 static	int	oprgetmap(proc_t *, list_t *);
 
 static int
@@ -462,9 +462,10 @@ startover:
 	case PIOCSTOP:		/* stop process or lwp from running */
 	case PIOCWSTOP:		/* wait for process or lwp to stop */
 		/*
-		 * Can't apply to a system process.
+		 * Can't apply to a system process or to a spawn(2) child
+		 * that has not yet exec'd.
 		 */
-		if ((p->p_flag & SSYS) || p->p_as == &kas) {
+		if ((p->p_flag & (SSYS | SSPAWNING)) || p->p_as == &kas) {
 			prunlock(pnp);
 			error = EBUSY;
 			break;
@@ -1443,7 +1444,7 @@ oprgetstatus32(kthread_t *t, prstatus32_t *sp, zone_t *zp)
 	mutex_enter(&p->p_lock);
 }
 
-void
+static void
 oprgetpsinfo32(proc_t *p, prpsinfo32_t *psp, kthread_t *tp)
 {
 	kthread_t *t;
@@ -1986,9 +1987,10 @@ startover:
 	case PIOCSTOP:		/* stop process or lwp from running */
 	case PIOCWSTOP:		/* wait for process or lwp to stop */
 		/*
-		 * Can't apply to a system process.
+		 * Can't apply to a system process or to a spawn(2) child
+		 * that has not yet exec'd.
 		 */
-		if ((p->p_flag & SSYS) || p->p_as == &kas) {
+		if ((p->p_flag & (SSYS | SSPAWNING)) || p->p_as == &kas) {
 			prunlock(pnp);
 			error = EBUSY;
 			break;
@@ -3081,7 +3083,7 @@ propenm(prnode_t *pnp, caddr_t cmaddr, caddr_t va, int *rvalp, cred_t *cr)
  * Return old version of process/lwp status.
  * The u-block is mapped in by this routine and unmapped at the end.
  */
-void
+static void
 oprgetstatus(kthread_t *t, prstatus_t *sp, zone_t *zp)
 {
 	proc_t *p = ttoproc(t);
@@ -3230,7 +3232,7 @@ oprgetstatus(kthread_t *t, prstatus_t *sp, zone_t *zp)
 /*
  * Return old version of information used by ps(1).
  */
-void
+static void
 oprgetpsinfo(proc_t *p, prpsinfo_t *psp, kthread_t *tp)
 {
 	kthread_t *t;

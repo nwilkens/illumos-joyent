@@ -12,12 +12,13 @@
 #
 # Copyright (c) 2012 by Delphix. All rights reserved.
 # Copyright 2017 Joyent, Inc.
+# Copyright 2026 Oxide Computer Company
 #
 
 include $(SRC)/cmd/Makefile.cmd
 include $(SRC)/test/Makefile.com
 
-PROG = poll_test epoll_test
+PROG = poll_test epoll_test poll_close_test
 OBJS = $(PROG:%=%.o)
 SRCS = $(OBJS:%.o=%.c)
 
@@ -26,7 +27,7 @@ poll_test.ln := LDLIBS += -lsocket
 CSTD = $(CSTD_GNU99)
 
 ROOTOPTPKG = $(ROOT)/opt/os-tests
-TESTDIR = $(ROOTOPTPKG)/tests/poll
+TESTDIR = $(ROOTOPTPKG)/tests
 
 CMDS = $(PROG:%=$(TESTDIR)/%)
 $(CMDS) := FILEMODE = 0555

@@ -24,7 +24,7 @@
  * Copyright 2019 Joyent, Inc.
  * Copyright 2021 OmniOS Community Edition (OmniOSce) Association.
  * Copyright 2022 Garrett D'Amore <garrett@damore.org>
- * Copyright 2024 Oxide Computer Company
+ * Copyright 2026 Oxide Computer Company
  * Copyright 2023 MNX Cloud, Inc.
  */
 
@@ -502,15 +502,11 @@ fcnname##_info:							\
 	NO_UNLOAD_STUB(procfs, prgetlwpstatus,	nomod_zero);
 	NO_UNLOAD_STUB(procfs, prgetpsinfo,	nomod_zero);
 	NO_UNLOAD_STUB(procfs, prgetlwpsinfo,	nomod_zero);
-	NO_UNLOAD_STUB(procfs, oprgetstatus,	nomod_zero);
-	NO_UNLOAD_STUB(procfs, oprgetpsinfo,	nomod_zero);
 #ifdef _SYSCALL32_IMPL
 	NO_UNLOAD_STUB(procfs, prgetstatus32,	nomod_zero);
 	NO_UNLOAD_STUB(procfs, prgetlwpstatus32, nomod_zero);
 	NO_UNLOAD_STUB(procfs, prgetpsinfo32,	nomod_zero);
 	NO_UNLOAD_STUB(procfs, prgetlwpsinfo32,	nomod_zero);
-	NO_UNLOAD_STUB(procfs, oprgetstatus32,	nomod_zero);
-	NO_UNLOAD_STUB(procfs, oprgetpsinfo32,	nomod_zero);
 	NO_UNLOAD_STUB(procfs, psinfo_kto32,	nomod_zero);
 	NO_UNLOAD_STUB(procfs, lwpsinfo_kto32,	nomod_zero);
 #endif	/* _SYSCALL32_IMPL */
@@ -743,6 +739,7 @@ fcnname##_info:							\
 	NO_UNLOAD_STUB(c2audit, audit_anchorpath,	nomod_zero);
 	NO_UNLOAD_STUB(c2audit, audit_exit,		nomod_zero);
 	NO_UNLOAD_STUB(c2audit, audit_exec,		nomod_zero);
+	NO_UNLOAD_STUB(c2audit, audit_spawn,		nomod_zero);
 	NO_UNLOAD_STUB(c2audit, audit_symlink,		nomod_zero);
 	NO_UNLOAD_STUB(c2audit, audit_symlink_create,	nomod_zero);
 	NO_UNLOAD_STUB(c2audit, audit_vncreate_start,	nomod_zero);

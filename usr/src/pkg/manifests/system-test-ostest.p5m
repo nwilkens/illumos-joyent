@@ -65,6 +65,7 @@ file path=opt/os-tests/tests/definit/definit_test.32 mode=0555
 file path=opt/os-tests/tests/definit/definit_test.64 mode=0555
 file path=opt/os-tests/tests/definit/init.data mode=0444
 file path=opt/os-tests/tests/definit/init.expected mode=0444
+file path=opt/os-tests/tests/epoll_test mode=0555
 file path=opt/os-tests/tests/eventfd.32 mode=0555
 file path=opt/os-tests/tests/eventfd.64 mode=0555
 dir  path=opt/os-tests/tests/execvpe
@@ -212,6 +213,9 @@ file path=opt/os-tests/tests/mac/mac_cksum mode=0555
 file path=opt/os-tests/tests/mac/mac_ktest mode=0555
 file path=opt/os-tests/tests/mac/mac_lso mode=0555
 file path=opt/os-tests/tests/mac/mac_parsing mode=0555
+dir  path=opt/os-tests/tests/memlist
+file path=opt/os-tests/tests/memlist/memlist_test.32 mode=0555
+file path=opt/os-tests/tests/memlist/memlist_test.64 mode=0555
 dir  path=opt/os-tests/tests/minttl
 file path=opt/os-tests/tests/minttl/minttl mode=0555
 file path=opt/os-tests/tests/minttl/minttl_err mode=0555
@@ -228,9 +232,8 @@ file path=opt/os-tests/tests/pf_key/acquire-spray mode=0555
 file path=opt/os-tests/tests/pf_key/eacq-enabler mode=0555
 file path=opt/os-tests/tests/pf_key/kmc-update mode=0555
 file path=opt/os-tests/tests/pf_key/kmc-updater mode=0555
-dir  path=opt/os-tests/tests/poll
-file path=opt/os-tests/tests/poll/epoll_test mode=0555
-file path=opt/os-tests/tests/poll/poll_test mode=0555
+file path=opt/os-tests/tests/poll_close_test mode=0555
+file path=opt/os-tests/tests/poll_test mode=0555
 dir  path=opt/os-tests/tests/portfs
 file path=opt/os-tests/tests/portfs/file_assoc.32 mode=0555
 file path=opt/os-tests/tests/portfs/file_assoc.64 mode=0555
@@ -291,6 +294,11 @@ file path=opt/os-tests/tests/sockfs/so_protocol mode=0555
 file path=opt/os-tests/tests/sockfs/sockpair mode=0555
 file path=opt/os-tests/tests/sockfs/timeouts.32 mode=0555
 file path=opt/os-tests/tests/sockfs/timeouts.64 mode=0555
+dir  path=opt/os-tests/tests/sockopt
+file path=opt/os-tests/tests/sockopt/v4mapped mode=0555
+dir  path=opt/os-tests/tests/spawn
+file path=opt/os-tests/tests/spawn/spawn-syscall.32 mode=0555
+file path=opt/os-tests/tests/spawn/spawn-syscall.64 mode=0555
 file path=opt/os-tests/tests/spoof-ras mode=0555
 dir  path=opt/os-tests/tests/stackalign
 file path=opt/os-tests/tests/stackalign/stackalign.32 mode=0555
@@ -375,6 +383,8 @@ $(i386_ONLY)file path=opt/os-tests/tests/xsave/setcontext_restore.32 mode=0555
 $(i386_ONLY)file path=opt/os-tests/tests/xsave/setcontext_restore.64 mode=0555
 $(i386_ONLY)file path=opt/os-tests/tests/xsave/signal_restore.32 mode=0555
 $(i386_ONLY)file path=opt/os-tests/tests/xsave/signal_restore.64 mode=0555
+$(i386_ONLY)file path=opt/os-tests/tests/xsave/spawn_fpu.32 mode=0555
+$(i386_ONLY)file path=opt/os-tests/tests/xsave/spawn_fpu.64 mode=0555
 $(i386_ONLY)file path=opt/os-tests/tests/xsave/swapcontext_extd.32 mode=0555
 $(i386_ONLY)file path=opt/os-tests/tests/xsave/swapcontext_extd.64 mode=0555
 $(i386_ONLY)file path=opt/os-tests/tests/xsave/xregs_dump.32 mode=0555

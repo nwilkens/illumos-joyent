@@ -26,7 +26,7 @@
 # Copyright 2018 Nexenta Systems, Inc.
 # Copyright 2019 Joyent, Inc.
 # Copyright 2020 OmniOS Community Edition (OmniOSce) Association.
-# Copyright 2025 Oxide Computer Company
+# Copyright 2026 Oxide Computer Company
 # Copyright 2025 Hans Rosenfeld
 # Copyright 2025 MNX Cloud, Inc.
 #
@@ -161,6 +161,7 @@ COMSYSOBJS=			\
 	__rusagesys.o		\
 	__signotify.o		\
 	__sigrt.o		\
+	__spawn.o		\
 	__time.o		\
 	_lgrp_home_fast.o	\
 	_lgrpsys.o		\
@@ -751,6 +752,7 @@ PORTI18N_COND=			\
 PORTLOCALE=			\
 	big5.o			\
 	btowc.o			\
+	c8rtomb.o		\
 	c16rtomb.o		\
 	c32rtomb.o		\
 	collate.o		\
@@ -778,6 +780,7 @@ PORTLOCALE=			\
 	mbftowc.o		\
 	mblen.o			\
 	mbrlen.o		\
+	mbrtoc8.o		\
 	mbrtoc16.o		\
 	mbrtoc32.o		\
 	mbrtowc.o		\
@@ -974,6 +977,7 @@ VALUES=				\
 	values-Xa.o
 
 BITOBJS=			\
+	bitext.o		\
 	stdbit.o
 
 MOSTOBJS=			\

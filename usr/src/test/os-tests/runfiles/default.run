@@ -27,9 +27,13 @@ timeout = 60
 post =
 outputdir = /var/tmp/test_results
 
-[/opt/os-tests/tests/poll]
+[/opt/os-tests/tests/poll_test]
 user = root
-tests = ['poll_test', 'epoll_test']
+
+[/opt/os-tests/tests/epoll_test]
+user = root
+
+[/opt/os-tests/tests/poll_close_test]
 
 [/opt/os-tests/tests/eventfd.32]
 [/opt/os-tests/tests/eventfd.64]
@@ -70,6 +74,9 @@ tests = ['basic_args', 'basic_read', 'multipoll']
 
 [/opt/os-tests/tests/sigqueue]
 tests = ['sigqueue_queue_size']
+
+[/opt/os-tests/tests/spawn]
+tests = ['spawn-syscall.32', 'spawn-syscall.64']
 
 [/opt/os-tests/tests/sdevfs]
 user = root
@@ -218,7 +225,7 @@ tests = [ 'bad_xregs.32', 'bad_xregs.64', 'mdb_xregs', 'proc_writes',
     'setcontext_restore.64', 'signal_restore.32', 'signal_restore.64',
     'xregs_roundtrip.32', 'xregs_roundtrip.64', 'xsave_baducontext',
     'fpregs_xbv.32', 'fpregs_xbv.64', 'swapcontext_extd.32',
-    'swapcontext_extd.64' ]
+    'swapcontext_extd.64', 'spawn_fpu.32', 'spawn_fpu.64' ]
 
 [/opt/os-tests/tests/hexdump]
 tests = ['hexdump_basic.32', 'hexdump_basic.64']
@@ -226,12 +233,18 @@ tests = ['hexdump_basic.32', 'hexdump_basic.64']
 [/opt/os-tests/tests/ilstr]
 tests = ['ilstr_basic.32', 'ilstr_basic.64']
 
+[/opt/os-tests/tests/memlist]
+tests = ['memlist_test.32', 'memlist_test.64']
+
 [/opt/os-tests/tests/execvpe]
 tests = ['execvpe-test.32', 'execvpe-test.64']
 
 [/opt/os-tests/tests/minttl]
 user = root
 tests = ['minttl', 'minttl_err']
+
+[/opt/os-tests/tests/sockopt]
+tests = ['v4mapped']
 
 [/opt/os-tests/tests/tcpsig]
 pre_user = root
