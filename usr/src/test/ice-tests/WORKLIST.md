@@ -23,7 +23,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | 7 | P2 | RX descriptor DMA faults are checked late or missed | Implemented; hardware fault injection pending |
 | 8 | P2 | Small-MSS LSO fallback retains the wrong checksum seed | Implemented; LSO disabled by default, hardware validation pending |
 | 9 | Maintenance | Duplicate MAC filter constructors | Implemented; request equivalence tested |
-| 10 | Architecture | Filter ownership and replay contract is incomplete | Contract and recovery implemented; retained VSI stats guard pending |
+| 10 | Architecture | Filter ownership and replay contract is incomplete | Implemented; hardware fault injection pending |
 | 11 | Architecture | Lifecycle callers conflate several kinds of quiescence | Completed; explicit lifecycle contracts documented |
 | 12 | Documentation | Some comments promise stronger invariants than the code establishes | Completed; comments checked against current callers |
 | 13 | Test repair | `tx_bind_threshold.py` has a stale exact-text assertion | Implemented with executable copy/bind regression |
@@ -333,6 +333,17 @@ receive set and detach. Returning retirement success is not immediate
 hardware deletion or a DMA barrier.
 
 
+A failed rebuild can retain a core VSI context whose hardware number failed
+setup validation. Statistics now validate that number again before every GLV
+counter read or clear write, retaining the last cached counters when rejected.
+`vsi_stats.py` executes the actual refresh body and covers both valid boundary
+numbers, the first invalid number and UINT16_MAX, and missing context, before
+and after initial statistics loading. Both original-source invalid cases and
+an inclusive-boundary negative control fail at runtime. The core clears
+GLV_REPC explicitly during initialization and after accumulation; the glue
+comments now reflect that ownership.
+
+
 ## 11. Lifecycle contract
 
 [LIFECYCLE.md](../../uts/common/io/ice/LIFECYCLE.md) records lock order,
@@ -389,15 +400,15 @@ coverage of integration and ordering properties outside those fixtures.
 `c_test.py` shares source extraction with original line locations, generated
 headers, C99 compilation, compiler selection, and bounded case execution.
 Compiler failures and runtime failures have distinct diagnostics. The explicit
-`run_tests.py` manifest runs 40 scripts and excludes support modules; it
+`run_tests.py` manifest runs 41 scripts and excludes support modules; it
 continues after a failure and reports an aggregate result. `runner_checks.py`
 uses real compiler and child processes to verify flags, arguments, multiple
 cases, source locations, compile/runtime failures and timeouts, suite
 continuation, and support exclusion. Existing behavioral fixture semantics
 and baseline/mutant source-selection options are preserved.
 
-Validation: all 40 scripts pass locally. The documented historical controls
-compile and then fail their behavioral assertions; the item 13 historical
+Validation: all 41 scripts pass locally, including the VSI statistics follow-up.
+The documented historical controls compile and fail their behavioral assertions; the item 13 historical
 source passes as expected, while its runt-guard mutant fails. See
 [REGRESSIONS.md](REGRESSIONS.md) for exact commands, coverage and the remaining
 device matrix. Native kernel compilation and hardware acceptance remain

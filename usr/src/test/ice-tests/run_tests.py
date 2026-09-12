@@ -48,6 +48,7 @@ TESTS = (
     "tx_quiesce.py",
     "vlan_rx.py",
     "vsi_replay.py",
+    "vsi_stats.py",
     "vsi_tx_vlan.py",
 )
 

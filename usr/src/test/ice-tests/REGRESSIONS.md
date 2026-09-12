@@ -8,7 +8,7 @@ python3 -B usr/src/test/ice-tests/run_tests.py --list
 python3 -B usr/src/test/ice-tests/run_tests.py reset_requests.py rx_dma_faults.py
 ```
 
-`run_tests.py` has an explicit manifest of 40 runnable tests. It excludes the
+`run_tests.py` has an explicit manifest of 41 runnable tests. It excludes the
 `c_test.py` and `rx_test.py` support modules and the hardware programs. It
 reports each script, continues after failure, and returns nonzero if any script
 fails or exceeds 60 seconds. Add new runnable checks to this manifest.
@@ -41,6 +41,7 @@ separate gate; its results belong with the exact source revision built.
 | 8 | `lso_context.py` | IPv4/IPv6 MSS limits, context fields and rejection marker | Wire checksums and segmentation; LSO remains disabled by default |
 | 9 | `filter_requests.py` | Captured request fields for GLD, attach, replay and teardown | Imported-core encoding and actual device programming |
 | 13 | `tx_bind_threshold.py` | Copy/bind decisions, runt padding and fallback ownership | Ordinary datapath acceptance; driver behavior was unchanged by this test repair |
+| 10 follow-up | `vsi_stats.py` | Actual refresh, statistics structure and register definitions; 0/767 accepted; 768/UINT16_MAX and missing context preserve counters with no reads/clear writes, before and after initial loading | Device MMIO and firmware behavior |
 
 ## Reproduce failing controls
 
@@ -120,6 +121,17 @@ Path(sys.argv[2]).write_text(source.replace(old, "if (res == ICE_TX_BUILD_DROP)"
 PY
 python3 -B "$ice_tests/tx_bind_threshold.py" \
     --source "$ice_control/tx-without-runt-guard.c"
+```
+
+For the retained-context statistics follow-up, use the source before its range
+guard. Both invalid-number cases compile and fail at runtime:
+
+```sh
+git show "145683f78a:$ice_source/ice_stats.c" > "$ice_control/stats-before-bounds.c"
+python3 -B "$ice_tests/vsi_stats.py" \
+    --source "$ice_control/stats-before-bounds.c" --case limit
+python3 -B "$ice_tests/vsi_stats.py" \
+    --source "$ice_control/stats-before-bounds.c" --case maximum
 ```
 
 Other focused incomplete-fix controls and their expected assertions are

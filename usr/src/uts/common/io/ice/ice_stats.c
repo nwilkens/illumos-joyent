@@ -21,9 +21,9 @@
  * counter and folds it into a running software total through
  * ice_stat_update40/32, subtracting a baseline captured on the first read so
  * the reported values count up from attach even though the hardware counters
- * survive a PF reset.  A few VSI counters (GLV_REPC) clear on read, so a single
- * serialized reader must own them; ice_stat_lock provides that serialization
- * for both the kstat and mac_stat consumers.
+ * survive a PF reset.  The core explicitly clears GLV_REPC after initialization
+ * or accumulation, so a single serialized reader must own these counters;
+ * ice_stat_lock serializes both the kstat and mac_stat consumers.
  *
  * The counter selection and register layout follow FreeBSD
  * sys/dev/ice/ice_lib.c (ice_update_pf_stats, ice_update_vsi_hw_stats); the
@@ -106,8 +106,8 @@ ice_stats_update_port(ice_t *ice)
 }
 
 /*
- * Refresh the cached VSI counters for this interface's PF VSI.  GLV_REPC clears
- * on read and is handled by the common code, which accumulates its
+ * Refresh the cached VSI counters for this interface's PF VSI.  The common code
+ * explicitly clears GLV_REPC during initialization and after accumulating its
  * no-descriptor and error sub-counts into the current stats.
  */
 void
@@ -125,6 +125,9 @@ ice_stats_update_vsi(ice_t *ice)
 	if (!ice_is_vsi_valid(hw, handle))
 		return;
 	vsi_num = ice_get_hw_vsi_num(hw, handle);
+	/* Failed rebuild setup retains its context, including a rejected ID. */
+	if (vsi_num >= ICE_MAX_VSI)
+		return;
 
 #define	ICE_VSI_STAT40(reg, field)					\
 	ice_stat_update40(hw, reg ## L(vsi_num), loaded,		\
@@ -359,7 +362,7 @@ ice_stats_init(ice_t *ice)
 
 	/*
 	 * Establish both hardware baselines before exposing either kstat.
-	 * Otherwise, traffic and clear-on-read errors before the first observer
+	 * Otherwise, traffic and accumulated errors before the first observer
 	 * would be discarded as pre-attach activity.
 	 */
 	mutex_enter(&ice->ice_stat_lock);

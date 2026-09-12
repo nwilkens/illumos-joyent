@@ -30,7 +30,7 @@ def main() -> None:
         body = function(stats, name, following)
         assert "ASSERT(MUTEX_HELD(&ice->ice_stat_lock))" in body
 
-    # The VSI clear-on-read register is serviced through the common code.
+    # The VSI error register is accumulated and explicitly cleared by the core.
     vsi = function(
         stats,
         "ice_stats_update_vsi(ice_t *ice)\n{",

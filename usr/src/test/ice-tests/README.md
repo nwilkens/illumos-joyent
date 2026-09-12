@@ -155,6 +155,23 @@ that omit the effective publication/property gate or failed-start ERROR latch.
 These tests substitute hardware and MAC boundaries; physical link, queue, and
 wire behavior still require hardware validation.
 
+## VSI statistics bounds regression
+
+Run `python3 usr/src/test/ice-tests/vsi_stats.py` with Python 3 and a C99
+compiler. The shared C runner extracts the actual `ice_stats_update_vsi()`,
+statistics structure, maximum VSI count, and GLV register definitions.
+Controlled imported-core boundaries count counter reads and the GLV_REPC clear
+write. Five scenarios, each with initial and previously loaded counters,
+exercise VSI numbers 0, 767, 768, UINT16_MAX, and a missing context. Rejected
+identifiers issue no reads or writes and preserve cached counters and the
+loaded flag; valid identifiers continue refreshing the expected registers.
+
+Use `--source` for an earlier `ice_stats.c` and `--case` to select `zero`,
+`last`, `limit`, `maximum`, or `missing`. The baseline fails `limit` and
+`maximum`; a mutant using `>` rather than `>=` fails `limit`. This test does
+not exercise device MMIO or firmware behavior.
+
+
 ## Upstream integration baseline
 
 The 2026-09-11 integration merges TritonDataCenter/illumos-joyent master at
@@ -229,8 +246,8 @@ gcc -Wall -Wextra -Werror -idirafter usr/src/uts/common \
 ```
 
 `hw_stats.py` verifies the hardware statistics wiring: both counter refreshes
-run under the stat lock, the clear-on-read VSI register is serviced through the
-common code, attach captures both hardware baselines before exposing the
+run under the stat lock, the VSI error register is accumulated and explicitly
+cleared through the common code, attach captures both baselines before exposing the
 kstats, the kstat callbacks reject writes and lock correctly, teardown deletes
 the kstats before destroying their lock, attach installs stats before MAC while
 detach removes them before unmapping registers, and `ice_m_stat` sources the
