@@ -213,6 +213,43 @@ read path, which any process in the link's zone can reach through
 `DLDIOC_READTRAN`, holds only the adaptive lifecycle lock across its
 admin-queue polling.
 
+## DDP section bounds regression
+
+```
+python3 usr/src/test/ice-tests/ddp_sections.py
+```
+
+The runner compiles the real `ice_ddp_pkg_valid()` and its helpers against
+structure stand-ins with the vendor field order and widths, then builds
+packages whose section tables are valid, extend past the buffer, or declare
+typed sections and counted arrays larger than their extent. The metadata case
+reproduces the reviewed one-byte section at offset 4095. It also checks that
+the core's metadata consumer verifies the size it reads.
+
+## MAC IPv6 extension-header regression
+
+```
+python3 usr/src/test/ice-tests/mac_ipv6_eh.py
+```
+
+The runner compiles the real MAC mblk cursor and L3 parser. Cases cover no
+extension headers, a header split across mblks, the largest chain that fits
+the 16-bit L3 length, a chain that exceeds it (which formerly returned `-1`
+from a `bool` function with every output unset), and fragment flags. It also
+checks that the caller defines its outputs before the parse.
+
+## viona TX guard check
+
+```
+python3 usr/src/test/ice-tests/viona_tx_guards.py
+```
+
+viona is the path by which an untrusted guest reaches the driver. The check
+confirms LSO is admitted only when the whole parsed header lies in the first
+mblk, the protocol is TCP, and the guest's checksum location is the parsed
+TCP checksum field, and that a non-LSO frame above the link MTU is dropped
+before it reaches `mac_tx()`.
+
 ## Upstream integration baseline
 
 The 2026-09-11 integration merges TritonDataCenter/illumos-joyent master at

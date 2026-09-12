@@ -419,18 +419,20 @@ review revision.
 
 Reviewed at `5690d86ab142897599c5abbc5972bc9e679ebadb`. Items S1 and S8 are
 MAC/viona defects and are tracked here only because ICE-backed guests reach
-them. Hardware validation for each ICE fix is pending.
+them. Hardware validation for each fix is pending. The `core/` guards for S4
+and S6 diverge from the vendor import and are marked with `illumos:` comments
+so a later core refresh can carry or replace them.
 
 | ID | Severity | Issue | Status |
 | --- | --- | --- | --- |
-| S1 | High | Split IPv6 headers cause a guest-triggerable OOB write in viona LSO | Open; viona/MAC |
-| S2 | High | Oversized guest frames cross the E810 transmit limit | Implemented: `ice_tx_frame_fits()` drops non-LSO frames and LSO segments above MTU plus VLAN header, `tx_oversize_drops` counts them |
+| S1 | High | Split IPv6 headers cause a guest-triggerable OOB write in viona LSO | Implemented: viona admits LSO only with the whole parsed header in the first mblk, TCP, and the guest checksum at the parsed TCP field |
+| S2 | High | Oversized guest frames cross the E810 transmit limit | Implemented: `ice_tx_frame_fits()` drops non-LSO frames and LSO segments above MTU plus VLAN header, `tx_oversize_drops` counts them; viona drops non-LSO frames above its link MTU (`tx_drop_over_mtu`) |
 | S3 | High | Teardown frees DMA after reset failure | Implemented earlier (item 2) |
-| S4 | High, restricted input | Firmware AQ counts drive OOB reads in imported core | Open; core code |
+| S4 | High, restricted input | Firmware AQ counts drive OOB reads in imported core | Implemented: capability, switch-config, package-info and per-branch topology counts are bounded by their buffers (marked `illumos:` in `core/`) |
 | S5 | Medium | TDPU malicious-driver events neither cleared nor attributed | Implemented: `ice_oicr_mdd()` clears and attributes `GL/PF_MDET_TX_TDPU` |
-| S6 | Medium | Malformed DDP typed section reads beyond the package | Open; core code with adaptation guard pending |
+| S6 | Medium | Malformed DDP typed section reads beyond the package | Implemented: `ice_ddp_pkg_valid()` checks every buffer's section table and typed section minimums; the core metadata read checks its own size |
 | S7 | Medium | TX notification can cross MAC unregister | Implemented earlier (item 3) |
-| S8 | Medium | IPv6 extension-header overflow returns success from a bool parser | Open; MAC |
+| S8 | Medium | IPv6 extension-header overflow returns success from a bool parser | Implemented: `mac_mmc_parse_l3()` fails when the L3 length would exceed 16 bits; caller outputs are initialized |
 | S9 | Medium | Transceiver reads hold an interrupt-priority mutex across AQ polling | Implemented: only `ice_rebuild_lock` is held |
 | S10 | Medium | RX poll-mode register updates race reset routing | Implemented: one `QINT_RQCTL` writer under `irxr_lock` composes routing, arming and poll state |
 | S11 | Low | Small-MSS LSO downgrade retains a TSO checksum seed | Implemented earlier (item 8) |
