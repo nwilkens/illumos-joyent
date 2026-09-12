@@ -42,6 +42,7 @@ TESTS = (
     "safe_mode.py",
     "stale_comments.py",
     "terminal_filters.py",
+    "transceiver_lock.py",
     "tx_bind_threshold.py",
     "tx_blocked.py",
     "tx_doorbell.py",
