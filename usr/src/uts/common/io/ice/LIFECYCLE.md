@@ -17,10 +17,16 @@ handler takes `ice_rebuild_lock`: handlers latch causes and defer recovery.
 drops it before waiting for the lifecycle lock; the reset worker acquires the
 lifecycle lock first and briefly takes `ice_lock` when retiring dispatch
 ownership. Never wait for a worker while holding a lock it needs.
+`ice_lock` is an interrupt-priority mutex: never hold it across a firmware
+command, which can poll for up to a second. Management paths hold only
+`ice_rebuild_lock` across admin-queue commands; the core's queue lock
+serializes them.
 
 Each TX ring lock protects descriptors, backpressure, admission, and the
-`mac_tx_ring_update()` call. Each RX ring lock protects pool ownership and
-delivery admission. `mac_rx_ring()` runs outside that lock with
+`mac_tx_ring_update()` call. Each RX ring lock protects pool ownership,
+delivery admission, and the queue's interrupt routing register: the lifecycle
+transitions and MAC's poll-mode callbacks change ring state, and one writer
+composes `QINT_RQCTL` from it. `mac_rx_ring()` runs outside that lock with
 `irxr_intr_busy` set; loan returns also acquire the ring lock. Free a delivered
 or discarded loan chain outside the lock. The frame assembly error path is a
 special case: it retires its unpublished loans before freeing their mblks.

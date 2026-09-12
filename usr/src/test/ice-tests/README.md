@@ -172,6 +172,47 @@ Use `--source` for an earlier `ice_stats.c` and `--case` to select `zero`,
 not exercise device MMIO or firmware behavior.
 
 
+## TX frame admission regression
+
+```
+python3 usr/src/test/ice-tests/tx_frame_limit.py
+```
+
+The runner compiles the real `ice_tx_frame_fits()` and the TX context type.
+MAC does not bound a client's frame against the link SDU, and E810 reports a
+packet above its programmed maximum as a malicious-driver event that halts
+every client of the function. Cases cover a tagged maximum frame and one byte
+more at MTU 1500 and 9000, the hardware maximum and a 65535-byte frame at MTU
+9000, and LSO requests whose header plus MSS meets or exceeds the frame. It
+also checks that the rule sits on the single admission path after LSO gating
+and before any DMA binding, with its own `tx_oversize_drops` counter.
+
+## RX interrupt routing regression
+
+```
+python3 usr/src/test/ice-tests/rx_intr_route.py
+```
+
+The runner compiles the real `QINT_RQCTL` writer, the lifecycle routing
+transitions, and MAC's poll-mode callbacks against a recording register file
+and a checked ring lock. Scenarios interleave a poll transition with reset
+unmap and remap, and with stop's dissociation, and assert after every step
+that the register equals the composition of ring state: no cause on a cleared
+vector, no re-arm of a cause the lifecycle cleared, and MAC's chosen mode
+restored by the rebuild's remap. It also checks that no other writer of the
+register remains.
+
+## Transceiver lock check
+
+```
+python3 usr/src/test/ice-tests/transceiver_lock.py
+```
+
+`ice_lock` is an interrupt-priority mutex. The check confirms the transceiver
+read path, which any process in the link's zone can reach through
+`DLDIOC_READTRAN`, holds only the adaptive lifecycle lock across its
+admin-queue polling.
+
 ## Upstream integration baseline
 
 The 2026-09-11 integration merges TritonDataCenter/illumos-joyent master at

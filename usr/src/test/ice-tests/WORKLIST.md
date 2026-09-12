@@ -414,3 +414,23 @@ source passes as expected, while its runt-guard mutant fails. See
 device matrix. Native kernel compilation and hardware acceptance remain
 separate evidence; earlier branch throughput results do not validate this
 review revision.
+
+## Security review (2026-09-12)
+
+Reviewed at `5690d86ab142897599c5abbc5972bc9e679ebadb`. Items S1 and S8 are
+MAC/viona defects and are tracked here only because ICE-backed guests reach
+them. Hardware validation for each ICE fix is pending.
+
+| ID | Severity | Issue | Status |
+| --- | --- | --- | --- |
+| S1 | High | Split IPv6 headers cause a guest-triggerable OOB write in viona LSO | Open; viona/MAC |
+| S2 | High | Oversized guest frames cross the E810 transmit limit | Implemented: `ice_tx_frame_fits()` drops non-LSO frames and LSO segments above MTU plus VLAN header, `tx_oversize_drops` counts them |
+| S3 | High | Teardown frees DMA after reset failure | Implemented earlier (item 2) |
+| S4 | High, restricted input | Firmware AQ counts drive OOB reads in imported core | Open; core code |
+| S5 | Medium | TDPU malicious-driver events neither cleared nor attributed | Implemented: `ice_oicr_mdd()` clears and attributes `GL/PF_MDET_TX_TDPU` |
+| S6 | Medium | Malformed DDP typed section reads beyond the package | Open; core code with adaptation guard pending |
+| S7 | Medium | TX notification can cross MAC unregister | Implemented earlier (item 3) |
+| S8 | Medium | IPv6 extension-header overflow returns success from a bool parser | Open; MAC |
+| S9 | Medium | Transceiver reads hold an interrupt-priority mutex across AQ polling | Implemented: only `ice_rebuild_lock` is held |
+| S10 | Medium | RX poll-mode register updates race reset routing | Implemented: one `QINT_RQCTL` writer under `irxr_lock` composes routing, arming and poll state |
+| S11 | Low | Small-MSS LSO downgrade retains a TSO checksum seed | Implemented earlier (item 8) |
