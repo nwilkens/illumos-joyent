@@ -1,4 +1,27 @@
-# ice driver source checks
+# ice driver checks
+
+The [review working list](WORKLIST.md) tracks the open correctness,
+architecture, performance, and test issues, their priorities, and acceptance
+criteria.
+
+## Terminal filter callback regression
+
+Run the portable C regression with Python 3 and a C99 compiler (`CC` defaults
+to `cc`):
+
+```
+python3 usr/src/test/ice-tests/terminal_filters.py
+```
+
+The runner extracts the actual filter callbacks from `ice_gld.c` and the state
+enum from `ice.h`, then compiles them unchanged with the boundary stubs in
+`terminal_filters.c`. Six scenarios exercise normal firmware errors and
+terminal unicast, multicast, and promiscuous cleanup. Assertions check return
+values, software ownership, command counts, and lock boundaries. This test
+does not load the driver or establish hardware isolation.
+
+Use `--source /path/to/ice_gld.c` to check an earlier implementation against
+the same regression. The reviewed baseline fails terminal unicast removal.
 
 ## Upstream integration baseline
 

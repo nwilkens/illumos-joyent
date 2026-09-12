@@ -95,6 +95,11 @@ ice_gld_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)
 	ice_mac_filter_t *imf;
 	int status;
 
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+
+	if (add && (ice->ice_state & ICE_STATE_RESET_FAILED) != 0)
+		return (EIO);
+
 	mutex_enter(&vsi->vi_mac_lock);
 	imf = ice_gld_find_mac(vsi, addr);
 	if (add && imf != NULL) {
@@ -108,19 +113,27 @@ ice_gld_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)
 	}
 	mutex_exit(&vsi->vi_mac_lock);
 
-	INIT_LIST_HEAD(&m_list);
-	ice_gld_fltr_init(&e, vsi->vi_handle, addr);
-	LIST_ADD(&e.list_entry, &m_list);
+	/*
+	 * A terminal reset failure shuts down the control queue and prevents
+	 * restart or filter replay until reload.  Retire only the software
+	 * record in that state so MAC can release its address references.
+	 * Other failures must still propagate the hardware removal error.
+	 */
+	if ((ice->ice_state & ICE_STATE_RESET_FAILED) == 0) {
+		INIT_LIST_HEAD(&m_list);
+		ice_gld_fltr_init(&e, vsi->vi_handle, addr);
+		LIST_ADD(&e.list_entry, &m_list);
 
-	if (add)
-		status = ice_add_mac(hw, &m_list);
-	else
-		status = ice_remove_mac(hw, &m_list);
+		if (add)
+			status = ice_add_mac(hw, &m_list);
+		else
+			status = ice_remove_mac(hw, &m_list);
 
-	if (status != ICE_SUCCESS) {
-		ice_error(ice, "failed to %s MAC filter: %d",
-		    add ? "add" : "remove", status);
-		return (ice_status_to_errno(ice, status));
+		if (status != ICE_SUCCESS) {
+			ice_error(ice, "failed to %s MAC filter: %d",
+			    add ? "add" : "remove", status);
+			return (ice_status_to_errno(ice, status));
+		}
 	}
 
 	mutex_enter(&vsi->vi_mac_lock);
@@ -633,6 +646,14 @@ ice_promisc_apply(ice_t *ice, boolean_t on)
 	int rollback, status, ret;
 
 	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+
+	/* MAC also needs to release promiscuous ownership after failure. */
+	if ((ice->ice_state & ICE_STATE_RESET_FAILED) != 0) {
+		if (on)
+			return (EIO);
+		ice->ice_promisc_on = B_FALSE;
+		return (0);
+	}
 
 	ice_zero_bitmap(mask, ICE_PROMISC_MAX);
 	ice_set_bit(ICE_PROMISC_UCAST_RX, mask);
