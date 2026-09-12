@@ -81,9 +81,9 @@ and build integration; `usr/src/uts/common/Makefile.files` combines the ICE
 object lists with the upstream changes without a manual resolution.
 
 The pre-merge source-check baseline is 29 of 30 scripts passing.
-`tx_bind_threshold.py` has a known stale exact-text assertion for the DROP
-condition; the current condition also handles minimum-length frame padding.
-Track this separately from any failure introduced by the integration.
+`tx_bind_threshold.py` failed an obsolete exact-text assertion for the DROP
+condition, which also handles minimum-length frame padding. That baseline
+failure is now repaired by the executable copy/bind regression described below.
 
 Run the source checks and a native module build against the merged source
 tree before beginning driver fixes. Source checks do not compile the driver;
@@ -234,12 +234,15 @@ and VSI are freed; detach marks the device detaching under the rebuild lock
 before unconfigure; and `ice_reset_dispatch` mirrors the `oicr_pending`
 single-flight coalescing.
 
-`tx_bind_threshold.py` verifies the bind-versus-copy decision: a whole packet
-up to `ICE_TX_SMALL_PKT` is copied into one small-pool buffer before any
-fragment is bound and claims exactly one TCB and one descriptor; an
-undeliverable frame is not retried through the bind loop; and a bind failure or
-a packet exceeding the `ICE_TX_MAX_COOKIE` budget degrades to a full-packet
-copy rather than a drop.
+`tx_bind_threshold.py` compiles the actual `ice_tx_build_tcbs()` and
+`ice_tx_copy_packet()` with a C99 compiler (`CC` defaults to `cc`). Twelve cases
+exercise the copy threshold, zero-filled runt padding, runt retry when no
+copy buffer is available, minimum-length bind fallback, permanent copy
+failure, descriptor-budget and bind-failure fallback, partial-binding cleanup,
+and transient/permanent fallback copy failures. The C harness substitutes pool
+and DMA allocation boundaries; it does not load the driver or perform DMA.
+Use `--source /path/to/ice_tx.c` to run against another source revision.
+Controls omitting the DROP guard, runt guard, or pad zeroing each fail.
 
 `tx_blocked.py` verifies the transmit back-pressure handshake: `itxr_blocked`
 is armed under the ring lock and reclaim is re-driven after arming and before

@@ -1,53 +1,59 @@
 #!/usr/bin/env python3
 
-"""Check the ice transmit bind-versus-copy source invariants."""
+"""Compile and exercise the actual ICE transmit bind-versus-copy decisions."""
 
+import argparse
+import os
 from pathlib import Path
+import shlex
+import subprocess
+import tempfile
+
+from terminal_filters import extract
 
 
-REPO = Path(__file__).resolve().parents[4]
-ICE_HEADER = REPO / "usr/src/uts/common/io/ice/ice.h"
-TX_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_tx.c"
-
-
-def function(source: str, signature: str, following: str) -> str:
-    start = source.index(signature)
-    end = source.index(following, start)
-    return source[start:end]
+TESTDIR = Path(__file__).resolve().parent
+REPO = TESTDIR.parents[3]
+DRIVER = REPO / "usr/src/uts/common/io/ice"
 
 
 def main() -> None:
-    header = ICE_HEADER.read_text(encoding="utf-8")
-    assert "#define\tICE_TX_SMALL_PKT\t512" in header
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", type=Path, default=DRIVER / "ice_tx.c")
+    args = parser.parse_args()
+    source = args.source.read_text(encoding="utf-8")
+    header = DRIVER / "ice.h"
+    types = header.read_text(encoding="utf-8")
+    fragments = [extract(source,
+                         r"^typedef enum ice_tx_build \{[\s\S]*?^} ice_tx_build_t;",
+                         args.source),
+                 extract(types,
+                         r"^typedef enum ice_tcb_type \{[\s\S]*?^} ice_tcb_type_t;",
+                         header)]
+    for name in ("ice_dma_buffer", "ice_tx_ctrl_block", "ice_txq_stat"):
+        fragments.append(extract(types,
+                                 rf"^typedef struct {name} \{{[\s\S]*?^}} {name}_t;",
+                                 header))
+    for name in ("ICE_TX_SMALL_PKT", "ICE_TX_MIN_LEN", "ICE_TX_MAX_COOKIE"):
+        fragments.append(extract(types, rf"^#define\s+{name}\s+[^\n]*", header))
+    bodies = []
+    for name in ("ice_tx_copy_packet", "ice_tx_build_tcbs"):
+        bodies.append(extract(source,
+                              rf"^static [\w *]+\n{name}\([\s\S]*?^}}",
+                              args.source))
 
-    tx = TX_SOURCE.read_text(encoding="utf-8")
-    build = function(
-        tx,
-        "ice_tx_build_tcbs(ice_tx_ring_t *itr, mblk_t *mp, size_t msglen,",
-        "\nstatic void\nice_tx_free_tcbs",
-    )
-
-    # a whole small packet is copied before any fragment is bound
-    short_circuit = build.index("msglen <= ICE_TX_SMALL_PKT")
-    bind = build.index("ice_tx_bind_fragment(")
-    assert short_circuit < bind
-    assert build.index("ice_tx_copy_packet(") < bind
-
-    # an undeliverable frame is not retried through the bind loop
-    assert "if (res == ICE_TX_BUILD_DROP)" in build
-    assert build.index("if (res == ICE_TX_BUILD_DROP)") < bind
-
-    # the short-circuit only claims one descriptor for one TCB
-    head = build[short_circuit:bind]
-    assert "*ntcbp = 1;" in head
-    assert "*ndescp = 1;" in head
-
-    # bind failure still degrades to a full copy rather than dropping
-    assert "goto force_copy;" in build[bind:]
-    assert "force_copy:" in build
-    assert build.index("ndesc + ncookies > ICE_TX_MAX_COOKIE") > bind
-
-    print("PASS: ice tx bind/copy source invariants")
+    with tempfile.TemporaryDirectory(prefix="ice-tx-bind-") as tmp:
+        work = Path(tmp)
+        (work / "ice_tx_types.h").write_text("\n".join(fragments), encoding="utf-8")
+        (work / "ice_tx_build.h").write_text("\n".join(bodies), encoding="utf-8")
+        binary = work / "tx_bind_threshold"
+        compiler = shlex.split(os.environ.get("CC", "cc"))
+        subprocess.run(compiler + [
+            "-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic",
+            "-I", str(work), str(TESTDIR / "tx_bind_threshold.c"),
+            "-o", str(binary),
+        ], check=True)
+        subprocess.run([str(binary)], check=True)
 
 
 if __name__ == "__main__":

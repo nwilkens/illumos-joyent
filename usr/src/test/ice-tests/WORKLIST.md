@@ -26,7 +26,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | 10 | Architecture | Filter ownership and replay contract is incomplete | Open |
 | 11 | Architecture | Lifecycle callers conflate several kinds of quiescence | Open |
 | 12 | Documentation | Some comments promise stronger invariants than the code establishes | Open |
-| 13 | Test repair | `tx_bind_threshold.py` has a stale exact-text assertion | Open; known baseline failure |
+| 13 | Test repair | `tx_bind_threshold.py` has a stale exact-text assertion | Implemented with executable copy/bind regression |
 | 14 | Test coverage | Most checks inspect source strings instead of executing behavior | Open; first behavioral test added for item 1 |
 
 ## 1. Terminal filter retirement
@@ -257,11 +257,19 @@ the remaining glue once the lifecycle changes settle.
 
 ## 13. Stale TX source check
 
-`tx_bind_threshold.py` requires the exact condition
-`if (res == ICE_TX_BUILD_DROP)`, while production also checks
-`|| msglen < ICE_TX_MIN_LEN`. Preserve validation of both DROP handling and runt
-padding without requiring the obsolete spelling. Baseline: 29 of 30 original
-scripts pass; this failure predates the merge and item 1.
+`tx_bind_threshold.py` now compiles the actual `ice_tx_build_tcbs()` and
+`ice_tx_copy_packet()` with controlled pool and DMA-allocation boundaries.
+Its 12 cases cover the copy threshold, zero-filled runt padding, retry without
+binding when runt padding is unavailable, binding at the minimum frame length,
+permanent copy failures, descriptor-budget fallback and retirement of partial
+bindings, and transient/permanent fallback copy failures. The driver behavior
+is unchanged by this test repair.
+
+Validation: the executable regression passes the reviewed production source.
+Controls that omit either the DROP guard, the runt guard, or zeroing of the
+pad fail their corresponding behavioral assertions. The original source-only
+script's obsolete exact-condition assertion was reproduced before replacing
+it. Pool and DMA boundaries are stubs; this is not a hardware DMA test.
 
 ## 14. Behavioral coverage
 
