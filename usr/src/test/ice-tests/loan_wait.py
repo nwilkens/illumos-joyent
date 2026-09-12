@@ -127,7 +127,7 @@ def main() -> None:
     rings_free = function(
         rx,
         "ice_rx_rings_free(ice_t *ice)\n{",
-        "\n/*\n * Tie an rx queue",
+        "\n/*\n * QINT_RQCTL has no common-code helper",
     )
     assert "ice_rx_ring_free(&ice->ice_rxr[i])" in rings_free
 

@@ -226,22 +226,53 @@ ice_rx_rings_free(ice_t *ice)
 }
 
 /*
- * Tie an rx queue to its MSI-X vector and arm the cause.  There is no common
- * code helper for this; the driver writes QINT_RQCTL directly.
+ * QINT_RQCTL has no common-code helper and three writers: the lifecycle routes
+ * the queue to its vector and removes that routing, stop dissociates the cause
+ * ahead of a queue disable, and MAC flips the cause for poll mode.  Separate
+ * read-modify-write sequences let a poll transition racing a reset write back
+ * a stale routing (vector 0) or a cause the lifecycle had cleared.  One writer
+ * composes the register from ring state under irxr_lock; callers change only
+ * the state.
  */
-void
-ice_map_rxq_vector(ice_t *ice, ice_rx_ring_t *irr)
+static void
+ice_rx_ring_intr_program(ice_rx_ring_t *irr)
 {
-	struct ice_hw *hw = &ice->ice_hw;
-	uint32_t reg;
+	struct ice_hw *hw = &irr->irxr_ice->ice_hw;
+	uint32_t reg = 0;
 
-	reg = ((irr->irxr_vec << QINT_RQCTL_MSIX_INDX_S) &
-	    QINT_RQCTL_MSIX_INDX_M) |
-	    ((ICE_ITR_IDX_0 << QINT_RQCTL_ITR_INDX_S) &
-	    QINT_RQCTL_ITR_INDX_M) |
-	    QINT_RQCTL_CAUSE_ENA_M;
+	ASSERT(MUTEX_HELD(&irr->irxr_lock));
+
+	if (irr->irxr_intr_routed) {
+		reg = ((irr->irxr_vec << QINT_RQCTL_MSIX_INDX_S) &
+		    QINT_RQCTL_MSIX_INDX_M) |
+		    ((ICE_ITR_IDX_0 << QINT_RQCTL_ITR_INDX_S) &
+		    QINT_RQCTL_ITR_INDX_M);
+		if (irr->irxr_intr_armed && !irr->irxr_intr_poll)
+			reg |= QINT_RQCTL_CAUSE_ENA_M;
+	}
 	wr32(hw, QINT_RQCTL(irr->irxr_index), reg);
 	ice_flush(hw);
+}
+
+void
+ice_rx_ring_intr_route(ice_rx_ring_t *irr, ice_rx_intr_route_t how)
+{
+	mutex_enter(&irr->irxr_lock);
+	switch (how) {
+	case ICE_RX_INTR_UNMAP:
+		irr->irxr_intr_routed = B_FALSE;
+		irr->irxr_intr_armed = B_FALSE;
+		break;
+	case ICE_RX_INTR_DISSOCIATE:
+		irr->irxr_intr_armed = B_FALSE;
+		break;
+	case ICE_RX_INTR_MAP:
+		irr->irxr_intr_routed = B_TRUE;
+		irr->irxr_intr_armed = B_TRUE;
+		break;
+	}
+	ice_rx_ring_intr_program(irr);
+	mutex_exit(&irr->irxr_lock);
 }
 
 /*
@@ -1323,24 +1354,24 @@ ice_rx_ring_intr(ice_rx_ring_t *irr)
 /*
  * mac(9E) interrupt enable/disable for a poll-capable ring.  Toggling the
  * queue's interrupt cause is what flips the ring between interrupt and poll
- * modes; mac owns the transition.
+ * modes; mac owns the transition.  MAC always leaves poll mode through the
+ * enable callback (MAC_SRS_POLLING_OFF), so a ring routed while MAC polls it
+ * is armed here, not by the routing.
  */
 int
 ice_ring_rx_intr_enable(mac_intr_handle_t intrh)
 {
 	ice_rx_ring_t *irr = (ice_rx_ring_t *)intrh;
 	struct ice_hw *hw = &irr->irxr_ice->ice_hw;
-	uint32_t reg;
 
 	mutex_enter(&irr->irxr_lock);
 	irr->irxr_intr_poll = B_FALSE;
-
-	reg = rd32(hw, QINT_RQCTL(irr->irxr_index));
-	reg |= QINT_RQCTL_CAUSE_ENA_M;
-	wr32(hw, QINT_RQCTL(irr->irxr_index), reg);
-
-	wr32(hw, GLINT_DYN_CTL(irr->irxr_vec), ICE_GLINT_DYN_CTL_REARM);
-	ice_flush(hw);
+	ice_rx_ring_intr_program(irr);
+	if (irr->irxr_intr_routed && irr->irxr_intr_armed) {
+		wr32(hw, GLINT_DYN_CTL(irr->irxr_vec),
+		    ICE_GLINT_DYN_CTL_REARM);
+		ice_flush(hw);
+	}
 	mutex_exit(&irr->irxr_lock);
 
 	return (0);
@@ -1350,16 +1381,10 @@ int
 ice_ring_rx_intr_disable(mac_intr_handle_t intrh)
 {
 	ice_rx_ring_t *irr = (ice_rx_ring_t *)intrh;
-	struct ice_hw *hw = &irr->irxr_ice->ice_hw;
-	uint32_t reg;
 
 	mutex_enter(&irr->irxr_lock);
 	irr->irxr_intr_poll = B_TRUE;
-
-	reg = rd32(hw, QINT_RQCTL(irr->irxr_index));
-	reg &= ~QINT_RQCTL_CAUSE_ENA_M;
-	wr32(hw, QINT_RQCTL(irr->irxr_index), reg);
-	ice_flush(hw);
+	ice_rx_ring_intr_program(irr);
 	mutex_exit(&irr->irxr_lock);
 
 	return (0);
@@ -1647,11 +1672,13 @@ ice_rx_stop(ice_t *ice)
 
 /*
  * Resume the rx rings after a reset rebuild.  Unlike a plumb, a reset does not
- * have MAC re-drive the per-ring start callbacks, so repost the buffers, reopen
- * each ring, and re-enable its interrupt here.  ice_start_datapath() must have
- * re-allocated the rcb pool first.  The generation number each ring already
- * holds is the one MAC last assigned, so it is left alone; a late mr_start
- * racing this refreshes it and finds the ring already open.
+ * have MAC re-drive the per-ring start callbacks, so repost the buffers and
+ * reopen each ring here.  ice_start_datapath() must have re-allocated the rcb
+ * pool first and re-routed the interrupt causes; that routing honors MAC's
+ * poll state, so the rings are not forced into interrupt mode.  The generation
+ * number each ring already holds is the one MAC last assigned, so it is left
+ * alone; a late mr_start racing this refreshes it and finds the ring already
+ * open.
  */
 boolean_t
 ice_rx_rings_resume(ice_t *ice)
@@ -1668,8 +1695,6 @@ ice_rx_rings_resume(ice_t *ice)
 
 		if (ret != 0)
 			return (B_FALSE);
-
-		(void) ice_ring_rx_intr_enable((mac_intr_handle_t)irr);
 	}
 
 	return (B_TRUE);

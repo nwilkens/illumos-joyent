@@ -38,6 +38,7 @@ TESTS = (
     "rx_double_start.py",
     "rx_intr_limit.py",
     "rx_intr_rearm.py",
+    "rx_intr_route.py",
     "rx_layout.py",
     "safe_mode.py",
     "stale_comments.py",
