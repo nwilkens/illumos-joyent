@@ -41,6 +41,12 @@
  */
 #define	ICE_DDP_PKG_MAX		(16 * 1024 * 1024)
 
+/* Field vector width in words per block; must match blk_sizes[].fvw. */
+#define	ICE_DDP_FVW_SW		48
+#define	ICE_DDP_FVW_ACL		32
+#define	ICE_DDP_FVW_FD		24
+CTASSERT(ICE_DDP_FVW_SW == ICE_MAX_FV_WORDS);
+
 static void
 ice_ddp_safe_mode(ice_t *ice)
 {
@@ -170,21 +176,35 @@ ice_ddp_sect_min(const uint8_t *sect, uint32_t size, uint32_t type)
 	case ICE_SID_PROFID_REDIR_PE:
 		return (offsetof(struct ice_prof_redir_section, redir_value) +
 		    (uint64_t)count * sizeof (uint8_t));
+	/*
+	 * Field vector entries are fvw words wide per block (ice_flex_pipe.c
+	 * blk_sizes): only the switch block uses the full struct ice_fv.
+	 */
 	case ICE_SID_FLD_VEC_SW:
+		return (offsetof(struct ice_sw_fv_section, fv) +
+		    (uint64_t)count * ICE_DDP_FVW_SW *
+		    sizeof (struct ice_fv_word));
 	case ICE_SID_FLD_VEC_ACL:
+		return (offsetof(struct ice_sw_fv_section, fv) +
+		    (uint64_t)count * ICE_DDP_FVW_ACL *
+		    sizeof (struct ice_fv_word));
 	case ICE_SID_FLD_VEC_FD:
 	case ICE_SID_FLD_VEC_RSS:
 	case ICE_SID_FLD_VEC_PE:
 		return (offsetof(struct ice_sw_fv_section, fv) +
-		    (uint64_t)count * sizeof (struct ice_fv));
+		    (uint64_t)count * ICE_DDP_FVW_FD *
+		    sizeof (struct ice_fv_word));
 	case ICE_SID_RXPARSER_BOOST_TCAM:
 		return (offsetof(struct ice_boost_tcam_section, tcam) +
 		    (uint64_t)count * sizeof (struct ice_boost_tcam_entry));
+	/*
+	 * The only label section the driver enumerates.  Other label types
+	 * use different entry layouts (PTYPE_META entries are 34 bytes).
+	 */
+	case ICE_SID_LBL_RXPARSER_TMEM:
+		return (offsetof(struct ice_label_section, label) +
+		    (uint64_t)count * sizeof (struct ice_label));
 	default:
-		if (type >= ICE_SID_LBL_FIRST && type <= ICE_SID_LBL_LAST) {
-			return (offsetof(struct ice_label_section, label) +
-			    (uint64_t)count * sizeof (struct ice_label));
-		}
 		return (0);
 	}
 }
@@ -237,6 +257,9 @@ ice_ddp_cfg_seg_ok(const struct ice_generic_seg_hdr *hdr)
 	uint64_t cnt, i;
 
 	if (!ice_ddp_cfg_seg_bufs(hdr, &cnt, &bufs))
+		return (B_FALSE);
+	/* The core reads buf_array[0] before consulting the count. */
+	if (cnt == 0)
 		return (B_FALSE);
 	for (i = 0; i < cnt; i++) {
 		if (!ice_ddp_buf_ok(&bufs->buf_array[i]))

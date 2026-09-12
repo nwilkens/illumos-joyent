@@ -118,9 +118,8 @@ struct ice_buf_hdr {
 #define	ICE_SID_PROFID_TCAM_PE		84
 #define	ICE_SID_PROFID_REDIR_PE		85
 #define	ICE_SID_FLD_VEC_PE		86
-#define	ICE_SID_LBL_FIRST		0x80000010
 #define	ICE_SID_LBL_RXPARSER_TMEM	0x80000018
-#define	ICE_SID_LBL_LAST		0x80000038
+#define	ICE_SID_LBL_PTYPE_META		0x8000002F
 
 struct ice_meta_sect {
 	struct ice_pkg_ver ver;
@@ -145,7 +144,7 @@ struct ice_boost_tcam_section {
 };
 struct ice_xlt1_section { __le16 count, offset; u8 value[STRUCT_HACK_VAR_LEN]; };
 struct ice_xlt2_section { __le16 count, offset; __le16 value[STRUCT_HACK_VAR_LEN]; };
-struct ice_prof_tcam_entry { __le16 addr; u8 key[26]; u8 prof_id; };
+struct ice_prof_tcam_entry { __le16 addr; u8 key[10]; u8 prof_id; };
 struct ice_prof_id_section {
 	__le16 count;
 	struct ice_prof_tcam_entry entry[STRUCT_HACK_VAR_LEN];
@@ -156,6 +155,8 @@ struct ice_prof_redir_section {
 };
 #pragma pack()
 
+#define	ICE_MAX_FV_WORDS	48
+#define	CTASSERT(x)	extern char ctassert_dummy[(x) ? 1 : -1]
 #include "ddp_sections_body.h"
 
 /*
@@ -211,11 +212,38 @@ one(uint32_t type, uint16_t off, uint16_t size, uint16_t count)
 	return (ok);
 }
 
+/* The shipped package must pass every check. */
+static void
+real_package(const char *path)
+{
+	FILE *fp = fopen(path, "rb");
+	uint8_t *pkg;
+	long len;
+
+	assert(fp != NULL);
+	assert(fseek(fp, 0, SEEK_END) == 0);
+	len = ftell(fp);
+	assert(len > 0);
+	rewind(fp);
+	pkg = malloc((size_t)len);
+	assert(pkg != NULL);
+	assert(fread(pkg, 1, (size_t)len, fp) == (size_t)len);
+	(void) fclose(fp);
+	assert(ice_ddp_pkg_valid(pkg, (uint64_t)len));
+	/* Truncating the file must fail the outer bounds, not read past. */
+	assert(!ice_ddp_pkg_valid(pkg, (uint64_t)len - 1));
+	free(pkg);
+	(void) printf("real package %s: %ld bytes valid\n", path, len);
+}
+
 int
-main(void)
+main(int argc, char **argv)
 {
 	struct ice_buf_hdr *buf;
 	uint8_t *pkg;
+
+	if (argc > 1)
+		real_package(argv[1]);
 
 	/* Metadata: the struct fits, or the section is one byte at the end. */
 	assert(one(ICE_SID_METADATA, 20, 36, 1));
@@ -232,6 +260,12 @@ main(void)
 	assert(one(ICE_SID_FLD_VEC_SW, 20, 4 + 2 * 192, 2));
 	assert(!one(ICE_SID_FLD_VEC_SW, 20, 4 + 2 * 192, 3));
 	assert(!one(ICE_SID_FLD_VEC_SW, 20, 200, 100));
+	/* Field vectors are narrower outside the switch block. */
+	assert(one(ICE_SID_FLD_VEC_ACL, 20, 4 + 31 * 128, 31));
+	assert(!one(ICE_SID_FLD_VEC_ACL, 20, 4 + 31 * 128 - 1, 31));
+	assert(one(ICE_SID_FLD_VEC_RSS, 20, 4 + 40 * 96, 40));
+	assert(!one(ICE_SID_FLD_VEC_RSS, 20, 4 + 40 * 96 - 1, 40));
+	assert(one(ICE_SID_FLD_VEC_PE, 20, 4 + 96, 1));
 	assert(one(ICE_SID_LBL_RXPARSER_TMEM, 20, 2 + 3 * 66, 3));
 	assert(!one(ICE_SID_LBL_RXPARSER_TMEM, 20, 2 + 3 * 66 - 1, 3));
 	assert(one(ICE_SID_RXPARSER_BOOST_TCAM, 20, 4 + 88, 1));
@@ -240,17 +274,25 @@ main(void)
 	assert(!one(ICE_SID_XLT1_PE, 20, 4 + 99, 100));
 	assert(one(ICE_SID_XLT2_RSS, 20, 4 + 200, 100));
 	assert(!one(ICE_SID_XLT2_RSS, 20, 4 + 199, 100));
-	assert(one(ICE_SID_PROFID_TCAM_FD, 20, 2 + 29 * 4, 4));
-	assert(!one(ICE_SID_PROFID_TCAM_FD, 20, 2 + 29 * 4 - 1, 4));
+	assert(one(ICE_SID_PROFID_TCAM_FD, 20, 2 + 13 * 4, 4));
+	assert(!one(ICE_SID_PROFID_TCAM_FD, 20, 2 + 13 * 4 - 1, 4));
 	assert(one(ICE_SID_PROFID_REDIR_ACL, 20, 4 + 7, 7));
 	assert(!one(ICE_SID_PROFID_REDIR_ACL, 20, 4 + 6, 7));
 
 	/* A type the driver never enumerates carries no minimum. */
 	assert(one(0x7000, 4095, 1, 0));
+	/* Other label types have their own layouts; the shipped PTYPE_META. */
+	assert(one(ICE_SID_LBL_PTYPE_META, 12, 3164, 93));
 	/* A typed section too short for its count still owes its header. */
 	assert(!one(ICE_SID_FLD_VEC_SW, 4095, 1, 0));
 	assert(one(ICE_SID_FLD_VEC_SW, 4092, 4, 0));
 	assert(!one(ICE_SID_LBL_RXPARSER_TMEM, 4095, 1, 0));
+
+	/* A segment with no buffers is unusable: the core reads the first. */
+	pkg = package(1, &buf);
+	((struct ice_buf_table *)(pkg + BUFS_OFF))->buf_count = 0;
+	assert(!ice_ddp_pkg_valid(pkg, PKG_LEN(1)));
+	free(pkg);
 
 	/* Buffer header bounds. */
 	pkg = package(1, &buf);
