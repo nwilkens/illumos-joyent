@@ -26,7 +26,7 @@ def main() -> None:
 
     # the doorbell is still rung, and still FM-checked
     assert "wr32(hw, QTX_COMM_DBELL(itr->itxr_index), tail);" in emit
-    assert "ice_check_acc_handle(ice->ice_osdep.ios_reg_handle)" in emit
+    assert "ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle)" in emit
 
     # no per-packet MMIO readback
     assert "ice_flush(" not in emit

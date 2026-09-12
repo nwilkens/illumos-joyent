@@ -23,6 +23,20 @@ does not load the driver or establish hardware isolation.
 Use `--source /path/to/ice_gld.c` to check an earlier implementation against
 the same regression. The reviewed baseline fails terminal unicast removal.
 
+## Detach lifecycle regression
+
+```
+python3 usr/src/test/ice-tests/detach_quiesce.py
+```
+
+This compiles the actual detach, FMA observer, reset redispatch, and MAC-start
+functions. Fourteen scenarios cover the hardware barrier before unregister,
+resource retention on failure, the bounded RX fence, start admission, and FMA
+errors consumed by another observer. `--source` selects an older detach body
+while retaining the current FMA boundary; `--gld-source` selects the start
+callback. The test stubs hardware and atomics and does not prove live DMA or
+CPU memory ordering.
+
 ## Upstream integration baseline
 
 The 2026-09-11 integration merges TritonDataCenter/illumos-joyent master at

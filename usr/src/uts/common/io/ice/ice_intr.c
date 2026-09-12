@@ -767,7 +767,7 @@ ice_intr_oicr_setup(ice_t *ice, boolean_t harvest)
 		 * A severed bus reads all ones, which would synthesise a
 		 * phantom GRST plus MDD plus every fatal cause.
 		 */
-		if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) !=
+		if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
 		    DDI_FM_OK) {
 			ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
 			atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
@@ -804,7 +804,8 @@ ice_intr_oicr(ice_t *ice)
 
 	oicr = rd32(hw, PFINT_OICR);
 
-	if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {
+	if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
+	    DDI_FM_OK) {
 		/*
 		 * oicr is untrustworthy here (a severed bus reads all ones),
 		 * so latch nothing; the vector still has to be re-armed.

@@ -1520,7 +1520,8 @@ ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs, uint_t ntcb,
 	 * latches the error (stopping further tx until replumb); it must not
 	 * unwind the TCBs the caller would otherwise free a second time.
 	 */
-	if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {
+	if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
+	    DDI_FM_OK) {
 		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
 		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
 	}

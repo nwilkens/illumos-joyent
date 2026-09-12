@@ -46,7 +46,7 @@ static void ice_rx_free_rcbs(ice_rx_ring_t *);
  * The control-block pool is normally released by ice_rx_stop() at unplumb, but
  * a stop that timed out waiting for loans leaves it behind.  Reclaiming it here
  * is the last chance to do so, and it is safe: detach only reaches this after
- * ice_rx_drain() confirmed irxr_nloaned is zero on every ring, and freeing a
+ * ice_rx_quiesce() confirmed irxr_nloaned is zero on every ring, and freeing a
  * pool with a loan outstanding would double free the stack's mblk.
  */
 static void
@@ -1217,7 +1217,8 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp)
 	irr->irxr_tail = (irr->irxr_head == 0) ? irr->irxr_size - 1 :
 	    irr->irxr_head - 1;
 	wr32(hw, QRX_TAIL(irr->irxr_index), irr->irxr_tail);
-	if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {
+	if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
+	    DDI_FM_OK) {
 		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
 		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
 	}
@@ -1270,7 +1271,7 @@ ice_ring_rx_poll(void *arg, int poll_bytes)
  * irxr_intr_busy is held across mac_rx_ring(), which runs without the ring
  * lock and dereferences the mac_ring_t and mac_impl_t that mac_unregister()
  * frees.  A chain that was copied rather than loaned leaves no loan for
- * ice_rx_drain() to block on, so the teardown paths wait this flag out
+ * ice_rx_quiesce() to block on, so the teardown paths wait this flag out
  * instead.
  */
 boolean_t
@@ -1541,8 +1542,8 @@ unwind:
  * still open while an earlier one is waited out keeps issuing them -- and
  * ice_prepare_for_reset() runs this before ice_queues_disable(), so hardware
  * is still delivering.  A late ring could otherwise reach its wait with more
- * loans than when this was entered and no budget left.  ice_rx_drain() needs
- * no such pass because ice_rx_stop() has already closed every ring.
+ * loans than when this was entered and no budget left.  Detach uses the same
+ * gate and also waits out copied-packet upcalls that hold no buffer loan.
  */
 boolean_t
 ice_rx_quiesce(ice_t *ice)
@@ -1626,45 +1627,6 @@ ice_rx_stop(ice_t *ice)
 
 	drained = ice_rx_quiesce(ice);
 	ice_rx_reclaim(ice);
-
-	return (drained);
-}
-
-/*
- * Detach-time drain: the last gate before the rx rings themselves are freed.
- * ice_rx_recycle() dereferences its ring, so a late loan return after the
- * rings are gone is a use-after-free; detach must fail rather than proceed
- * while any loan is outstanding.
- *
- * This waits and nothing more, matching i40e_drain_rx().  It runs while the
- * rings are still live and armed, so freeing anything here would leave the
- * datapath reading buffers it no longer owns; the reclaim belongs to
- * ice_rx_ring_free(), which runs only once teardown is committed.
- */
-boolean_t
-ice_rx_drain(ice_t *ice)
-{
-	clock_t deadline = ddi_get_lbolt() +
-	    drv_usectohz(ICE_RX_LOAN_WAIT_US);
-	boolean_t drained = B_TRUE;
-	uint_t i;
-
-	for (i = 0; i < ice->ice_num_rxr; i++) {
-		ice_rx_ring_t *irr = &ice->ice_rxr[i];
-
-		mutex_enter(&irr->irxr_lock);
-
-		while (irr->irxr_nloaned > 0) {
-			if (cv_timedwait(&irr->irxr_cv, &irr->irxr_lock,
-			    deadline) == -1)
-				break;
-		}
-
-		if (irr->irxr_nloaned > 0)
-			drained = B_FALSE;
-
-		mutex_exit(&irr->irxr_lock);
-	}
 
 	return (drained);
 }

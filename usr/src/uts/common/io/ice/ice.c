@@ -179,12 +179,25 @@ ice_error(ice_t *ice, const char *fmt, ...)
 }
 
 int
-ice_check_acc_handle(ddi_acc_handle_t h)
+ice_check_acc_handle(ice_t *ice, ddi_acc_handle_t h)
 {
 	ddi_fm_error_t de;
 
 	ddi_fm_acc_err_get(h, &de, DDI_FME_VERSION);
-	ddi_fm_acc_err_clear(h, DDI_FME_VERSION);
+	if (de.fme_status != DDI_FM_OK) {
+		/*
+		 * Record an observer before it consumes the shared error.
+		 * Detach must also reject a clear already in flight when its
+		 * polling begins: that clear could erase a newer error.
+		 */
+		atomic_inc_32(&ice->ice_acc_clears);
+		atomic_inc_32(&ice->ice_acc_errors);
+		membar_enter();
+		ddi_fm_acc_err_clear(h, DDI_FME_VERSION);
+		membar_exit();
+		atomic_dec_32(&ice->ice_acc_clears);
+	}
+	/* An OK observation must not clear an error arriving after the GET. */
 	return (de.fme_status);
 }
 
@@ -756,16 +769,10 @@ ice_unconfigure(ice_t *ice)
 		ice_stats_fini(ice);
 
 	/*
-	 * Fence the interrupt handlers before anything they touch is released,
-	 * and before the queue stop below.  Masking (ice_intr_disable) only
-	 * stops new deliveries; removing the handler is what waits out one
-	 * already running on another CPU.  ice_detach() has already called
-	 * mac_unregister(), so ice_mac_hdl is NULL: a tx completion landing
-	 * here would reach mac_tx_ring_update() through ice_tx_ring_intr() and
-	 * dereference it.  The queue ISR also walks the ring arrays, so the
-	 * handlers must be gone before the rings are freed and before the OICR
-	 * taskq the OICR handler dispatches onto is destroyed.  Nothing below
-	 * needs interrupts: the admin queue commands are polled.
+	 * Detach has closed the packet paths before unregistering MAC.  The
+	 * remaining handlers can still touch ring storage and dispatch admin
+	 * work, so mask and remove them before releasing those resources.
+	 * Admin queue commands below are polled and need no interrupts.
 	 */
 	if (ice->ice_attach_progress & ICE_ATTACH_ENABLE_INTR) {
 		ice_intr_disable(ice);
@@ -778,31 +785,8 @@ ice_unconfigure(ice_t *ice)
 		ice_rem_intr_handlers(ice);
 
 	/*
-	 * Stop the queues before anything they can master into is released.
-	 * mac stop normally did this, but it declines to when a disable does
-	 * not complete, and the PF reset it then requests is swallowed by the
-	 * detaching gate.  ICE_ATTACH_QUEUE_INTR implies the rings, the VSI
-	 * and the control queue ice_dis_vsi_txq() rides are all still up.  A
-	 * queue that still will not stop gets the reset barrier here, since
-	 * nothing below can wait for it; reset_ongoing then keeps the admin
-	 * queue teardown further down from waiting out commands the reset ate.
-	 *
-	 * The cause dissociation ice_m_stop() performs is pointless now that
-	 * the handlers are gone, and the PFR is a stronger barrier than it
-	 * would provide.
-	 */
-	if (ice->ice_attach_progress & ICE_ATTACH_QUEUE_INTR) {
-		if (!ice_queues_disable(ice)) {
-			(void) ice_reset(&ice->ice_hw, ICE_RESET_PFR);
-			ice->ice_hw.reset_ongoing = true;
-		}
-		ice_tx_reclaim(ice);
-	}
-
-	/*
-	 * The MAC handle (a higher progress bit) is unregistered by ice_detach
-	 * before this runs and the queues are stopped above, so nothing can
-	 * reach the shared copy-buffer pools any more.
+	 * Detach confirmed packet DMA isolation before unregistering MAC.
+	 * Attach failure never exposed the datapath or enabled its queues.
 	 */
 	if (ice->ice_attach_progress & ICE_ATTACH_BUFS)
 		ice_buf_fini(ice);
@@ -849,7 +833,7 @@ ice_unconfigure(ice_t *ice)
 	 * ice_rx_rings_free() also reclaims a control-block pool that an
 	 * ice_rx_stop() timeout left behind.  Reaching it here rather than
 	 * earlier in detach is deliberate: by now the taskqs are drained and
-	 * ice_rx_drain() has confirmed no loans remain, so nothing can be
+	 * ice_rx_quiesce() has confirmed no loans remain, so nothing can be
 	 * reposting or reading the pool as it is freed.
 	 */
 	if (ice->ice_attach_progress & ICE_ATTACH_RINGS) {
@@ -881,11 +865,12 @@ ice_unconfigure(ice_t *ice)
 		 */
 		ice_deinit_hw(&ice->ice_hw);
 		/*
-		 * Quiesce the function with a PF reset so a later re-attach
-		 * inherits clean hardware state (scheduler tree, queue and VSI
-		 * contexts, PHY config, in-flight DMA) not stale config.
+		 * Best-effort cleanup for a later attach.  Packet DMA was
+		 * already stopped before any resource release; this reset is
+		 * not part of that isolation proof.
 		 */
-		(void) ice_reset(&ice->ice_hw, ICE_RESET_PFR);
+		if (ice_reset(&ice->ice_hw, ICE_RESET_PFR) != ICE_SUCCESS)
+			ice_error(ice, "cleanup PF reset failed");
 	}
 
 	if (ice->ice_attach_progress & ICE_ATTACH_REGS_MAP) {
@@ -1000,8 +985,8 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		goto fail;
 	ice->ice_attach_progress |= ICE_ATTACH_REGS_MAP;
 
-	if (ice_check_acc_handle(osdep->ios_cfg_handle) != DDI_FM_OK ||
-	    ice_check_acc_handle(osdep->ios_reg_handle) != DDI_FM_OK) {
+	if (ice_check_acc_handle(ice, osdep->ios_cfg_handle) != DDI_FM_OK ||
+	    ice_check_acc_handle(ice, osdep->ios_reg_handle) != DDI_FM_OK) {
 		ddi_fm_service_impact(dip, DDI_SERVICE_LOST);
 		goto fail;
 	}
@@ -1015,8 +1000,8 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	 * register or config-space access faulted during bring-up.  The
 	 * progress bit is already set, so teardown undoes the hardware init.
 	 */
-	if (ice_check_acc_handle(osdep->ios_reg_handle) != DDI_FM_OK ||
-	    ice_check_acc_handle(osdep->ios_cfg_handle) != DDI_FM_OK) {
+	if (ice_check_acc_handle(ice, osdep->ios_reg_handle) != DDI_FM_OK ||
+	    ice_check_acc_handle(ice, osdep->ios_cfg_handle) != DDI_FM_OK) {
 		ddi_fm_service_impact(dip, DDI_SERVICE_LOST);
 		goto fail;
 	}
@@ -1211,6 +1196,73 @@ fail:
 	return (DDI_FAILURE);
 }
 
+/*
+ * Close the stopped datapath and establish the packet DMA barrier before
+ * unregistering MAC.  A failure releases nothing and leaves detach retryable.
+ * The caller holds ice_rebuild_lock and has barred new starts and rebuilds.
+ */
+static boolean_t
+ice_detach_quiesce(ice_t *ice)
+{
+	uint32_t acc_errors;
+
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+	ASSERT((ice->ice_state & ICE_STATE_STARTED) == 0);
+
+	if ((ice->ice_attach_progress & ICE_ATTACH_RINGS) != 0) {
+		ice_tx_quiesce(ice);
+		if (!ice_rx_quiesce(ice)) {
+			ice_error(ice, "timed out draining rx loans; "
+			    "detach deferred");
+			return (B_FALSE);
+		}
+	}
+
+	if ((ice->ice_attach_progress & ICE_ATTACH_QUEUE_INTR) == 0)
+		return (B_TRUE);
+
+	acc_errors = atomic_add_32_nv(&ice->ice_acc_errors, 0);
+	if (atomic_add_32_nv(&ice->ice_acc_clears, 0) != 0)
+		goto access_failed;
+	membar_enter();
+
+	ice_queues_intr_dissociate(ice);
+	if (!ice_queues_disable(ice)) {
+		/*
+		 * A reset invalidates the cached AQ/VSI configuration.  If
+		 * unregister later refuses an open control client, the gate
+		 * rollback must rebuild it before admitting another start.
+		 */
+		atomic_or_32(&ice->ice_state,
+		    ICE_STATE_ERROR | ICE_STATE_PFR_REQ);
+		ice->ice_hw.reset_ongoing = true;
+		if (ice_reset(&ice->ice_hw, ICE_RESET_PFR) != ICE_SUCCESS) {
+			ice_error(ice, "cannot stop packet DMA; "
+			    "detach deferred");
+			ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
+			return (B_FALSE);
+		}
+	}
+
+	/* An interrupt observer must not hide a fault in the polled reads. */
+	if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
+	    DDI_FM_OK)
+		goto access_failed;
+	membar_exit();
+	if (atomic_add_32_nv(&ice->ice_acc_clears, 0) != 0 ||
+	    atomic_add_32_nv(&ice->ice_acc_errors, 0) != acc_errors)
+		goto access_failed;
+
+	ice_tx_reclaim(ice);
+	return (B_TRUE);
+
+access_failed:
+	atomic_or_32(&ice->ice_state, ICE_STATE_ERROR | ICE_STATE_PFR_REQ);
+	ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
+	ice_error(ice, "cannot verify packet DMA stop; detach deferred");
+	return (B_FALSE);
+}
+
 static int
 ice_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 {
@@ -1226,52 +1278,30 @@ ice_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 		return (DDI_FAILURE);
 
 	/*
-	 * Mark the device detaching under the rebuild lock before any of the
-	 * teardown below.  Acquiring the lock waits out an in-flight rebuild or
-	 * OICR worker, and the flag makes a not-yet-started one a no-op;
-	 * ice_unconfigure then drains the taskqs for good.  It must precede
-	 * mac_unregister(), which frees the mac_impl_t that those workers
-	 * report link state through, and ice_loopback_fini(), whose
-	 * admin-queue commands would otherwise race a rebuild tearing the
-	 * control queue down.  It also fences the rx drain below against a
-	 * rebuild reposting the very pools the drain is waiting out.
+	 * Leave an active datapath alone.  The same lock makes the detaching
+	 * gate atomic with ice_m_start(), and waits out a stop or rebuild.
+	 * Workers honor the gate until teardown or the failure rollback below.
 	 */
 	mutex_enter(&ice->ice_rebuild_lock);
-	ice->ice_detaching = B_TRUE;
-	mutex_exit(&ice->ice_rebuild_lock);
-
-	/*
-	 * Drain the rx loans before mac_unregister(), per mac_register(9F).
-	 * This is the only step here that can fail, and detach(9E) requires a
-	 * failing detach to leave the instance uncompromised; mac_unregister()
-	 * is irreversible, so everything after it must be no-fail.  detach is
-	 * only entered with no outstanding opens, so ice_m_stop() has already
-	 * stopped the rings and no new loan can appear while this waits.
-	 */
-	if ((ice->ice_attach_progress & ICE_ATTACH_RINGS) != 0 &&
-	    !ice_rx_drain(ice)) {
-		ice_error(ice, "timed out draining rx loans; detach deferred");
-		mutex_enter(&ice->ice_rebuild_lock);
-		ice->ice_detaching = B_FALSE;
-		ice_reset_redispatch(ice);
+	if ((ice->ice_state & ICE_STATE_STARTED) != 0) {
 		mutex_exit(&ice->ice_rebuild_lock);
 		return (DDI_FAILURE);
 	}
+	ice->ice_detaching = B_TRUE;
+	if (!ice_detach_quiesce(ice)) {
+		mutex_exit(&ice->ice_rebuild_lock);
+		goto fail;
+	}
+	mutex_exit(&ice->ice_rebuild_lock);
 
 	/*
-	 * Unregister from MAC: it fails if a client is still bound, in which
-	 * case the driver must remain attached and usable, so roll the flag
-	 * back and requeue any rebuild the gate swallowed while it was set.
-	 * Nothing in the hardware re-delivers that cause.
+	 * All fallible hardware work and the loan/upcall drain precede this
+	 * irreversible step.  Stopped control clients can still refuse it;
+	 * preserve resources and recover any reset-invalidated state then.
 	 */
 	if (ice->ice_attach_progress & ICE_ATTACH_MAC) {
-		if (ice_mac_unregister(ice) != 0) {
-			mutex_enter(&ice->ice_rebuild_lock);
-			ice->ice_detaching = B_FALSE;
-			ice_reset_redispatch(ice);
-			mutex_exit(&ice->ice_rebuild_lock);
-			return (DDI_FAILURE);
-		}
+		if (ice_mac_unregister(ice) != 0)
+			goto fail;
 		ice->ice_attach_progress &= ~ICE_ATTACH_MAC;
 	}
 
@@ -1284,6 +1314,13 @@ ice_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	ice_unconfigure(ice);
 	ddi_soft_state_free(ice_state_p, instance);
 	return (DDI_SUCCESS);
+
+fail:
+	mutex_enter(&ice->ice_rebuild_lock);
+	ice->ice_detaching = B_FALSE;
+	ice_reset_redispatch(ice);
+	mutex_exit(&ice->ice_rebuild_lock);
+	return (DDI_FAILURE);
 }
 
 /*

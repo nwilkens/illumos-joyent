@@ -346,7 +346,8 @@ ice_loopback_mode_set_locked(ice_t *ice, uint32_t mode)
 		mutex_exit(&ice->ice_loopback_lock);
 		return (error);
 	}
-	if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {
+	if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
+	    DDI_FM_OK) {
 		if (enable) {
 			rollback = ice_loopback_disable(ice);
 		} else {
@@ -566,7 +567,7 @@ ice_m_start(void *arg)
 	 * rebuild.  A replumb must not clear the fail-closed state or reprogram
 	 * queues on stale hardware; the rebuild alone clears these bits.
 	 */
-	if ((ice->ice_state & blocked) != 0) {
+	if (ice->ice_detaching || (ice->ice_state & blocked) != 0) {
 		mutex_exit(&ice->ice_rebuild_lock);
 		return (EIO);
 	}
@@ -918,7 +919,8 @@ ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 	mutex_exit(&ice->ice_rebuild_lock);
 
 	if (ret == 0 &&
-	    ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {
+	    ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
+	    DDI_FM_OK) {
 		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
 		return (EIO);
 	}

@@ -106,23 +106,8 @@ def main() -> None:
     assert "irxr_rcb_area != NULL" in start
     assert start.index("irxr_nloaned > 0") < start.index("ice_rx_alloc_rcbs")
 
-    # Detach drain shares the same bounded shape, but it is WAIT-ONLY: it runs
-    # while the rings are still live and armed, so freeing a control-block pool
-    # here would leave the datapath reading buffers it no longer owns.  Same
-    # reason i40e_drain_rx() frees nothing.
-    drain = function(
-        rx,
-        "ice_rx_drain(ice_t *ice)\n{",
-        "\n/*\n * Resume the rx rings",
-    )
-    assert drain.index("deadline = ddi_get_lbolt()") < \
-        drain.index("for (i = 0; i < ice->ice_num_rxr")
-    assert "cv_timedwait(&irr->irxr_cv" in drain
-    assert "ice_rx_free_rcbs" not in drain
-
-    # The reclaim the drain no longer does lives in the ring teardown instead,
-    # which detach only reaches through ice_unconfigure() -- after the taskqs
-    # are drained and after the drain confirmed no loans remain.
+    # Detach now uses the same close/upcall/loan fence as mac stop.  It
+    # releases no buffer pool until hardware isolation has been confirmed.
     ring_free = function(
         rx,
         "ice_rx_ring_free(ice_rx_ring_t *irr)\n{",
@@ -148,43 +133,23 @@ def main() -> None:
 
     # A single bounded stop serves both the unplumb and the reset callers.
     assert "extern boolean_t ice_rx_stop(ice_t *);" in header
-    assert "extern boolean_t ice_rx_drain(ice_t *);" in header
+    assert "ice_rx_drain" not in header
     assert "ice_rx_stop_reset" not in header
     assert "ice_rx_stop_reset" not in rx
     assert "ICE_RX_RESET_LOAN_WAIT_US" not in rx
     assert "#define\tICE_RX_LOAN_WAIT_US" in rx
 
-    # The drain is wired into detach at the one correct place: inside the
-    # ice_detaching handshake (so a rebuild cannot repost the pools underneath
-    # it), before mac_unregister, and before ice_unconfigure, which frees the
-    # rings it protects.  mac_register(9F) requires the drain to precede
-    # mac_unregister, and detach(9E) requires a failing detach to leave the
-    # instance uncompromised: the drain is the only fallible step here, and
-    # mac_unregister is irreversible, so everything after it must be no-fail.
+    # The behavioral detach regression exercises timeout, reset failure,
+    # unregister failure, and admission rollback.  Check the integration
+    # with the same bounded RX fence here.
     ice_c = ICE.read_text(encoding="utf-8")
-    detach = function(
-        ice_c,
-        "ice_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)\n{",
-        "\nstatic void\nice_reset_set_failed",
-    )
-    assert "ice_rx_drain(ice)" in detach
-    assert "return (DDI_FAILURE)" in detach
-    assert detach.index("ice_detaching = B_TRUE") < detach.index(
-        "ice_rx_drain(ice)"
-    )
-    assert detach.index("ice_rx_drain(ice)") < detach.index(
-        "ice_mac_unregister(ice)"
-    )
-    assert detach.index("ice_mac_unregister(ice)") < detach.index(
-        "ice_unconfigure(ice)"
-    )
-    # Both fallible steps precede the irreversible mac_unregister, so each one
-    # rolls the gate back and requeues the reset it swallowed.
-    assert detach.count("ice_detaching = B_FALSE") == 2
-    assert detach.count("ice_reset_redispatch(ice)") == 2
-    assert detach.index("ice_detaching = B_FALSE") < detach.index(
-        "ice_mac_unregister(ice)"
-    )
+    quiesce_detach = function(
+        ice_c, "ice_detach_quiesce(ice_t *ice)\n{",
+        "\nstatic int\nice_detach")
+    assert quiesce_detach.index("ice_rx_quiesce(ice)") < \
+        quiesce_detach.index("ice_queues_disable(ice)")
+    assert "ice_rx_reclaim" not in quiesce_detach
+    assert "ice_rx_drain" not in rx
 
     print("PASS: ice rx loan wait is bounded on every teardown path")
 

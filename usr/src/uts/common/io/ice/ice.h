@@ -471,6 +471,9 @@ typedef struct ice {
 	list_node_t		ice_glink;
 
 	int			ice_fm_caps;
+	/* Error-only atomic accounting protects detach's MMIO polling proof. */
+	uint32_t		ice_acc_errors;
+	uint32_t		ice_acc_clears;
 
 	/*
 	 * Intel common code, embedded inline.  ice_hw.back points at
@@ -598,7 +601,7 @@ typedef struct ice {
  */
 /*PRINTFLIKE2*/
 extern void ice_error(ice_t *, const char *, ...);
-extern int ice_check_acc_handle(ddi_acc_handle_t);
+extern int ice_check_acc_handle(ice_t *, ddi_acc_handle_t);
 extern int ice_status_to_errno(ice_t *, int);
 extern void ice_update_mtu(ice_t *);
 extern int ice_queues_program(ice_t *);
@@ -700,7 +703,6 @@ extern boolean_t ice_rx_start(ice_t *);
 extern boolean_t ice_rx_quiesce(ice_t *);
 extern void ice_rx_reclaim(ice_t *);
 extern boolean_t ice_rx_stop(ice_t *);
-extern boolean_t ice_rx_drain(ice_t *);
 extern boolean_t ice_rx_rings_resume(ice_t *);
 extern boolean_t ice_rx_ring_intr(ice_rx_ring_t *);
 extern mblk_t *ice_ring_rx_poll(void *, int);

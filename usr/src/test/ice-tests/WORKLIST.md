@@ -15,7 +15,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | ID | Priority | Issue | Status |
 | --- | --- | --- | --- |
 | 1 | P1 | Terminal reset failure prevents filter retirement and can make unregister panic | Implemented; hardware validation pending |
-| 2 | P1 | Detach releases DMA after an unchecked fallback reset | Open |
+| 2 | P1 | Detach releases DMA after an unchecked fallback reset | Implemented; hardware validation pending |
 | 3 | P1 | Pending TX notifications can outlive MAC unregister | Open |
 | 4 | P2 | RX alignment and VLAN header layout defeat IP fast paths | Open |
 | 5 | P2 | One reset request can cause two complete resets | Open |
@@ -73,15 +73,38 @@ Do this together with validation of the remaining detach defects.
 
 ## 2. DMA release after failed fallback reset
 
-`ice_unconfigure()` in [ice.c](../../uts/common/io/ice/ice.c) discards the
-fallback `ice_reset()` result after queue-disable failure, then reclaims TX
-buffers and ultimately frees rings. A timed-out reset does not prove that DMA
-has stopped. Establish a confirmed hardware barrier before irreversible
-unregister/release; retain resources coherently if isolation cannot be proved.
+The old `ice_unconfigure()` in [ice.c](../../uts/common/io/ice/ice.c)
+discarded the fallback reset result and released packet DMA after unregister.
+`ice_detach_quiesce()` now performs the fallible work first, under
+`ice_rebuild_lock`:
 
-Acceptance: inject queue-disable failure followed by reset timeout and verify
-that no mapping or backing memory is released without confirmed isolation.
-Continued DMA and corruption were not demonstrated by the source review.
+- A started interface refuses detach without disturbing its datapath; the
+  detach gate prevents a concurrent MAC start.
+- TX submissions and RX upcalls/loans are quiesced without freeing buffers.
+  Detach shares the bounded RX fence instead of a separate wait-only drain.
+- Every queue must confirm disable, or a fallback PF reset must succeed.
+  A faulted register access or an overlapping FMA observer also prevents
+  accepting the polling result. Error epochs and active-clear accounting
+  preserve evidence even when an interrupt observer consumes a shared fault.
+  Normal successful FMA checks add no atomic operations and clear no latch.
+- Failure retains MAC, pools, mappings, rings, interrupts, and task queues.
+  A reset latches recovery work before it invalidates cached configuration;
+  if unregister refuses a control client, gate rollback redispatches recovery.
+- Unconfigure releases already-isolated packet resources. Attach failure has
+  never enabled a datapath queue. Its final PF reset is best-effort cleanup,
+  not the DMA barrier.
+
+`detach_quiesce.py` executes the actual detach, FMA observer, redispatch, and
+start functions in 14 controlled scenarios. The original detach fails before
+proven isolation. Coverage includes disable/reset failure, MMIO faults,
+consumed or delayed FMA clears, loan timeout, active-interface refusal,
+unregister refusal, subsequent start, and terminal recovery suppression.
+Atomic/barrier stubs exercise interleaving states, not CPU memory ordering.
+
+Hardware acceptance remains: inject queue-disable failure followed by reset
+timeout; verify that no mapping or backing memory is released, and retry
+unload after recovery. Continued DMA/corruption was not demonstrated during
+source review. Item 3 still covers the broader TX stop-time notification gate.
 
 ## 3. TX notification lifetime
 

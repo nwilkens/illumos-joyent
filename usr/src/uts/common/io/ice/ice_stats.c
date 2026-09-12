@@ -160,7 +160,8 @@ ice_stats_update_vsi(ice_t *ice)
 static void
 ice_stats_check_acc(ice_t *ice)
 {
-	if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK)
+	if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
+	    DDI_FM_OK)
 		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_UNAFFECTED);
 }
 

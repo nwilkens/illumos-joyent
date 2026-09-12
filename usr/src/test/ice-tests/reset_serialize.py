@@ -261,20 +261,13 @@ def main() -> None:
     )
     assert "ice->ice_detaching = B_FALSE" in detach
 
-    # The rx drain lives INSIDE the detaching handshake.  Outside it, a rebuild
-    # in ice_rx_rings_resume() reallocates and reposts the pools ring by ring
-    # while the detach thread walks the same rings holding only irxr_lock.
-    # It precedes mac_unregister per mac_register(9F): it is the only fallible
-    # step, and detach(9E) forbids failing after an irreversible one.
+    # Both the bounded RX fence and fallible hardware isolation precede
+    # unregister.  detach_quiesce.py executes the failure/rollback paths.
     assert detach.index("ice_detaching = B_TRUE") < detach.index(
-        "ice_rx_drain(ice)"
-    )
-    assert detach.index("ice_rx_drain(ice)") < detach.index(
-        "ice_mac_unregister(ice)"
-    )
-    assert detach.index("ice_rx_drain(ice)") < detach.index(
-        "ice_unconfigure(ice)"
-    )
+        "ice_detach_quiesce(ice)")
+    assert detach.index("ice_detach_quiesce(ice)") < detach.index(
+        "ice_mac_unregister(ice)")
+    assert "ice->ice_detaching ||" in start
 
     # Every gate lift requeues an owed rebuild.  The GRST and fatal-cause
     # latches are one-shot and there is no watchdog or periodic anywhere in the
@@ -309,9 +302,8 @@ def main() -> None:
             assert "ice_reset_redispatch(ice)" in attach[offset:end], flag
             lifts += 1
             offset += 1
-    # Three: the end of attach, and the two fallible detach steps that precede
-    # mac_unregister (rx drain timeout, unregister failure).
-    assert lifts == 3
+    # The end of attach, and the shared rollback for every detach failure.
+    assert lifts == 2
 
     # Attach arms the interrupts last, as FreeBSD's ice_if_attach_post does:
     # after every step that builds the state a rebuild would free, and still
