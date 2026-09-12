@@ -26,7 +26,7 @@ def main() -> None:
 
     # the doorbell is still rung, and still FM-checked
     assert "wr32(hw, QTX_COMM_DBELL(itr->itxr_index), tail);" in emit
-    assert "ice_check_acc_handle(ice->ice_osdep.ios_reg_handle)" in emit
+    assert "ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle)" in emit
 
     # no per-packet MMIO readback
     assert "ice_flush(" not in emit
@@ -53,11 +53,26 @@ def main() -> None:
     assert "DDI_DMA_SYNC_FORDEV" in helper
     assert "itr->itxr_size - start" in helper
 
-    # control paths keep their flush; recycle keeps its FORKERNEL sync
+    # control paths keep their flush
     mapq = function(tx, "ice_map_txq_vector(ice_t *ice,", "\nstatic boolean_t")
     assert "ice_flush(hw);" in mapq
+
+    # the report-status queue probes scattered slots, so the completion sync
+    # lives in the probe and covers exactly the one descriptor it reads
+    done = function(
+        tx,
+        "ice_tx_desc_done(const ice_tx_ring_t *itr, uint16_t slot)",
+        "\n/*\n * Reclaim descriptors",
+    )
+    assert "DDI_DMA_SYNC_FORKERNEL" in done
+    assert "(off_t)slot * dsz" in done
+    assert done.count("ddi_dma_sync(") == 1
+
+    # recycle no longer syncs the whole ring; it walks the report-status queue
     rec = function(tx, "ice_tx_recycle(ice_tx_ring_t *itr)", "\n/*")
-    assert "DDI_DMA_SYNC_FORKERNEL" in rec
+    assert "ddi_dma_sync(" not in rec
+    assert "itr->itxr_rsq[rs_cidx]" in rec
+    assert "ice_check_dma_handle(itr->itxr_dma.idb_dma_handle)" in rec
 
     print("PASS: ice tx doorbell source invariants")
 

@@ -200,7 +200,7 @@ ice_dma_alloc(ice_t *ice, ice_dma_buffer_t *idb, ddi_dma_attr_t *attrp,
 	ret = ddi_dma_alloc_handle(ice->ice_dip, attrp, memcb, NULL,
 	    &idb->idb_dma_handle);
 	if (ret != DDI_SUCCESS) {
-		ice_error(ice, "!failed to allocate DMA handle: %d", ret);
+		ice_error(ice, "failed to allocate DMA handle: %d", ret);
 		idb->idb_dma_handle = NULL;
 		return (B_FALSE);
 	}
@@ -208,7 +208,7 @@ ice_dma_alloc(ice_t *ice, ice_dma_buffer_t *idb, ddi_dma_attr_t *attrp,
 	ret = ddi_dma_mem_alloc(idb->idb_dma_handle, size, accp, flags, memcb,
 	    NULL, &idb->idb_va, &len, &idb->idb_acc_handle);
 	if (ret != DDI_SUCCESS) {
-		ice_error(ice, "!failed to allocate %lu bytes of DMA "
+		ice_error(ice, "failed to allocate %lu bytes of DMA "
 		    "memory: %d", size, ret);
 		idb->idb_va = NULL;
 		idb->idb_acc_handle = NULL;
@@ -222,7 +222,7 @@ ice_dma_alloc(ice_t *ice, ice_dma_buffer_t *idb, ddi_dma_attr_t *attrp,
 	ret = ddi_dma_addr_bind_handle(idb->idb_dma_handle, NULL, idb->idb_va,
 	    len, DDI_DMA_RDWR | flags, memcb, NULL, &cookie, &ncookies);
 	if (ret != DDI_DMA_MAPPED) {
-		ice_error(ice, "!failed to bind %lu bytes of DMA "
+		ice_error(ice, "failed to bind %lu bytes of DMA "
 		    "memory: %d", size, ret);
 		ice_dma_free(idb);
 		return (B_FALSE);

@@ -74,6 +74,20 @@
 #define	ICE_OICR_CAUSE_MASK	\
 	(ICE_OICR_FATAL_MASK | PFINT_OICR_GRST_M)
 
+static void ice_intr_oicr_enable(ice_t *);
+
+/* Preserve the carrier cache while exposing an unusable datapath as DOWN. */
+link_state_t
+ice_link_state_effective(ice_t *ice, link_state_t state)
+{
+	const uint32_t failed = ICE_STATE_ERROR | ICE_STATE_RESET_FAILED |
+	    ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ;
+
+	ASSERT(MUTEX_HELD(&ice->ice_lse_lock));
+
+	return ((ice->ice_state & failed) != 0 ? LINK_STATE_DOWN : state);
+}
+
 static void
 ice_link_state_set(ice_t *ice, link_state_t state)
 {
@@ -86,18 +100,18 @@ ice_link_state_set(ice_t *ice, link_state_t state)
 	if (ice->ice_mac_hdl == NULL)
 		return;
 
-	mac_link_update(ice->ice_mac_hdl, state);
+	mac_link_update(ice->ice_mac_hdl, ice_link_state_effective(ice, state));
 }
 
 /*
- * Set the cached link state and report it to MAC under ice_lse_lock.  The
- * reset path uses this to force the link down while the function is rebuilt.
+ * Report an operational transition without changing the carrier cache.  The
+ * reset path uses this to force the link down while the function is rebuilt;
+ * only a carrier query or loopback transition replaces the cached state.
  */
 void
 ice_link_report(ice_t *ice, link_state_t state)
 {
 	mutex_enter(&ice->ice_lse_lock);
-	ice->ice_link_state = state;
 	ice_link_state_set(ice, state);
 	mutex_exit(&ice->ice_lse_lock);
 }
@@ -354,8 +368,9 @@ ice_link_status_update(ice_t *ice)
 
 /*
  * Coalesce a rebuild request and hand it to the dedicated reset taskq.
- * Mirrors the ice_oicr_pending idiom: at most one task is queued at a time,
- * and the flag re-arms when ice_reset_task clears it.  Runs in thread context
+ * The ownership flag spans queued, waiting, and running work.  The worker
+ * releases it after checking the lifecycle gates and servicing its requests,
+ * then redispatches any later requests.  Runs in thread context
  * only (the OICR worker or the DEBUG test hook), never at interrupt priority.
  */
 void
@@ -519,7 +534,6 @@ ice_oicr_fatal(ice_t *ice, uint32_t cause, boolean_t mdd)
 	 */
 	if (fault) {
 		mutex_enter(&ice->ice_lse_lock);
-		ice->ice_link_state = LINK_STATE_DOWN;
 		ice_link_state_set(ice, LINK_STATE_DOWN);
 		mutex_exit(&ice->ice_lse_lock);
 	}
@@ -655,6 +669,17 @@ ice_oicr_task(void *arg)
 	 */
 	ice_link_status_update_impl(ice, NULL);
 
+	/*
+	 * Belt and braces for a re-arm the ISR lost to a faulted register
+	 * write: the vector is self-disarming, so one dropped write is
+	 * otherwise permanent.  Both early returns above skip this, and
+	 * ice_rebuild_lock is held here, so it cannot land between
+	 * ice_prepare_for_reset()'s disable and ice_rebuild()'s re-arm.
+	 * FreeBSD re-enables the same vector from its admin task
+	 * (if_ice_iflib.c:2497).
+	 */
+	ice_intr_oicr_enable(ice);
+
 	mutex_exit(&ice->ice_rebuild_lock);
 }
 
@@ -663,10 +688,7 @@ ice_intr_oicr_enable(ice_t *ice)
 {
 	struct ice_hw *hw = &ice->ice_hw;
 
-	wr32(hw, GLINT_DYN_CTL(ICE_OICR_VECTOR),
-	    GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |
-	    ((ICE_ITR_INDEX_NONE << GLINT_DYN_CTL_ITR_INDX_S) &
-	    GLINT_DYN_CTL_ITR_INDX_M));
+	wr32(hw, GLINT_DYN_CTL(ICE_OICR_VECTOR), ICE_GLINT_DYN_CTL_REARM);
 	ice_flush(hw);
 }
 
@@ -739,8 +761,9 @@ ice_intr_oicr_disable(ice_t *ice)
  * first: on the attach path they were latched on this driver's watch, the
  * window is hundreds of milliseconds of firmware interaction, and nothing else
  * re-derives them.  The rebuild path must NOT harvest -- it has just performed
- * the owed rebuild and cleared the reset-owed bits, so re-latching would
- * dispatch the same rebuild in a loop.
+ * the owed rebuild after claiming its request bits, so re-latching those
+ * causes would dispatch the same rebuild in a loop.  Later software requests
+ * remain owed independently of this hardware-latch discard.
  */
 void
 ice_intr_oicr_setup(ice_t *ice, boolean_t harvest)
@@ -757,7 +780,7 @@ ice_intr_oicr_setup(ice_t *ice, boolean_t harvest)
 		 * A severed bus reads all ones, which would synthesise a
 		 * phantom GRST plus MDD plus every fatal cause.
 		 */
-		if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) !=
+		if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
 		    DDI_FM_OK) {
 			ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
 			atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
@@ -794,10 +817,15 @@ ice_intr_oicr(ice_t *ice)
 
 	oicr = rd32(hw, PFINT_OICR);
 
-	if (ice_check_acc_handle(ice->ice_osdep.ios_reg_handle) != DDI_FM_OK) {
+	if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
+	    DDI_FM_OK) {
+		/*
+		 * oicr is untrustworthy here (a severed bus reads all ones),
+		 * so latch nothing; the vector still has to be re-armed.
+		 */
 		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
 		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
-		return (DDI_INTR_CLAIMED);
+		goto rearm;
 	}
 
 	ice_oicr_causes_latch(ice, oicr);
@@ -826,6 +854,12 @@ ice_intr_oicr(ice_t *ice)
 		ice_error(ice, "OICR taskq dispatch failed");
 	}
 
+rearm:
+	/*
+	 * The vector auto-clears INTENA on assertion (datasheet 9.1.1.3), so
+	 * a path that returns without re-arming leaves the OICR dead for the
+	 * life of the instance.  Every exit routes through here.
+	 */
 	ice_intr_oicr_enable(ice);
 	return (DDI_INTR_CLAIMED);
 }
@@ -835,6 +869,7 @@ ice_intr_queue(ice_t *ice, uint_t vector)
 {
 	struct ice_hw *hw = &ice->ice_hw;
 	uint_t idx = vector - 1;
+	uint32_t dyn_ctl = ICE_GLINT_DYN_CTL_REARM;
 
 	/*
 	 * Data queue i (rx and tx) is wired to vector i + 1 (ice_rx.c,
@@ -844,15 +879,28 @@ ice_intr_queue(ice_t *ice, uint_t vector)
 	 * cache lines.  Vector 0 (OICR) never reaches here.  Rx delivery is
 	 * suppressed while mac polls the ring (ice_rx_ring_intr).
 	 */
-	if (idx < ice->ice_num_rxr)
-		ice_rx_ring_intr(&ice->ice_rxr[idx]);
+	if (idx < ice->ice_num_rxr &&
+	    ice_rx_ring_intr(&ice->ice_rxr[idx])) {
+		/*
+		 * The rx drain yielded at ice_rx_limit_per_intr with frames
+		 * still ready.  Hardware consumed their events when it wrote
+		 * the descriptors back, so a plain re-arm would strand the
+		 * residue until new traffic arrives (datasheet 9.1.2.6
+		 * prescribes a software interrupt for this).  SW_ITR_INDX
+		 * selects the queues' ITR slot rather than No-ITR so the
+		 * refire train is paced, not immediate.  If mac switches the
+		 * ring to poll mode first, the refire finds irxr_intr_poll
+		 * set and no-ops.
+		 */
+		dyn_ctl |= GLINT_DYN_CTL_SWINT_TRIG_M |
+		    GLINT_DYN_CTL_SW_ITR_INDX_ENA_M |
+		    ((ICE_ITR_IDX_0 << GLINT_DYN_CTL_SW_ITR_INDX_S) &
+		    GLINT_DYN_CTL_SW_ITR_INDX_M);
+	}
 	if (idx < ice->ice_num_txr)
 		ice_tx_ring_intr(&ice->ice_txr[idx]);
 
-	wr32(hw, GLINT_DYN_CTL(vector),
-	    GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |
-	    ((ICE_ITR_INDEX_NONE << GLINT_DYN_CTL_ITR_INDX_S) &
-	    GLINT_DYN_CTL_ITR_INDX_M));
+	wr32(hw, GLINT_DYN_CTL(vector), dyn_ctl);
 	ice_flush(hw);
 
 	return (DDI_INTR_CLAIMED);
@@ -988,9 +1036,14 @@ ice_set_link_events(ice_t *ice)
 	 * Also wake on media insert/remove and unqualified-module plug so the
 	 * cached link/transceiver state stays current and a media-available
 	 * transition can re-drive the PHY enable.
+	 *
+	 * The complement is confined to the events the hardware defines: the
+	 * datasheet assigns bits 1 through 12 and requires every other bit of
+	 * this mask to be zero.
 	 */
-	mask = (uint16_t)~(ICE_AQ_LINK_EVENT_UPDOWN |
-	    ICE_AQ_LINK_EVENT_MEDIA_NA | ICE_AQ_LINK_EVENT_MODULE_QUAL_FAIL);
+	mask = (uint16_t)(ICE_AQ_LINK_EVENT_MASK_DEFINED &
+	    ~(ICE_AQ_LINK_EVENT_UPDOWN | ICE_AQ_LINK_EVENT_MEDIA_NA |
+	    ICE_AQ_LINK_EVENT_MODULE_QUAL_FAIL));
 
 	mutex_enter(&ice->ice_lse_lock);
 	ice->ice_lse_flags |= ICE_LSE_F_ENABLE;

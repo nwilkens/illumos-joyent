@@ -179,13 +179,61 @@ ice_error(ice_t *ice, const char *fmt, ...)
 }
 
 int
-ice_check_acc_handle(ddi_acc_handle_t h)
+ice_check_acc_handle(ice_t *ice, ddi_acc_handle_t h)
 {
 	ddi_fm_error_t de;
 
 	ddi_fm_acc_err_get(h, &de, DDI_FME_VERSION);
-	ddi_fm_acc_err_clear(h, DDI_FME_VERSION);
+	if (de.fme_status != DDI_FM_OK) {
+		/*
+		 * Record an observer before it consumes the shared error.
+		 * Detach must also reject a clear already in flight when its
+		 * polling begins: that clear could erase a newer error.
+		 */
+		atomic_inc_32(&ice->ice_acc_clears);
+		atomic_inc_32(&ice->ice_acc_errors);
+		membar_enter();
+		ddi_fm_acc_err_clear(h, DDI_FME_VERSION);
+		membar_exit();
+		atomic_dec_32(&ice->ice_acc_clears);
+	}
+	/* An OK observation must not clear an error arriving after the GET. */
 	return (de.fme_status);
+}
+
+/*
+ * Translate a common-code status into an errno.  mac(9E) recovers from ENOSPC
+ * on the unicast add path by falling back to promiscuous mode plus software
+ * classification; collapsing every failure to EIO forfeits that.  Firmware
+ * reports a filter it could not allocate as ICE_AQ_RC_ENOSPC (E810 datasheet
+ * Table 7-78, Add Switch Rules Response), which the common code records in
+ * hw->adminq.sq_last_status while returning ICE_ERR_AQ_ERROR.  The next admin
+ * queue command overwrites sq_last_status, so callers must decode a failure
+ * before issuing anything else.
+ */
+int
+ice_status_to_errno(ice_t *ice, int status)
+{
+	switch (status) {
+	case ICE_SUCCESS:
+		return (0);
+	case ICE_ERR_NO_MEMORY:
+		return (ENOMEM);
+	case ICE_ERR_RESET_ONGOING:
+		return (EAGAIN);
+	case ICE_ERR_AQ_ERROR:
+		break;
+	default:
+		return (EIO);
+	}
+
+	switch (ice->ice_hw.adminq.sq_last_status) {
+	case ICE_AQ_RC_ENOSPC:
+	case ICE_AQ_RC_ENOMEM:
+		return (ENOSPC);
+	default:
+		return (EIO);
+	}
 }
 
 static int
@@ -594,18 +642,24 @@ ice_queues_program(ice_t *ice)
 	for (i = 0; i < ice->ice_num_txr; i++) {
 		status = ice_tx_ring_program(ice, &ice->ice_txr[i]);
 		if (status != ICE_SUCCESS) {
-			while (i-- > 0)
-				ice_tx_ring_unprogram(ice, &ice->ice_txr[i]);
+			while (i-- > 0) {
+				(void) ice_tx_ring_unprogram(ice,
+				    &ice->ice_txr[i]);
+			}
 			return (status);
 		}
 	}
 	for (i = 0; i < ice->ice_num_rxr; i++) {
 		status = ice_rx_ring_program(ice, &ice->ice_rxr[i]);
 		if (status != ICE_SUCCESS) {
-			while (i-- > 0)
-				ice_rx_ring_unprogram(ice, &ice->ice_rxr[i]);
-			for (j = 0; j < ice->ice_num_txr; j++)
-				ice_tx_ring_unprogram(ice, &ice->ice_txr[j]);
+			while (i-- > 0) {
+				(void) ice_rx_ring_unprogram(ice,
+				    &ice->ice_rxr[i]);
+			}
+			for (j = 0; j < ice->ice_num_txr; j++) {
+				(void) ice_tx_ring_unprogram(ice,
+				    &ice->ice_txr[j]);
+			}
 			return (status);
 		}
 	}
@@ -613,18 +667,31 @@ ice_queues_program(ice_t *ice)
 	return (ICE_SUCCESS);
 }
 
-void
+/*
+ * Disable every tx/rx queue.  Every ring is attempted even after a failure, so
+ * a queue that can be stopped is stopped.  Returns B_FALSE if any queue did not
+ * confirm the disable: its DMA may still be live, so the caller must not
+ * release anything the hardware can still reach.
+ */
+boolean_t
 ice_queues_disable(ice_t *ice)
 {
+	boolean_t ok = B_TRUE;
 	uint_t i;
 
-	for (i = 0; i < ice->ice_num_txr; i++)
-		ice_tx_ring_unprogram(ice, &ice->ice_txr[i]);
-	for (i = 0; i < ice->ice_num_rxr; i++)
-		ice_rx_ring_unprogram(ice, &ice->ice_rxr[i]);
+	for (i = 0; i < ice->ice_num_txr; i++) {
+		if (ice_tx_ring_unprogram(ice, &ice->ice_txr[i]) != ICE_SUCCESS)
+			ok = B_FALSE;
+	}
+	for (i = 0; i < ice->ice_num_rxr; i++) {
+		if (ice_rx_ring_unprogram(ice, &ice->ice_rxr[i]) != ICE_SUCCESS)
+			ok = B_FALSE;
+	}
+
+	return (ok);
 }
 
-static void
+void
 ice_queues_intr_map(ice_t *ice)
 {
 	uint_t i;
@@ -650,6 +717,46 @@ ice_queues_intr_unmap(ice_t *ice)
 	ice_flush(hw);
 }
 
+/*
+ * Dissociate every queue's interrupt cause from its vector before the queues
+ * are disabled: clear CAUSE_ENA, then trigger a software interrupt on the
+ * vector so a cause already in flight is retired (datasheet 9.1.3.1.2).  A
+ * queue disable issued without this is not guaranteed to complete.  The MSI-X
+ * and ITR routing is left in place, unlike ice_queues_intr_unmap(), so
+ * ice_queues_intr_map() is what re-arms the cause on the next start.
+ */
+void
+ice_queues_intr_dissociate(ice_t *ice)
+{
+	struct ice_hw *hw = &ice->ice_hw;
+	uint32_t reg;
+	uint_t i;
+
+	for (i = 0; i < ice->ice_num_txr; i++) {
+		ice_tx_ring_t *itr = &ice->ice_txr[i];
+
+		reg = rd32(hw, QINT_TQCTL(itr->itxr_index));
+		reg &= ~QINT_TQCTL_CAUSE_ENA_M;
+		wr32(hw, QINT_TQCTL(itr->itxr_index), reg);
+		ice_flush(hw);
+		wr32(hw, GLINT_DYN_CTL(itr->itxr_vec),
+		    GLINT_DYN_CTL_SWINT_TRIG_M | GLINT_DYN_CTL_INTENA_MSK_M);
+	}
+
+	for (i = 0; i < ice->ice_num_rxr; i++) {
+		ice_rx_ring_t *irr = &ice->ice_rxr[i];
+
+		reg = rd32(hw, QINT_RQCTL(irr->irxr_index));
+		reg &= ~QINT_RQCTL_CAUSE_ENA_M;
+		wr32(hw, QINT_RQCTL(irr->irxr_index), reg);
+		ice_flush(hw);
+		wr32(hw, GLINT_DYN_CTL(irr->irxr_vec),
+		    GLINT_DYN_CTL_SWINT_TRIG_M | GLINT_DYN_CTL_INTENA_MSK_M);
+	}
+
+	ice_flush(hw);
+}
+
 static void
 ice_unconfigure(ice_t *ice)
 {
@@ -662,29 +769,10 @@ ice_unconfigure(ice_t *ice)
 		ice_stats_fini(ice);
 
 	/*
-	 * The MAC handle (a higher progress bit) is unregistered by ice_detach
-	 * before this runs, so the datapath is already quiesced: mac_stop drove
-	 * ice_rx_stop()/ice_tx_stop(), draining loans and reclaiming TCBs.  The
-	 * shared copy-buffer pools can now be freed.
-	 */
-	if (ice->ice_attach_progress & ICE_ATTACH_BUFS)
-		ice_buf_fini(ice);
-
-	/*
-	 * Tear down the datapath before the VSI: the queues belong to the VSI
-	 * and the queue disables ride the admin queue, which a lower progress
-	 * bit (ice_deinit_hw) undoes later.
-	 */
-	if (ice->ice_attach_progress & ICE_ATTACH_QUEUE_INTR)
-		ice_queues_intr_unmap(ice);
-
-	/*
-	 * Fence the interrupt handlers before freeing anything they touch.
-	 * Masking (ice_intr_disable) only stops new deliveries; removing the
-	 * handler is what waits out one already running on another CPU.  The
-	 * queue ISR dereferences the ring arrays, so the handlers must be
-	 * removed before the rings are freed and before the OICR taskq, which
-	 * the OICR handler dispatches onto, is destroyed.
+	 * Detach has closed the packet paths before unregistering MAC.  The
+	 * remaining handlers can still touch ring storage and dispatch admin
+	 * work, so mask and remove them before releasing those resources.
+	 * Admin queue commands below are polled and need no interrupts.
 	 */
 	if (ice->ice_attach_progress & ICE_ATTACH_ENABLE_INTR) {
 		ice_intr_disable(ice);
@@ -695,6 +783,20 @@ ice_unconfigure(ice_t *ice)
 
 	if (ice->ice_attach_progress & ICE_ATTACH_ADD_INTR)
 		ice_rem_intr_handlers(ice);
+
+	/*
+	 * Detach confirmed packet DMA isolation before unregistering MAC.
+	 * Attach failure never exposed the datapath or enabled its queues.
+	 */
+	if (ice->ice_attach_progress & ICE_ATTACH_BUFS)
+		ice_buf_fini(ice);
+
+	/*
+	 * Remove the remaining queue-to-vector routing.  Packet DMA is already
+	 * isolated; the VSI and control queue still exist for later cleanup.
+	 */
+	if (ice->ice_attach_progress & ICE_ATTACH_QUEUE_INTR)
+		ice_queues_intr_unmap(ice);
 
 	/*
 	 * Stop the admin periodic before the taskq it dispatches into.
@@ -730,7 +832,7 @@ ice_unconfigure(ice_t *ice)
 	 * ice_rx_rings_free() also reclaims a control-block pool that an
 	 * ice_rx_stop() timeout left behind.  Reaching it here rather than
 	 * earlier in detach is deliberate: by now the taskqs are drained and
-	 * ice_rx_drain() has confirmed no loans remain, so nothing can be
+	 * ice_rx_quiesce() has confirmed no loans remain, so nothing can be
 	 * reposting or reading the pool as it is freed.
 	 */
 	if (ice->ice_attach_progress & ICE_ATTACH_RINGS) {
@@ -762,11 +864,12 @@ ice_unconfigure(ice_t *ice)
 		 */
 		ice_deinit_hw(&ice->ice_hw);
 		/*
-		 * Quiesce the function with a PF reset so a later re-attach
-		 * inherits clean hardware state (scheduler tree, queue and VSI
-		 * contexts, PHY config, in-flight DMA) not stale config.
+		 * Best-effort cleanup for a later attach.  Packet DMA was
+		 * already stopped before any resource release; this reset is
+		 * not part of that isolation proof.
 		 */
-		(void) ice_reset(&ice->ice_hw, ICE_RESET_PFR);
+		if (ice_reset(&ice->ice_hw, ICE_RESET_PFR) != ICE_SUCCESS)
+			ice_error(ice, "cleanup PF reset failed");
 	}
 
 	if (ice->ice_attach_progress & ICE_ATTACH_REGS_MAP) {
@@ -802,11 +905,10 @@ ice_prop_get_num_queues(ice_t *ice)
 }
 
 /*
- * Hand an owed rebuild to the reset taskq.  Both the GRST and the fatal-cause
- * latches are one-shot and there is no watchdog, so an owed rebuild that a gate
- * dropped is owed forever: ice_m_start() then refuses to plumb for the life of
- * the module.  Call this at every point a gate is lifted, and wherever a caller
- * observes the owed bits without being able to service them itself.
+ * Hand an owed rebuild to the reset taskq when a lifetime gate lifts or a
+ * caller observes a request it cannot service itself.  The hardware causes
+ * are one-shot; persistent request bits retain the work.  Redispatch promptly
+ * here, while the admin periodic provides a retry if taskq dispatch fails.
  *
  * Runs under ice_rebuild_lock, which ice_reset_dispatch() does not take; it
  * only sets a flag and queues onto the reset taskq, and that worker waits on
@@ -833,6 +935,7 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	struct ice_hw *hw;
 	struct ice_osdep *osdep;
 	int mtu;
+	int limit;
 	int instance;
 
 	if (cmd != DDI_ATTACH)
@@ -880,8 +983,8 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		goto fail;
 	ice->ice_attach_progress |= ICE_ATTACH_REGS_MAP;
 
-	if (ice_check_acc_handle(osdep->ios_cfg_handle) != DDI_FM_OK ||
-	    ice_check_acc_handle(osdep->ios_reg_handle) != DDI_FM_OK) {
+	if (ice_check_acc_handle(ice, osdep->ios_cfg_handle) != DDI_FM_OK ||
+	    ice_check_acc_handle(ice, osdep->ios_reg_handle) != DDI_FM_OK) {
 		ddi_fm_service_impact(dip, DDI_SERVICE_LOST);
 		goto fail;
 	}
@@ -895,8 +998,8 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	 * register or config-space access faulted during bring-up.  The
 	 * progress bit is already set, so teardown undoes the hardware init.
 	 */
-	if (ice_check_acc_handle(osdep->ios_reg_handle) != DDI_FM_OK ||
-	    ice_check_acc_handle(osdep->ios_cfg_handle) != DDI_FM_OK) {
+	if (ice_check_acc_handle(ice, osdep->ios_reg_handle) != DDI_FM_OK ||
+	    ice_check_acc_handle(ice, osdep->ios_cfg_handle) != DDI_FM_OK) {
 		ddi_fm_service_impact(dip, DDI_SERVICE_LOST);
 		goto fail;
 	}
@@ -994,6 +1097,13 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	ice->ice_mtu = mtu;
 	ice->ice_tx_lso_enable = ddi_prop_get_int(DDI_DEV_T_ANY,
 	    ice->ice_dip, DDI_PROP_DONTPASS, "tx_lso_enable", 0) != 0;
+	limit = ddi_prop_get_int(DDI_DEV_T_ANY, ice->ice_dip,
+	    DDI_PROP_DONTPASS, "rx_limit_per_intr", ICE_DEF_RX_LIMIT_PER_INTR);
+	if (limit < ICE_MIN_RX_LIMIT_PER_INTR)
+		limit = ICE_MIN_RX_LIMIT_PER_INTR;
+	else if (limit > ICE_MAX_RX_LIMIT_PER_INTR)
+		limit = ICE_MAX_RX_LIMIT_PER_INTR;
+	ice->ice_rx_limit_per_intr = limit;
 	ice_update_mtu(ice);
 
 	if (!ice_tx_rings_alloc(ice))
@@ -1053,25 +1163,18 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	mutex_exit(&ice_glock);
 
 	/*
-	 * Open the instance to rebuilds, and requeue one the gate discarded
-	 * during the attach window: the hardware latches are one-shot, so
-	 * nothing re-delivers a cause the gate already consumed.
+	 * Refresh carrier after registration and interrupt setup, before
+	 * opening the instance to rebuilds.  The lifecycle lock serializes
+	 * this admin-queue query and its publication with MAC start and reset.
+	 * The periodic refresh handles later events, including a link cause
+	 * whose notification was consumed while attach gated the worker.
 	 */
 	mutex_enter(&ice->ice_rebuild_lock);
+	ice_link_status_update(ice);
 	ice->ice_attaching = B_FALSE;
 	ice_reset_redispatch(ice);
 	mutex_exit(&ice->ice_rebuild_lock);
 
-	/*
-	 * Resync the link only now.  ice_setup_link() enables the PHY early in
-	 * attach and a DAC negotiates in well under the time the rest of attach
-	 * takes, so the up event lands while the gate above is still dropping
-	 * OICR work.  That latch is one-shot and there is no periodic to
-	 * re-read it, so without this poll the port stays down forever.  It
-	 * must follow both the gate lift and mac_register(), which is what
-	 * makes the result publishable.
-	 */
-	ice_link_status_update(ice);
 	ice_oicr_resync(ice);
 	ice_admin_periodic_start(ice);
 
@@ -1082,6 +1185,73 @@ fail:
 	ice_unconfigure(ice);
 	ddi_soft_state_free(ice_state_p, instance);
 	return (DDI_FAILURE);
+}
+
+/*
+ * Close the stopped datapath and establish the packet DMA barrier before
+ * unregistering MAC.  A failure releases nothing and leaves detach retryable.
+ * The caller holds ice_rebuild_lock and has barred new starts and rebuilds.
+ */
+static boolean_t
+ice_detach_quiesce(ice_t *ice)
+{
+	uint32_t acc_errors;
+
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+	ASSERT((ice->ice_state & ICE_STATE_STARTED) == 0);
+
+	if ((ice->ice_attach_progress & ICE_ATTACH_RINGS) != 0) {
+		ice_tx_quiesce(ice);
+		if (!ice_rx_quiesce(ice)) {
+			ice_error(ice, "timed out draining rx loans; "
+			    "detach deferred");
+			return (B_FALSE);
+		}
+	}
+
+	if ((ice->ice_attach_progress & ICE_ATTACH_QUEUE_INTR) == 0)
+		return (B_TRUE);
+
+	acc_errors = atomic_add_32_nv(&ice->ice_acc_errors, 0);
+	if (atomic_add_32_nv(&ice->ice_acc_clears, 0) != 0)
+		goto access_failed;
+	membar_enter();
+
+	ice_queues_intr_dissociate(ice);
+	if (!ice_queues_disable(ice)) {
+		/*
+		 * A reset invalidates the cached AQ/VSI configuration.  If
+		 * unregister later refuses an open control client, the gate
+		 * rollback must rebuild it before admitting another start.
+		 */
+		atomic_or_32(&ice->ice_state,
+		    ICE_STATE_ERROR | ICE_STATE_PFR_REQ);
+		ice->ice_hw.reset_ongoing = true;
+		if (ice_reset(&ice->ice_hw, ICE_RESET_PFR) != ICE_SUCCESS) {
+			ice_error(ice, "cannot stop packet DMA; "
+			    "detach deferred");
+			ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
+			return (B_FALSE);
+		}
+	}
+
+	/* An interrupt observer must not hide a fault in the polled reads. */
+	if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
+	    DDI_FM_OK)
+		goto access_failed;
+	membar_exit();
+	if (atomic_add_32_nv(&ice->ice_acc_clears, 0) != 0 ||
+	    atomic_add_32_nv(&ice->ice_acc_errors, 0) != acc_errors)
+		goto access_failed;
+
+	ice_tx_reclaim(ice);
+	return (B_TRUE);
+
+access_failed:
+	atomic_or_32(&ice->ice_state, ICE_STATE_ERROR | ICE_STATE_PFR_REQ);
+	ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
+	ice_error(ice, "cannot verify packet DMA stop; detach deferred");
+	return (B_FALSE);
 }
 
 static int
@@ -1099,52 +1269,30 @@ ice_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 		return (DDI_FAILURE);
 
 	/*
-	 * Mark the device detaching under the rebuild lock before any of the
-	 * teardown below.  Acquiring the lock waits out an in-flight rebuild or
-	 * OICR worker, and the flag makes a not-yet-started one a no-op;
-	 * ice_unconfigure then drains the taskqs for good.  It must precede
-	 * mac_unregister(), which frees the mac_impl_t that those workers
-	 * report link state through, and ice_loopback_fini(), whose
-	 * admin-queue commands would otherwise race a rebuild tearing the
-	 * control queue down.  It also fences the rx drain below against a
-	 * rebuild reposting the very pools the drain is waiting out.
+	 * Leave an active datapath alone.  The same lock makes the detaching
+	 * gate atomic with ice_m_start(), and waits out a stop or rebuild.
+	 * Workers honor the gate until teardown or the failure rollback below.
 	 */
 	mutex_enter(&ice->ice_rebuild_lock);
-	ice->ice_detaching = B_TRUE;
-	mutex_exit(&ice->ice_rebuild_lock);
-
-	/*
-	 * Drain the rx loans before mac_unregister(), per mac_register(9F).
-	 * This is the only step here that can fail, and detach(9E) requires a
-	 * failing detach to leave the instance uncompromised; mac_unregister()
-	 * is irreversible, so everything after it must be no-fail.  detach is
-	 * only entered with no outstanding opens, so ice_m_stop() has already
-	 * stopped the rings and no new loan can appear while this waits.
-	 */
-	if ((ice->ice_attach_progress & ICE_ATTACH_RINGS) != 0 &&
-	    !ice_rx_drain(ice)) {
-		ice_error(ice, "timed out draining rx loans; detach deferred");
-		mutex_enter(&ice->ice_rebuild_lock);
-		ice->ice_detaching = B_FALSE;
-		ice_reset_redispatch(ice);
+	if ((ice->ice_state & ICE_STATE_STARTED) != 0) {
 		mutex_exit(&ice->ice_rebuild_lock);
 		return (DDI_FAILURE);
 	}
+	ice->ice_detaching = B_TRUE;
+	if (!ice_detach_quiesce(ice)) {
+		mutex_exit(&ice->ice_rebuild_lock);
+		goto fail;
+	}
+	mutex_exit(&ice->ice_rebuild_lock);
 
 	/*
-	 * Unregister from MAC: it fails if a client is still bound, in which
-	 * case the driver must remain attached and usable, so roll the flag
-	 * back and requeue any rebuild the gate swallowed while it was set.
-	 * Nothing in the hardware re-delivers that cause.
+	 * All fallible hardware work and the loan/upcall drain precede this
+	 * irreversible step.  Stopped control clients can still refuse it;
+	 * preserve resources and recover any reset-invalidated state then.
 	 */
 	if (ice->ice_attach_progress & ICE_ATTACH_MAC) {
-		if (ice_mac_unregister(ice) != 0) {
-			mutex_enter(&ice->ice_rebuild_lock);
-			ice->ice_detaching = B_FALSE;
-			ice_reset_redispatch(ice);
-			mutex_exit(&ice->ice_rebuild_lock);
-			return (DDI_FAILURE);
-		}
+		if (ice_mac_unregister(ice) != 0)
+			goto fail;
 		ice->ice_attach_progress &= ~ICE_ATTACH_MAC;
 	}
 
@@ -1157,6 +1305,13 @@ ice_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	ice_unconfigure(ice);
 	ddi_soft_state_free(ice_state_p, instance);
 	return (DDI_SUCCESS);
+
+fail:
+	mutex_enter(&ice->ice_rebuild_lock);
+	ice->ice_detaching = B_FALSE;
+	ice_reset_redispatch(ice);
+	mutex_exit(&ice->ice_rebuild_lock);
+	return (DDI_FAILURE);
 }
 
 /*
@@ -1209,7 +1364,7 @@ ice_prepare_for_reset(ice_t *ice)
 	 */
 	if ((ice->ice_state & ICE_STATE_STARTED) != 0) {
 		ice_queues_intr_unmap(ice);
-		ice_queues_disable(ice);
+		(void) ice_queues_disable(ice);
 		ice_tx_quiesce(ice);
 		(void) ice_rx_quiesce(ice);
 	}
@@ -1252,13 +1407,59 @@ ice_prepare_for_reset(ice_t *ice)
 }
 
 /*
+ * Claim the requests this worker will service without erasing a concurrently
+ * latched cause.  The returned mask selects the reset type; requests arriving
+ * after the successful CAS remain owed to the next worker.
+ */
+static uint32_t
+ice_reset_take_requests(ice_t *ice)
+{
+	const uint32_t mask = ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ;
+	uint32_t old, requests;
+
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+
+	do {
+		old = ice->ice_state;
+		requests = old & mask;
+		if (requests == 0)
+			return (0);
+	} while (atomic_cas_32(&ice->ice_state, old,
+	    (old & ~requests) | ICE_STATE_ERROR) != old);
+
+	return (requests);
+}
+
+/*
+ * The completed rebuild can reopen the datapath only when no later reset is
+ * owed.  A CAS keeps a new request's fail-closed state intact if it races the
+ * final transition.  The worker will redispatch that request on exit.
+ */
+static boolean_t
+ice_reset_complete(ice_t *ice)
+{
+	uint32_t old;
+
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+
+	do {
+		old = ice->ice_state;
+		if ((old & (ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ)) != 0)
+			return (B_FALSE);
+	} while (atomic_cas_32(&ice->ice_state, old,
+	    old & ~ICE_STATE_ERROR) != old);
+
+	return (B_TRUE);
+}
+
+/*
  * Reinitialize the function after a reset and restore the datapath.  Modeled
  * on the FreeBSD ice driver's ice_rebuild().  Runs under ice_rebuild_lock.
  * Each failing step jumps to reset_failed, which fails closed until the driver
  * is reloaded.
  */
 static void
-ice_rebuild(ice_t *ice)
+ice_rebuild(ice_t *ice, uint32_t requests)
 {
 	struct ice_hw *hw = &ice->ice_hw;
 	int rc;
@@ -1272,7 +1473,7 @@ ice_rebuild(ice_t *ice)
 	 * and otherwise drives a real PF reset, which is what the fatal-cause
 	 * and test-hook PFR_REQ paths need.
 	 */
-	if ((ice->ice_state & ICE_STATE_RESET_PENDING) != 0)
+	if ((requests & ICE_STATE_RESET_PENDING) != 0)
 		rc = ice_check_reset(hw);
 	else
 		rc = ice_reset(hw, ICE_RESET_PFR);
@@ -1385,20 +1586,10 @@ ice_rebuild(ice_t *ice)
 	ice_loopback_replay(ice);
 
 	/*
-	 * Clear the reset-owed bits before re-enabling the OICR below: the owed
-	 * rebuild has been performed by the steps above, so a link-change cause
-	 * arriving right after the OICR is re-armed must not observe a stale
-	 * RESET_PENDING/PFR_REQ and dispatch a redundant rebuild.  The
-	 * fail-closed bit stays set until the datapath is confirmed restored.
-	 */
-	atomic_and_32(&ice->ice_state,
-	    ~(ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ));
-
-	/*
-	 * Re-route and re-arm the interrupts a reset clears.  Deliberately a
-	 * discard, not a harvest: the owed rebuild has just been performed and
-	 * the reset-owed bits cleared above, so re-latching the causes that
-	 * requested it would dispatch this rebuild again in a loop.
+	 * Re-route and re-arm the interrupts a reset clears.  Discard the
+	 * hardware causes that requested this rebuild; the worker already
+	 * consumed their software request bits.  Leave later software requests
+	 * intact for its next pass.
 	 */
 	ice_intr_oicr_setup(ice, B_FALSE);
 	if (!ice_set_link_events(ice))
@@ -1410,11 +1601,9 @@ ice_rebuild(ice_t *ice)
 	ice_setup_link(ice);
 	ice_phy_caps_update(ice);
 
-	/*
-	 * The rebuild steps succeeded: clear the fail-closed bit before
-	 * restoring the datapath.
-	 */
-	atomic_and_32(&ice->ice_state, ~ICE_STATE_ERROR);
+	/* A later request keeps the datapath closed until its own rebuild. */
+	if (!ice_reset_complete(ice))
+		return;
 
 	if ((ice->ice_state & ICE_STATE_STARTED) != 0 &&
 	    (ice_start_datapath(ice) != 0 || !ice_rx_rings_resume(ice))) {
@@ -1463,11 +1652,10 @@ reset_failed:
 	ice_link_loopback_update(ice, ICE_LB_NONE);
 
 	/*
-	 * Drop the owed-rebuild bits: an early failure leaves them latched, and
-	 * nothing consults them once the terminal bit is set (ice_m_start()
-	 * blocks on ICE_STATE_RESET_FAILED independently), so clearing them
-	 * keeps the terminal state quiescent instead of owing a rebuild that
-	 * ice_reset_task() would only discard.
+	 * Retire any later requests on terminal failure.  They cannot be
+	 * serviced until reload, and ice_m_start() blocks independently on
+	 * ICE_STATE_RESET_FAILED.  Ordinary success leaves later requests
+	 * untouched so the worker can redispatch them.
 	 */
 	atomic_and_32(&ice->ice_state,
 	    ~(ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ));
@@ -1482,32 +1670,31 @@ void
 ice_reset_task(void *arg)
 {
 	ice_t *ice = arg;
+	uint32_t requests;
 
+	/* The queued/running ownership flag stays set while this lock waits. */
+	mutex_enter(&ice->ice_rebuild_lock);
+	/*
+	 * Terminal failure cannot recover without reload.  The attaching and
+	 * detaching gates leave requests owed; the gate-lifting caller
+	 * redispatches them once the instance is usable again.
+	 */
+	if (ice->ice_attaching || ice->ice_detaching ||
+	    (ice->ice_state & ICE_STATE_RESET_FAILED) != 0)
+		goto done;
+
+	requests = ice_reset_take_requests(ice);
+	if (requests != 0) {
+		ice_prepare_for_reset(ice);
+		ice_rebuild(ice, requests);
+	}
+
+done:
 	mutex_enter(&ice->ice_lock);
 	ice->ice_reset_pending = B_FALSE;
 	mutex_exit(&ice->ice_lock);
-
-	/*
-	 * ice_rebuild_lock is the outermost lock and is taken only after
-	 * ice_lock is dropped.
-	 */
-	mutex_enter(&ice->ice_rebuild_lock);
-	/*
-	 * ICE_STATE_RESET_FAILED is terminal: ice_m_start() refuses to plumb
-	 * until the driver is reloaded, so a later rebuild must not bring the
-	 * rings and link back up underneath that refusal.  Testing it here is
-	 * race free because it is only ever set from this lock.  The attaching
-	 * and detaching gates keep the rebuild off a half-built or dying
-	 * instance; both leave any owed RESET_PENDING/PFR_REQ set, and
-	 * ice_reset_redispatch() requeues it when the gate lifts.
-	 */
-	if (ice->ice_attaching || ice->ice_detaching ||
-	    (ice->ice_state & ICE_STATE_RESET_FAILED) != 0) {
-		mutex_exit(&ice->ice_rebuild_lock);
-		return;
-	}
-	ice_prepare_for_reset(ice);
-	ice_rebuild(ice);
+	if (!ice->ice_attaching && !ice->ice_detaching)
+		ice_reset_redispatch(ice);
 	mutex_exit(&ice->ice_rebuild_lock);
 }
 

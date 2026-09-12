@@ -46,13 +46,13 @@ def main() -> None:
     assert "if (!ice_prepare_for_reset" not in task
     assert "ice_prepare_for_reset(ice);" in task
     assert task.index("ice_prepare_for_reset(ice);") < task.index(
-        "ice_rebuild(ice)"
+        "ice_rebuild(ice, requests)"
     )
 
     # The terminal state has exactly one source: the rebuild's hardware and
     # firmware failure label.  (The definition line does not match this form.)
     assert ice.count("ice_reset_set_failed(ice)") == 1
-    rebuild = function(ice, "ice_rebuild(ice_t *ice)\n{", "\nvoid\nice_reset_task")
+    rebuild = function(ice, "ice_rebuild(ice_t *ice, uint32_t requests)\n{", "\nvoid\nice_reset_task")
     assert "ice_reset_set_failed(ice)" in rebuild[rebuild.index("reset_failed:"):]
 
     # Dropping the escalation is only safe because the soft path is already

@@ -82,6 +82,21 @@ CTASSERT(ICE_MAX_MTU + sizeof (struct ether_vlan_header) + ETHERFCSL ==
     ICE_MAX_FRAME_SIZE);
 CTASSERT(ICE_MAX_FRAME_SIZE <= UINT16_MAX);
 
+/*
+ * Every link event the Set Event Mask command (0x0613) defines.  The datasheet
+ * assigns bits 1 through 12 and requires the rest of the mask to be zero, so a
+ * complement taken to build a mask has to be confined to these.
+ */
+#define	ICE_AQ_LINK_EVENT_MASK_DEFINED					\
+	(ICE_AQ_LINK_EVENT_UPDOWN | ICE_AQ_LINK_EVENT_MEDIA_NA |	\
+	ICE_AQ_LINK_EVENT_LINK_FAULT | ICE_AQ_LINK_EVENT_PHY_TEMP_ALARM | \
+	ICE_AQ_LINK_EVENT_EXCESSIVE_ERRORS |				\
+	ICE_AQ_LINK_EVENT_SIGNAL_DETECT | ICE_AQ_LINK_EVENT_AN_COMPLETED | \
+	ICE_AQ_LINK_EVENT_MODULE_QUAL_FAIL |				\
+	ICE_AQ_LINK_EVENT_PORT_TX_SUSPENDED |				\
+	ICE_AQ_LINK_EVENT_TOPO_CONFLICT | ICE_AQ_LINK_EVENT_MEDIA_CONFLICT | \
+	ICE_AQ_LINK_EVENT_PHY_FW_LOAD_FAIL)
+
 /* Standard netlb(4I) modes supported by ice_m_ioctl(). */
 #define	ICE_LB_NONE		0
 #define	ICE_LB_INTERNAL_MAC	1
@@ -98,6 +113,8 @@ CTASSERT(ICE_MAX_FRAME_SIZE <= UINT16_MAX);
 /* The refetched header is the eighth descriptor in each hardware segment. */
 #define	ICE_TX_LSO_SEG_DESCS	7		/* payload descs per segment */
 #define	ICE_TX_LSO_MIN_MSS	64
+/* Datasheet 10.5.8.4.1: TSO header (L2+L3+L4) maximum, in bytes. */
+#define	ICE_TX_LSO_MAX_HDRLEN	512
 #define	ICE_LSO_MAXLEN		(64 * 1024)
 #define	ICE_TX_LSO_BUFSZ	P2ROUNDUP(ICE_MAX_FRAME_SIZE, PAGESIZE)
 /*
@@ -106,8 +123,12 @@ CTASSERT(ICE_MAX_FRAME_SIZE <= UINT16_MAX);
  */
 #define	ICE_TX_COPY_BUFSZ	P2ROUNDUP(ICE_MAX_FRAME_SIZE, PAGESIZE)
 #define	ICE_TX_SMALL_PKT	512		/* small-copy threshold */
+/* GLCOMM_MIN_MAX_PKT.MIHDL reset value; a shorter frame is a TCLAN MDD. */
+#define	ICE_TX_MIN_LEN		17
 
 CTASSERT(sizeof (struct ice_tx_ctx_desc) == sizeof (struct ice_tx_desc));
+/* Runts take the copy path; the pad fits the smallest pool buffer. */
+CTASSERT(ICE_TX_MIN_LEN <= ICE_TX_SMALL_PKT);
 /*
  * ICE_TX_COPY_BUFSZ is page-rounded, so it is >= ICE_MAX_FRAME_SIZE by
  * construction and is not a constant expression a CTASSERT can read.  Assert
@@ -132,6 +153,27 @@ CTASSERT(ICE_TXD_CTX_MAX_MSS <= (ICE_TXD_CTX_QW1_MSS_M >>
 #define	ICE_ITR_INDEX_NONE	3		/* "do not update the ITR" */
 #define	ICE_ITR_DEFAULT_US	50		/* rx interrupt throttle */
 #define	ICE_Q_ENA_MAX_WAIT	50		/* QENA_STAT poll, 20us each */
+
+/*
+ * Frames consumed per rx ring per interrupt invocation before the drain
+ * yields the ring lock and interrupt context.  Residue is serviced by an
+ * ITR-paced software interrupt (ice_intr.c); the values match i40e's
+ * rx_limit_per_intr property.
+ */
+#define	ICE_DEF_RX_LIMIT_PER_INTR	256
+#define	ICE_MIN_RX_LIMIT_PER_INTR	16
+#define	ICE_MAX_RX_LIMIT_PER_INTR	4096
+
+/*
+ * The standard vector re-arm word: enable, clear the pending bit, and leave
+ * the programmed ITR intervals alone (a real ITR index in this write would
+ * reload that slot's interval from the write's zero interval field).  One
+ * definition so every re-arm site stays in lockstep.
+ */
+#define	ICE_GLINT_DYN_CTL_REARM						\
+	(GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |		\
+	((ICE_ITR_INDEX_NONE << GLINT_DYN_CTL_ITR_INDX_S) &		\
+	GLINT_DYN_CTL_ITR_INDX_M))
 
 typedef enum ice_state {
 	ICE_STATE_ATTACHED	= 1 << 0,
@@ -263,6 +305,12 @@ typedef struct ice_tx_ring {
 	uint32_t		itxr_index;	/* absolute HW tx queue index */
 	uint32_t		itxr_vec;	/* MSI-X vector index */
 	uint32_t		itxr_q_teid;	/* core: from ice_ena_vsi_txq */
+	/*
+	 * Set before the Add Tx Queues command and cleared only by a confirmed
+	 * disable, so a queue the command enabled before a later step of
+	 * ice_ena_vsi_txq() failed is still treated as live.
+	 */
+	boolean_t		itxr_programmed;
 
 	kmutex_t		itxr_lock;
 	kcondvar_t		itxr_cv;	/* stop waits for tx drain */
@@ -278,6 +326,10 @@ typedef struct ice_tx_ring {
 	uint16_t		itxr_avail;
 	uint16_t		itxr_head;
 	uint16_t		itxr_tail;
+	/* Slot of each in-flight packet's RS descriptor, in transmit order. */
+	uint16_t		*itxr_rsq;	/* [itxr_size] */
+	uint16_t		itxr_rs_pidx;
+	uint16_t		itxr_rs_cidx;
 
 	ice_tx_ctrl_block_t	*itxr_tcb_area;	/* [itxr_size] backing */
 	ice_tx_ctrl_block_t	**itxr_tcbs;	/* [itxr_size], by slot */
@@ -314,6 +366,7 @@ typedef struct ice_rxq_stat {
 	kstat_named_t		icrxs_desc_error;
 	kstat_named_t		icrxs_copy_nomem;
 	kstat_named_t		icrxs_no_rcb;
+	kstat_named_t		icrxs_intr_limit;
 } ice_rxq_stat_t;
 
 typedef struct ice_rx_ring {
@@ -323,9 +376,11 @@ typedef struct ice_rx_ring {
 	boolean_t		irxr_shutdown;
 	boolean_t		irxr_started;	/* irxr_lock */
 	boolean_t		irxr_intr_poll;	/* mac is polling this ring */
+	boolean_t		irxr_intr_busy;	/* ISR is in mac_rx_ring */
 
 	kmutex_t		irxr_lock;
 	kcondvar_t		irxr_cv;	/* teardown waits on loans */
+	kcondvar_t		irxr_intr_cv;	/* stop waits on the ISR */
 	mac_ring_handle_t	irxr_macrxring;
 	uint64_t		irxr_rxgen;
 
@@ -416,6 +471,9 @@ typedef struct ice {
 	list_node_t		ice_glink;
 
 	int			ice_fm_caps;
+	/* Error-only atomic accounting protects detach's MMIO polling proof. */
+	uint32_t		ice_acc_errors;
+	uint32_t		ice_acc_clears;
 
 	/*
 	 * Intel common code, embedded inline.  ice_hw.back points at
@@ -445,8 +503,10 @@ typedef struct ice {
 	 * thread context and is the outermost driver lock: it serializes a
 	 * rebuild against a mac start/stop.  The rebuild runs on its own
 	 * single-thread taskq so it never starves the OICR worker's ARQ drain;
-	 * ice_reset_pending coalesces dispatches under ice_lock, mirroring
-	 * ice_oicr_pending.  ice_attaching and ice_detaching turn a queued
+	 * ice_reset_pending coalesces queued, waiting, and running work under
+	 * ice_lock.  The worker atomically consumes its reset request bits,
+	 * leaving later requests owed to its next pass.  ice_attaching and
+	 * ice_detaching turn a queued
 	 * rebuild into a no-op while the instance is not fully constructed:
 	 * the rebuild frees and reinitializes scheduler and control-queue
 	 * state that the attach thread is still building on, and it reports
@@ -463,8 +523,9 @@ typedef struct ice {
 	/*
 	 * Link-state cache.  The authoritative state lives in
 	 * ice_hw.port_info->phy.link_info, refreshed by the common code; these
-	 * are the decoded values MAC will consume once mac_register lands.
-	 * Guarded by ice_lse_lock.
+	 * are the decoded carrier values, including the loopback override.
+	 * MAC publication and MAC_PROP_STATUS apply the operational failure
+	 * state separately.  Guarded by ice_lse_lock.
 	 */
 	kmutex_t		ice_lse_lock;
 	kcondvar_t		ice_lse_cv;
@@ -496,6 +557,7 @@ typedef struct ice {
 
 	uint32_t		ice_tx_ring_size;
 	uint32_t		ice_rx_ring_size;
+	uint32_t		ice_rx_limit_per_intr;
 
 	/* Shared TX copy-buffer pools. */
 	kmutex_t		ice_buf_lock;
@@ -542,10 +604,13 @@ typedef struct ice {
  */
 /*PRINTFLIKE2*/
 extern void ice_error(ice_t *, const char *, ...);
-extern int ice_check_acc_handle(ddi_acc_handle_t);
+extern int ice_check_acc_handle(ice_t *, ddi_acc_handle_t);
+extern int ice_status_to_errno(ice_t *, int);
 extern void ice_update_mtu(ice_t *);
 extern int ice_queues_program(ice_t *);
-extern void ice_queues_disable(ice_t *);
+extern boolean_t ice_queues_disable(ice_t *);
+extern void ice_queues_intr_map(ice_t *);
+extern void ice_queues_intr_dissociate(ice_t *);
 extern void ice_reset_task(void *);
 extern void ice_reset_redispatch(ice_t *);
 #ifdef DEBUG
@@ -573,6 +638,9 @@ extern void ice_link_report(ice_t *, link_state_t);
 /*
  * ice_vsi.c
  */
+struct ice_fltr_list_entry;
+extern void ice_fltr_entry_init(struct ice_fltr_list_entry *, uint16_t,
+    const uint8_t *);
 extern boolean_t ice_vsi_init(ice_t *);
 extern void ice_vsi_fini(ice_t *);
 extern int ice_vsi_rebuild(ice_t *);
@@ -609,7 +677,7 @@ extern void ice_buf_fini(ice_t *);
 extern boolean_t ice_tx_rings_alloc(ice_t *);
 extern void ice_tx_rings_free(ice_t *);
 extern int ice_tx_ring_program(ice_t *, ice_tx_ring_t *);
-extern void ice_tx_ring_unprogram(ice_t *, ice_tx_ring_t *);
+extern int ice_tx_ring_unprogram(ice_t *, ice_tx_ring_t *);
 extern void ice_map_txq_vector(ice_t *, ice_tx_ring_t *);
 
 /*
@@ -618,7 +686,7 @@ extern void ice_map_txq_vector(ice_t *, ice_tx_ring_t *);
 extern boolean_t ice_rx_rings_alloc(ice_t *);
 extern void ice_rx_rings_free(ice_t *);
 extern int ice_rx_ring_program(ice_t *, ice_rx_ring_t *);
-extern void ice_rx_ring_unprogram(ice_t *, ice_rx_ring_t *);
+extern int ice_rx_ring_unprogram(ice_t *, ice_rx_ring_t *);
 extern void ice_map_rxq_vector(ice_t *, ice_rx_ring_t *);
 extern void ice_cfg_itr(ice_t *, uint32_t);
 
@@ -641,9 +709,8 @@ extern boolean_t ice_rx_start(ice_t *);
 extern boolean_t ice_rx_quiesce(ice_t *);
 extern void ice_rx_reclaim(ice_t *);
 extern boolean_t ice_rx_stop(ice_t *);
-extern boolean_t ice_rx_drain(ice_t *);
 extern boolean_t ice_rx_rings_resume(ice_t *);
-extern void ice_rx_ring_intr(ice_rx_ring_t *);
+extern boolean_t ice_rx_ring_intr(ice_rx_ring_t *);
 extern mblk_t *ice_ring_rx_poll(void *, int);
 extern int ice_ring_rx_start(mac_ring_driver_t, uint64_t);
 extern void ice_ring_rx_stop(mac_ring_driver_t);
@@ -657,6 +724,7 @@ extern int ice_ring_rx_intr_disable(mac_intr_handle_t);
 extern boolean_t ice_mac_register(ice_t *);
 extern int ice_mac_unregister(ice_t *);
 extern void ice_link_state_publish(ice_t *);
+extern link_state_t ice_link_state_effective(ice_t *, link_state_t);
 extern int ice_start_datapath(ice_t *);
 extern int ice_promisc_apply(ice_t *, boolean_t);
 

@@ -178,7 +178,7 @@ def main() -> None:
         "\nstatic int\nice_detach",
     )
     rebuild_fn = function(
-        ice_c, "ice_rebuild(ice_t *ice)\n{", "\nvoid\nice_reset_task")
+        ice_c, "ice_rebuild(ice_t *ice, uint32_t requests)\n{", "\nvoid\nice_reset_task")
     assert "ice_intr_oicr_setup(ice, B_TRUE)" in attach_fn
     assert "ice_intr_oicr_setup(ice, B_FALSE)" in rebuild_fn
 

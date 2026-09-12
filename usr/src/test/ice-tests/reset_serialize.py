@@ -60,11 +60,33 @@ def main() -> None:
     assert "mutex_exit(&ice->ice_rebuild_lock)" in promisc
 
     # ice_promisc_apply must NOT take the lock: ice_vsi_rebuild calls it while
-    # already holding ice_rebuild_lock.
+    # already holding ice_rebuild_lock.  It asserts the lock instead, and owns
+    # ice_promisc_on as the accepted policy used by the rebuild.
     apply = function(
         gld, "ice_promisc_apply(ice_t *ice, boolean_t on)\n{", "\nstatic int\nice_m_promisc"
     )
-    assert "ice_rebuild_lock" not in apply
+    assert "mutex_enter(&ice->ice_rebuild_lock)" not in apply
+    assert "mutex_exit(&ice->ice_rebuild_lock)" not in apply
+    assert "ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));" in apply
+    assert "ice->ice_promisc_on = prev;" in apply
+    assert "ice_gld_filter_recover(ice);" in apply
+
+    # A failed enable rolls the same mask back so a retry is not rejected with
+    # ICE_ERR_ALREADY_EXISTS, and the errno is decoded before the rollback
+    # overwrites sq_last_status.
+    assert apply.count("ice_clear_vsi_promisc(hw, vsi->vi_handle, mask, 0)") == 2
+    assert apply.index("ret = ice_status_to_errno(ice, status);") < apply.index(
+        "rollback = ice_clear_vsi_promisc("
+    )
+
+    setmac_locked = function(
+        gld,
+        "ice_gld_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)\n{",
+        "\n/*\n * ice_rebuild_lock is the outermost",
+    )
+    assert setmac_locked.index("int error = ice_status_to_errno(ice, status);") < (
+        setmac_locked.index("ice_gld_filter_recover(ice);"))
+    assert "return (error);" in setmac_locked
 
     lbset = function(
         gld,
@@ -131,7 +153,7 @@ def main() -> None:
     # lock, which would invert the documented order.
     attach_src = ATTACH_SOURCE.read_text(encoding="utf-8")
     assert "ice_stat_lock" not in function(
-        attach_src, "ice_rebuild(ice_t *ice)\n{", "\nvoid\nice_reset_task"
+        attach_src, "ice_rebuild(ice_t *ice, uint32_t requests)\n{", "\nvoid\nice_reset_task"
     )
 
     # The MAC handle is cleared under ice_lse_lock so a concurrent async link
@@ -144,16 +166,18 @@ def main() -> None:
 
     attach = ATTACH_SOURCE.read_text(encoding="utf-8")
 
-    # The taskq worker consumes the coalesced request, no-ops while detaching,
-    # and takes the rebuild lock only after dropping ice_lock (outermost rule).
+    # The worker claims requests under the lifecycle lock and retains its
+    # dispatch ownership until the rebuild finishes. reset_requests.py executes
+    # the claim, redispatch, and request-during-rebuild interleavings.
     task = function(attach, "ice_reset_task(void *arg)\n{", "\n#ifdef DEBUG")
     assert "ice->ice_attaching" in task
     assert "ice->ice_detaching" in task
     assert "ice_prepare_for_reset(ice)" in task
-    assert "ice_rebuild(ice)" in task
-    assert task.index("mutex_exit(&ice->ice_lock)") < task.index(
-        "mutex_enter(&ice->ice_rebuild_lock)"
-    )
+    assert "ice_rebuild(ice, requests)" in task
+    assert task.index("mutex_enter(&ice->ice_rebuild_lock)") < task.index(
+        "ice_reset_take_requests(ice)")
+    assert task.index("ice_rebuild(ice, requests)") < task.index(
+        "ice->ice_reset_pending = B_FALSE")
     # The prepare cannot fail, so the worker always proceeds into the rebuild.
     # An undrained rx loan is handled where it is recoverable -- ice_rx_start()
     # refuses the surviving pool and the rebuild fails soft -- not by taking the
@@ -161,7 +185,7 @@ def main() -> None:
     assert "if (!ice_prepare_for_reset(ice))" not in task
     assert "ice_reset_set_failed" not in task
     assert task.index("ice_prepare_for_reset(ice);") < task.index(
-        "ice_rebuild(ice)"
+        "ice_rebuild(ice, requests)"
     )
     # The terminal state has exactly one source: the rebuild's hardware and
     # firmware failure label.
@@ -169,7 +193,7 @@ def main() -> None:
 
     # The rebuild never tears the common code down, so ICE_ATTACH_HW_INIT stays
     # set for the life of the instance and detach owns the single teardown.
-    rebuild = function(attach, "ice_rebuild(ice_t *ice)\n{", "\nvoid\nice_reset_task")
+    rebuild = function(attach, "ice_rebuild(ice_t *ice, uint32_t requests)\n{", "\nvoid\nice_reset_task")
     assert "ICE_ATTACH_HW_INIT" not in rebuild
     unconf_hw = function(
         attach,
@@ -240,25 +264,17 @@ def main() -> None:
     )
     assert "ice->ice_detaching = B_FALSE" in detach
 
-    # The rx drain lives INSIDE the detaching handshake.  Outside it, a rebuild
-    # in ice_rx_rings_resume() reallocates and reposts the pools ring by ring
-    # while the detach thread walks the same rings holding only irxr_lock.
-    # It precedes mac_unregister per mac_register(9F): it is the only fallible
-    # step, and detach(9E) forbids failing after an irreversible one.
+    # Both the bounded RX fence and fallible hardware isolation precede
+    # unregister.  detach_quiesce.py executes the failure/rollback paths.
     assert detach.index("ice_detaching = B_TRUE") < detach.index(
-        "ice_rx_drain(ice)"
-    )
-    assert detach.index("ice_rx_drain(ice)") < detach.index(
-        "ice_mac_unregister(ice)"
-    )
-    assert detach.index("ice_rx_drain(ice)") < detach.index(
-        "ice_unconfigure(ice)"
-    )
+        "ice_detach_quiesce(ice)")
+    assert detach.index("ice_detach_quiesce(ice)") < detach.index(
+        "ice_mac_unregister(ice)")
+    assert "ice->ice_detaching ||" in start
 
     # Every gate lift requeues an owed rebuild.  The GRST and fatal-cause
-    # latches are one-shot and there is no watchdog or periodic anywhere in the
-    # driver, so a rebuild the gate discarded is never re-delivered: without
-    # this, ice_m_start() returns EIO for the life of the module.
+    # latches are one-shot; persistent requests preserve the work. Gate lifts
+    # redispatch promptly and the admin periodic retries failed dispatches.
     redispatch = function(
         attach,
         "ice_reset_redispatch(ice_t *ice)\n{",
@@ -288,9 +304,8 @@ def main() -> None:
             assert "ice_reset_redispatch(ice)" in attach[offset:end], flag
             lifts += 1
             offset += 1
-    # Three: the end of attach, and the two fallible detach steps that precede
-    # mac_unregister (rx drain timeout, unregister failure).
-    assert lifts == 3
+    # The end of attach, and the shared rollback for every detach failure.
+    assert lifts == 2
 
     # Attach arms the interrupts last, as FreeBSD's ice_if_attach_post does:
     # after every step that builds the state a rebuild would free, and still
@@ -309,19 +324,17 @@ def main() -> None:
     assert attach_fn.index("ice_set_link_events(ice)") < attach_fn.index(
         "ice_setup_link(ice)"
     )
-    # The link resync is the LAST thing attach does.  Hardware evidence
-    # (boston/hunter, E810-C, 2026-07-18): ice_setup_link() enables the PHY
-    # early and a 10G DAC negotiates inside the ~180ms the rest of attach
-    # takes, so the up event lands while the OICR is still masked or the
-    # attaching gate is still dropping work -- and ice_intr_oicr_setup()
-    # read-clears PFINT_OICR, stranding the ARQ message with no interrupt
-    # pending.  Nothing re-reads it, so the port stayed down forever.  The
-    # poll must follow the gate lift AND mac_register() to be publishable.
+    # Final carrier resync follows registration and interrupt setup, under
+    # the lifecycle lock and before lifting the attach gate.  This prevents
+    # querying or publishing across a concurrent start or reset rebuild.
     resync = attach_fn.rindex("ice_link_status_update(ice)")
     assert enable < resync
     assert attach_fn.index("ice_mac_register(ice)") < resync
-    assert attach_fn.index("ice->ice_attaching = B_FALSE") < resync
-    assert resync < attach_fn.index("ICE_STATE_ATTACHED")
+    clear = attach_fn.index("ice->ice_attaching = B_FALSE")
+    assert resync < clear < attach_fn.index("ICE_STATE_ATTACHED")
+    locked = attach_fn.rindex("mutex_enter(&ice->ice_rebuild_lock)", 0, clear)
+    unlocked = attach_fn.index("mutex_exit(&ice->ice_rebuild_lock)", clear)
+    assert locked < resync < clear < unlocked
 
     # Defense in depth for a cause latched before the enable: the attaching
     # gate is set before the reset taskq exists and cleared under the rebuild
@@ -422,11 +435,10 @@ def main() -> None:
         "ice_reset_dispatch(ice)"
     )
 
-    # The terminal state is quiescent: an early rebuild failure never reaches
-    # the clear at the end of the success path, so reset_failed drops the owed
-    # bits itself rather than leaving a rebuild permanently owed.
+    # The terminal state retires any later requests because they cannot be
+    # serviced until reload. Successful rebuilds preserve those requests.
     rebuild = function(
-        attach, "ice_rebuild(ice_t *ice)\n{", "\n/*\n * Reset taskq worker:"
+        attach, "ice_rebuild(ice_t *ice, uint32_t requests)\n{", "\n/*\n * Reset taskq worker:"
     )
     failed = rebuild[rebuild.index("\nreset_failed:"):]
     assert "~(ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ)" in failed
