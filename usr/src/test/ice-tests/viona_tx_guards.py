@@ -31,12 +31,15 @@ def main() -> None:
     gate = function(offloads, "if ((link->l_features & dev_feature) == 0 ||",
                     "lso_info_set(mp, gso_size, HW_LSO);")
     assert "meoi->meoi_l4proto != IPPROTO_TCP" in gate
-    assert "full_hdr_sz > MBLKL(mp)" in gate
-    assert "hdr->vrh_csum_offset !=\n\t\t    tcp_csum_off" in gate
+    assert "tcp_csum_end > MBLKL(mp)" in gate
+    assert "hdr->vrh_csum_start != l4_off" in gate
+    assert "hdr->vrh_csum_offset != TCP_CHECKSUM_OFFSET" in gate
+    assert "gso_size == 0" in gate
+    assert "l4_off + meoi->meoi_l4hlen + gso_size > seg_max" in gate
     assert "VIONA_RING_STAT_INCR(ring, tx_gso_fail);" in gate
     assert "return (B_FALSE);" in gate
     # The raw-pointer seed still follows the gate, not the other way round.
-    assert offloads.index("full_hdr_sz > MBLKL(mp)") < \
+    assert offloads.index("tcp_csum_end > MBLKL(mp)") < \
         offloads.index("TCP_CHECKSUM_OFFSET);")
 
     # Over-MTU frames reach mac_tx only as an accepted LSO request.
