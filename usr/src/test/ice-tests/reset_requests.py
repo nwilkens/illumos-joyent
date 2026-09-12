@@ -2,14 +2,10 @@
 """Execute ICE reset dispatch and rebuilding with controlled interleavings."""
 
 import argparse
-import os
 from pathlib import Path
 import re
-import shlex
-import subprocess
-import tempfile
 
-from terminal_filters import DRIVER, TESTDIR, extract
+from c_test import DRIVER, TESTDIR, extract, run_c
 
 
 def main():
@@ -32,16 +28,10 @@ def main():
             raise ValueError(f"missing reset function {name}")
         fragments.append(extract(source,
             rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}", args.source))
-    with tempfile.TemporaryDirectory(prefix="ice-reset-requests-") as tmp:
-        work = Path(tmp)
-        (work / "ice_reset_types.h").write_text(types)
-        (work / "ice_reset_body.h").write_text("\n".join(fragments))
-        binary = work / "reset_requests"
-        subprocess.run(shlex.split(os.environ.get("CC", "cc")) + [
-            "-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic",
-            "-Wno-unused-function", "-I", str(work),
-            str(TESTDIR / "reset_requests.c"), "-o", str(binary)], check=True)
-        subprocess.run([str(binary)], check=True)
+    run_c(TESTDIR / "reset_requests.c", {
+        "ice_reset_types.h": types,
+        "ice_reset_body.h": "\n".join(fragments),
+    }, cflags=("-Wno-unused-function",))
 
 
 if __name__ == "__main__":

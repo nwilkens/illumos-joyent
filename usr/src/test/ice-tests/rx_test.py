@@ -2,30 +2,17 @@
 """Compile selected production RX functions against controlled DDI/STREAMS."""
 
 import argparse
-import json
-import os
 from pathlib import Path
 import re
-import shlex
-import subprocess
-import tempfile
 
-TESTDIR = Path(__file__).resolve().parent
-DRIVER = TESTDIR.parents[3] / "usr/src/uts/common/io/ice"
+from c_test import DRIVER, TESTDIR, extract, run_c
+
 FUNCTIONS = (
     "ice_rx_alloc_mp", "ice_rcb_alloc", "ice_rcb_free", "ice_rx_recycle",
     "ice_rx_reset_desc", "ice_rx_alloc_rcbs", "ice_rx_free_rcbs",
     "ice_rx_next", "ice_rx_copy", "ice_rx_bind", "ice_rx_discard_frame",
     "ice_rx_vlan_insert", "ice_rx_desc_sync", "ice_ring_rx_frame",
 )
-
-
-def extract(source, pattern, path):
-    match = re.search(pattern, source, re.MULTILINE)
-    if match is None:
-        raise ValueError(f"cannot extract {pattern!r} from {path}")
-    line = source.count("\n", 0, match.start()) + 1
-    return f"#line {line} {json.dumps(str(path))}\n{match.group()}\n"
 
 
 def run(test, functions=FUNCTIONS, optional=("ice_rx_desc_sync",)):
@@ -49,12 +36,5 @@ def run(test, functions=FUNCTIONS, optional=("ice_rx_desc_sync",)):
         parts.append(extract(source,
                              rf"^(?:static )?(?:inline )?[\w *]+\n{name}\([\s\S]*?^}}",
                              args.source))
-    with tempfile.TemporaryDirectory(prefix="ice-rx-test-") as tmp:
-        work = Path(tmp)
-        (work / "rx_functions.h").write_text("\n".join(parts))
-        binary = work / test
-        compiler = shlex.split(os.environ.get("CC", "cc"))
-        subprocess.run(compiler + ["-std=c99", "-Wall", "-Wextra", "-Werror",
-                       "-Wno-unused-function", "-pedantic", "-I", str(work),
-                       str(TESTDIR / f"{test}.c"), "-o", str(binary)], check=True)
-        subprocess.run([str(binary)], check=True)
+    run_c(TESTDIR / f"{test}.c", {"rx_functions.h": "\n".join(parts)},
+          cflags=("-Wno-unused-function",))

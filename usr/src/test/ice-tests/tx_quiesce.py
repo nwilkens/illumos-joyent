@@ -2,13 +2,9 @@
 """Exercise the real ICE TX notification fence with pthread handshakes."""
 
 import argparse
-import os
 from pathlib import Path
-import shlex
-import subprocess
-import tempfile
 
-from terminal_filters import DRIVER, TESTDIR, extract
+from c_test import DRIVER, TESTDIR, extract, run_c
 
 
 def main():
@@ -23,16 +19,9 @@ def main():
     for name in ("ice_tx_recycle", "ice_tx_quiesce", "ice_tx_ring_intr"):
         fragments.append(extract(source,
             rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}", args.source))
-    with tempfile.TemporaryDirectory(prefix="ice-tx-quiesce-") as tmp:
-        work = Path(tmp)
-        (work / "ice_tx_quiesce_body.h").write_text("\n".join(fragments))
-        binary = work / "tx_quiesce"
-        subprocess.run(shlex.split(os.environ.get("CC", "cc")) + [
-            "-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic",
-            "-pthread", "-I", str(work), str(TESTDIR / "tx_quiesce.c"),
-            "-o", str(binary)], check=True)
-        command = [str(binary)] + ([args.case] if args.case else [])
-        subprocess.run(command, check=True, timeout=15)
+    run_c(TESTDIR / "tx_quiesce.c",
+          {"ice_tx_quiesce_body.h": "\n".join(fragments)},
+          cflags=("-pthread",), cases=((args.case,) if args.case else (),))
 
 
 if __name__ == "__main__":

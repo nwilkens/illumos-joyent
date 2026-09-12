@@ -3,18 +3,9 @@
 """Compile and exercise the actual ICE transmit bind-versus-copy decisions."""
 
 import argparse
-import os
 from pathlib import Path
-import shlex
-import subprocess
-import tempfile
 
-from terminal_filters import extract
-
-
-TESTDIR = Path(__file__).resolve().parent
-REPO = TESTDIR.parents[3]
-DRIVER = REPO / "usr/src/uts/common/io/ice"
+from c_test import DRIVER, TESTDIR, extract, run_c
 
 
 def main() -> None:
@@ -42,18 +33,10 @@ def main() -> None:
                               rf"^static [\w *]+\n{name}\([\s\S]*?^}}",
                               args.source))
 
-    with tempfile.TemporaryDirectory(prefix="ice-tx-bind-") as tmp:
-        work = Path(tmp)
-        (work / "ice_tx_types.h").write_text("\n".join(fragments), encoding="utf-8")
-        (work / "ice_tx_build.h").write_text("\n".join(bodies), encoding="utf-8")
-        binary = work / "tx_bind_threshold"
-        compiler = shlex.split(os.environ.get("CC", "cc"))
-        subprocess.run(compiler + [
-            "-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic",
-            "-I", str(work), str(TESTDIR / "tx_bind_threshold.c"),
-            "-o", str(binary),
-        ], check=True)
-        subprocess.run([str(binary)], check=True)
+    run_c(TESTDIR / "tx_bind_threshold.c", {
+        "ice_tx_types.h": "\n".join(fragments),
+        "ice_tx_build.h": "\n".join(bodies),
+    })
 
 
 if __name__ == "__main__":

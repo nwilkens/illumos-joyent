@@ -3,13 +3,9 @@
 
 import argparse
 from pathlib import Path
-import os
 import re
-import shlex
-import subprocess
-import tempfile
 
-from terminal_filters import DRIVER, TESTDIR, extract
+from c_test import DRIVER, TESTDIR, extract, run_c
 
 
 def main():
@@ -37,16 +33,10 @@ def main():
             rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}", args.source))
     fragments.append(extract(args.gld_source.read_text(),
         r"^static int\nice_m_start\([\s\S]*?^}", args.gld_source))
-    with tempfile.TemporaryDirectory(prefix="ice-detach-") as tmp:
-        work = Path(tmp)
-        (work / "ice_detach_body.h").write_text("\n".join(fragments))
-        binary = work / "detach_quiesce"
-        subprocess.run(shlex.split(os.environ.get("CC", "cc")) + [
-            "-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic",
-            # Some stubs are needed only by the old implementation.
-            "-Wno-unused-function", "-I", str(work),
-            str(TESTDIR / "detach_quiesce.c"), "-o", str(binary)], check=True)
-        subprocess.run([str(binary)], check=True)
+    # Some stubs are needed only by the old implementation.
+    run_c(TESTDIR / "detach_quiesce.c",
+          {"ice_detach_body.h": "\n".join(fragments)},
+          cflags=("-Wno-unused-function",))
 
 
 if __name__ == "__main__":

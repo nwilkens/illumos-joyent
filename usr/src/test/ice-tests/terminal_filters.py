@@ -3,18 +3,12 @@
 """Compile and exercise the real ICE filter callbacks with a stub admin queue."""
 
 import argparse
-import json
-import os
 from pathlib import Path
 import re
-import shlex
-import subprocess
-import tempfile
+
+from c_test import DRIVER, TESTDIR, extract, run_c
 
 
-TESTDIR = Path(__file__).resolve().parent
-REPO = TESTDIR.parents[3]
-DRIVER = REPO / "usr/src/uts/common/io/ice"
 FUNCTIONS = (
     "ice_gld_find_mac",
     "ice_gld_set_mac_locked",
@@ -25,14 +19,6 @@ FUNCTIONS = (
     "ice_m_promisc",
     "ice_m_multicst",
 )
-
-
-def extract(source: str, pattern: str, path: Path) -> str:
-    match = re.search(pattern, source, re.MULTILINE)
-    if match is None:
-        raise ValueError(f"cannot extract {pattern!r} from {path}")
-    line = source.count("\n", 0, match.start()) + 1
-    return f"#line {line} {json.dumps(str(path))}\n{match.group()}\n"
 
 
 def callback_fragments(gld_source: Path, vsi_source: Path) -> list[str]:
@@ -67,18 +53,9 @@ def main() -> None:
     args = parser.parse_args()
     fragments = callback_fragments(args.source, args.vsi_source)
 
-    with tempfile.TemporaryDirectory(prefix="ice-terminal-filters-") as tmp:
-        work = Path(tmp)
-        (work / "ice_filter_callbacks.h").write_text(
-            "\n".join(fragments), encoding="utf-8")
-        binary = work / "terminal_filters"
-        compiler = shlex.split(os.environ.get("CC", "cc"))
-        subprocess.run(compiler + [
-            "-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic", "-Wno-unused-function",
-            "-I", str(work), str(TESTDIR / "terminal_filters.c"),
-            "-o", str(binary),
-        ], check=True)
-        subprocess.run([str(binary)], check=True)
+    run_c(TESTDIR / "terminal_filters.c",
+          {"ice_filter_callbacks.h": "\n".join(fragments)},
+          cflags=("-Wno-unused-function",))
 
 
 if __name__ == "__main__":

@@ -2,14 +2,10 @@
 """Execute ICE carrier updates, operational publication, and MAC startup."""
 
 import argparse
-import os
 from pathlib import Path
 import re
-import shlex
-import subprocess
-import tempfile
 
-from terminal_filters import DRIVER, TESTDIR, extract
+from c_test import DRIVER, TESTDIR, extract, run_c
 
 
 def main():
@@ -39,16 +35,10 @@ def main():
     for name in ("ice_m_start", "ice_m_getprop"):
         bodies.append(extract(args.gld_source.read_text(),
             rf"^static int\n{name}\([\s\S]*?^}}", args.gld_source))
-    with tempfile.TemporaryDirectory(prefix="ice-link-operational-") as tmp:
-        work = Path(tmp)
-        (work / "ice_link_types.h").write_text("\n".join(types))
-        (work / "ice_link_body.h").write_text("\n".join(bodies))
-        binary = work / "link_operational"
-        subprocess.run(shlex.split(os.environ.get("CC", "cc")) + [
-            "-std=c99", "-Wall", "-Wextra", "-Werror", "-pedantic",
-            "-I", str(work), str(TESTDIR / "link_operational.c"),
-            "-o", str(binary)], check=True)
-        subprocess.run([str(binary)], check=True)
+    run_c(TESTDIR / "link_operational.c", {
+        "ice_link_types.h": "\n".join(types),
+        "ice_link_body.h": "\n".join(bodies),
+    })
 
 
 if __name__ == "__main__":

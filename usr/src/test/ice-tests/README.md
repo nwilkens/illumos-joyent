@@ -5,6 +5,15 @@ architecture, performance, and test issues, their priorities, and acceptance
 criteria. The driver [lifecycle contract](../../uts/common/io/ice/LIFECYCLE.md)
 records the lock, callback, DMA, and recovery boundaries exercised here.
 
+## Portable suite
+
+Run `python3 -B usr/src/test/ice-tests/run_tests.py` from the repository root
+with Python 3.9+ and a C99 compiler. The explicit suite runs source checks and
+actual-C regressions, excluding support modules. Use `--list` to see its
+manifest, or pass script names to select checks. See
+[REGRESSIONS.md](REGRESSIONS.md) for runner failure/timeout behavior,
+reproducible negative controls, and the pending hardware acceptance matrix.
+
 ## Filter callback and recovery regression
 
 ```
@@ -165,40 +174,9 @@ a module build does not validate the reviewed runtime failure paths.
 
 ## Running the source checks
 
-These tests cover safety properties that can regress without requiring an
-E810 device. Run them from anywhere in the source tree with:
-
-```
-python3 usr/src/test/ice-tests/rx_checksum.py
-python3 usr/src/test/ice-tests/jumbo_rx.py
-python3 usr/src/test/ice-tests/admin_interrupt.py
-python3 usr/src/test/ice-tests/link_state.py
-python3 usr/src/test/ice-tests/fma_dma.py
-python3 usr/src/test/ice-tests/dma_lifetime.py
-python3 usr/src/test/ice-tests/mac_filter.py
-python3 usr/src/test/ice-tests/vsi_tx_vlan.py
-python3 usr/src/test/ice-tests/loopback.py
-python3 usr/src/test/ice-tests/hw_stats.py
-python3 usr/src/test/ice-tests/link_speed_caps.py
-python3 usr/src/test/ice-tests/lso.py
-python3 usr/src/test/ice-tests/rss.py
-python3 usr/src/test/ice-tests/reset_oicr.py
-python3 usr/src/test/ice-tests/reset_rebuild.py
-python3 usr/src/test/ice-tests/reset_serialize.py
-python3 usr/src/test/ice-tests/tx_bind_threshold.py
-python3 usr/src/test/ice-tests/tx_blocked.py
-python3 usr/src/test/ice-tests/tx_doorbell.py
-python3 usr/src/test/ice-tests/vlan_rx.py
-python3 usr/src/test/ice-tests/rx_layout.py
-python3 usr/src/test/ice-tests/rx_dma_faults.py
-python3 usr/src/test/ice-tests/pool_locks.py
-python3 usr/src/test/ice-tests/jumbo_copy.py
-python3 usr/src/test/ice-tests/loan_wait.py
-python3 usr/src/test/ice-tests/safe_mode.py
-python3 usr/src/test/ice-tests/stale_comments.py
-python3 usr/src/test/ice-tests/rx_intr_limit.py
-python3 usr/src/test/ice-tests/rx_intr_rearm.py
-```
+The suite above includes all source checks. Individual scripts remain
+runnable, for example `python3 -B usr/src/test/ice-tests/rx_checksum.py`.
+The following descriptions identify what each source check establishes.
 
 `rx_checksum.py` verifies that receive checksum metadata is captured before
 the descriptor is reposted and that all hardware-reported L3/L4 checksum error
@@ -411,5 +389,9 @@ and after traffic; small and near-MTU ICMP reach the peer; a four-stream
 `iperf` run moves traffic and advances the PF byte counters; MAC and CRC error
 counters stay zero; and three plumb/unplumb cycles each bring the link back
 with FMA still clean. Exit status is zero only if every check passes. Run it
-from both hosts to cover both traffic directions. Validated on boston<->hunter
-at MTU 1500 (9.36 Gbps) and 9000 (9.59 Gbps), all checks green.
+from both hosts to cover both traffic directions.
+
+Historical validation recorded in commit `60beba06389` (2026-07-18) reported
+boston<->hunter at MTU 1500 (9.36 Gbps) and 9000 (9.59 Gbps), with all checks
+green. Those earlier branch results do not validate the reviewed fixes.
+Hardware acceptance for this review revision remains pending.

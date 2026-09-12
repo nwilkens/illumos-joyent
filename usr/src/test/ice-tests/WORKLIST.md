@@ -27,7 +27,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | 11 | Architecture | Lifecycle callers conflate several kinds of quiescence | Completed; explicit lifecycle contracts documented |
 | 12 | Documentation | Some comments promise stronger invariants than the code establishes | Completed; comments checked against current callers |
 | 13 | Test repair | `tx_bind_threshold.py` has a stale exact-text assertion | Implemented with executable copy/bind regression |
-| 14 | Test coverage | Most checks inspect source strings instead of executing behavior | Open; first behavioral test added for item 1 |
+| 14 | Test coverage | Most checks inspect source strings instead of executing behavior | Implemented; behavioral suite and controls documented, hardware validation pending |
 
 ## 1. Terminal filter retirement
 
@@ -382,9 +382,24 @@ it. Pool and DMA boundaries are stubs; this is not a hardware DMA test.
 
 ## 14. Behavioral coverage
 
-Keep useful source invariants, but add executable tests of the actual C
-behavior for each fixed lifecycle or descriptor defect. Include failing
-controls so a test demonstrates the old bug and rejects an incomplete fix.
-Track kernel/hardware acceptance separately from host stubs and native
-compilation. `terminal_filters.py` begins this work; concurrency, DMA, wire
-behavior, and throughput remain outside its scope.
+The fixes now have executable regressions of the actual C bodies, with small
+hardware, MAC, allocation, or taskq boundaries. Existing source checks retain
+coverage of integration and ordering properties outside those fixtures.
+
+`c_test.py` shares source extraction with original line locations, generated
+headers, C99 compilation, compiler selection, and bounded case execution.
+Compiler failures and runtime failures have distinct diagnostics. The explicit
+`run_tests.py` manifest runs 40 scripts and excludes support modules; it
+continues after a failure and reports an aggregate result. `runner_checks.py`
+uses real compiler and child processes to verify flags, arguments, multiple
+cases, source locations, compile/runtime failures and timeouts, suite
+continuation, and support exclusion. Existing behavioral fixture semantics
+and baseline/mutant source-selection options are preserved.
+
+Validation: all 40 scripts pass locally. The documented historical controls
+compile and then fail their behavioral assertions; the item 13 historical
+source passes as expected, while its runt-guard mutant fails. See
+[REGRESSIONS.md](REGRESSIONS.md) for exact commands, coverage and the remaining
+device matrix. Native kernel compilation and hardware acceptance remain
+separate evidence; earlier branch throughput results do not validate this
+review revision.
