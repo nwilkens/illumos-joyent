@@ -44,7 +44,7 @@ typedef char *caddr_t;
 #define	ICE_RX_FLX_DESC_PKT_LEN_M	0x3fff
 #define	ICE_RX_FLEX_DESC_PTYPE_M	0x3ff
 #define	CPU_TO_LE64(n)	(n)
-#define	LE16_TO_CPU(n)	(n)
+#define	LE16_TO_CPU(n)	checked_le16(&(n))
 #define	ASSERT(n)	assert(n)
 #define	ASSERT0(n)	assert((n) == 0)
 /* The op parameter is a comparison operator, not a function name. */
@@ -88,6 +88,7 @@ typedef struct dma_handle {
 	unsigned syncs, checks;
 	size_t last_offset, last_length;
 	int fail_sync, fail_check;
+	unsigned fail_sync_after, fail_check_after;
 	int fail_direction;
 } *ddi_dma_handle_t;
 typedef int ddi_acc_handle_t;
@@ -166,10 +167,25 @@ typedef struct ice_rx_ring {
 
 static unsigned live_mblks, live_dma, impacts, barriers, doorbells, delivered;
 static int alloc_fail, desballoc_fail, acc_fail;
+static unsigned wb_reads, bad_wb_reads;
 static ice_rx_ring_t *active_ring;
 static mblk_t *checksum_head;
 static void ice_rx_recycle(caddr_t);
 static void ice_rx_free_rcbs(ice_rx_ring_t *);
+
+static uint16_t
+checked_le16(const uint16_t *p)
+{
+	ddi_dma_handle_t d = active_ring->irxr_desc_dma.idb_dma_handle;
+
+	wb_reads++;
+	if ((d->fail_sync && d->syncs >= d->fail_sync_after &&
+	    (!d->fail_direction ||
+	    d->fail_direction == DDI_DMA_SYNC_FORKERNEL)) ||
+	    (d->fail_check && d->checks >= d->fail_check_after))
+		bad_wb_reads++;
+	return (*p);
+}
 
 static void
 mutex_enter(int *lock)
@@ -368,15 +384,17 @@ ddi_dma_sync(ddi_dma_handle_t d, off_t offset, size_t len, int dir)
 	d->syncs++;
 	d->last_offset = (size_t)offset;
 	d->last_length = len;
-	return (d->fail_sync && (!d->fail_direction ||
-	    d->fail_direction == dir) ? -1 : DDI_SUCCESS);
+	return (d->fail_sync && d->syncs >= d->fail_sync_after &&
+	    (!d->fail_direction || d->fail_direction == dir) ?
+	    -1 : DDI_SUCCESS);
 }
 
 static int
 ice_check_dma_handle(ddi_dma_handle_t d)
 {
 	d->checks++;
-	return (d->fail_check ? -1 : DDI_FM_OK);
+	return (d->fail_check && d->checks >= d->fail_check_after ?
+	    -1 : DDI_FM_OK);
 }
 
 static int
@@ -428,6 +446,7 @@ setup(ice_rx_ring_t *r, ice_t *ice)
 	memset(r, 0, sizeof (*r));
 	memset(ice, 0, sizeof (*ice));
 	impacts = barriers = doorbells = delivered = 0;
+	wb_reads = bad_wb_reads = 0;
 	alloc_fail = desballoc_fail = acc_fail = 0;
 	checksum_head = NULL;
 	active_ring = r;

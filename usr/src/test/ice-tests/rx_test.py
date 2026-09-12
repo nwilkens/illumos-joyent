@@ -16,7 +16,7 @@ FUNCTIONS = (
     "ice_rx_alloc_mp", "ice_rcb_alloc", "ice_rcb_free", "ice_rx_recycle",
     "ice_rx_reset_desc", "ice_rx_alloc_rcbs", "ice_rx_free_rcbs",
     "ice_rx_next", "ice_rx_copy", "ice_rx_bind", "ice_rx_discard_frame",
-    "ice_rx_vlan_insert", "ice_ring_rx_frame",
+    "ice_rx_vlan_insert", "ice_rx_desc_sync", "ice_ring_rx_frame",
 )
 
 
@@ -28,7 +28,7 @@ def extract(source, pattern, path):
     return f"#line {line} {json.dumps(str(path))}\n{match.group()}\n"
 
 
-def run(test, functions=FUNCTIONS):
+def run(test, functions=FUNCTIONS, optional=("ice_rx_desc_sync",)):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=DRIVER / "ice_rx.c")
     parser.add_argument("--header", type=Path, default=DRIVER / "ice.h")
@@ -44,6 +44,8 @@ def run(test, functions=FUNCTIONS):
         if re.search(rf"^#define\s+{name}\s+", source, re.MULTILINE):
             parts.append(extract(source, rf"^#define\s+{name}\s+.*", args.source))
     for name in functions:
+        if name in optional and not re.search(rf"^{name}\(", source, re.MULTILINE):
+            continue
         parts.append(extract(source,
                              rf"^(?:static )?(?:inline )?[\w *]+\n{name}\([\s\S]*?^}}",
                              args.source))

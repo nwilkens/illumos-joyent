@@ -101,6 +101,7 @@ python3 usr/src/test/ice-tests/tx_blocked.py
 python3 usr/src/test/ice-tests/tx_doorbell.py
 python3 usr/src/test/ice-tests/vlan_rx.py
 python3 usr/src/test/ice-tests/rx_layout.py
+python3 usr/src/test/ice-tests/rx_dma_faults.py
 python3 usr/src/test/ice-tests/pool_locks.py
 python3 usr/src/test/ice-tests/jumbo_copy.py
 python3 usr/src/test/ice-tests/loan_wait.py
@@ -245,6 +246,13 @@ and contiguous IP headers, packet bytes, the full DMA allocation and sync
 extent, jumbo chains, and loan accounting. Shared `rx_test.py`/`rx_test.h`
 supply controlled DDI/STREAMS boundaries. These are host regressions;
 hardware performance measurements remain separate.
+
+`rx_dma_faults.py` executes the production descriptor walk, frame assembly,
+drain, and interrupt/poll entry points. Its 108 cases inject DMA sync and
+handle faults before DD-clear/set reads, during jumbo validation, at cap
+peeks and repost, plus data-buffer and register faults. Copy/loan cases
+verify delivery suppression, counter/tail behavior, and cleanup outside
+the ring lock; healthy controls retain ordinary delivery.
 
 `pool_locks.py` verifies that both transmit copy-buffer pool locks are created
 once at the negotiated interrupt priority before first use, destroyed exactly

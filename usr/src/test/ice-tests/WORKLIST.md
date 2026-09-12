@@ -20,7 +20,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | 4 | P2 | RX alignment and VLAN header layout defeat IP fast paths | Implemented; hardware performance validation pending |
 | 5 | P2 | One reset request can cause two complete resets | Open |
 | 6 | P2 | Link refresh reports UP while the datapath remains failed | Open |
-| 7 | P2 | RX descriptor DMA faults are checked late or missed | Open |
+| 7 | P2 | RX descriptor DMA faults are checked late or missed | Implemented; hardware fault injection pending |
 | 8 | P2 | Small-MSS LSO fallback retains the wrong checksum seed | Open; LSO disabled by default |
 | 9 | Maintenance | Duplicate MAC filter constructors | Open |
 | 10 | Architecture | Filter ownership and replay contract is incomplete | Open |
@@ -178,13 +178,33 @@ the admin periodic, and verify operational DOWN until a successful restart.
 
 ## 7. Descriptor DMA fault timing
 
-The receive walk in [ice_rx.c](../../uts/common/io/ice/ice_rx.c) reads
-descriptor writeback after an unchecked synchronization. Its handle check is
-deferred until repost, and the empty-ring return bypasses it. Check before
-consumption and suppress delivery from a faulted operation.
+Every descriptor synchronization now checks both the synchronization result
+and the DMA handle before reading DD or other writeback fields. This includes
+DD-clear empty rings, continuation descriptors, and the interrupt-limit peek.
+A fault leaves the unconsumed descriptor in place for recovery and reports
+DDI_SERVICE_DEGRADED with ICE_STATE_ERROR.
 
-Acceptance: inject descriptor sync/handle faults with DD clear and set; verify
-fault reporting and no delivery. Packet corruption was not demonstrated.
+A faulted drain does not publish a new RX tail after a descriptor/data DMA
+fault, update delivered packet/byte counters, or return packets to MAC.
+Frames accumulated before the fault are discarded after releasing the ring
+lock, allowing loan-recycle callbacks to acquire that lock. Descriptor repost
+and register-access errors likewise suppress delivery; a register error can
+only be detected after the attempted doorbell write.
+
+`rx_dma_faults.py` compiles the actual descriptor/frame/drain and interrupt/poll
+entry points against controlled DDI/STREAMS boundaries. Its 108 cases cover
+sync/handle faults with DD clear/set, first and later frames, incomplete jumbo
+chains, cap peeks, repost, data-buffer faults, register faults, and healthy
+copy/loan delivery. The pre-fix source fails on DD-clear fault detection;
+negative controls omitting the peek check or poll-chain discard also fail.
+Checks include zero writeback decode from faulted reads, no delivery/counters,
+no unexpected tail write, and no leaked loans or recursive ring locking.
+
+Hardware acceptance remains: inject descriptor sync/handle faults with DD
+clear and set and verify FMA reporting, no packet delivery, and recovery.
+Host regressions do not reproduce a physical DMA failure or prove the
+review's unconfirmed packet-corruption hypothesis.
+
 
 ## 8. Small-MSS LSO downgrade
 

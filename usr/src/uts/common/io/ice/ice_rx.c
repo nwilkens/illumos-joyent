@@ -28,6 +28,7 @@
  * the tail doorbell.
  */
 
+#include <sys/strsubr.h>
 #include <sys/strsun.h>
 #include <sys/pattr.h>
 #include <sys/vlan.h>
@@ -883,6 +884,30 @@ ice_rx_vlan_insert(mblk_t *mp, uint16_t tci)
 }
 
 /*
+ * Synchronize and check the descriptor mapping before even reading DD.  This
+ * also covers an empty ring and the interrupt-limit peek.  A failed mapping
+ * leaves this descriptor untouched for recovery; no writeback is usable.
+ */
+static boolean_t
+ice_rx_desc_sync(ice_rx_ring_t *irr, union ice_32b_rx_flex_desc *desc)
+{
+	ice_t *ice = irr->irxr_ice;
+	int sync, status;
+
+	sync = ddi_dma_sync(irr->irxr_desc_dma.idb_dma_handle,
+	    (off_t)((uintptr_t)desc - (uintptr_t)irr->irxr_descs),
+	    sizeof (*desc), DDI_DMA_SYNC_FORKERNEL);
+	status = ice_check_dma_handle(irr->irxr_desc_dma.idb_dma_handle);
+	if (sync != DDI_SUCCESS || status != DDI_FM_OK) {
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
+		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
+		return (B_FALSE);
+	}
+
+	return (B_TRUE);
+}
+
+/*
  * Validate one complete frame without changing ring state, then assemble its
  * descriptor buffers into a b_cont chain.  On entry, a non-zero *total_lenp
  * is the remaining budget for a non-empty poll result; zero means unlimited.
@@ -917,9 +942,10 @@ ice_ring_rx_frame(ice_rx_ring_t *irr, uint32_t *total_lenp,
 		union ice_32b_rx_flex_desc *desc = &irr->irxr_descs[h];
 		uint16_t status0, seglen;
 
-		(void) ddi_dma_sync(irr->irxr_desc_dma.idb_dma_handle,
-		    (off_t)((uintptr_t)desc - (uintptr_t)irr->irxr_descs),
-		    sizeof (*desc), DDI_DMA_SYNC_FORKERNEL);
+		if (!ice_rx_desc_sync(irr, desc)) {
+			*deferp = B_TRUE;
+			return (NULL);
+		}
 
 		status0 = LE16_TO_CPU(desc->wb.status_error0);
 		if ((status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_DD_S)) == 0) {
@@ -1075,6 +1101,8 @@ assemble_fail:
  * through *limitp so the ISR can schedule a software interrupt for them; see
  * ice_intr_queue() for why a plain re-arm cannot service that residue.
  * Refilled slots advance the tail doorbell so hardware can reuse them.
+ * On error the caller must discard the returned chain after dropping the
+ * ring lock: freeing loaned segments synchronously re-enters that lock.
  */
 static mblk_t *
 ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp)
@@ -1112,10 +1140,8 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp)
 			 * otherwise schedule a software interrupt into an
 			 * empty ring and overcount the kstat.
 			 */
-			(void) ddi_dma_sync(irr->irxr_desc_dma.idb_dma_handle,
-			    (off_t)((uintptr_t)desc -
-			    (uintptr_t)irr->irxr_descs),
-			    sizeof (*desc), DDI_DMA_SYNC_FORKERNEL);
+			if (!ice_rx_desc_sync(irr, desc))
+				break;
 			if ((LE16_TO_CPU(desc->wb.status_error0) &
 			    BIT(ICE_RX_FLEX_DESC_STATUS0_DD_S)) != 0) {
 				irr->irxr_stats.icrxs_intr_limit.value.ui64++;
@@ -1163,6 +1189,9 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp)
 		npkts++;
 	}
 
+	/* A fault invalidates even frames already assembled in this drain. */
+	if ((ice->ice_state & ICE_STATE_ERROR) != 0)
+		goto failed;
 	if (nposted == 0)
 		return (mp_head);
 
@@ -1177,6 +1206,7 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp)
 	    DDI_FM_OK) {
 		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
 		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
+		goto failed;
 	}
 
 	irr->irxr_tail = (irr->irxr_head == 0) ? irr->irxr_size - 1 :
@@ -1186,6 +1216,7 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp)
 	    DDI_FM_OK) {
 		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
 		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
+		goto failed;
 	}
 
 	if (npkts > 0) {
@@ -1193,6 +1224,11 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp)
 		irr->irxr_stats.icrxs_packets.value.ui64 += npkts;
 	}
 
+	return (mp_head);
+
+failed:
+	/* The caller frees this chain after dropping irxr_lock. */
+	*limitp = B_FALSE;
 	return (mp_head);
 }
 
@@ -1203,7 +1239,7 @@ mblk_t *
 ice_ring_rx_poll(void *arg, int poll_bytes)
 {
 	ice_rx_ring_t *irr = arg;
-	boolean_t limit;
+	boolean_t limit, failed;
 	mblk_t *mp;
 
 	/*
@@ -1221,7 +1257,14 @@ ice_ring_rx_poll(void *arg, int poll_bytes)
 		return (NULL);
 	}
 	mp = ice_ring_rx(irr, poll_bytes, &limit);
+	failed = (irr->irxr_ice->ice_state & ICE_STATE_ERROR) != 0;
 	mutex_exit(&irr->irxr_lock);
+
+	/* Loan recycling re-enters irxr_lock, so discard outside it. */
+	if (failed) {
+		freemsgchain(mp);
+		return (NULL);
+	}
 
 	return (mp);
 }
@@ -1243,7 +1286,7 @@ boolean_t
 ice_rx_ring_intr(ice_rx_ring_t *irr)
 {
 	ice_t *ice = irr->irxr_ice;
-	mblk_t *mp;
+	mblk_t *mp, *discard = NULL;
 	uint64_t gen;
 	boolean_t limit;
 
@@ -1253,10 +1296,17 @@ ice_rx_ring_intr(ice_rx_ring_t *irr)
 		return (B_FALSE);
 	}
 	mp = ice_ring_rx(irr, 0, &limit);
+	if ((ice->ice_state & ICE_STATE_ERROR) != 0) {
+		discard = mp;
+		mp = NULL;
+	}
 	gen = irr->irxr_rxgen;
 	if (mp != NULL)
 		irr->irxr_intr_busy = B_TRUE;
 	mutex_exit(&irr->irxr_lock);
+
+	/* A failed drain can contain loans; their callbacks need irxr_lock. */
+	freemsgchain(discard);
 
 	if (mp != NULL) {
 		mac_rx_ring(ice->ice_mac_hdl, irr->irxr_macrxring, mp, gen);
