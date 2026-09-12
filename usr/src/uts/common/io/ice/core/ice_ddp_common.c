@@ -881,6 +881,12 @@ enum ice_ddp_state ice_get_pkg_info(struct ice_hw *hw)
 		goto init_pkg_free_alloc;
 	}
 
+	/* illumos: the count is firmware data; it must fit the buffer. */
+	if (LE32_TO_CPU(pkg_info->count) > ICE_PKG_CNT) {
+		state = ICE_DDP_PKG_ERR;
+		goto init_pkg_free_alloc;
+	}
+
 	for (i = 0; i < LE32_TO_CPU(pkg_info->count); i++) {
 #define ICE_PKG_FLAG_COUNT	4
 		char flags[ICE_PKG_FLAG_COUNT + 1] = { 0 };
@@ -1147,6 +1153,12 @@ ice_chk_pkg_compat(struct ice_hw *hw, struct ice_pkg_hdr *ospkg,
 		return ICE_DDP_PKG_ERR;
 
 	if (ice_aq_get_pkg_info_list(hw, pkg, size, NULL)) {
+		state = ICE_DDP_PKG_ERR;
+		goto fw_ddp_compat_free_alloc;
+	}
+
+	/* illumos: the count is firmware data; it must fit the buffer. */
+	if (LE32_TO_CPU(pkg->count) > ICE_PKG_CNT) {
 		state = ICE_DDP_PKG_ERR;
 		goto fw_ddp_compat_free_alloc;
 	}

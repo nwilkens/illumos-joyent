@@ -1368,6 +1368,15 @@ int ice_sched_init_port(struct ice_port_info *pi)
 	for (i = 0; i < num_branches; i++) {
 		num_elems = LE16_TO_CPU(buf[i].hdr.num_elems);
 
+		/* illumos: every branch count is firmware data; bound each. */
+		if (num_elems < 1 || num_elems > ICE_AQC_TOPO_MAX_LEVEL_NUM) {
+			ice_debug(hw, ICE_DBG_SCHED,
+				  "branch %d num_elems unexpected %d\n",
+				  i, num_elems);
+			status = ICE_ERR_PARAM;
+			goto err_init_port;
+		}
+
 		/* Skip root element as already inserted */
 		for (j = 1; j < num_elems; j++) {
 			/* update the sw entry point */
