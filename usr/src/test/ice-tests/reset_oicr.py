@@ -87,9 +87,13 @@ def main() -> None:
     # The MDD handler clears every detection register and fails closed only when
     # this function is the offender.
     mdd = function(intr, "ice_oicr_mdd(ice_t *ice)\n{", "\nstatic void\nice_oicr_fatal")
-    for reg in ("GL_MDET_TX_PQM", "GL_MDET_TX_TCLAN", "GL_MDET_RX",
-                "PF_MDET_TX_PQM", "PF_MDET_TX_TCLAN", "PF_MDET_RX"):
+    # TDPU is the transmit-data protection unit (oversized or malformed
+    # packets); a set register nothing clears can reassert MAL_DETECT.
+    for reg in ("GL_MDET_TX_PQM", "GL_MDET_TX_TCLAN", "GL_MDET_TX_TDPU",
+                "GL_MDET_RX", "PF_MDET_TX_PQM", "PF_MDET_TX_TCLAN",
+                "PF_MDET_TX_TDPU", "PF_MDET_RX"):
         assert reg in mdd, reg
+        assert f"wr32(hw, {reg}, 0xffffffff)" in mdd, reg
     assert "ICE_STATE_ERROR | ICE_STATE_PFR_REQ" in mdd
     # Reports whether this function was the offender so the caller can gate.
     assert "return (pf_mdd);" in mdd

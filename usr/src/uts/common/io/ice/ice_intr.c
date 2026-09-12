@@ -475,6 +475,8 @@ ice_oicr_mdd(ice_t *ice)
 		wr32(hw, GL_MDET_TX_PQM, 0xffffffff);
 	if (rd32(hw, GL_MDET_TX_TCLAN) != 0)
 		wr32(hw, GL_MDET_TX_TCLAN, 0xffffffff);
+	if (rd32(hw, GL_MDET_TX_TDPU) != 0)
+		wr32(hw, GL_MDET_TX_TDPU, 0xffffffff);
 	if (rd32(hw, GL_MDET_RX) != 0)
 		wr32(hw, GL_MDET_RX, 0xffffffff);
 
@@ -484,6 +486,10 @@ ice_oicr_mdd(ice_t *ice)
 	}
 	if ((rd32(hw, PF_MDET_TX_TCLAN) & PF_MDET_TX_TCLAN_VALID_M) != 0) {
 		wr32(hw, PF_MDET_TX_TCLAN, 0xffffffff);
+		pf_mdd = B_TRUE;
+	}
+	if ((rd32(hw, PF_MDET_TX_TDPU) & PF_MDET_TX_TDPU_VALID_M) != 0) {
+		wr32(hw, PF_MDET_TX_TDPU, 0xffffffff);
 		pf_mdd = B_TRUE;
 	}
 	if ((rd32(hw, PF_MDET_RX) & PF_MDET_RX_VALID_M) != 0) {
