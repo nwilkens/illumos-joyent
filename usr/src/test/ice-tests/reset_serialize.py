@@ -272,9 +272,8 @@ def main() -> None:
     assert "ice->ice_detaching ||" in start
 
     # Every gate lift requeues an owed rebuild.  The GRST and fatal-cause
-    # latches are one-shot and there is no watchdog or periodic anywhere in the
-    # driver, so a rebuild the gate discarded is never re-delivered: without
-    # this, ice_m_start() returns EIO for the life of the module.
+    # latches are one-shot; persistent requests preserve the work. Gate lifts
+    # redispatch promptly and the admin periodic retries failed dispatches.
     redispatch = function(
         attach,
         "ice_reset_redispatch(ice_t *ice)\n{",
@@ -435,9 +434,8 @@ def main() -> None:
         "ice_reset_dispatch(ice)"
     )
 
-    # The terminal state is quiescent: an early rebuild failure never reaches
-    # the clear at the end of the success path, so reset_failed drops the owed
-    # bits itself rather than leaving a rebuild permanently owed.
+    # The terminal state retires any later requests because they cannot be
+    # serviced until reload. Successful rebuilds preserve those requests.
     rebuild = function(
         attach, "ice_rebuild(ice_t *ice, uint32_t requests)\n{", "\n/*\n * Reset taskq worker:"
     )

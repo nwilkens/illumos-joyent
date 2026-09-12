@@ -1021,8 +1021,8 @@ ice_tx_context(mblk_t *mp, ice_tx_ctx_t *ctx)
  * copied into one small-pool buffer; anything larger has each of its fragments
  * bound.  A bind failure, or a fragment that would push the packet past the
  * ICE_TX_MAX_COOKIE descriptor budget, forces a single full-packet copy.
- * Returns the number of TCBs produced (0 on resource exhaustion) and fills
- * tcbs[]/ndesc.
+ * Returns OK, transient resource exhaustion, or a permanent drop decision;
+ * on success, fills tcbs[] and the TCB and descriptor counts.
  */
 static ice_tx_build_t
 ice_tx_build_tcbs(ice_tx_ring_t *itr, mblk_t *mp, size_t msglen,

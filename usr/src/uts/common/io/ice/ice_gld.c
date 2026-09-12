@@ -27,7 +27,8 @@
  * the Intel common-code switch APIs, matching the filter bookkeeping already
  * established by ice_vsi.c (ice_add_mac/ice_remove_mac with the fltr list
  * entry, tracked on the VSI's vi_macs list).  Link state is reported from cache
- * ice_intr.c maintains; the MAC path never blocks on hardware.
+ * ice_intr.c maintains.  Filter and control callbacks can block on firmware;
+ * cached link property getters do not issue hardware commands.
  *
  * Hardware checksum offload is advertised.  LSO remains dark unless the
  * operator enables the validation property before attach.
@@ -134,8 +135,8 @@ ice_gld_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)
 
 /*
  * ice_rebuild_lock is the outermost lock: hold it across the admin-queue filter
- * command so a reset rebuild cannot tear the control queue down (via
- * ice_deinit_hw) underneath ice_add_mac/ice_remove_mac.  It is taken before the
+ * command so a reset rebuild cannot shut down and reinitialize the control
+ * queue underneath ice_add_mac/ice_remove_mac.  It is taken before the
  * vi_mac_lock the inner routine uses, matching the rebuild's own lock order.
  */
 static int
@@ -935,7 +936,7 @@ ice_transceiver_info(void *arg, uint_t id, mac_transceiver_info_t *infop)
 
 	/*
 	 * ice_rebuild_lock is the outermost lock: hold it so a reset
-	 * rebuild's ice_deinit_hw() cannot free port_info out from under this
+	 * rebuild cannot reinitialize port_info underneath this
 	 * read.  Read link_info under the lock rather than snapshotting the
 	 * pointer earlier.
 	 */

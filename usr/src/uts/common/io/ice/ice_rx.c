@@ -981,7 +981,7 @@ ice_ring_rx_frame(ice_rx_ring_t *irr, uint32_t *total_lenp,
 	/*
 	 * A tag the hardware extracted has to go back into the frame, so it
 	 * counts against the frame limits and the poll budget below, and the
-	 * first segment must be long enough to donate a whole ether header.
+	 * first segment must contain the Ethernet header before tag insertion.
 	 */
 	if (eop && (eop_status0 &
 	    BIT(ICE_RX_FLEX_DESC_STATUS0_L2TAG1P_S)) != 0) {
@@ -1414,7 +1414,7 @@ ice_rx_ring_open_locked(ice_rx_ring_t *irr)
 
 /*
  * mac(9E) ring start: post buffers and record the mac generation number.  The
- * queue context is already programmed and the queue enabled at attach; this
+ * queue context is already programmed and enabled by MAC start; this
  * only fills the ring and opens it for traffic.
  */
 int
@@ -1554,11 +1554,10 @@ unwind:
  *
  * Closing every ring before waiting on any of them is what makes one shared
  * deadline fair.  irxr_shutdown is the gate that stops new loans, so a ring
- * still open while an earlier one is waited out keeps issuing them -- and
- * ice_prepare_for_reset() runs this before ice_queues_disable(), so hardware
- * is still delivering.  A late ring could otherwise reach its wait with more
- * loans than when this was entered and no budget left.  Detach uses the same
- * gate and also waits out copied-packet upcalls that hold no buffer loan.
+ * still open while an earlier one is waited out can keep issuing them if
+ * queue disable failed or was not attempted yet.  A late ring could reach its
+ * wait with more loans than on entry and no budget left.  Detach uses the
+ * same gate and also waits out copied-packet upcalls that hold no buffer loan.
  */
 boolean_t
 ice_rx_quiesce(ice_t *ice)

@@ -792,9 +792,8 @@ ice_unconfigure(ice_t *ice)
 		ice_buf_fini(ice);
 
 	/*
-	 * Tear down the datapath before the VSI: the queues belong to the VSI
-	 * and the queue disables ride the admin queue, which a lower progress
-	 * bit (ice_deinit_hw) undoes later.
+	 * Remove the remaining queue-to-vector routing.  Packet DMA is already
+	 * isolated; the VSI and control queue still exist for later cleanup.
 	 */
 	if (ice->ice_attach_progress & ICE_ATTACH_QUEUE_INTR)
 		ice_queues_intr_unmap(ice);
@@ -906,11 +905,10 @@ ice_prop_get_num_queues(ice_t *ice)
 }
 
 /*
- * Hand an owed rebuild to the reset taskq.  Both the GRST and the fatal-cause
- * latches are one-shot and there is no watchdog, so an owed rebuild that a gate
- * dropped is owed forever: ice_m_start() then refuses to plumb for the life of
- * the module.  Call this at every point a gate is lifted, and wherever a caller
- * observes the owed bits without being able to service them itself.
+ * Hand an owed rebuild to the reset taskq when a lifetime gate lifts or a
+ * caller observes a request it cannot service itself.  The hardware causes
+ * are one-shot; persistent request bits retain the work.  Redispatch promptly
+ * here, while the admin periodic provides a retry if taskq dispatch fails.
  *
  * Runs under ice_rebuild_lock, which ice_reset_dispatch() does not take; it
  * only sets a flag and queues onto the reset taskq, and that worker waits on

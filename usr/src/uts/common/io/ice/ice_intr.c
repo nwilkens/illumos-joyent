@@ -761,8 +761,9 @@ ice_intr_oicr_disable(ice_t *ice)
  * first: on the attach path they were latched on this driver's watch, the
  * window is hundreds of milliseconds of firmware interaction, and nothing else
  * re-derives them.  The rebuild path must NOT harvest -- it has just performed
- * the owed rebuild and cleared the reset-owed bits, so re-latching would
- * dispatch the same rebuild in a loop.
+ * the owed rebuild after claiming its request bits, so re-latching those
+ * causes would dispatch the same rebuild in a loop.  Later software requests
+ * remain owed independently of this hardware-latch discard.
  */
 void
 ice_intr_oicr_setup(ice_t *ice, boolean_t harvest)

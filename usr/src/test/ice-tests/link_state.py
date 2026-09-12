@@ -50,6 +50,8 @@ def main() -> None:
     publish = registration.index("ice_link_state_publish(ice)", failure)
     success = registration.index("return (B_TRUE)", publish)
     assert register < failure < publish < success
+    assert registration.index("mutex_enter(&ice->ice_rebuild_lock)") < publish
+    assert publish < registration.index("mutex_exit(&ice->ice_rebuild_lock)")
 
 
 if __name__ == "__main__":

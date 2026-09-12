@@ -25,7 +25,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | 9 | Maintenance | Duplicate MAC filter constructors | Implemented; request equivalence tested |
 | 10 | Architecture | Filter ownership and replay contract is incomplete | In progress; VSI failure ownership corrected |
 | 11 | Architecture | Lifecycle callers conflate several kinds of quiescence | Open |
-| 12 | Documentation | Some comments promise stronger invariants than the code establishes | Open |
+| 12 | Documentation | Some comments promise stronger invariants than the code establishes | Completed; comments checked against current callers |
 | 13 | Test repair | `tx_bind_threshold.py` has a stale exact-text assertion | Implemented with executable copy/bind regression |
 | 14 | Test coverage | Most checks inspect source strings instead of executing behavior | Open; first behavioral test added for item 1 |
 
@@ -304,10 +304,19 @@ acceptance cases. Prefer small corrections to a broad lifecycle rewrite.
 
 ## 12. Comments and proven invariants
 
-Audit comments against the checks that establish their claims. For example,
-the detach fallback reset is described as a DMA barrier despite an unchecked
-result. Update such comments with the corresponding behavior fixes and check
-the remaining glue once the lifecycle changes settle.
+Reviewed the glue comments against current helper bodies and callers. The
+behavior fixes carry their local contracts: detach isolation precedes
+unregister, TX notification gating is separate from DMA reclamation, request
+claims preserve later resets, and VSI setup retains caller-owned filters.
+The remaining corrections describe the admin periodic's retry role, cached
+link getters versus blocking control callbacks, reset's retained control-queue
+objects, actual RX queue-start and quiesce ordering, in-place VLAN insertion,
+and the TX builder's enum result. Source-test commentary now describes the
+current request protocol too.
+
+Validation: the source and actual-C regressions remain unchanged in behavior;
+C style and patch whitespace checks pass. This is a documentation audit, not a
+proof of every driver invariant or hardware behavior.
 
 ## 13. Stale TX source check
 
