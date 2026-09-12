@@ -17,7 +17,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | 1 | P1 | Terminal reset failure prevents filter retirement and can make unregister panic | Implemented; hardware validation pending |
 | 2 | P1 | Detach releases DMA after an unchecked fallback reset | Implemented; hardware validation pending |
 | 3 | P1 | Pending TX notifications can outlive MAC unregister | Implemented; hardware validation pending |
-| 4 | P2 | RX alignment and VLAN header layout defeat IP fast paths | Open |
+| 4 | P2 | RX alignment and VLAN header layout defeat IP fast paths | Implemented; hardware performance validation pending |
 | 5 | P2 | One reset request can cause two complete resets | Open |
 | 6 | P2 | Link refresh reports UP while the datapath remains failed | Open |
 | 7 | P2 | RX descriptor DMA faults are checked late or missed | Open |
@@ -129,16 +129,30 @@ quiescence, no callback crossing unregister, and no premature DMA release.
 
 ## 4. RX header layout
 
-The copy and loan paths in [ice_rx.c](../../uts/common/io/ice/ice_rx.c) start
-Ethernet at an aligned allocation base. The IP header after 14 bytes is then
-unaligned, causing MAC fast-path rejection and IP pullup/copy. Reserve two
-bytes of headroom while accounting for the full DMA write extent. VLAN
-reinsertion also creates an L2-only head; preserve the headers required by the
-MAC fast path in its first block.
+The receive path reserves six bytes before each frame: two align the IP
+header after Ethernet, and four allow a stripped VLAN tag to be restored in
+place. DMA allocations include the entire 2048-byte hardware write extent
+plus that headroom; descriptor addresses and packet synchronization use the
+same offset, while allocation metadata stays unchanged for teardown. Copy
+and loan mblks both retain this headroom. VLAN reinsertion moves only the
+address pair, preserving the original first-block IP and transport headers.
 
-Acceptance: check copy/loan, tagged/untagged, and jumbo header alignment and
-first-block layout; measure CPU, copy counts, software fanout, and throughput.
-Hardware RSS distribution is distinct from this software-path problem.
+The E810 datasheet section 10.4.2.1 defines receive packet addresses in byte
+units; section 3.1.2.4.1 imposes no software 4K alignment requirement. The
+layout uses the same IP-alignment principle as illumos i40e.
+
+`rx_layout.py` compiles the actual receive functions with controlled
+DDI/STREAMS boundaries. Sixteen cases exercise copy/loan, tagged/untagged,
+128/1500/2048/9216-byte frames, full DMA write bounds and synchronization
+range, contiguous IPv6/TCP headers, exact frame bytes, and loan retirement.
+The original source fails; negative controls removing allocation headroom
+or copy alignment also fail. These host tests do not establish hardware
+throughput, software fanout, or CPU/copy-count improvements.
+
+Hardware acceptance remains: measure copy/loan, tagged/untagged, and jumbo
+CPU, copy counts, software fanout, and throughput. Hardware RSS distribution
+is distinct from this software-path correction.
+
 
 ## 5. Duplicate reset work
 

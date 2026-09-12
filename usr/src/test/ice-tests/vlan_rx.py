@@ -25,7 +25,7 @@ def main() -> None:
     )
     insert = function(
         source,
-        "ice_rx_vlan_insert(mblk_t *mp, mblk_t *vmp, uint16_t tci)\n{",
+        "ice_rx_vlan_insert(mblk_t *mp, uint16_t tci)\n{",
         "\n/*\n * Validate one complete frame",
     )
 
@@ -37,33 +37,15 @@ def main() -> None:
     # Writeback fields are only trusted after the consumer barrier.
     assert frame.index("membar_consumer()") < tag
 
-    # The donated ether header is bounds-checked before b_rptr advances.
+    # Bounds are established before inserting into the reserved headroom.
     check = frame.index("seglens[0] < sizeof (struct ether_header)")
     assert check < frame.index("ice_rx_vlan_insert(")
-    assert "mp->b_rptr += sizeof (struct ether_header)" in insert
-    assert insert.index("bcopy(mp->b_rptr") < insert.index("mp->b_rptr +=")
-
-    # mac_strip_vlan_tag() asserts the head holds a full tagged ether header,
-    # so the original ethertype has to be carried up into it.
-    assert "2 * ETHERADDRL + VLAN_TAGSZ" not in frame
-    assert "mp->b_rptr += 2 * ETHERADDRL" not in insert
-    assert "bcopy(mp->b_rptr + 2 * ETHERADDRL, p, sizeof (uint16_t))" in insert
     assert "ASSERT3U(MBLKL(mp), >=, sizeof (struct ether_header))" in insert
-    assert (
-        "ASSERT3U(MBLKL(vmp), >=, sizeof (struct ether_vlan_header))" in insert
-    )
-
-    # An emptied head is freed rather than left in the chain.
-    empty = insert.index("if (MBLKL(mp) == 0)")
-    assert insert.index("mp->b_rptr +=") < empty
-    assert "vmp->b_cont = mp->b_cont;" in insert
-    assert "freeb(mp);" in insert
-
-    # A failed tag-header allocation drops the frame instead of delivering it.
-    alloc = frame.index("allocb(sizeof (struct ether_vlan_header)")
-    nomem = frame.index("icrxs_copy_nomem", alloc)
-    assert frame.index("ice_rx_discard_frame", alloc) < nomem
-    assert alloc < frame.index("Pass B")
+    assert "mp->b_rptr - mp->b_datap->db_base" in insert
+    assert "mp->b_rptr -= VLAN_TAGSZ" in insert
+    assert "ovbcopy(mp->b_rptr + VLAN_TAGSZ, mp->b_rptr, 2 * ETHERADDRL)" in insert
+    assert "ASSERT3U(MBLKL(mp), >=, sizeof (struct ether_vlan_header))" in insert
+    # Byte preservation and contiguous IP/TCP headers run in rx_layout.py.
 
     # Checksum metadata lands on the head mac actually receives.
     assert frame.index("ice_rx_vlan_insert(") < frame.index("ice_rx_hcksum(")

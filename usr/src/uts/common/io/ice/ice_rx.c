@@ -415,6 +415,9 @@ ice_rx_ring_unprogram(ice_t *ice, ice_rx_ring_t *irr)
 /* Bind (loan) a frame at least this large; smaller frames are copied. */
 #define	ICE_RX_COPY_THRESHOLD	256
 
+/* Keep IP aligned and leave room to restore a stripped VLAN tag in place. */
+#define	ICE_RX_HEADROOM		(2 + VLAN_TAGSZ)
+
 /*
  * Upper bound on a teardown path's wait for loaned rx buffers to return, in
  * microseconds.  Bounds both the unplumb (ice_rx_stop()) and the reset and
@@ -561,14 +564,16 @@ ice_rx_reset_desc(ice_rx_ring_t *irr, uint16_t idx, ice_rx_ctrl_block_t *rcb)
 	ASSERT3U(rcb->ircb_dma.idb_ncookies, ==, 1);
 
 	irr->irxr_rcbs[idx] = rcb;
-	desc->read.pkt_addr = CPU_TO_LE64(ICE_DMA_PA(&rcb->ircb_dma));
+	desc->read.pkt_addr = CPU_TO_LE64(ICE_DMA_PA(&rcb->ircb_dma) +
+	    ICE_RX_HEADROOM);
 	desc->read.hdr_addr = 0;
 }
 
 /*
  * Allocate the per-ring control-block backing: one control block per
- * descriptor slot plus a loan reserve, each owning an ICE_RX_BUF_SIZE DMA
- * buffer and a desballoc loaner.  Builds the spare free list; the descriptor
+ * descriptor slot plus a loan reserve, each owning a DMA buffer with room
+ * for ICE_RX_BUF_SIZE bytes after ICE_RX_HEADROOM, and a desballoc loaner.
+ * Builds the spare free list; the descriptor
  * ring is populated by ice_rx_setup_bufs().
  */
 static boolean_t
@@ -601,7 +606,7 @@ ice_rx_alloc_rcbs(ice_rx_ring_t *irr)
 		rcb->ircb_free_rtn.free_arg = (caddr_t)rcb;
 
 		if (!ice_dma_alloc(ice, &rcb->ircb_dma, &attr, &acc, B_TRUE,
-		    ICE_RX_BUF_SIZE, B_TRUE)) {
+		    ICE_RX_BUF_SIZE + ICE_RX_HEADROOM, B_TRUE)) {
 			ice_error(ice, "failed to allocate rx buffer for queue "
 			    "%u", irr->irxr_index);
 			return (B_FALSE);
@@ -712,13 +717,14 @@ ice_rx_copy(ice_rx_ring_t *irr, ice_rx_ctrl_block_t *rcb, uint16_t plen)
 {
 	mblk_t *mp;
 
-	mp = allocb(plen, 0);
+	mp = allocb(plen + ICE_RX_HEADROOM, 0);
 	if (mp == NULL) {
 		irr->irxr_stats.icrxs_copy_nomem.value.ui64++;
 		return (NULL);
 	}
 
-	bcopy(rcb->ircb_dma.idb_va, mp->b_rptr, plen);
+	mp->b_rptr += ICE_RX_HEADROOM;
+	bcopy(rcb->ircb_dma.idb_va + ICE_RX_HEADROOM, mp->b_rptr, plen);
 	mp->b_wptr = mp->b_rptr + plen;
 
 	irr->irxr_stats.icrxs_copy_bytes.value.ui64 += plen;
@@ -761,7 +767,7 @@ ice_rx_bind(ice_rx_ring_t *irr, uint16_t idx, ice_rx_ctrl_block_t *rcb,
 
 	mp = rcb->ircb_mp;
 	mp->b_cont = mp->b_next = NULL;
-	mp->b_rptr = (unsigned char *)rcb->ircb_dma.idb_va;
+	mp->b_rptr = (unsigned char *)rcb->ircb_dma.idb_va + ICE_RX_HEADROOM;
 	mp->b_wptr = mp->b_rptr + plen;
 
 	rcb->ircb_state = IRXB_ONLOAN;
@@ -850,26 +856,22 @@ ice_rx_discard_frame(ice_rx_ring_t *irr, uint16_t nsegs)
 }
 
 /*
- * Put a hardware-extracted VLAN tag back into the frame.  illumos MAC has no
- * rx VLAN metadata channel; it demultiplexes a VLAN link from the tag inline,
- * so a stripped tag means the frame can never reach the VLAN client.  vmp
- * carries a copy of the address pair, the 802.1Q header and the original
- * ethertype, and the original head is advanced past the ether header it
- * already holds, which keeps the payload zero-copy.  tci is in host byte
- * order.
- *
- * The split point mirrors mac_add_vlan_tag(): MAC requires the head to hold a
- * full struct ether_vlan_header, and mac_strip_vlan_tag() asserts it.
+ * Restore a stripped VLAN tag in the reserved headroom.  Only the address
+ * pair moves: the original ethertype and all following headers stay in the
+ * first block, with the IP header still aligned.  Both copy and loan mblks
+ * retain the allocation base and reserve ICE_RX_HEADROOM before b_rptr.
  */
-static mblk_t *
-ice_rx_vlan_insert(mblk_t *mp, mblk_t *vmp, uint16_t tci)
+static void
+ice_rx_vlan_insert(mblk_t *mp, uint16_t tci)
 {
-	uint8_t *p = vmp->b_wptr;
+	uint8_t *p;
 
 	ASSERT3U(MBLKL(mp), >=, sizeof (struct ether_header));
+	ASSERT3U(mp->b_rptr - mp->b_datap->db_base, >=, ICE_RX_HEADROOM);
 
-	bcopy(mp->b_rptr, p, 2 * ETHERADDRL);
-	p += 2 * ETHERADDRL;
+	mp->b_rptr -= VLAN_TAGSZ;
+	ovbcopy(mp->b_rptr + VLAN_TAGSZ, mp->b_rptr, 2 * ETHERADDRL);
+	p = mp->b_rptr + 2 * ETHERADDRL;
 
 	/* The 802.1Q header is built in network byte order. */
 	*p++ = (ETHERTYPE_VLAN >> 8) & 0xff;
@@ -877,30 +879,7 @@ ice_rx_vlan_insert(mblk_t *mp, mblk_t *vmp, uint16_t tci)
 	*p++ = (tci >> 8) & 0xff;
 	*p++ = tci & 0xff;
 
-	/* A 2-byte copy keeps network byte order without an aligned load. */
-	bcopy(mp->b_rptr + 2 * ETHERADDRL, p, sizeof (uint16_t));
-	p += sizeof (uint16_t);
-
-	vmp->b_wptr = p;
-	mp->b_rptr += sizeof (struct ether_header);
-
-	/*
-	 * Drop a now-empty head rather than pass it upstack.  Only a 14-byte
-	 * first segment can get here, which is below ICE_RX_COPY_THRESHOLD and
-	 * so is always a copy mblk: freeb() cannot re-enter ice_rx_recycle()
-	 * under the ring lock.
-	 */
-	if (MBLKL(mp) == 0) {
-		vmp->b_cont = mp->b_cont;
-		mp->b_cont = NULL;
-		freeb(mp);
-	} else {
-		vmp->b_cont = mp;
-	}
-
-	ASSERT3U(MBLKL(vmp), >=, sizeof (struct ether_vlan_header));
-
-	return (vmp);
+	ASSERT3U(MBLKL(mp), >=, sizeof (struct ether_vlan_header));
 }
 
 /*
@@ -914,7 +893,7 @@ ice_ring_rx_frame(ice_rx_ring_t *irr, uint32_t *total_lenp,
     boolean_t *deferp)
 {
 	ice_t *ice = irr->irxr_ice;
-	mblk_t *mp_head = NULL, *mp_tail = NULL, *vmp = NULL;
+	mblk_t *mp_head = NULL, *mp_tail = NULL;
 	ice_rx_ctrl_block_t *loaned[ICE_RX_MAX_DESC];
 	uint16_t seglens[ICE_RX_MAX_DESC];
 	uint32_t frame_limit = *total_lenp;
@@ -1003,19 +982,6 @@ ice_ring_rx_frame(ice_rx_ring_t *irr, uint32_t *total_lenp,
 		return (NULL);
 	}
 
-	/*
-	 * Obtain the tag header before any descriptor is consumed: a failure
-	 * here is then just a dropped frame, not a partially unwound one.
-	 */
-	if (vlan) {
-		vmp = allocb(sizeof (struct ether_vlan_header), 0);
-		if (vmp == NULL) {
-			ice_rx_discard_frame(irr, nsegs);
-			irr->irxr_stats.icrxs_copy_nomem.value.ui64++;
-			return (NULL);
-		}
-	}
-
 	/* Pass B: every segment is present and its length is now trusted. */
 	h = irr->irxr_head;
 	for (i = 0; i < nsegs; i++) {
@@ -1024,7 +990,8 @@ ice_ring_rx_frame(ice_rx_ring_t *irr, uint32_t *total_lenp,
 		uint16_t seglen = seglens[i];
 		boolean_t bound = B_FALSE;
 
-		if (ddi_dma_sync(rcb->ircb_dma.idb_dma_handle, 0, seglen,
+		if (ddi_dma_sync(rcb->ircb_dma.idb_dma_handle,
+		    ICE_RX_HEADROOM, seglen,
 		    DDI_DMA_SYNC_FORKERNEL) != DDI_SUCCESS ||
 		    ice_check_dma_handle(rcb->ircb_dma.idb_dma_handle) !=
 		    DDI_FM_OK) {
@@ -1058,9 +1025,9 @@ ice_ring_rx_frame(ice_rx_ring_t *irr, uint32_t *total_lenp,
 		h = ice_rx_next(irr, h);
 	}
 
-	/* hcksum metadata belongs on the final head, so prepend first. */
-	if (vmp != NULL)
-		mp_head = ice_rx_vlan_insert(mp_head, vmp, eop_l2tag1);
+	/* Restore the tag before attaching checksum metadata to the head. */
+	if (vlan)
+		ice_rx_vlan_insert(mp_head, eop_l2tag1);
 
 	ice_rx_hcksum(irr, mp_head, eop_status0, eop_ptype);
 	irr->irxr_head = h;
@@ -1082,8 +1049,6 @@ assemble_fail:
 	}
 	if (mp_head != NULL)
 		freemsg(mp_head);
-	if (vmp != NULL)
-		freeb(vmp);
 	for (i = 0; i < nloans; i++) {
 		(void) ice_rx_alloc_mp(loaned[i]);
 		ice_rcb_free(irr, loaned[i]);

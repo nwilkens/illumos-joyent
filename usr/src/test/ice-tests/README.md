@@ -100,6 +100,7 @@ python3 usr/src/test/ice-tests/tx_bind_threshold.py
 python3 usr/src/test/ice-tests/tx_blocked.py
 python3 usr/src/test/ice-tests/tx_doorbell.py
 python3 usr/src/test/ice-tests/vlan_rx.py
+python3 usr/src/test/ice-tests/rx_layout.py
 python3 usr/src/test/ice-tests/pool_locks.py
 python3 usr/src/test/ice-tests/jumbo_copy.py
 python3 usr/src/test/ice-tests/loan_wait.py
@@ -237,12 +238,13 @@ the doorbell write is FM-checked; there is no per-packet MMIO readback or
 whole-ring sync; and the control paths keep their flush while recycle keeps its
 `DDI_DMA_SYNC_FORKERNEL` sync.
 
-`vlan_rx.py` verifies that a hardware-stripped VLAN tag is reinserted into the
-frame: the tag and its status bit are read only after the consumer barrier, the
-donated address pair is bounds-checked before `b_rptr` advances, a failed
-tag-header allocation discards the frame instead of delivering it, checksum
-metadata lands on the head MAC actually receives, and the 802.1Q header is
-emitted in network byte order.
+`vlan_rx.py` checks descriptor tag/decode ordering and in-place insertion
+bounds. `rx_layout.py` executes the production copy, loan, descriptor posting,
+VLAN reinsertion, and frame assembly functions. Sixteen cases verify aligned
+and contiguous IP headers, packet bytes, the full DMA allocation and sync
+extent, jumbo chains, and loan accounting. Shared `rx_test.py`/`rx_test.h`
+supply controlled DDI/STREAMS boundaries. These are host regressions;
+hardware performance measurements remain separate.
 
 `pool_locks.py` verifies that both transmit copy-buffer pool locks are created
 once at the negotiated interrupt priority before first use, destroyed exactly
