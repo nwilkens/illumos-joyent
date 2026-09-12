@@ -223,8 +223,10 @@ The runner compiles the real `ice_ddp_pkg_valid()` and its helpers against
 structure stand-ins with the vendor field order and widths, then builds
 packages whose section tables are valid, extend past the buffer, or declare
 typed sections and counted arrays larger than their extent. The metadata case
-reproduces the reviewed one-byte section at offset 4095. It also checks that
-the core's metadata consumer verifies the size it reads.
+reproduces the reviewed one-byte section at offset 4095. When the shipped
+`firmware/ice.pkg` is present it must pass in full and fail when truncated by
+one byte. It also checks that the core's metadata consumer verifies the size
+it reads.
 
 ## MAC IPv6 extension-header regression
 
