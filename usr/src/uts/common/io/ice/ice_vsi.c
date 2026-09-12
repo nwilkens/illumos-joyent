@@ -255,6 +255,11 @@ ice_vsi_loopback_set(ice_t *ice, boolean_t enable)
 	return (status);
 }
 
+/*
+ * Setup does not own VSI lifetime. On failure, ice_vsi_init() tears down its
+ * new instance; ice_vsi_rebuild() retains the desired MAC list and any partial
+ * VSI state for terminal client retirement and eventual ice_vsi_fini().
+ */
 static int
 ice_vsi_setup(ice_t *ice)
 {
@@ -289,14 +294,12 @@ ice_vsi_setup(ice_t *ice)
 	if (!ice_is_vsi_valid(hw, vsi->vi_handle)) {
 		ice_error(ice, "PF VSI handle %u invalid after add",
 		    vsi->vi_handle);
-		ice_vsi_teardown(ice);
 		return (ICE_ERR_PARAM);
 	}
 	vsi->vi_hw_num = ice_get_hw_vsi_num(hw, vsi->vi_handle);
 	if (vsi->vi_hw_num >= ICE_MAX_VSI) {
 		ice_error(ice, "firmware returned out-of-range VSI number %u",
 		    vsi->vi_hw_num);
-		ice_vsi_teardown(ice);
 		return (ICE_ERR_PARAM);
 	}
 
@@ -311,7 +314,6 @@ ice_vsi_setup(ice_t *ice)
 	cached = ice_get_vsi_ctx(hw, vsi->vi_handle);
 	if (cached == NULL) {
 		ice_error(ice, "PF VSI context missing after add");
-		ice_vsi_teardown(ice);
 		return (ICE_ERR_DOES_NOT_EXIST);
 	}
 	cached->info = ctx.info;
@@ -327,7 +329,6 @@ ice_vsi_setup(ice_t *ice)
 	    max_lanqs);
 	if (status != ICE_SUCCESS) {
 		ice_error(ice, "failed to configure VSI scheduler: %d", status);
-		ice_vsi_teardown(ice);
 		return (status);
 	}
 

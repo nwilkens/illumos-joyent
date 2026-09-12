@@ -37,10 +37,19 @@ software handle, and address fields across add, remove, attach, replay, and
 teardown. An attach-failure case verifies the same rollback request and no
 new desired-state ownership. Replay preserves the existing desired list.
 
-The original constructors and the shared constructor both pass; deleting the
-TX direction assignment fails the request check at runtime. Select paired
-baseline files with `--gld-source` and `--vsi-source`. The test models the
-request boundary and does not verify firmware encoding or device programming.
+The runner also executes the real VSI setup and attach initialization bodies.
+Four rebuild failures (invalid handle, out-of-range hardware VSI, missing cached
+context, and scheduler failure) preserve desired records for terminal client
+removal without firmware calls. Seven attach failures verify that the existing
+attach owner still destroys partial VSI state, lists, and locks, including
+retiring desired records after RSS setup fails.
+
+The original constructors and the shared constructor both pass the `requests`
+scenario; deleting TX direction fails its request check at runtime. Select paired
+baseline files with `--gld-source` and `--vsi-source`, and a single scenario with
+`--scenario`. Before the ownership fix, each `rebuild_*` scenario fails because
+setup drains the desired list. The test controls imported-core and firmware
+boundaries; it does not verify firmware encoding or device programming.
 
 ## Detach lifecycle regression
 

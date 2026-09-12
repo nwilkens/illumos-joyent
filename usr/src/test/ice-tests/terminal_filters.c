@@ -44,6 +44,7 @@ struct ice_mac_filter {
 	ice_mac_filter_t *prev;
 	ice_mac_filter_t *next;
 	uint8_t imf_addr[ETHERADDRL];
+	int imf_node;
 };
 typedef struct list {
 	ice_mac_filter_t *head;
@@ -51,6 +52,7 @@ typedef struct list {
 } list_t;
 typedef struct ice_vsi {
 	uint16_t vi_handle;
+	uint16_t vi_nrxq, vi_ntxq, vi_hw_num;
 	kmutex_t vi_mac_lock;
 	list_t vi_macs;
 	boolean_t vi_added;
@@ -72,6 +74,7 @@ struct ice {
 	kmutex_t ice_rebuild_lock;
 	uint32_t ice_state;
 	boolean_t ice_promisc_on;
+	unsigned int ice_nqueues;
 };
 
 struct LIST_HEAD_TYPE {

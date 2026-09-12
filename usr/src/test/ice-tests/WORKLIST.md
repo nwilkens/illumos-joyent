@@ -23,7 +23,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | 7 | P2 | RX descriptor DMA faults are checked late or missed | Implemented; hardware fault injection pending |
 | 8 | P2 | Small-MSS LSO fallback retains the wrong checksum seed | Implemented; LSO disabled by default, hardware validation pending |
 | 9 | Maintenance | Duplicate MAC filter constructors | Implemented; request equivalence tested |
-| 10 | Architecture | Filter ownership and replay contract is incomplete | Open |
+| 10 | Architecture | Filter ownership and replay contract is incomplete | In progress; VSI failure ownership corrected |
 | 11 | Architecture | Lifecycle callers conflate several kinds of quiescence | Open |
 | 12 | Documentation | Some comments promise stronger invariants than the code establishes | Open |
 | 13 | Test repair | `tx_bind_threshold.py` has a stale exact-text assertion | Implemented with executable copy/bind regression |
@@ -280,6 +280,20 @@ Document ownership across MAC users, `vi_macs` desired state, imported-core
 bookkeeping, and hardware rules. Define how failures create divergence and how
 replay/teardown resolves it. Item 1 defines terminal retirement only; partial
 programming, rollback, and normal replay still need a complete contract.
+
+VSI setup no longer releases its caller's desired filters on validation or
+scheduler failure. Attach's existing failure label owns full teardown; rebuild
+failure preserves `vi_macs` and any partial VSI state for terminal client
+retirement and eventual detach. Successful replay continues to preserve the
+same list. This changes no imported-core routine or queue programming.
+
+`filter_requests.py` compiles actual setup, attach initialization, GLD callbacks,
+replay, and teardown bodies. The four formerly destructive setup failures all
+fail on the original implementation and pass after removing the inner teardown
+calls. Tests verify terminal unicast/multicast retirement without firmware
+commands, seven attach failure points (including RSS after filters exist), and
+unchanged successful request/replay behavior. Hardware programming remains
+outside this controlled host test.
 
 ## 11. Lifecycle contract
 
