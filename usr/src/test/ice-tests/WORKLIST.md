@@ -415,6 +415,22 @@ device matrix. Native kernel compilation and hardware acceptance remain
 separate evidence; earlier branch throughput results do not validate this
 review revision.
 
+## Scheduler resource validation follow-up (2026-09-14)
+
+The initial scheduler layer range check was incomplete. Resource admission now
+requires `ICE_SCHED_5_LAYERS` or `ICE_SCHED_9_LAYERS` before narrowing the count,
+and validates every sibling-group size used as a child fanout before publishing
+hardware state. These values feed layer indexing and child-node sizing. The
+root's sibling count is not a child fanout; records outside the active topology
+are not consumed. The local FreeBSD reference at `5319035afa` defines the same
+topologies and mapping; the query guards remain marked illumos deviations.
+
+`sched_resources.py` executes the real resource-query function. Its 34 cases
+check rejection without state publication, valid minimum/nonuniform fanouts,
+allocation and AQ cleanup, and reuse of accepted state. The previous source
+compiled but failed both rejection groups by returning success. The tests stop
+at query admission; downstream panic paths and hardware were not exercised.
+
 ## Security review (2026-09-12)
 
 Reviewed at `5690d86ab142897599c5abbc5972bc9e679ebadb`. Items S1 and S8 are
@@ -428,7 +444,7 @@ so a later core refresh can carry or replace them.
 | S1 | High | Split IPv6 headers cause a guest-triggerable OOB write in viona LSO | Implemented: viona admits LSO only with the IP header and TCP checksum field in the first mblk, TCP, an exact guest checksum start/offset, and header plus MSS within the link MTU |
 | S2 | High | Oversized guest frames cross the E810 transmit limit | Implemented: `ice_tx_frame_fits()` drops non-LSO frames and LSO segments above MTU plus VLAN header, `tx_oversize_drops` counts them; viona drops non-LSO frames above its link MTU (`tx_drop_over_mtu`) |
 | S3 | High | Teardown frees DMA after reset failure | Implemented earlier (item 2) |
-| S4 | High, restricted input | Firmware AQ counts drive OOB reads in imported core | Implemented: capability, switch-config, package-info and per-branch topology counts are bounded by their buffers, and scheduler node insertion checks the parent's child capacity (marked `illumos:` in `core/`) |
+| S4 | High, restricted input | Firmware AQ counts drive OOB reads in imported core | Implemented: capability, switch-config, package-info and per-branch topology counts are bounded by their buffers, scheduler node insertion checks the parent's child capacity, and scheduler resources require 5 or 9 layers with nonzero child fanouts (marked `illumos:` in `core/`, with executable admission coverage in `sched_resources.py`) |
 | S5 | Medium | TDPU malicious-driver events neither cleared nor attributed | Implemented: `ice_oicr_mdd()` clears and attributes `GL/PF_MDET_TX_TDPU` |
 | S6 | Medium | Malformed DDP typed section reads beyond the package | Implemented: `ice_ddp_pkg_valid()` checks every buffer's section table and typed section minimums (per-block field-vector widths); the shipped `ice.pkg` passes in `ddp_sections.py`; the core metadata read checks its own size and debug name prints are bounded |
 | S7 | Medium | TX notification can cross MAC unregister | Implemented earlier (item 3) |

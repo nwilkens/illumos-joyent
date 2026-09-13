@@ -5,6 +5,21 @@ architecture, performance, and test issues, their priorities, and acceptance
 criteria. The driver [lifecycle contract](../../uts/common/io/ice/LIFECYCLE.md)
 records the lock, callback, DMA, and recovery boundaries exercised here.
 
+## Scheduler resource admission regression
+
+`sched_resources.py` compiles the real `ice_sched_query_res_alloc()` and its
+response types. Thirty-four cases cover unsupported layer counts (including
+one layer and values that would truncate to a supported count), zero child
+fanouts at every consumed layer, valid 5/9-layer responses with varied and
+minimum fanouts, allocation/AQ errors, and reuse of accepted cached resources.
+Rejected responses leave scheduler state unchanged and release their buffer.
+Unused records outside the reported topology may remain zero.
+
+The test stops at resource admission; it does not build a scheduler tree or
+exercise the downstream invalid-index/division paths. Both rejection groups
+fail against the previous range-only check. Use `--source` for a source
+revision and `--scenario levels|fanout|valid|failures|cached` to select a group.
+
 ## Portable suite
 
 Run `python3 -B usr/src/test/ice-tests/run_tests.py` from the repository root

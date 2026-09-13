@@ -11,6 +11,7 @@ import sys
 TESTS = (
     "runner_checks.py",
     "admin_interrupt.py",
+    "core_counts.py",
     "detach_quiesce.py",
     "ddp_sections.py",
     "dma_lifetime.py",
@@ -43,6 +44,7 @@ TESTS = (
     "rx_intr_route.py",
     "rx_layout.py",
     "safe_mode.py",
+    "sched_resources.py",
     "stale_comments.py",
     "terminal_filters.py",
     "transceiver_lock.py",

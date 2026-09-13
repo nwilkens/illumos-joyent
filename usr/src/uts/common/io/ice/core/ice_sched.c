@@ -1458,7 +1458,7 @@ int ice_sched_query_res_alloc(struct ice_hw *hw)
 	struct ice_aqc_query_txsched_res_resp *buf;
 	__le16 max_sibl;
 	int status = 0;
-	u16 i;
+	u16 i, num_layers;
 
 	if (hw->layer_info)
 		return status;
@@ -1472,8 +1472,23 @@ int ice_sched_query_res_alloc(struct ice_hw *hw)
 	if (status)
 		goto sched_query_out;
 
-	hw->num_tx_sched_layers =
-		(u8)LE16_TO_CPU(buf->sched_props.logical_levels);
+	/* illumos: layer offsets require a supported scheduler topology. */
+	num_layers = LE16_TO_CPU(buf->sched_props.logical_levels);
+	if (num_layers != ICE_SCHED_5_LAYERS &&
+	    num_layers != ICE_SCHED_9_LAYERS) {
+		status = ICE_ERR_AQ_ERROR;
+		goto sched_query_out;
+	}
+
+	/* illumos: validate child fanouts before publishing scheduler state. */
+	for (i = 1; i < num_layers; i++) {
+		if (!LE16_TO_CPU(buf->layer_props[i].max_sibl_grp_sz)) {
+			status = ICE_ERR_AQ_ERROR;
+			goto sched_query_out;
+		}
+	}
+
+	hw->num_tx_sched_layers = (u8)num_layers;
 	hw->num_tx_sched_phys_layers =
 		(u8)LE16_TO_CPU(buf->sched_props.phys_levels);
 	hw->flattened_layers = buf->sched_props.flattening_bitmap;
