@@ -424,6 +424,14 @@ the lock is dropped, so a fully drained ring that will raise no further
 completion interrupt cannot stay blocked at MAC; the chain is returned for MAC
 to retry; and both exits of the recycle path own the wakeup.
 
+`tx_emit.py` compiles the actual descriptor writers, emission, DMA sync,
+TCB cleanup, and completion walk. Twenty cases cover ordinary/LSO bindings,
+all copy-buffer types, ring wrap, context and RS descriptors, exactly-once
+ownership, pre-doorbell DMA failures, and doorbell errors. Descriptor fields
+are decoded independently of the writers. Controls with wrong addresses,
+TCB placement, rollback, or bind-handle selection fail at runtime. Pool and
+DDI operations are boundary substitutes, not hardware validation.
+
 `tx_doorbell.py` verifies the descriptor-sync and doorbell sequence: only the
 descriptors the packet wrote are synced, split at ring wrap with
 descriptor-sized offsets; the sync precedes the tail advance and the doorbell;

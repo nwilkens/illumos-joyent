@@ -72,7 +72,7 @@ def main() -> None:
         "ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs,",
         "\nstatic boolean_t\nice_tx_desc_done",
     )
-    assert "else if (tcb->itcb_type == ITCB_LSO_BIND)" in emit
+    # tx_emit.py executes cookie emission for ordinary and LSO bindings.
     assert "ice_tx_write_ctx_desc" in emit
 
     lso_build = function(

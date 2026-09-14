@@ -502,6 +502,15 @@ ice_tcb_alloc(ice_tx_ring_t *itr)
 	return (tcb);
 }
 
+/* Only bound TCBs select between the preallocated ordinary/LSO handles. */
+static inline ddi_dma_handle_t
+ice_tcb_bind_handle(const ice_tx_ctrl_block_t *tcb)
+{
+	ASSERT(tcb->itcb_type == ITCB_BIND || tcb->itcb_type == ITCB_LSO_BIND);
+	return (tcb->itcb_type == ITCB_BIND ? tcb->itcb_dmah :
+	    tcb->itcb_lso_dmah);
+}
+
 /*
  * Release whatever a TCB holds (copy buffer, DMA binding, retained mblk) and
  * return it to the ring's free list.  The bind handles are preallocated per
@@ -523,10 +532,8 @@ ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
 		tcb->itcb_buf = NULL;
 		break;
 	case ITCB_BIND:
-		(void) ddi_dma_unbind_handle(tcb->itcb_dmah);
-		break;
 	case ITCB_LSO_BIND:
-		(void) ddi_dma_unbind_handle(tcb->itcb_lso_dmah);
+		(void) ddi_dma_unbind_handle(ice_tcb_bind_handle(tcb));
 		break;
 	}
 
@@ -1374,10 +1381,8 @@ ice_tx_sync_tcb(ice_t *ice, ice_tx_ctrl_block_t *tcb)
 		h = tcb->itcb_buf->idb_dma_handle;
 		break;
 	case ITCB_BIND:
-		h = tcb->itcb_dmah;
-		break;
 	case ITCB_LSO_BIND:
-		h = tcb->itcb_lso_dmah;
+		h = ice_tcb_bind_handle(tcb);
 		break;
 	default:
 		return (B_TRUE);
@@ -1433,28 +1438,15 @@ ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs, uint_t ntcb,
 		ice_tx_ctrl_block_t *tcb = tcbs[i];
 		uint16_t first = tail;
 
-		if (tcb->itcb_type == ITCB_BIND) {
-			uint_t nc = ddi_dma_ncookies(tcb->itcb_dmah);
+		if (tcb->itcb_type == ITCB_BIND ||
+		    tcb->itcb_type == ITCB_LSO_BIND) {
+			ddi_dma_handle_t handle = ice_tcb_bind_handle(tcb);
+			uint_t nc = ddi_dma_ncookies(handle);
 			uint_t c;
 
 			for (c = 0; c < nc; c++) {
 				const ddi_dma_cookie_t *ck =
-				    ddi_dma_cookie_get(tcb->itcb_dmah, c);
-
-				ice_tx_write_desc(itr, tail,
-				    ck->dmac_laddress, ck->dmac_size,
-				    ctx->itc_data_cmd, ctx->itc_data_off);
-				last = tail;
-				tail = ice_tx_ring_next(itr, tail);
-				written++;
-			}
-		} else if (tcb->itcb_type == ITCB_LSO_BIND) {
-			uint_t nc = ddi_dma_ncookies(tcb->itcb_lso_dmah);
-			uint_t c;
-
-			for (c = 0; c < nc; c++) {
-				const ddi_dma_cookie_t *ck =
-				    ddi_dma_cookie_get(tcb->itcb_lso_dmah, c);
+				    ddi_dma_cookie_get(handle, c);
 
 				ice_tx_write_desc(itr, tail,
 				    ck->dmac_laddress, ck->dmac_size,

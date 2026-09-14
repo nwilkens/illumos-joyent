@@ -53,6 +53,7 @@ TESTS = (
     "tx_bind_threshold.py",
     "tx_blocked.py",
     "tx_doorbell.py",
+    "tx_emit.py",
     "tx_frame_limit.py",
     "tx_quiesce.py",
     "viona_tx_guards.py",

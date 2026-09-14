@@ -478,4 +478,21 @@ unchanged.
   from its OS-specific glue, which this driver does not import. Kept the actual
   link-update synchronization, firmware return handling, diagnostic DDP state,
   and debugger reset hook. `control_setup.py` exercises the unchanged link/RSS
-  behavior in 17 scenarios; the native module link checks remaining callers.
+  behavior in 17 scenarios. Commit `88b5c54928` passes 50/50 portable checks
+  and a clean native build with 20 GCC/smatch compilation pairs, module link,
+  and CTF generation.
+
+- **A3 — Duplicate TX bound-descriptor walks: implemented.** Ordinary and LSO
+  bindings select their preallocated handle through one helper used by emit,
+  sync, and release. A single cookie walk writes both forms. Kept LSO's
+  distinct admission and cookie-count checks; its preparation is not equivalent
+  to ordinary binding. FreeBSD `5319035afa`, `ice_iflib_txrx.c`, likewise uses
+  one data-segment emission loop after separate TSO preparation. The actual-C
+  regression covers 20 success/failure cases, including ring wrap, completion,
+  and exactly-once ownership. Four runtime negative controls exercise cookie
+  address, TCB placement, rollback, and handle selection. Hardware validation
+  remains pending.
+
+Validation after A3: full portable suite passes 51/51; source/style checks
+pass. Native builds are run from an isolated committed source snapshot after
+each atomic commit. No hardware or throughput qualification is implied.
