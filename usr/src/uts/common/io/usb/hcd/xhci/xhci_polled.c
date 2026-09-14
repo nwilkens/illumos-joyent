@@ -114,7 +114,10 @@ xhci_polled_get_endpoint(xhci_t *xhcip, xhci_trb_t *trb)
 	/*
 	 * Endpoint IDs are indexed based on their Device Context Index, which
 	 * means that we need to subtract one to get the actual ID that we use.
+	 * A DCI of zero is not a valid endpoint.
 	 */
+	if (endpoint < 1 || endpoint > XHCI_NUM_ENDPOINTS)
+		return (NULL);
 	return (xd->xd_endpoints[endpoint - 1]);
 }
 

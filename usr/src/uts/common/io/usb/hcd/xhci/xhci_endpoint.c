@@ -1281,10 +1281,23 @@ xhci_endpoint_control_callback(xhci_t *xhcip, xhci_device_t *xd,
 
 		/*
 		 * This is a data stage TRB. The only reason we should have
-		 * gotten something for this is beacuse it was short. Make sure
-		 * it's okay before we continue.
+		 * gotten something for this is because it was short. The
+		 * completion code and the remaining length come from the
+		 * controller and bound the copy below, so anything that does
+		 * not add up fails the transfer instead of being trusted.
 		 */
-		VERIFY3S(code, ==, XHCI_CODE_SHORT_XFER);
+		remain = XHCI_TRB_REMAIN(LE_32(trb->trb_status));
+		if (code != XHCI_CODE_SHORT_XFER ||
+		    remain > xt->xt_buffer.xdb_len) {
+			xhci_error(xhcip, "!control data stage on slot %d "
+			    "endpoint %u completed with code %d and remaining "
+			    "length %u for a %lu byte transfer", xd->xd_slot,
+			    xep->xep_num, code, remain,
+			    (ulong_t)xt->xt_buffer.xdb_len);
+			xt->xt_cr = USB_CR_HC_HARDWARE_ERR;
+			mutex_exit(&xhcip->xhci_lock);
+			return (B_TRUE);
+		}
 		if (!(ucrp->ctrl_attributes & USB_ATTRS_SHORT_XFER_OK)) {
 			xt->xt_cr = USB_CR_DATA_UNDERRUN;
 			mutex_exit(&xhcip->xhci_lock);
@@ -1296,7 +1309,6 @@ xhci_endpoint_control_callback(xhci_t *xhcip, xhci_device_t *xd,
 		 * be transferred. Normalize that against the original buffer
 		 * size.
 		 */
-		remain = XHCI_TRB_REMAIN(LE_32(trb->trb_status));
 		xt->xt_short = xt->xt_buffer.xdb_len - remain;
 		mutex_exit(&xhcip->xhci_lock);
 		return (B_TRUE);
@@ -1432,6 +1444,7 @@ xhci_endpoint_norm_callback(xhci_t *xhcip, xhci_device_t *xd,
 	int attrs;
 	mblk_t *mp;
 	boolean_t periodic = B_FALSE;
+	boolean_t bad = B_FALSE;
 	usb_opaque_t urp;
 
 	ASSERT(MUTEX_HELD(&xhcip->xhci_lock));
@@ -1440,12 +1453,25 @@ xhci_endpoint_norm_callback(xhci_t *xhcip, xhci_device_t *xd,
 
 	code = XHCI_TRB_GET_CODE(LE_32(trb->trb_status));
 
+	/*
+	 * The remaining length comes from the controller and bounds the copy
+	 * below. A value larger than the transfer, or a bulk short completion
+	 * that is not an event data TRB, fails the transfer instead of being
+	 * trusted.
+	 */
 	if (code == XHCI_CODE_SHORT_XFER) {
 		uint_t residue;
 		residue = XHCI_TRB_REMAIN(LE_32(trb->trb_status));
 
-		if (xep->xep_type == USB_EP_ATTR_BULK) {
-			VERIFY3U(XHCI_TRB_GET_ED(LE_32(trb->trb_flags)), !=, 0);
+		if (residue > xt->xt_buffer.xdb_len ||
+		    (xep->xep_type == USB_EP_ATTR_BULK &&
+		    XHCI_TRB_GET_ED(LE_32(trb->trb_flags)) == 0)) {
+			xhci_error(xhcip, "!short completion on slot %d "
+			    "endpoint %u has remaining length %u for a %lu "
+			    "byte transfer", xd->xd_slot, xep->xep_num,
+			    residue, (ulong_t)xt->xt_buffer.xdb_len);
+			bad = B_TRUE;
+		} else if (xep->xep_type == USB_EP_ATTR_BULK) {
 			xt->xt_short = residue;
 		} else {
 			xt->xt_short = xt->xt_buffer.xdb_len - residue;
@@ -1486,6 +1512,11 @@ xhci_endpoint_norm_callback(xhci_t *xhcip, xhci_device_t *xd,
 
 		attrs = uirp->intr_attributes;
 		mp = uirp->intr_data;
+	}
+
+	if (bad) {
+		cr = USB_CR_HC_HARDWARE_ERR;
+		goto out;
 	}
 
 	if (xt->xt_data_tohost == B_TRUE) {
@@ -1558,7 +1589,14 @@ xhci_endpoint_isoch_callback(xhci_t *xhcip, xhci_device_t *xd,
 	 */
 	desc = &xt->xt_isoc[off];
 	if (code == XHCI_CODE_SHORT_XFER) {
-		int residue = XHCI_TRB_REMAIN(LE_32(trb->trb_status));
+		uint_t residue = XHCI_TRB_REMAIN(LE_32(trb->trb_status));
+
+		/*
+		 * The residue comes from the controller; it cannot exceed what
+		 * was scheduled for the packet.
+		 */
+		if (residue > desc->isoc_pkt_actual_length)
+			residue = desc->isoc_pkt_actual_length;
 		desc->isoc_pkt_actual_length -= residue;
 	}
 

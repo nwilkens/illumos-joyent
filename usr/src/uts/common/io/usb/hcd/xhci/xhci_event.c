@@ -125,10 +125,13 @@ xhci_event_process_psc(xhci_t *xhcip, xhci_trb_t *trb)
 	port = XHCI_TRB_PORTID(LE_64(trb->trb_addr));
 	if (port < 1 || port > xhcip->xhci_caps.xcap_max_ports) {
 		/*
-		 * At some point we may want to send a DDI_FM_DEVICE_INVAL_STATE
-		 * ereport as part of this.
+		 * Returning failure here would stop event processing without
+		 * a reset and leave the ring dequeue pointer behind. The event
+		 * carries no data we rely on, so drop it.
 		 */
-		return (B_FALSE);
+		xhci_error(xhcip, "!dropping port status change event for "
+		    "invalid port %u", port);
+		return (B_TRUE);
 	}
 
 	xhci_root_hub_psc_callback(xhcip);

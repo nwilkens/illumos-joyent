@@ -584,8 +584,24 @@ xhci_command_enable_slot(xhci_t *xhcip, uint8_t *slotp)
 	slot = XHCI_TRB_GET_SLOT(co.xco_res.trb_flags);
 
 	if (code == XHCI_CODE_SUCCESS) {
-		*slotp = slot;
-		ret = USB_SUCCESS;
+		boolean_t inuse;
+
+		/*
+		 * The slot number comes from the controller and indexes the
+		 * DCBAA. It must be in range and not already ours.
+		 */
+		mutex_enter(&xhcip->xhci_lock);
+		inuse = xhci_device_lookup_by_slot(xhcip, slot) != NULL;
+		mutex_exit(&xhcip->xhci_lock);
+		if (slot < 1 || slot > xhcip->xhci_caps.xcap_max_slots ||
+		    inuse) {
+			xhci_error(xhcip, "controller granted invalid or "
+			    "in-use slot %u", slot);
+			ret = USB_HC_HARDWARE_ERROR;
+		} else {
+			*slotp = slot;
+			ret = USB_SUCCESS;
+		}
 	} else if (code == XHCI_CODE_NO_SLOTS) {
 		ret = USB_NO_RESOURCES;
 	} else if (code == XHCI_CODE_CMD_ABORTED) {
