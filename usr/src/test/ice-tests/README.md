@@ -436,10 +436,16 @@ peeks and repost, plus data-buffer and register faults. Copy/loan cases
 verify delivery suppression, counter/tail behavior, and cleanup outside
 the ring lock; healthy controls retain ordinary delivery.
 
-`pool_locks.py` verifies that both transmit copy-buffer pool locks are created
-once at the negotiated interrupt priority before first use, destroyed exactly
-once after the pools are torn down, and never held across the `ice_buf_fini`
-unwind inside `ice_buf_init`.
+`buf_pool.py` compiles the actual shared TX pool functions. Its 27 lifecycle
+cases cover LSO enabled/disabled, failure at every DMA allocation, repeated
+cleanup, full-stack exhaustion, and returns to the correct pool when ordinary
+and LSO buffers have equal sizes. Allocation and release boundaries assert
+that no pool lock is held. The original implementation fails the sleeping
+allocation check. These controlled boundaries do not exercise real DMA.
+
+`pool_locks.py` checks the two pool locks are initialized once at the negotiated
+interrupt priority and destroyed after pool teardown. Construction and
+unwind rely on exclusive lifecycle ownership rather than holding those locks.
 
 `jumbo_copy.py` verifies that the transmit copy pool can hold any MTU-legal
 frame: the general pool buffer is page-rounded from `ICE_MAX_FRAME_SIZE`, a

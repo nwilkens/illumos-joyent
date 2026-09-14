@@ -452,3 +452,19 @@ so a later core refresh can carry or replace them.
 | S9 | Medium | Transceiver reads hold an interrupt-priority mutex across AQ polling | Implemented: only `ice_rebuild_lock` is held |
 | S10 | Medium | RX poll-mode register updates race reset routing | Implemented: one `QINT_RQCTL` writer under `irxr_lock` composes routing, arming and poll state |
 | S11 | Low | Small-MSS LSO downgrade retains a TSO checksum seed | Implemented earlier (item 8) |
+
+## 2026-09-14 abstraction and duplication pass
+
+Baseline: `ice-e810` at `aa48c5cad6`. This pass is confined to the local ICE
+glue and its regressions; imported core functionality and offload policy remain
+unchanged.
+
+- **A1 — TX copy-pool ownership and duplicated lifecycle: implemented.** Three
+  free-stack implementations now share one pool type and lifecycle. Buffers
+  carry their owner and return through one interface. Removed sleeping
+  allocations under interrupt-priority pool locks; initialization/destruction
+  use the existing exclusive lifecycle fences. Sizes, counts, allocation order,
+  optional LSO reserve, and the two-lock layout are preserved. The executable
+  regression fails on the previous allocation-under-lock behavior and passes
+  27 lifecycle cases. Full portable suite: 49/49. Native build follows the
+  atomic commit; hardware qualification remains pending.

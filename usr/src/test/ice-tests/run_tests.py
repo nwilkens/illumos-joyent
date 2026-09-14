@@ -11,6 +11,7 @@ import sys
 TESTS = (
     "runner_checks.py",
     "admin_interrupt.py",
+    "buf_pool.py",
     "core_counts.py",
     "detach_quiesce.py",
     "ddp_sections.py",

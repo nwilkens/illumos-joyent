@@ -782,8 +782,10 @@ ice_unconfigure(ice_t *ice)
 		ice_rem_intr_handlers(ice);
 
 	/*
-	 * Detach confirmed packet DMA isolation before unregistering MAC.
-	 * Attach failure never exposed the datapath or enabled its queues.
+	 * ice_detach_quiesce() isolated packet DMA and reclaimed TX descriptors
+	 * before unregistering MAC, returning their copy buffers to the pools.
+	 * The pools can therefore be destroyed before the remaining ring/TCB
+	 * storage. Attach failure never exposed the datapath or enabled queues.
 	 */
 	if (ice->ice_attach_progress & ICE_ATTACH_BUFS)
 		ice_buf_fini(ice);

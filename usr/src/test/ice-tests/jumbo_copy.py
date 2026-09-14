@@ -63,13 +63,9 @@ def main() -> None:
         "ice_buf_init(ice_t *ice)\n{",
         "\nvoid\nice_buf_fini",
     )
-    general = braced_block(buf_init, buf_init.index("for (i = 0; i < n; i++)"))
-    assert "ice->ice_dma_bufs[i] = &ice->ice_bufs[i];" in general
     assert re.search(
-        r"ice_dma_alloc\(ice,\s*&ice->ice_bufs\[i\],[^;]*"
-        r"ICE_TX_COPY_BUFSZ",
-        general,
-    )
+        r"ice_buf_pool_init\(ice,\s*&ice->ice_copy_pool,\s*n,\s*"
+        r"ICE_TX_COPY_BUFSZ\)", buf_init)
     # rx data buffers are allocated in ice_rx.c, not from these pools.
     assert "ICE_RX_BUF_SIZE" not in dma_source
 

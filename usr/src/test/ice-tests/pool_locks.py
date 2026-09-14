@@ -48,21 +48,10 @@ def main() -> None:
     dma = DMA_SOURCE.read_text(encoding="utf-8")
     buf_init = function(
         dma, "ice_buf_init(ice_t *ice)\n{", "\nvoid\nice_buf_fini")
-    pos = 0
-    fini_calls = 0
-    while True:
-        try:
-            fini = buf_init.index("ice_buf_fini(ice)", pos)
-        except ValueError:
-            break
-        fini_calls += 1
-        enter = max(buf_init.rfind("mutex_enter(&ice->%s)" % lock, 0, fini)
-            for lock in LOCKS)
-        assert enter != -1
-        window = buf_init[enter:fini]
-        assert any("mutex_exit(&ice->%s)" % lock in window for lock in LOCKS)
-        pos = fini + 1
-    assert fini_calls > 0
+    # Pool construction/destruction have exclusive lifecycle ownership.
+    # The actual-C buf_pool test checks every allocator/free boundary.
+    assert "mutex_enter(" not in buf_init
+    assert "ice_buf_fini(ice)" in buf_init
 
     print("PASS: ice copy-buffer pool lock lifetime invariants")
 

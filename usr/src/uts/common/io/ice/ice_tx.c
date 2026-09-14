@@ -511,8 +511,6 @@ ice_tcb_alloc(ice_tx_ring_t *itr)
 static void
 ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
 {
-	ice_t *ice = itr->itxr_ice;
-
 	if (tcb == NULL)
 		return;
 
@@ -520,15 +518,9 @@ ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
 	case ITCB_NOT_USED:
 		break;
 	case ITCB_SMALL_COPY:
-		ice_small_buf_free(ice, tcb->itcb_buf);
-		tcb->itcb_buf = NULL;
-		break;
 	case ITCB_COPY:
-		ice_buf_free(ice, tcb->itcb_buf);
-		tcb->itcb_buf = NULL;
-		break;
 	case ITCB_LSO_COPY:
-		ice_lso_buf_free(ice, tcb->itcb_buf);
+		ice_buf_free(tcb->itcb_buf);
 		tcb->itcb_buf = NULL;
 		break;
 	case ITCB_BIND:

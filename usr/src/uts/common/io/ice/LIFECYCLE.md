@@ -52,6 +52,24 @@ that callback must finish before its MAC/ring storage can be freed. TX likewise
 waits for admitted calls and notifications to return. These waits are software
 ownership fences, not hardware queue-stop acknowledgments.
 
+## TX copy-buffer pools
+
+The small, ordinary, and LSO copy pools share one stack implementation. Each
+buffer records its owning pool, so completion returns it without inferring
+ownership from its size or the TX operation. Ordinary and LSO buffers can
+have the same size and still belong to separate reserves. Their existing
+shared lock and the small-pool lock protect only allocation/return on the
+live stacks.
+
+Pool construction precedes MAC registration. Destruction follows TX
+quiescence, descriptor reclaim, and packet DMA isolation. Neither operation
+holds a pool lock across memory allocation or DMA release. Partial construction
+tracks successfully allocated buffers separately from array capacity; cleanup
+requires all initialized buffers to be on the free stack and is repeatable.
+The teardown order in `ice_unconfigure()` frees pools before ring/TCB storage.
+It relies on `ice_detach_quiesce()` having reclaimed TX descriptors and returned
+their pooled buffers before unregister. Attach failure has no admitted TX.
+
 ## Start, stop, and reset
 
 `ICE_STATE_STARTED` records a successful softc start and whether reset should

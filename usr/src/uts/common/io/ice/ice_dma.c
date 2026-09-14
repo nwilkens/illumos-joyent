@@ -245,243 +245,160 @@ ice_check_dma_handle(ddi_dma_handle_t handle)
 	return (de.fme_status);
 }
 
-ice_dma_buffer_t *
-ice_buf_alloc(ice_t *ice)
+/*
+ * Pool storage is constructed before MAC registration and destroyed only
+ * after TX is quiesced and reclaimed.  Those lifecycle fences exclude users
+ * while allocation/free can sleep; the interrupt-priority lock protects only
+ * the live free stack.  Normal and LSO copies share a lock, as before.
+ */
+static void
+ice_buf_pool_fini(ice_buf_pool_t *pool)
+{
+	uint_t i;
+
+	ASSERT3U(pool->ibp_nfree, ==, pool->ibp_nbufs);
+	if (pool->ibp_bufs != NULL) {
+		for (i = 0; i < pool->ibp_nbufs; i++)
+			ice_dma_free(&pool->ibp_bufs[i]);
+		kmem_free(pool->ibp_free,
+		    pool->ibp_size * sizeof (*pool->ibp_free));
+		kmem_free(pool->ibp_bufs,
+		    pool->ibp_size * sizeof (*pool->ibp_bufs));
+	}
+	pool->ibp_bufs = NULL;
+	pool->ibp_free = NULL;
+	pool->ibp_size = 0;
+	pool->ibp_nbufs = 0;
+	pool->ibp_nfree = 0;
+}
+
+static boolean_t
+ice_buf_pool_init(ice_t *ice, ice_buf_pool_t *pool, uint_t n, size_t size)
+{
+	ddi_dma_attr_t attr;
+	ddi_device_acc_attr_t acc;
+	uint_t i;
+
+	ASSERT3P(pool->ibp_bufs, ==, NULL);
+	ice_pkt_dma_attr(ice, &attr);
+	ice_dma_acc_attr(ice, &acc);
+
+	pool->ibp_size = n;
+	pool->ibp_free = kmem_zalloc(n * sizeof (*pool->ibp_free), KM_SLEEP);
+	pool->ibp_bufs = kmem_zalloc(n * sizeof (*pool->ibp_bufs), KM_SLEEP);
+	for (i = 0; i < n; i++) {
+		ice_dma_buffer_t *buf = &pool->ibp_bufs[i];
+
+		if (!ice_dma_alloc(ice, buf, &attr, &acc, B_TRUE, size,
+		    B_FALSE)) {
+			ice_buf_pool_fini(pool);
+			return (B_FALSE);
+		}
+		buf->idb_pool = pool;
+		pool->ibp_free[pool->ibp_nfree++] = buf;
+		pool->ibp_nbufs++;
+	}
+	return (B_TRUE);
+}
+
+static ice_dma_buffer_t *
+ice_buf_pool_alloc(ice_buf_pool_t *pool)
 {
 	ice_dma_buffer_t *buf;
 
-	/* ice_buf_alloc is the count of free buffers left on the stack. */
-	mutex_enter(&ice->ice_buf_lock);
-	if (ice->ice_buf_alloc == 0) {
-		mutex_exit(&ice->ice_buf_lock);
+	mutex_enter(pool->ibp_lock);
+	if (pool->ibp_nfree == 0) {
+		mutex_exit(pool->ibp_lock);
 		return (NULL);
 	}
-
-	buf = ice->ice_dma_bufs[--ice->ice_buf_alloc];
-	ice->ice_dma_bufs[ice->ice_buf_alloc] = NULL;
-	mutex_exit(&ice->ice_buf_lock);
-
+	buf = pool->ibp_free[--pool->ibp_nfree];
+	pool->ibp_free[pool->ibp_nfree] = NULL;
+	mutex_exit(pool->ibp_lock);
 	return (buf);
 }
 
-void
-ice_buf_free(ice_t *ice, ice_dma_buffer_t *buf)
+ice_dma_buffer_t *
+ice_buf_alloc(ice_t *ice)
 {
-	if (buf == NULL)
-		return;
-
-	/* Make sure we're not freeing to the wrong pool. */
-	ASSERT3U(buf->idb_len, ==, ICE_TX_COPY_BUFSZ);
-
-	mutex_enter(&ice->ice_buf_lock);
-	ASSERT3U(ice->ice_buf_alloc, <, ice->ice_buf_sz);
-	ice->ice_dma_bufs[ice->ice_buf_alloc++] = buf;
-	mutex_exit(&ice->ice_buf_lock);
+	return (ice_buf_pool_alloc(&ice->ice_copy_pool));
 }
 
 ice_dma_buffer_t *
 ice_lso_buf_alloc(ice_t *ice)
 {
-	ice_dma_buffer_t *buf;
-
-	mutex_enter(&ice->ice_buf_lock);
-	if (ice->ice_lso_buf_alloc == 0) {
-		mutex_exit(&ice->ice_buf_lock);
-		return (NULL);
-	}
-
-	buf = ice->ice_dma_lso_bufs[--ice->ice_lso_buf_alloc];
-	ice->ice_dma_lso_bufs[ice->ice_lso_buf_alloc] = NULL;
-	mutex_exit(&ice->ice_buf_lock);
-
-	return (buf);
-}
-
-void
-ice_lso_buf_free(ice_t *ice, ice_dma_buffer_t *buf)
-{
-	if (buf == NULL)
-		return;
-
-	ASSERT3U(buf->idb_len, ==, ICE_TX_LSO_BUFSZ);
-
-	mutex_enter(&ice->ice_buf_lock);
-	ASSERT3U(ice->ice_lso_buf_alloc, <, ice->ice_lso_buf_sz);
-	ice->ice_dma_lso_bufs[ice->ice_lso_buf_alloc++] = buf;
-	mutex_exit(&ice->ice_buf_lock);
+	return (ice_buf_pool_alloc(&ice->ice_lso_pool));
 }
 
 ice_dma_buffer_t *
 ice_small_buf_alloc(ice_t *ice)
 {
-	ice_dma_buffer_t *buf;
-
-	mutex_enter(&ice->ice_small_buf_lock);
-	if (ice->ice_small_buf_alloc == 0) {
-		mutex_exit(&ice->ice_small_buf_lock);
-		return (NULL);
-	}
-
-	buf = ice->ice_dma_small_bufs[--ice->ice_small_buf_alloc];
-	ice->ice_dma_small_bufs[ice->ice_small_buf_alloc] = NULL;
-	mutex_exit(&ice->ice_small_buf_lock);
-
-	return (buf);
+	return (ice_buf_pool_alloc(&ice->ice_small_pool));
 }
 
+/* The allocation records its owner; callers never choose a return pool. */
 void
-ice_small_buf_free(ice_t *ice, ice_dma_buffer_t *buf)
+ice_buf_free(ice_dma_buffer_t *buf)
 {
+	ice_buf_pool_t *pool;
+
 	if (buf == NULL)
 		return;
+	pool = buf->idb_pool;
+	ASSERT3P(pool, !=, NULL);
 
-	mutex_enter(&ice->ice_small_buf_lock);
-	ASSERT3U(ice->ice_small_buf_alloc, <, ice->ice_small_buf_sz);
-	ice->ice_dma_small_bufs[ice->ice_small_buf_alloc++] = buf;
-	mutex_exit(&ice->ice_small_buf_lock);
+	mutex_enter(pool->ibp_lock);
+	ASSERT3U(pool->ibp_nfree, <, pool->ibp_nbufs);
+	pool->ibp_free[pool->ibp_nfree++] = buf;
+	mutex_exit(pool->ibp_lock);
 }
 
 boolean_t
 ice_buf_init(ice_t *ice)
 {
-	ddi_dma_attr_t attr;
-	ddi_device_acc_attr_t acc;
-	uint_t i, n;
+	uint_t i, n = 0;
 
-	ice_pkt_dma_attr(ice, &attr);
-	ice_dma_acc_attr(ice, &acc);
+	ice->ice_copy_pool.ibp_lock = &ice->ice_buf_lock;
+	ice->ice_lso_pool.ibp_lock = &ice->ice_buf_lock;
+	ice->ice_small_pool.ibp_lock = &ice->ice_small_buf_lock;
 
-	/*
-	 * These pools back only the tx copy path (rx has its own control-block
-	 * buffers), so size them to one tx ring's worth: at most every
-	 * descriptor in flight is a copied packet holding a single buffer.
-	 * The allocations use DDI_DMA_DONTWAIT so a shortage fails the attach
-	 * cleanly rather than blocking or panicking.
-	 */
-	n = 0;
+	/* One copy buffer per TX descriptor, across all rings. */
 	for (i = 0; i < ice->ice_num_txr; i++)
 		n += ice->ice_txr[i].itxr_size;
 
-	mutex_enter(&ice->ice_buf_lock);
-	ice->ice_dma_bufs = kmem_zalloc(n * sizeof (ice_dma_buffer_t *),
-	    KM_SLEEP);
-	ice->ice_bufs = kmem_zalloc(n * sizeof (ice_dma_buffer_t), KM_SLEEP);
-	ice->ice_buf_sz = n;
-	for (i = 0; i < n; i++) {
-		if (!ice_dma_alloc(ice, &ice->ice_bufs[i], &attr, &acc, B_TRUE,
-		    ICE_TX_COPY_BUFSZ, B_FALSE)) {
-			mutex_exit(&ice->ice_buf_lock);
-			ice_error(ice, "failed to allocate tx copy buffers");
-			ice_buf_fini(ice);
-			return (B_FALSE);
-		}
-		ice->ice_dma_bufs[i] = &ice->ice_bufs[i];
+	if (!ice_buf_pool_init(ice, &ice->ice_copy_pool, n,
+	    ICE_TX_COPY_BUFSZ)) {
+		ice_error(ice, "failed to allocate tx copy buffers");
+		goto fail;
 	}
-	ice->ice_buf_alloc = n;
-	mutex_exit(&ice->ice_buf_lock);
 
 	if (ice->ice_tx_lso_enable) {
 		VERIFY3U(ICE_TX_LSO_BUFSZ, >=, ICE_MAX_FRAME_SIZE);
 		VERIFY3U(ICE_TX_LSO_BUFSZ, <=, ICE_TX_MAX_BUFSZ);
-
-		/*
-		 * LSO fallback copies must close an arbitrary MSS window with
-		 * one descriptor.  A page-rounded maximum frame covers every
-		 * supported MSS while retaining a single DMA cookie.
-		 */
-		mutex_enter(&ice->ice_buf_lock);
-		ice->ice_dma_lso_bufs = kmem_zalloc(n *
-		    sizeof (ice_dma_buffer_t *), KM_SLEEP);
-		ice->ice_lso_bufs = kmem_zalloc(n *
-		    sizeof (ice_dma_buffer_t), KM_SLEEP);
-		ice->ice_lso_buf_sz = n;
-		for (i = 0; i < n; i++) {
-			if (!ice_dma_alloc(ice, &ice->ice_lso_bufs[i], &attr,
-			    &acc, B_TRUE, ICE_TX_LSO_BUFSZ, B_FALSE)) {
-				mutex_exit(&ice->ice_buf_lock);
-				ice_error(ice,
-				    "failed to allocate tx LSO copy buffers");
-				ice_buf_fini(ice);
-				return (B_FALSE);
-			}
-			ice->ice_dma_lso_bufs[i] = &ice->ice_lso_bufs[i];
+		/* Close any supported MSS window with one descriptor. */
+		if (!ice_buf_pool_init(ice, &ice->ice_lso_pool, n,
+		    ICE_TX_LSO_BUFSZ)) {
+			ice_error(ice,
+			    "failed to allocate tx LSO copy buffers");
+			goto fail;
 		}
-		ice->ice_lso_buf_alloc = n;
-		mutex_exit(&ice->ice_buf_lock);
 	}
 
-	mutex_enter(&ice->ice_small_buf_lock);
-	ice->ice_dma_small_bufs = kmem_zalloc(n * sizeof (ice_dma_buffer_t *),
-	    KM_SLEEP);
-	ice->ice_small_bufs = kmem_zalloc(n * sizeof (ice_dma_buffer_t),
-	    KM_SLEEP);
-	ice->ice_small_buf_sz = n;
-	for (i = 0; i < n; i++) {
-		if (!ice_dma_alloc(ice, &ice->ice_small_bufs[i], &attr, &acc,
-		    B_TRUE, ICE_TX_SMALL_PKT, B_FALSE)) {
-			mutex_exit(&ice->ice_small_buf_lock);
-			ice_error(ice, "failed to allocate tx small buffers");
-			ice_buf_fini(ice);
-			return (B_FALSE);
-		}
-		ice->ice_dma_small_bufs[i] = &ice->ice_small_bufs[i];
+	if (!ice_buf_pool_init(ice, &ice->ice_small_pool, n,
+	    ICE_TX_SMALL_PKT)) {
+		ice_error(ice, "failed to allocate tx small buffers");
+		goto fail;
 	}
-	ice->ice_small_buf_alloc = n;
-	mutex_exit(&ice->ice_small_buf_lock);
-
 	return (B_TRUE);
+
+fail:
+	ice_buf_fini(ice);
+	return (B_FALSE);
 }
 
 void
 ice_buf_fini(ice_t *ice)
 {
-	size_t i;
-
-	/*
-	 * Free the DMA backing every buffer, not just the free stack: the
-	 * stack only holds the not-loaned ones.  The caller must have drained
-	 * all loaned buffers before tearing the pool down.
-	 */
-	mutex_enter(&ice->ice_small_buf_lock);
-	if (ice->ice_small_bufs != NULL) {
-		for (i = 0; i < ice->ice_small_buf_sz; i++)
-			ice_dma_free(&ice->ice_small_bufs[i]);
-		kmem_free(ice->ice_dma_small_bufs,
-		    ice->ice_small_buf_sz * sizeof (ice_dma_buffer_t *));
-		kmem_free(ice->ice_small_bufs,
-		    ice->ice_small_buf_sz * sizeof (ice_dma_buffer_t));
-		ice->ice_dma_small_bufs = NULL;
-		ice->ice_small_bufs = NULL;
-	}
-	ice->ice_small_buf_alloc = 0;
-	ice->ice_small_buf_sz = 0;
-	mutex_exit(&ice->ice_small_buf_lock);
-
-	mutex_enter(&ice->ice_buf_lock);
-	if (ice->ice_lso_bufs != NULL) {
-		for (i = 0; i < ice->ice_lso_buf_sz; i++)
-			ice_dma_free(&ice->ice_lso_bufs[i]);
-		kmem_free(ice->ice_dma_lso_bufs,
-		    ice->ice_lso_buf_sz * sizeof (ice_dma_buffer_t *));
-		kmem_free(ice->ice_lso_bufs,
-		    ice->ice_lso_buf_sz * sizeof (ice_dma_buffer_t));
-		ice->ice_dma_lso_bufs = NULL;
-		ice->ice_lso_bufs = NULL;
-	}
-	ice->ice_lso_buf_alloc = 0;
-	ice->ice_lso_buf_sz = 0;
-
-	if (ice->ice_bufs != NULL) {
-		for (i = 0; i < ice->ice_buf_sz; i++)
-			ice_dma_free(&ice->ice_bufs[i]);
-		kmem_free(ice->ice_dma_bufs,
-		    ice->ice_buf_sz * sizeof (ice_dma_buffer_t *));
-		kmem_free(ice->ice_bufs,
-		    ice->ice_buf_sz * sizeof (ice_dma_buffer_t));
-		ice->ice_dma_bufs = NULL;
-		ice->ice_bufs = NULL;
-	}
-	ice->ice_buf_alloc = 0;
-	ice->ice_buf_sz = 0;
-	mutex_exit(&ice->ice_buf_lock);
+	ice_buf_pool_fini(&ice->ice_small_pool);
+	ice_buf_pool_fini(&ice->ice_lso_pool);
+	ice_buf_pool_fini(&ice->ice_copy_pool);
 }

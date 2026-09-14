@@ -251,7 +251,18 @@ typedef struct ice_dma_buffer {
 	ddi_dma_handle_t	idb_dma_handle;
 	uint_t			idb_ncookies;
 	ddi_dma_cookie_t	idb_cookie;	/* single cookie (sgllen 1) */
+	struct ice_buf_pool	*idb_pool;	/* TX pool, or NULL */
 } ice_dma_buffer_t;
+
+/* Shared stack implementation for each fixed-size TX copy-buffer pool. */
+typedef struct ice_buf_pool {
+	kmutex_t		*ibp_lock;
+	ice_dma_buffer_t	*ibp_bufs;	/* backing allocation */
+	ice_dma_buffer_t	**ibp_free;	/* free stack */
+	uint_t			ibp_size;	/* backing array capacity */
+	uint_t			ibp_nbufs;	/* initialized DMA buffers */
+	uint_t			ibp_nfree;	/* free stack entries */
+} ice_buf_pool_t;
 
 #define	ICE_DMA_PA(idb)		((idb)->idb_cookie.dmac_laddress)
 
@@ -565,19 +576,10 @@ typedef struct ice {
 
 	/* Shared TX copy-buffer pools. */
 	kmutex_t		ice_buf_lock;
-	ice_dma_buffer_t	*ice_bufs;	/* backing array */
-	ice_dma_buffer_t	**ice_dma_bufs;	/* free stack */
-	uint_t			ice_buf_sz;
-	uint_t			ice_buf_alloc;
-	ice_dma_buffer_t	*ice_lso_bufs;
-	ice_dma_buffer_t	**ice_dma_lso_bufs;
-	uint_t			ice_lso_buf_sz;
-	uint_t			ice_lso_buf_alloc;
 	kmutex_t		ice_small_buf_lock;
-	ice_dma_buffer_t	*ice_small_bufs;
-	ice_dma_buffer_t	**ice_dma_small_bufs;
-	uint_t			ice_small_buf_sz;
-	uint_t			ice_small_buf_alloc;
+	ice_buf_pool_t		ice_copy_pool;
+	ice_buf_pool_t		ice_lso_pool;
+	ice_buf_pool_t		ice_small_pool;
 
 	/* DDP firmware. */
 	/* Attach-only: MAC caches mi_capab at mac_register(). */
@@ -667,11 +669,9 @@ extern boolean_t ice_dma_alloc(ice_t *, ice_dma_buffer_t *, ddi_dma_attr_t *,
 extern void ice_dma_free(ice_dma_buffer_t *);
 extern int ice_check_dma_handle(ddi_dma_handle_t);
 extern ice_dma_buffer_t *ice_buf_alloc(ice_t *);
-extern void ice_buf_free(ice_t *, ice_dma_buffer_t *);
+extern void ice_buf_free(ice_dma_buffer_t *);
 extern ice_dma_buffer_t *ice_lso_buf_alloc(ice_t *);
-extern void ice_lso_buf_free(ice_t *, ice_dma_buffer_t *);
 extern ice_dma_buffer_t *ice_small_buf_alloc(ice_t *);
-extern void ice_small_buf_free(ice_t *, ice_dma_buffer_t *);
 extern boolean_t ice_buf_init(ice_t *);
 extern void ice_buf_fini(ice_t *);
 
