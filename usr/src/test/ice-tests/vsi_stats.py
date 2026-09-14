@@ -27,7 +27,7 @@ def main():
         fragments.append(extract(registers.read_text(),
             rf"^#define {name}\([^\n]+", registers))
     function = extract(args.source.read_text(),
-        r"^void\nice_stats_update_vsi\([\s\S]*?^}", args.source)
+        r"^(?:static )?void\nice_stats_update_vsi\([\s\S]*?^}", args.source)
     run_c(TESTDIR / "vsi_stats.c", {
         "vsi_stats_types.h": "\n".join(fragments),
         "vsi_stats_function.h": function,

@@ -50,6 +50,7 @@ TESTS = (
     "safe_mode.py",
     "sched_resources.py",
     "stale_comments.py",
+    "stats_read.py",
     "terminal_filters.py",
     "transceiver_lock.py",
     "tx_bind_threshold.py",

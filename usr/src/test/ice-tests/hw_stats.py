@@ -3,6 +3,7 @@
 """Check ICE hardware statistics wiring and read serialization."""
 
 from pathlib import Path
+import re
 
 
 REPO = Path(__file__).resolve().parents[4]
@@ -24,8 +25,8 @@ def main() -> None:
 
     # Both refresh routines must run under the shared stat lock.
     for name, following in (
-        ("ice_stats_update_port(ice_t *ice)\n{", "\nvoid\nice_stats_update_vsi"),
-        ("ice_stats_update_vsi(ice_t *ice)\n{", "\nstatic void\nice_stats_check_acc"),
+        ("ice_stats_update_port(ice_t *ice)\n{", "\nstatic void\nice_stats_update_vsi"),
+        ("ice_stats_update_vsi(ice_t *ice)\n{", "\nint\nice_stats_read"),
     ):
         body = function(stats, name, following)
         assert "ASSERT(MUTEX_HELD(&ice->ice_stat_lock))" in body
@@ -34,7 +35,7 @@ def main() -> None:
     vsi = function(
         stats,
         "ice_stats_update_vsi(ice_t *ice)\n{",
-        "\nstatic void\nice_stats_check_acc",
+        "\nint\nice_stats_read",
     )
     assert "ice_stat_update_repc(hw, handle, loaded, cur)" in vsi
 
@@ -80,23 +81,22 @@ def main() -> None:
         "ddi_regs_map_free(&ice->ice_osdep.ios_reg_handle)"
     )
 
-    # The MAC stat entry point refreshes port counters under the stat lock.
+    # MAC submits a selector; the statistics owner handles cache and policy.
     gld = GLD_SOURCE.read_text(encoding="utf-8")
     mstat = function(gld, "ice_m_stat(void *arg, uint_t stat, uint64_t *val)\n{", "\n/*")
-    assert "ice_stats_update_port(ice)" in mstat
-    assert "mutex_enter(&ice->ice_stat_lock)" in mstat
-    locked = mstat[mstat.index("mutex_enter(&ice->ice_stat_lock)") :]
-    assert locked.index("switch (stat)") < locked.index("ice_stats_update_port(ice)")
-    assert locked.count("ice_stats_update_port(ice)") == 14
-    assert locked.rindex("ice_stats_update_port(ice)") < locked.index("default:")
-    unlock = mstat.index("mutex_exit(&ice->ice_stat_lock)", mstat.index("mutex_enter"))
-    acc = mstat.index("ice_check_acc_handle", unlock)
-    degraded = mstat.index("DDI_SERVICE_DEGRADED", acc)
-    io_error = mstat.index("return (EIO)", degraded)
-    assert unlock < acc < degraded < io_error
-    for stat in ("MAC_STAT_RBYTES", "MAC_STAT_IPACKETS", "MAC_STAT_OBYTES",
-                 "MAC_STAT_OPACKETS", "MAC_STAT_IERRORS"):
-        assert stat in mstat
+    assert "return (ice_stats_read(ice, stat, val));" in mstat
+    private = re.compile(r"\b(?:ice_stat_lock|ice_stat_port_\w+|ice_stat_vsi_\w+|"
+                         r"ice_stats_update_port|ice_stats_update_vsi)\b")
+    for path in STATS_SOURCE.parent.glob("*.c"):
+        if path == STATS_SOURCE:
+            continue
+        code = re.sub(r"/\*[\s\S]*?\*/|//[^\n]*", "", path.read_text())
+        match = private.search(code)
+        assert match is None, f"{path.name} reaches into statistics: {match[0]}"
+    for name in ("ice_stats_update_port", "ice_stats_update_vsi"):
+        assert f"static void\n{name}" in stats
+        assert name not in (STATS_SOURCE.parent / "ice.h").read_text()
+    # Executable stats_read.py covers selector mapping, refresh and fault policy.
 
     # A MAC kstat snapshot invokes m_stat once per field.  Bound those calls to
     # one hardware refresh window and do not read registers for unsupported
@@ -104,7 +104,7 @@ def main() -> None:
     port_update = function(
         stats,
         "ice_stats_update_port(ice_t *ice)\n{",
-        "\nvoid\nice_stats_update_vsi",
+        "\nstatic void\nice_stats_update_vsi",
     )
     assert "ICE_STATS_MIN_UPDATE_NS" in stats
     assert "ice_stat_port_last_update" in port_update

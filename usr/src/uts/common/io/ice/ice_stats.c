@@ -47,7 +47,7 @@
  * from the "low" register (the adjacent high register is captured by the same
  * 64-bit access); ice_stat_update32 reads a 32-bit counter.
  */
-void
+static void
 ice_stats_update_port(ice_t *ice)
 {
 	struct ice_hw *hw = &ice->ice_hw;
@@ -110,7 +110,7 @@ ice_stats_update_port(ice_t *ice)
  * explicitly clears GLV_REPC during initialization and after accumulating its
  * no-descriptor and error sub-counts into the current stats.
  */
-void
+static void
 ice_stats_update_vsi(ice_t *ice)
 {
 	struct ice_hw *hw = &ice->ice_hw;
@@ -156,9 +156,123 @@ ice_stats_update_vsi(ice_t *ice)
 }
 
 /*
+ * Read one hardware-backed MAC statistic.  GLDv3 reports the physical port's
+ * aggregate view, including every VSI on the function.  Keep selector mapping,
+ * cache refresh and error policy here so callers need no access to the cache
+ * or its locks.  Unsupported selectors leave val unchanged and read no
+ * registers.
+ *
+ * The lifecycle lock must precede the statistics lock: port information and
+ * VSI bookkeeping can change during reset.  This entry point takes both;
+ * reset callers use ice_stats_reset() while already holding the outer lock.
+ */
+int
+ice_stats_read(ice_t *ice, uint_t stat, uint64_t *val)
+{
+	struct ice_hw_port_stats *ps = &ice->ice_stat_port_cur;
+	int ret = 0;
+
+	mutex_enter(&ice->ice_rebuild_lock);
+	mutex_enter(&ice->ice_stat_lock);
+
+	switch (stat) {
+	case MAC_STAT_RBYTES:
+		ice_stats_update_port(ice);
+		*val = ps->eth.rx_bytes;
+		break;
+	case MAC_STAT_IPACKETS:
+		ice_stats_update_port(ice);
+		*val = ps->eth.rx_unicast + ps->eth.rx_multicast +
+		    ps->eth.rx_broadcast;
+		break;
+	case MAC_STAT_OBYTES:
+		ice_stats_update_port(ice);
+		*val = ps->eth.tx_bytes;
+		break;
+	case MAC_STAT_OPACKETS:
+		ice_stats_update_port(ice);
+		*val = ps->eth.tx_unicast + ps->eth.tx_multicast +
+		    ps->eth.tx_broadcast;
+		break;
+	case MAC_STAT_MULTIRCV:
+		ice_stats_update_port(ice);
+		*val = ps->eth.rx_multicast;
+		break;
+	case MAC_STAT_BRDCSTRCV:
+		ice_stats_update_port(ice);
+		*val = ps->eth.rx_broadcast;
+		break;
+	case MAC_STAT_MULTIXMT:
+		ice_stats_update_port(ice);
+		*val = ps->eth.tx_multicast;
+		break;
+	case MAC_STAT_BRDCSTXMT:
+		ice_stats_update_port(ice);
+		*val = ps->eth.tx_broadcast;
+		break;
+	case MAC_STAT_IERRORS:
+		ice_stats_update_port(ice);
+		*val = ps->crc_errors + ps->illegal_bytes + ps->rx_len_errors;
+		break;
+	case MAC_STAT_UNDERFLOWS:
+		ice_stats_update_port(ice);
+		*val = ps->rx_undersize + ps->rx_fragments;
+		break;
+	case MAC_STAT_OVERFLOWS:
+		ice_stats_update_port(ice);
+		*val = ps->rx_oversize + ps->rx_jabber;
+		break;
+	case ETHER_STAT_FCS_ERRORS:
+		ice_stats_update_port(ice);
+		*val = ps->crc_errors;
+		break;
+	case ETHER_STAT_TOOLONG_ERRORS:
+		ice_stats_update_port(ice);
+		*val = ps->rx_oversize;
+		break;
+	case ETHER_STAT_MACRCV_ERRORS:
+		ice_stats_update_port(ice);
+		*val = ps->rx_len_errors + ps->rx_undersize +
+		    ps->rx_fragments + ps->rx_oversize + ps->rx_jabber;
+		break;
+	default:
+		ret = ENOTSUP;
+		break;
+	}
+	mutex_exit(&ice->ice_stat_lock);
+	mutex_exit(&ice->ice_rebuild_lock);
+
+	if (ret == 0 &&
+	    ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
+	    DDI_FM_OK) {
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
+		return (EIO);
+	}
+
+	return (ret);
+}
+
+/*
+ * A completed reset can zero hardware counters.  The lifecycle owner calls
+ * this at the existing baseline invalidation point while holding its lock.
+ * Keep accumulated totals and the refresh deadline; the next scheduled read
+ * captures new baselines without counting the pre-reset hardware values.
+ */
+void
+ice_stats_reset(ice_t *ice)
+{
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+
+	mutex_enter(&ice->ice_stat_lock);
+	ice->ice_stat_port_loaded = B_FALSE;
+	ice->ice_stat_vsi_loaded = B_FALSE;
+	mutex_exit(&ice->ice_stat_lock);
+}
+
+/*
  * A failed private-kstat refresh does not affect service, so record it as
  * unaffected, matching i40e and ixgbe.  The GLDv3 MAC-stat path applies its
- * stronger degraded-service policy in ice_m_stat().
+ * stronger degraded-service policy in ice_stats_read().
  */
 static void
 ice_stats_check_acc(ice_t *ice)

@@ -115,11 +115,13 @@ def main() -> None:
     assert "mutex_enter(&ice->ice_rebuild_lock)" in tread
     assert "mutex_exit(&ice->ice_rebuild_lock)" in tread
 
-    # ice_m_stat reads the port counters through hw->port_info->lport, which a
+    # The statistics owner reads counters through hw->port_info->lport, which a
     # reset rebuild invalidates, so it takes the outermost rebuild lock around
     # the inner stat lock and drops them in reverse.
     stat = function(
-        gld, "ice_m_stat(void *arg, uint_t stat, uint64_t *val)\n{", "\n/*\n * SFF"
+        STATS_SOURCE.read_text(),
+        "ice_stats_read(ice_t *ice, uint_t stat, uint64_t *val)\n{",
+        "\nvoid\nice_stats_reset",
     )
     assert "mutex_enter(&ice->ice_rebuild_lock)" in stat
     assert stat.index("mutex_enter(&ice->ice_rebuild_lock)") < stat.index(
@@ -151,8 +153,8 @@ def main() -> None:
             "mutex_exit(&ice->ice_rebuild_lock)"
         ), signature
 
-    # The inverse of B1/B2: the rebuild must never reach for the inner stat
-    # lock, which would invert the documented order.
+    # Rebuild delegates baseline invalidation with its lifecycle lock held;
+    # the statistics owner takes the inner lock in the established order.
     attach_src = ATTACH_SOURCE.read_text(encoding="utf-8")
     assert "ice_stat_lock" not in function(
         attach_src, "ice_rebuild(ice_t *ice, uint32_t requests)\n{", "\nvoid\nice_reset_task"

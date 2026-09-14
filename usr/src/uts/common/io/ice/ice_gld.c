@@ -424,10 +424,8 @@ static int
 ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 {
 	ice_t *ice = arg;
-	struct ice_hw_port_stats *ps = &ice->ice_stat_port_cur;
 	uint16_t speed = 0;
 	boolean_t advertised = B_FALSE;
-	int ret = 0;
 
 	/* Link properties are served from the cached link state. */
 	switch (stat) {
@@ -517,95 +515,7 @@ ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 		return (0);
 	}
 
-	/*
-	 * The remaining statistics come from the physical-port MAC counters.
-	 * GLDv3 conflates port and interface statistics; as with i40e we report
-	 * the port's view, which aggregates every VSI on the function.
-	 *
-	 * ice_rebuild_lock is the outermost lock: hold it across the counter
-	 * reads so they cannot straddle a reset rebuild, which shuts the
-	 * control queue down and clears the scheduler tables while
-	 * ice_stats_update_port() is dereferencing port_info and indexing the
-	 * GLPRT_* registers by its lport.
-	 */
-	mutex_enter(&ice->ice_rebuild_lock);
-	mutex_enter(&ice->ice_stat_lock);
-
-	switch (stat) {
-	case MAC_STAT_RBYTES:
-		ice_stats_update_port(ice);
-		*val = ps->eth.rx_bytes;
-		break;
-	case MAC_STAT_IPACKETS:
-		ice_stats_update_port(ice);
-		*val = ps->eth.rx_unicast + ps->eth.rx_multicast +
-		    ps->eth.rx_broadcast;
-		break;
-	case MAC_STAT_OBYTES:
-		ice_stats_update_port(ice);
-		*val = ps->eth.tx_bytes;
-		break;
-	case MAC_STAT_OPACKETS:
-		ice_stats_update_port(ice);
-		*val = ps->eth.tx_unicast + ps->eth.tx_multicast +
-		    ps->eth.tx_broadcast;
-		break;
-	case MAC_STAT_MULTIRCV:
-		ice_stats_update_port(ice);
-		*val = ps->eth.rx_multicast;
-		break;
-	case MAC_STAT_BRDCSTRCV:
-		ice_stats_update_port(ice);
-		*val = ps->eth.rx_broadcast;
-		break;
-	case MAC_STAT_MULTIXMT:
-		ice_stats_update_port(ice);
-		*val = ps->eth.tx_multicast;
-		break;
-	case MAC_STAT_BRDCSTXMT:
-		ice_stats_update_port(ice);
-		*val = ps->eth.tx_broadcast;
-		break;
-	case MAC_STAT_IERRORS:
-		ice_stats_update_port(ice);
-		*val = ps->crc_errors + ps->illegal_bytes + ps->rx_len_errors;
-		break;
-	case MAC_STAT_UNDERFLOWS:
-		ice_stats_update_port(ice);
-		*val = ps->rx_undersize + ps->rx_fragments;
-		break;
-	case MAC_STAT_OVERFLOWS:
-		ice_stats_update_port(ice);
-		*val = ps->rx_oversize + ps->rx_jabber;
-		break;
-	case ETHER_STAT_FCS_ERRORS:
-		ice_stats_update_port(ice);
-		*val = ps->crc_errors;
-		break;
-	case ETHER_STAT_TOOLONG_ERRORS:
-		ice_stats_update_port(ice);
-		*val = ps->rx_oversize;
-		break;
-	case ETHER_STAT_MACRCV_ERRORS:
-		ice_stats_update_port(ice);
-		*val = ps->rx_len_errors + ps->rx_undersize +
-		    ps->rx_fragments + ps->rx_oversize + ps->rx_jabber;
-		break;
-	default:
-		ret = ENOTSUP;
-		break;
-	}
-	mutex_exit(&ice->ice_stat_lock);
-	mutex_exit(&ice->ice_rebuild_lock);
-
-	if (ret == 0 &&
-	    ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
-	    DDI_FM_OK) {
-		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
-		return (EIO);
-	}
-
-	return (ret);
+	return (ice_stats_read(ice, stat, val));
 }
 
 /*

@@ -200,6 +200,14 @@ ICE_NOOP(ice_phy_caps_update)
 ICE_NOOP(ice_link_state_publish)
 ICE_NOOP(ice_intr_oicr_disable)
 
+static void
+ice_stats_reset(ice_t *ice)
+{
+	assert(MUTEX_HELD(&ice->ice_rebuild_lock));
+	ice->ice_stat_port_loaded = B_FALSE;
+	ice->ice_stat_vsi_loaded = B_FALSE;
+}
+
 static void ice_clear_pxe_mode(struct ice_hw *hw) { (void) hw; }
 static int ice_validate_caps(ice_t *ice) { (void) ice; return (1); }
 static int ice_sched_init_port(void *port) { (void) port; return (0); }

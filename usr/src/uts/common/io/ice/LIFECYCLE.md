@@ -57,6 +57,21 @@ GLD setters acquire the lifecycle lock within that module; VSI replay passes
 its already-held lock through the filter lifecycle interface. Imported filter
 request types and list operations stay private to `ice_filter.c`.
 
+## Hardware statistics
+
+`ice_stats.c` owns the port/VSI caches, refresh timestamps, baseline validity,
+and counter lock. MAC requests a scalar through `ice_stats_read()`; that entry
+point takes the lifecycle lock before the statistics lock, maps supported
+selectors, refreshes the port cache at most once per 10ms, and applies the MAC
+access-fault policy. Unsupported selectors leave the output untouched and read
+no registers. Private kstat readers retain their separate service-impact policy.
+
+At the existing post-reset baseline invalidation point, lifecycle code calls
+`ice_stats_reset()` with the outer lock held. The statistics owner takes its
+inner lock and clears baseline validity while preserving accumulated counters
+and the refresh deadline. Attach initializes baselines before publishing
+kstats; teardown removes readers before destroying the statistics lock.
+
 ## TX copy-buffer pools
 
 The small, ordinary, and LSO copy pools share one stack implementation. Each

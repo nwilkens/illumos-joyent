@@ -1663,8 +1663,7 @@ ice_rebuild(ice_t *ice, uint32_t requests)
 	 * A global or core reset can zero the MAC counters, so drop the
 	 * baselines and let the next read re-establish them.
 	 */
-	ice->ice_stat_port_loaded = B_FALSE;
-	ice->ice_stat_vsi_loaded = B_FALSE;
+	ice_stats_reset(ice);
 
 	/*
 	 * Replay the DDP package the common code already holds a copy of.  The

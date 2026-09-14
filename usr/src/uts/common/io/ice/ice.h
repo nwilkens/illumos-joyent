@@ -745,8 +745,9 @@ extern link_state_t ice_link_state_effective(ice_t *, link_state_t);
  */
 extern boolean_t ice_stats_init(ice_t *);
 extern void ice_stats_fini(ice_t *);
-extern void ice_stats_update_port(ice_t *);
-extern void ice_stats_update_vsi(ice_t *);
+extern int ice_stats_read(ice_t *, uint_t, uint64_t *);
+/* Requires ice_rebuild_lock; preserves accumulated counters. */
+extern void ice_stats_reset(ice_t *);
 extern int ice_vsi_loopback_set(ice_t *, boolean_t);
 extern void ice_link_loopback_update(ice_t *, uint32_t);
 extern void ice_loopback_replay(ice_t *);

@@ -194,6 +194,18 @@ that omit the effective publication/property gate or failed-start ERROR latch.
 These tests substitute hardware and MAC boundaries; physical link, queue, and
 wire behavior still require hardware validation.
 
+## Statistics interface regression
+
+`stats_read.py` executes the real selector API, port refresh, imported 40/32-bit
+counter accumulation, baseline reset, and private-kstat fault reporting helper.
+It covers all 14 mappings and aggregations, four unsupported selectors without
+hardware access, the 10ms cache boundary, lock order, differing FMA policies,
+reset baseline renewal without losing totals, and missing port information.
+Five source mutations compile and fail runtime checks for mapping, unsupported
+reads, refresh timing, service impact, and reset ownership. Use `--source` to
+select another statistics implementation. `hw_stats.py` also rejects direct
+cache, lock, or refresh-helper access from other driver modules.
+
 ## VSI statistics bounds regression
 
 Run `python3 usr/src/test/ice-tests/vsi_stats.py` with Python 3 and a C99
@@ -372,7 +384,7 @@ cleared through the common code, attach captures both baselines before exposing 
 kstats, the kstat callbacks reject writes and lock correctly, teardown deletes
 the kstats before destroying their lock, attach installs stats before MAC while
 detach removes them before unmapping registers, and `ice_m_stat` sources the
-MAC counters under the stat lock. Port refreshes are rate-limited so a MAC
+MAC counters through the statistics owner. Port refreshes are rate-limited so a MAC
 kstat snapshot reads the hardware counter bank once, and unsupported MAC
 statistics do not trigger register reads. Register-access faults from a
 supported MAC statistic report degraded service and return `EIO`, while

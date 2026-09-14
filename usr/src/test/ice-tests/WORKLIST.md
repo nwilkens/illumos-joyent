@@ -518,7 +518,18 @@ creation in an isolated native build.
   preserving the existing DMA barriers and failed-stop ownership. Four runtime
   negative controls cover admission, queue failures, and asynchronous ERROR
   preservation. A structural regression rejects the old exported helper
-  boundary. Full portable suite: 53/53.
+  boundary. Full portable suite: 53/53. Commit `12e3b5d0d6` passes all 21
+  configured GCC/smatch compilation pairs, module link, and CTF generation
+  in an isolated native build.
+
+- **A6 — Hardware statistics internals exposed to GLD/reset: implemented.**
+  `ice_stats_read()` owns hardware selector mapping, lock order, cache refresh,
+  and MAC access-fault policy. Refresh helpers are private. Reset delegates
+  baseline invalidation at the same point through `ice_stats_reset()`, keeping
+  totals and refresh timing. The actual-C regression covers all 14 selectors,
+  unsupported no-read behavior, cache expiry, FMA, and baseline renewal; five
+  runtime negative controls check those contracts. Source checks reject outside
+  access to cache internals. Full portable suite: 54/54.
 
 Native builds run from an isolated committed source snapshot after each atomic
 commit. No hardware or throughput qualification is implied.

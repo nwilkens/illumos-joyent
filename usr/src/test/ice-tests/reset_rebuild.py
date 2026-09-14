@@ -171,8 +171,10 @@ def main() -> None:
     for token in ("num_rxq", "num_txq", "num_msix_vectors", "ice_rings_size"):
         assert token not in rebuild, token
     # A global/core reset can zero the MAC counters; drop both baselines.
-    assert "ice_stat_port_loaded = B_FALSE" in rebuild
-    assert "ice_stat_vsi_loaded = B_FALSE" in rebuild
+    assert rebuild.index("ice_sched_init_port(hw->port_info)") < (
+        rebuild.index("ice_stats_reset(ice)"))
+    assert rebuild.index("ice_stats_reset(ice)") < (
+        rebuild.index("ice_init_pkg(hw, hw->pkg_copy"))
     # The worker claims its request bits before rebuilding.  Success must
     # retain any later requests and leave them for the worker's next pass.
     # reset_requests.py executes the actual rebuild with requests arriving
