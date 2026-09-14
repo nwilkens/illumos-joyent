@@ -1642,7 +1642,7 @@ xhci_controller_takeover(xhci_t *xhcip)
 	return (B_TRUE);
 }
 
-static int
+int
 xhci_controller_stop(xhci_t *xhcip)
 {
 	uint32_t cmdreg;
@@ -1673,7 +1673,7 @@ xhci_controller_stop(xhci_t *xhcip)
 	    XHCI_STS_HCH, 50, 10));
 }
 
-static int
+int
 xhci_controller_reset(xhci_t *xhcip)
 {
 	int ret;
@@ -1727,7 +1727,7 @@ xhci_controller_reset(xhci_t *xhcip)
  *    o Initialize the Event Ring
  *    o Enable interrupts (set imod)
  */
-static int
+int
 xhci_controller_configure(xhci_t *xhcip)
 {
 	int ret;
@@ -1775,7 +1775,7 @@ xhci_controller_configure(xhci_t *xhcip)
 	return (0);
 }
 
-static int
+int
 xhci_controller_start(xhci_t *xhcip)
 {
 	uint32_t reg;
@@ -1801,22 +1801,26 @@ xhci_controller_start(xhci_t *xhcip)
 	    XHCI_STS_HCH, 0, 500, 10));
 }
 
-/* ARGSUSED */
-static void
-xhci_reset_task(void *arg)
+/*
+ * Apply the driver.conf "xhci-reroute" tuning. Some systems support having
+ * ports routed to both an ehci and xhci controller.
+ */
+void
+xhci_controller_reroute(xhci_t *xhcip)
 {
-	/*
-	 * Longer term, we'd like to properly perform a controller reset.
-	 * However, that requires a bit more assistance from USBA to work
-	 * properly and tear down devices. In the meantime, we panic.
-	 */
-	panic("XHCI runtime reset required");
+	int route;
+
+	route = ddi_prop_get_int(DDI_DEV_T_ANY, xhcip->xhci_dip,
+	    DDI_PROP_DONTPASS, "xhci-reroute", XHCI_PROP_REROUTE_DEFAULT);
+	if (route != XHCI_PROP_REROUTE_DISABLE &&
+	    (xhcip->xhci_quirks & XHCI_QUIRK_INTC_EHCI))
+		(void) xhci_reroute_intel(xhcip);
 }
 
 /*
- * This function is called when we've detected a fatal FM condition that has
- * resulted in a loss of service and we need to force a reset of the controller
- * as a whole. Only one such reset may be ongoing at a time.
+ * A fatal controller condition was found. Mark the controller unusable,
+ * retire every device slot, and hand the recovery to xhci_reset_task() on the
+ * driver taskq. This is safe to call with or without xhci_lock held.
  */
 void
 xhci_fm_runtime_reset(xhci_t *xhcip)
@@ -1830,15 +1834,28 @@ xhci_fm_runtime_reset(xhci_t *xhcip)
 	}
 
 	/*
-	 * If we're already in the error state than a reset is already ongoing
-	 * and there is nothing for us to do here.
+	 * A reset is already in flight, the controller has been given up on,
+	 * or the driver is detaching. There is nothing more to do.
 	 */
-	if (xhcip->xhci_state & XHCI_S_ERROR) {
+	if (xhcip->xhci_state & (XHCI_S_ERROR | XHCI_S_OFFLINE |
+	    XHCI_S_DETACHING)) {
+		goto out;
+	}
+
+	ddi_fm_service_impact(xhcip->xhci_dip, DDI_SERVICE_LOST);
+
+	/*
+	 * Before the controller has been started there is nothing to reset;
+	 * attach notices the offline state and fails.
+	 */
+	if (!(xhcip->xhci_seq & XHCI_ATTACH_STARTED)) {
+		xhcip->xhci_state |= XHCI_S_OFFLINE;
 		goto out;
 	}
 
 	xhcip->xhci_state |= XHCI_S_ERROR;
-	ddi_fm_service_impact(xhcip->xhci_dip, DDI_SERVICE_LOST);
+	xhcip->xhci_gen++;
+	xhci_root_hub_reset_begin(xhcip);
 	taskq_dispatch_ent(xhci_taskq, xhci_reset_task, xhcip, 0,
 	    &xhcip->xhci_tqe);
 out:
@@ -1974,6 +1991,19 @@ xhci_cleanup(xhci_t *xhcip)
 {
 	int ret, inst;
 
+	/*
+	 * Stop any further runtime reset from starting and wait for one in
+	 * flight to finish before tearing anything down under it.
+	 */
+	if (xhcip->xhci_seq & XHCI_ATTACH_SYNCH) {
+		mutex_enter(&xhcip->xhci_lock);
+		xhcip->xhci_state |= XHCI_S_DETACHING;
+		while (xhcip->xhci_state & XHCI_S_ERROR)
+			cv_wait(&xhcip->xhci_statecv, &xhcip->xhci_lock);
+		mutex_exit(&xhcip->xhci_lock);
+		taskq_wait(xhci_taskq);
+	}
+
 	if (xhcip->xhci_seq & XHCI_ATTACH_ROOT_HUB) {
 		if ((ret = xhci_root_hub_fini(xhcip)) != 0)
 			return (ret);
@@ -1983,12 +2013,8 @@ xhci_cleanup(xhci_t *xhcip)
 		xhci_hcd_fini(xhcip);
 	}
 
-	if (xhcip->xhci_seq & XHCI_ATTACH_STARTED) {
-		mutex_enter(&xhcip->xhci_lock);
-		while (xhcip->xhci_state & XHCI_S_ERROR)
-			cv_wait(&xhcip->xhci_statecv, &xhcip->xhci_lock);
-		mutex_exit(&xhcip->xhci_lock);
-
+	if ((xhcip->xhci_seq & XHCI_ATTACH_STARTED) &&
+	    !(xhcip->xhci_state & XHCI_S_OFFLINE)) {
 		(void) xhci_controller_stop(xhcip);
 	}
 
@@ -2039,6 +2065,17 @@ xhci_cleanup(xhci_t *xhcip)
 		xhcip->xhci_fm_caps = 0;
 	}
 
+	if (xhcip->xhci_port_fake != NULL) {
+		kmem_free(xhcip->xhci_port_fake,
+		    (size_t)xhcip->xhci_caps.xcap_max_ports + 1);
+		xhcip->xhci_port_fake = NULL;
+	}
+	if (xhcip->xhci_port_stale != NULL) {
+		kmem_free(xhcip->xhci_port_stale, sizeof (uint16_t) *
+		    ((size_t)xhcip->xhci_caps.xcap_max_ports + 1));
+		xhcip->xhci_port_stale = NULL;
+	}
+
 	inst = ddi_get_instance(xhcip->xhci_dip);
 	xhcip->xhci_dip = NULL;
 	ddi_soft_state_free(xhci_soft_state, inst);
@@ -2049,7 +2086,7 @@ xhci_cleanup(xhci_t *xhcip)
 static int
 xhci_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 {
-	int ret, inst, route;
+	int ret, inst;
 	xhci_t *xhcip;
 
 	if (cmd != DDI_ATTACH)
@@ -2109,6 +2146,13 @@ xhci_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 
 	if (xhci_port_count(xhcip) == B_FALSE)
 		goto err;
+	xhcip->xhci_port_fake = kmem_zalloc(
+	    (size_t)xhcip->xhci_caps.xcap_max_ports + 1, KM_SLEEP);
+	xhcip->xhci_port_stale = kmem_zalloc(
+	    sizeof (uint16_t) * ((size_t)xhcip->xhci_caps.xcap_max_ports + 1),
+	    KM_SLEEP);
+	xhcip->xhci_fatal_panic = ddi_prop_get_int(DDI_DEV_T_ANY, dip,
+	    DDI_PROP_DONTPASS, "xhci-fatal-panic", 0);
 
 	if (xhci_controller_takeover(xhcip) == B_FALSE)
 		goto err;
@@ -2141,16 +2185,7 @@ xhci_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		goto err;
 	}
 
-	/*
-	 * Some systems support having ports routed to both an ehci and xhci
-	 * controller. If we support it and the user hasn't requested otherwise
-	 * via a driver.conf tuning, we reroute it now.
-	 */
-	route = ddi_prop_get_int(DDI_DEV_T_ANY, xhcip->xhci_dip,
-	    DDI_PROP_DONTPASS, "xhci-reroute", XHCI_PROP_REROUTE_DEFAULT);
-	if (route != XHCI_PROP_REROUTE_DISABLE &&
-	    (xhcip->xhci_quirks & XHCI_QUIRK_INTC_EHCI))
-		(void) xhci_reroute_intel(xhcip);
+	xhci_controller_reroute(xhcip);
 
 	if ((ret = xhci_controller_start(xhcip)) != 0) {
 		xhci_log(xhcip, "failed to reset controller: %s",
@@ -2159,6 +2194,14 @@ xhci_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		goto err;
 	}
 	xhcip->xhci_seq |= XHCI_ATTACH_STARTED;
+
+	mutex_enter(&xhcip->xhci_lock);
+	if (xhcip->xhci_state & XHCI_S_OFFLINE) {
+		mutex_exit(&xhcip->xhci_lock);
+		xhci_error(xhcip, "fatal controller error during attach");
+		goto err;
+	}
+	mutex_exit(&xhcip->xhci_lock);
 
 	/*
 	 * Finally, register ourselves with the USB framework itself.

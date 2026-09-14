@@ -200,7 +200,7 @@ xhci_polled_event_process(xhci_polled_t *xhci_polledp, uint_t *num_characters)
 	int ret;
 	uint64_t addr;
 
-	if (xhcip->xhci_state & XHCI_S_ERROR)
+	if (xhcip->xhci_state & XHCI_S_UNUSABLE)
 		return (USB_HC_HARDWARE_ERROR);
 
 	VERIFY(xhcip->xhci_event.xev_segs != NULL);
@@ -238,7 +238,8 @@ xhci_polled_event_process(xhci_polled_t *xhci_polledp, uint_t *num_characters)
 			processed = xhci_event_process_trb(xhcip, trb);
 			mutex_enter(&xhcip->xhci_lock);
 
-			if (!processed && xhcip->xhci_state & XHCI_S_ERROR)
+			if (!processed &&
+			    (xhcip->xhci_state & XHCI_S_UNUSABLE))
 				return (USB_HC_HARDWARE_ERROR);
 			continue;
 		}

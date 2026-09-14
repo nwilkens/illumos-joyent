@@ -133,6 +133,17 @@ xhci_intr(caddr_t arg1, caddr_t arg2)
 	ASSERT0(vector);
 
 	/*
+	 * While a runtime reset is in flight, or after the controller has been
+	 * given up on, the registers must not be touched from here.
+	 */
+	mutex_enter(&xhcip->xhci_lock);
+	if (xhcip->xhci_state & XHCI_S_UNUSABLE) {
+		mutex_exit(&xhcip->xhci_lock);
+		return (DDI_INTR_CLAIMED);
+	}
+	mutex_exit(&xhcip->xhci_lock);
+
+	/*
 	 * First read the status register.
 	 */
 	status = xhci_get32(xhcip, XHCI_R_OPER, XHCI_USBSTS);

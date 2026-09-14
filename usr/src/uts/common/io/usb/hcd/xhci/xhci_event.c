@@ -194,7 +194,7 @@ xhci_event_process(xhci_t *xhcip)
 	 * too far down the path.
 	 */
 	mutex_enter(&xhcip->xhci_lock);
-	if (xhcip->xhci_state & XHCI_S_ERROR) {
+	if (xhcip->xhci_state & XHCI_S_UNUSABLE) {
 		mutex_exit(&xhcip->xhci_lock);
 		return (B_FALSE);
 	}

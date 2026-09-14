@@ -246,6 +246,7 @@ xhci_root_hub_handle_port_clear_feature(xhci_t *xhcip, usb_ctrl_req_t *ucrp)
 	int feat = ucrp->ctrl_wValue;
 	int port = XHCI_PS_INDPORT(ucrp->ctrl_wIndex);
 	uint32_t reg;
+	uint8_t fake;
 
 	ASSERT(MUTEX_HELD(&xhcip->xhci_lock));
 
@@ -253,6 +254,50 @@ xhci_root_hub_handle_port_clear_feature(xhci_t *xhcip, usb_ctrl_req_t *ucrp)
 		return (USB_CR_UNSPECIFIED_ERR);
 	if (ucrp->ctrl_wLength != 0)
 		return (USB_CR_UNSPECIFIED_ERR);
+
+	/*
+	 * hubd acknowledging a synthetic disconnect after a controller reset
+	 * moves the port on to the synthetic reconnect, which is delivered
+	 * once this request has completed. Offline, the port simply stays
+	 * disconnected.
+	 */
+	fake = xhcip->xhci_port_fake[port];
+	if (feat == CFS_C_PORT_CONNECTION && fake != XHCI_PORT_FAKE_NONE) {
+		if (xhcip->xhci_state & XHCI_S_OFFLINE) {
+			xhcip->xhci_port_fake[port] = XHCI_PORT_FAKE_NONE;
+		} else if (xhcip->xhci_state & XHCI_S_ERROR) {
+			/*
+			 * An acknowledgement that races the reset must not
+			 * consume the cycle. The port is reported again when
+			 * the reset completes.
+			 */
+			;
+		} else if (fake == XHCI_PORT_FAKE_DISCONNECT) {
+			/*
+			 * The reconnect must not be seen while hubd still
+			 * holds a child for this port, or it tries to address
+			 * the stale child and disables the port. It waits for
+			 * the last stale device on the port to be freed.
+			 */
+			if (xhcip->xhci_port_stale[port] != 0) {
+				xhcip->xhci_port_fake[port] =
+				    XHCI_PORT_FAKE_RECONNECT_WAIT;
+			} else {
+				xhcip->xhci_port_fake[port] =
+				    XHCI_PORT_FAKE_RECONNECT;
+				xhcip->xhci_port_notify = B_TRUE;
+			}
+		} else if (fake == XHCI_PORT_FAKE_RECONNECT) {
+			xhcip->xhci_port_fake[port] = XHCI_PORT_FAKE_NONE;
+		}
+	}
+
+	/*
+	 * While the controller is being reset or is offline, changes are
+	 * acknowledged in software only.
+	 */
+	if (xhcip->xhci_state & XHCI_S_UNUSABLE)
+		return (USB_CR_OK);
 
 	reg = xhci_get32(xhcip, XHCI_R_OPER, XHCI_PORTSC(port));
 	if (xhci_check_regs_acc(xhcip) != DDI_FM_OK) {
@@ -334,6 +379,9 @@ xhci_root_hub_handle_port_set_feature(xhci_t *xhcip, usb_ctrl_req_t *ucrp)
 		return (USB_CR_UNSPECIFIED_ERR);
 	if (ucrp->ctrl_wLength != 0)
 		return (USB_CR_UNSPECIFIED_ERR);
+
+	if (xhcip->xhci_state & XHCI_S_UNUSABLE)
+		return (USB_CR_HC_HARDWARE_ERR);
 
 	index = XHCI_PORTSC(port);
 	reg = xhci_get32(xhcip, XHCI_R_OPER, index);
@@ -449,6 +497,7 @@ xhci_root_hub_handle_port_get_status(xhci_t *xhcip, usb_ctrl_req_t *ucrp)
 	uint16_t ps, cs;
 	mblk_t *mp = ucrp->ctrl_data;
 	int port = XHCI_PS_INDPORT(ucrp->ctrl_wIndex);
+	uint8_t fake;
 
 	ASSERT(MUTEX_HELD(&xhcip->xhci_lock));
 
@@ -461,13 +510,25 @@ xhci_root_hub_handle_port_get_status(xhci_t *xhcip, usb_ctrl_req_t *ucrp)
 	if (ucrp->ctrl_wLength != PORT_GET_STATUS_PORT_LEN)
 		return (USB_CR_UNSPECIFIED_ERR);
 
-	reg = xhci_get32(xhcip, XHCI_R_OPER, XHCI_PORTSC(port));
-	if (xhci_check_regs_acc(xhcip) != DDI_FM_OK) {
-		xhci_error(xhcip, "failed to read port status register for "
-		    "port %d: encountered fatal FM error, resetting device",
-		    port);
-		xhci_fm_runtime_reset(xhcip);
-		return (USB_CR_HC_HARDWARE_ERR);
+	/*
+	 * A port in synthetic disconnect, or any port while the controller is
+	 * being reset or is offline, reads as powered with nothing attached.
+	 * The register is not touched.
+	 */
+	fake = xhcip->xhci_port_fake[port];
+	if (fake == XHCI_PORT_FAKE_DISCONNECT ||
+	    fake == XHCI_PORT_FAKE_RECONNECT_WAIT ||
+	    (xhcip->xhci_state & XHCI_S_UNUSABLE)) {
+		reg = XHCI_PS_PP;
+	} else {
+		reg = xhci_get32(xhcip, XHCI_R_OPER, XHCI_PORTSC(port));
+		if (xhci_check_regs_acc(xhcip) != DDI_FM_OK) {
+			xhci_error(xhcip, "failed to read port status "
+			    "register for port %d: encountered fatal FM "
+			    "error, resetting device", port);
+			xhci_fm_runtime_reset(xhcip);
+			return (USB_CR_HC_HARDWARE_ERR);
+		}
 	}
 
 	ps = cs = 0;
@@ -515,6 +576,9 @@ xhci_root_hub_handle_port_get_status(xhci_t *xhcip, usb_ctrl_req_t *ucrp)
 
 	if (reg & XHCI_PS_CSC)
 		cs |= PORT_CHANGE_CSC;
+	if (fake == XHCI_PORT_FAKE_DISCONNECT ||
+	    fake == XHCI_PORT_FAKE_RECONNECT)
+		cs |= PORT_CHANGE_CSC;
 	if (reg & XHCI_PS_PEC)
 		cs |= PORT_CHANGE_PESC;
 	if (reg & XHCI_PS_OCC)
@@ -547,6 +611,7 @@ xhci_root_hub_ctrl_req(xhci_t *xhcip, usba_pipe_handle_data_t *ph,
     usb_ctrl_req_t *ucrp)
 {
 	int ret = USB_CR_OK;
+	boolean_t notify;
 
 	ASSERT(MUTEX_HELD(&xhcip->xhci_lock));
 
@@ -594,11 +659,69 @@ xhci_root_hub_ctrl_req(xhci_t *xhcip, usba_pipe_handle_data_t *ph,
 		break;
 	}
 
+	notify = xhcip->xhci_port_notify;
+	xhcip->xhci_port_notify = B_FALSE;
 	mutex_exit(&xhcip->xhci_lock);
 	usba_hcdi_cb(ph, (usb_opaque_t)ucrp, ret);
+	if (notify)
+		xhci_root_hub_psc_callback(xhcip);
 	mutex_enter(&xhcip->xhci_lock);
 
 	return (USB_SUCCESS);
+}
+
+/*
+ * A runtime reset begins: every root port goes into synthetic disconnect and
+ * the number of devices that hang off each root port is recorded, so the
+ * synthetic reconnect can wait until hubd has freed them all. Called with
+ * xhci_lock held.
+ */
+void
+xhci_root_hub_reset_begin(xhci_t *xhcip)
+{
+	uint_t i;
+	xhci_device_t *xd;
+
+	ASSERT(MUTEX_HELD(&xhcip->xhci_lock));
+
+	if (xhcip->xhci_port_fake == NULL)
+		return;
+
+	for (i = 1; i <= xhcip->xhci_caps.xcap_max_ports; i++) {
+		xhcip->xhci_port_fake[i] = XHCI_PORT_FAKE_DISCONNECT;
+		xhcip->xhci_port_stale[i] = 0;
+	}
+
+	for (xd = list_head(&xhcip->xhci_usba.xa_devices); xd != NULL;
+	    xd = list_next(&xhcip->xhci_usba.xa_devices, xd)) {
+		if (xd->xd_root_port >= 1 &&
+		    xd->xd_root_port <= xhcip->xhci_caps.xcap_max_ports)
+			xhcip->xhci_port_stale[xd->xd_root_port]++;
+	}
+}
+
+/*
+ * A stale device under the given root port was freed. Returns B_TRUE when the
+ * port was waiting for that and the caller must deliver the synthetic
+ * reconnect with xhci_root_hub_psc_callback() once xhci_lock is dropped.
+ */
+boolean_t
+xhci_root_hub_stale_child_freed(xhci_t *xhcip, uint32_t port)
+{
+	ASSERT(MUTEX_HELD(&xhcip->xhci_lock));
+
+	if (xhcip->xhci_port_fake == NULL || port < 1 ||
+	    port > xhcip->xhci_caps.xcap_max_ports)
+		return (B_FALSE);
+
+	if (xhcip->xhci_port_stale[port] != 0)
+		xhcip->xhci_port_stale[port]--;
+	if (xhcip->xhci_port_stale[port] != 0 ||
+	    xhcip->xhci_port_fake[port] != XHCI_PORT_FAKE_RECONNECT_WAIT)
+		return (B_FALSE);
+
+	xhcip->xhci_port_fake[port] = XHCI_PORT_FAKE_RECONNECT;
+	return (B_TRUE);
 }
 
 /*
@@ -618,21 +741,38 @@ xhci_root_hub_psc_callback(xhci_t *xhcip)
 	mblk_t *mp;
 	uint32_t mask;
 	unsigned i;
+	boolean_t unusable;
 
+	/*
+	 * Ports in a synthetic state after a controller reset are always
+	 * reported. The registers are read only while the controller is up.
+	 */
 	mask = 0;
-	for (i = 0; i <= xhcip->xhci_caps.xcap_max_ports; i++) {
-		uint32_t reg;
-
-		reg = xhci_get32(xhcip, XHCI_R_OPER, XHCI_PORTSC(i));
-		if ((reg & XHCI_HUB_INTR_CHANGE_MASK) != 0)
+	mutex_enter(&xhcip->xhci_lock);
+	unusable = (xhcip->xhci_state & XHCI_S_UNUSABLE) != 0;
+	for (i = 1; i <= xhcip->xhci_caps.xcap_max_ports; i++) {
+		if (xhcip->xhci_port_fake[i] == XHCI_PORT_FAKE_DISCONNECT ||
+		    xhcip->xhci_port_fake[i] == XHCI_PORT_FAKE_RECONNECT)
 			mask |= 1UL << i;
 	}
+	mutex_exit(&xhcip->xhci_lock);
 
-	if (xhci_check_regs_acc(xhcip) != DDI_FM_OK) {
-		xhci_error(xhcip, "failed to read port status registers: "
-		    "encountered fatal FM error, resetting device");
-		xhci_fm_runtime_reset(xhcip);
-		return;
+	if (!unusable) {
+		for (i = 0; i <= xhcip->xhci_caps.xcap_max_ports; i++) {
+			uint32_t reg;
+
+			reg = xhci_get32(xhcip, XHCI_R_OPER, XHCI_PORTSC(i));
+			if ((reg & XHCI_HUB_INTR_CHANGE_MASK) != 0)
+				mask |= 1UL << i;
+		}
+
+		if (xhci_check_regs_acc(xhcip) != DDI_FM_OK) {
+			xhci_error(xhcip, "failed to read port status "
+			    "registers: encountered fatal FM error, resetting "
+			    "device");
+			xhci_fm_runtime_reset(xhcip);
+			return;
+		}
 	}
 	if (mask == 0)
 		return;
@@ -712,12 +852,12 @@ xhci_root_hub_intr_root_enable(xhci_t *xhcip, usba_pipe_handle_data_t *ph,
 	ASSERT((ph->p_ep.bEndpointAddress & USB_EP_NUM_MASK) == 1);
 	ASSERT((uirp->intr_attributes & USB_ATTRS_ONE_XFER) == 0);
 
+	/*
+	 * hubd restarts polling after every hotplug pass. That must succeed
+	 * while the controller is being reset or is offline, or hubd never
+	 * hears about the synthetic port changes that remove the children.
+	 */
 	mutex_enter(&xhcip->xhci_lock);
-	if (xhcip->xhci_state & XHCI_S_ERROR) {
-		mutex_exit(&xhcip->xhci_lock);
-		return (USB_HC_HARDWARE_ERROR);
-	}
-
 	if (xhcip->xhci_usba.xa_intr_cb_ph != NULL) {
 		mutex_exit(&xhcip->xhci_lock);
 		return (USB_BUSY);

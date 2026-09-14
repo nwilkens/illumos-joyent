@@ -1110,6 +1110,11 @@ xhci_endpoint_schedule(xhci_t *xhcip, xhci_device_t *xd, xhci_endpoint_t *xep,
 
 	XHCI_DMA_SYNC(rp->xr_dma, DDI_DMA_SYNC_FORDEV);
 	if (xhci_check_dma_handle(xhcip, &rp->xr_dma) != DDI_FM_OK) {
+		/*
+		 * The caller frees the transfer on failure, so it must not
+		 * stay on the list for the reset drain to find.
+		 */
+		list_remove(&xep->xep_transfers, xt);
 		xhci_error(xhcip, "failed to write out TRB for device on slot "
 		    "%d, port %d, and endpoint %u: encountered fatal FM error "
 		    "synchronizing ring DMA memory", xd->xd_slot, xd->xd_port,
@@ -1393,11 +1398,24 @@ xhci_device_lookup_by_slot(xhci_t *xhcip, int slot)
 
 	for (xd = list_head(&xhcip->xhci_usba.xa_devices); xd != NULL;
 	    xd = list_next(&xhcip->xhci_usba.xa_devices, xd)) {
-		if (xd->xd_slot == slot)
+		if (xd->xd_slot == slot && !xhci_device_stale(xhcip, xd))
 			return (xd);
 	}
 
 	return (NULL);
+}
+
+/*
+ * A device that was created before the last runtime reset has no slot in the
+ * controller any more. Callers must not issue commands or ring doorbells for
+ * it; USBA removes it through the normal hot removal path.
+ */
+boolean_t
+xhci_device_stale(xhci_t *xhcip, xhci_device_t *xd)
+{
+	ASSERT(MUTEX_HELD(&xhcip->xhci_lock));
+
+	return (xd->xd_gen != xhcip->xhci_gen);
 }
 
 /*

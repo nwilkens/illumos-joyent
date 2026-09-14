@@ -167,6 +167,11 @@ xhci_command_ring_init(xhci_t *xhcip)
 	if (xcr->xcr_ring.xr_trb == NULL) {
 		if ((ret = xhci_ring_alloc(xhcip, &xcr->xcr_ring)) != 0)
 			return (ret);
+		mutex_init(&xcr->xcr_lock, NULL, MUTEX_DRIVER,
+		    DDI_INTR_PRI(xhcip->xhci_intr_pri));
+		cv_init(&xcr->xcr_cv, NULL, CV_DRIVER, NULL);
+		list_create(&xcr->xcr_commands, sizeof (xhci_command_t),
+		    offsetof(xhci_command_t, xco_link));
 	}
 
 	if ((ret = xhci_ring_reset(xhcip, &xcr->xcr_ring)) != 0)
@@ -181,12 +186,42 @@ xhci_command_ring_init(xhci_t *xhcip)
 	if (xhci_check_regs_acc(xhcip) != DDI_FM_OK)
 		return (EIO);
 
-	mutex_init(&xcr->xcr_lock, NULL, MUTEX_DRIVER,
-	    DDI_INTR_PRI(xhcip->xhci_intr_pri));
-	cv_init(&xcr->xcr_cv, NULL, CV_DRIVER, NULL);
-	list_create(&xcr->xcr_commands, sizeof (xhci_command_t),
-	    offsetof(xhci_command_t, xco_link));
+	mutex_enter(&xcr->xcr_lock);
+	VERIFY(list_is_empty(&xcr->xcr_commands));
+	xcr->xcr_state = XHCI_COMMAND_RING_IDLE;
+	mutex_exit(&xcr->xcr_lock);
 	return (0);
+}
+
+/*
+ * Fail every queued command and every waiter ahead of a controller reset. The
+ * ring is left in the RESET state so that nothing is submitted until
+ * xhci_command_ring_init() runs again. The timeout is cancelled outside the
+ * lock because its handler takes the lock.
+ */
+void
+xhci_command_ring_drain(xhci_t *xhcip)
+{
+	xhci_command_ring_t *xcr = &xhcip->xhci_command;
+	xhci_command_t *xco;
+	timeout_id_t to;
+
+	if (xcr->xcr_ring.xr_trb == NULL)
+		return;
+
+	mutex_enter(&xcr->xcr_lock);
+	xcr->xcr_state = XHCI_COMMAND_RING_RESET;
+	to = xcr->xcr_timeout;
+	xcr->xcr_timeout = 0;
+	while ((xco = list_remove_head(&xcr->xcr_commands)) != NULL) {
+		xco->xco_state = XHCI_COMMAND_S_RESET;
+		cv_signal(&xco->xco_cv);
+	}
+	cv_broadcast(&xcr->xcr_cv);
+	mutex_exit(&xcr->xcr_lock);
+
+	if (to != 0)
+		(void) untimeout(to);
 }
 
 static void
@@ -237,6 +272,11 @@ xhci_command_timeout(void *arg)
 	delay = drv_usectohz(xhci_command_abort_wait);
 	while (xcr->xcr_state != XHCI_COMMAND_RING_ABORT_DONE) {
 		int ret;
+
+		if (xcr->xcr_state == XHCI_COMMAND_RING_RESET) {
+			mutex_exit(&xcr->xcr_lock);
+			return;
+		}
 
 		ret = cv_reltimedwait(&xcr->xcr_cv, &xcr->xcr_lock, delay,
 		    TR_CLOCK_TICK);
@@ -316,6 +356,14 @@ xhci_command_event_callback(xhci_t *xhcip, xhci_trb_t *trb)
 	mutex_enter(&xcr->xcr_lock);
 
 	/*
+	 * Nothing on a ring being reset is waiting for events any more.
+	 */
+	if (xcr->xcr_state == XHCI_COMMAND_RING_RESET) {
+		mutex_exit(&xcr->xcr_lock);
+		return (B_TRUE);
+	}
+
+	/*
 	 * If we got an event that indicates that the command ring was stopped,
 	 * then we have successfully finished an abort. While a command ring
 	 * stop can also be done by writing to the XHCI_CRCR register, the
@@ -331,8 +379,17 @@ xhci_command_event_callback(xhci_t *xhcip, xhci_trb_t *trb)
 		return (B_TRUE);
 	}
 
+	/*
+	 * A completion with nothing queued is a controller error, not a
+	 * driver invariant. Drop it.
+	 */
 	xco = list_head(&xcr->xcr_commands);
-	VERIFY(xco != NULL);
+	if (xco == NULL) {
+		mutex_exit(&xcr->xcr_lock);
+		xhci_error(xhcip, "!dropping command completion event with "
+		    "no command queued");
+		return (B_TRUE);
+	}
 
 	/*
 	 * The current event should be pointed to by the ring's tail pointer.
@@ -404,8 +461,14 @@ xhci_command_submit(xhci_t *xhcip, xhci_command_t *xco)
 
 	mutex_enter(&xcr->xcr_lock);
 
-	while (xhci_ring_trb_space(xrp, 1U) == B_FALSE ||
-	    xcr->xcr_state >= XHCI_COMMAND_RING_ABORTING) {
+	for (;;) {
+		if (xcr->xcr_state == XHCI_COMMAND_RING_RESET) {
+			mutex_exit(&xcr->xcr_lock);
+			return (USB_HC_HARDWARE_ERROR);
+		}
+		if (xhci_ring_trb_space(xrp, 1U) == B_TRUE &&
+		    xcr->xcr_state < XHCI_COMMAND_RING_ABORTING)
+			break;
 		cv_wait(&xcr->xcr_cv, &xcr->xcr_lock);
 	}
 
@@ -419,6 +482,12 @@ xhci_command_submit(xhci_t *xhcip, xhci_command_t *xco)
 	 */
 	XHCI_DMA_SYNC(xrp->xr_dma, DDI_DMA_SYNC_FORDEV);
 	if (xhci_check_dma_handle(xhcip, &xrp->xr_dma) != DDI_FM_OK) {
+		/*
+		 * The command lives on the caller's stack, so it must leave
+		 * the list before the reset drain can find it.
+		 */
+		list_remove(&xcr->xcr_commands, xco);
+		xco->xco_state = XHCI_COMMAND_S_RESET;
 		mutex_exit(&xcr->xcr_lock);
 		xhci_error(xhcip, "encountered fatal FM error syncing command "
 		    "ring DMA contents: resetting device");
@@ -433,6 +502,8 @@ xhci_command_submit(xhci_t *xhcip, xhci_command_t *xco)
 	 */
 	xhci_put32(xhcip, XHCI_R_DOOR, XHCI_DOORBELL(0), 0);
 	if (xhci_check_regs_acc(xhcip) != DDI_FM_OK) {
+		list_remove(&xcr->xcr_commands, xco);
+		xco->xco_state = XHCI_COMMAND_S_RESET;
 		mutex_exit(&xcr->xcr_lock);
 		xhci_error(xhcip, "encountered fatal FM error ringing command "
 		    "ring doorbell: resetting device");
@@ -465,6 +536,23 @@ xhci_command_submit(xhci_t *xhcip, xhci_command_t *xco)
 	mutex_exit(&xcr->xcr_lock);
 
 	return (ret);
+}
+
+/*
+ * Commands for a device that lost its slot in a controller reset must not
+ * reach the controller: the slot number may already belong to a new device.
+ * The check is made as late as possible, right before the command is queued.
+ */
+static boolean_t
+xhci_command_device_stale(xhci_t *xhcip, xhci_device_t *xd)
+{
+	boolean_t stale;
+
+	mutex_enter(&xhcip->xhci_lock);
+	stale = xhci_device_stale(xhcip, xd);
+	mutex_exit(&xhcip->xhci_lock);
+
+	return (stale);
 }
 
 int
@@ -514,7 +602,7 @@ done:
 }
 
 int
-xhci_command_disable_slot(xhci_t *xhcip, uint8_t slot)
+xhci_command_disable_slot(xhci_t *xhcip, xhci_device_t *xd)
 {
 	int ret, code;
 	xhci_command_t co;
@@ -523,7 +611,9 @@ xhci_command_disable_slot(xhci_t *xhcip, uint8_t slot)
 
 	xhci_command_init(&co);
 	co.xco_req.trb_flags = LE_32(XHCI_CMD_DISABLE_SLOT |
-	    XHCI_TRB_SET_SLOT(slot));
+	    XHCI_TRB_SET_SLOT(xd->xd_slot));
+	if (xhci_command_device_stale(xhcip, xd))
+		return (USB_HC_HARDWARE_ERROR);
 	ret = xhci_command_submit(xhcip, &co);
 	if (ret != 0)
 		goto done;
@@ -561,6 +651,8 @@ xhci_command_set_address(xhci_t *xhcip, xhci_device_t *xd, boolean_t bsr)
 	if (bsr == B_TRUE)
 		co.xco_req.trb_flags |= LE_32(XHCI_TRB_BSR);
 
+	if (xhci_command_device_stale(xhcip, xd))
+		return (USB_HC_HARDWARE_ERROR);
 	ret = xhci_command_submit(xhcip, &co);
 	if (ret != 0)
 		goto done;
@@ -595,6 +687,8 @@ xhci_command_configure_endpoint(xhci_t *xhcip, xhci_device_t *xd)
 	co.xco_req.trb_flags = LE_32(XHCI_CMD_CONFIG_EP |
 	    XHCI_TRB_SET_SLOT(xd->xd_slot));
 
+	if (xhci_command_device_stale(xhcip, xd))
+		return (USB_HC_HARDWARE_ERROR);
 	ret = xhci_command_submit(xhcip, &co);
 	if (ret != 0)
 		goto done;
@@ -643,6 +737,8 @@ xhci_command_evaluate_context(xhci_t *xhcip, xhci_device_t *xd)
 	co.xco_req.trb_flags = LE_32(XHCI_CMD_EVAL_CTX |
 	    XHCI_TRB_SET_SLOT(xd->xd_slot));
 
+	if (xhci_command_device_stale(xhcip, xd))
+		return (USB_HC_HARDWARE_ERROR);
 	ret = xhci_command_submit(xhcip, &co);
 	if (ret != 0)
 		goto done;
@@ -690,6 +786,8 @@ xhci_command_reset_endpoint(xhci_t *xhcip, xhci_device_t *xd,
 	    XHCI_TRB_SET_SLOT(xd->xd_slot) |
 	    XHCI_TRB_SET_EP(xep->xep_num + 1));
 
+	if (xhci_command_device_stale(xhcip, xd))
+		return (USB_HC_HARDWARE_ERROR);
 	ret = xhci_command_submit(xhcip, &co);
 	if (ret != 0)
 		goto done;
@@ -752,6 +850,8 @@ xhci_command_set_tr_dequeue(xhci_t *xhcip, xhci_device_t *xd,
 	    XHCI_TRB_SET_SLOT(xd->xd_slot) |
 	    XHCI_TRB_SET_EP(xep->xep_num + 1));
 
+	if (xhci_command_device_stale(xhcip, xd))
+		return (USB_HC_HARDWARE_ERROR);
 	ret = xhci_command_submit(xhcip, &co);
 	if (ret != 0)
 		goto done;
@@ -811,6 +911,8 @@ xhci_command_stop_endpoint(xhci_t *xhcip, xhci_device_t *xd,
 	    XHCI_TRB_SET_SLOT(xd->xd_slot) |
 	    XHCI_TRB_SET_EP(xep->xep_num + 1));
 
+	if (xhci_command_device_stale(xhcip, xd))
+		return (USB_HC_HARDWARE_ERROR);
 	ret = xhci_command_submit(xhcip, &co);
 	if (ret != 0)
 		goto done;

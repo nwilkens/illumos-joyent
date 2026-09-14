@@ -445,7 +445,8 @@ typedef enum xhci_command_ring_state {
 	XHCI_COMMAND_RING_IDLE		= 0x00,
 	XHCI_COMMAND_RING_RUNNING	= 0x01,
 	XHCI_COMMAND_RING_ABORTING	= 0x02,
-	XHCI_COMMAND_RING_ABORT_DONE	= 0x03
+	XHCI_COMMAND_RING_ABORT_DONE	= 0x03,
+	XHCI_COMMAND_RING_RESET		= 0x04
 } xhci_command_ring_state_t;
 
 typedef struct xhci_command_ring {
@@ -533,7 +534,8 @@ typedef enum xhci_endpoint_state {
  */
 #define	XHCI_ENDPOINT_DONT_SCHEDULE	(XHCI_ENDPOINT_HALTED |		\
 					XHCI_ENDPOINT_QUIESCE |		\
-					XHCI_ENDPOINT_TIMED_OUT)
+					XHCI_ENDPOINT_TIMED_OUT |	\
+					XHCI_ENDPOINT_TEARDOWN)
 
 /*
  * Forwards required for the endpoint
@@ -571,6 +573,8 @@ typedef struct xhci_device {
 	list_node_t		xd_link;
 	usb_port_t		xd_port;
 	uint8_t			xd_slot;
+	uint32_t		xd_root_port;
+	uint64_t		xd_gen;
 	boolean_t		xd_addressed;
 	usba_device_t		*xd_usbdev;
 	xhci_dma_buffer_t	xd_ictx;
@@ -632,8 +636,31 @@ typedef enum xhci_attach_seq {
 } xhci_attach_seq_t;
 
 typedef enum xhci_state_flags {
-	XHCI_S_ERROR		= 0x1 << 0
+	/* A fatal error was seen and a runtime reset is in flight. */
+	XHCI_S_ERROR		= 0x1 << 0,
+	/* Runtime reset failed or looped; the controller is given up on. */
+	XHCI_S_OFFLINE		= 0x1 << 1,
+	/* The driver is detaching; no new reset may start. */
+	XHCI_S_DETACHING	= 0x1 << 2
 } xhci_state_flags_t;
+
+#define	XHCI_S_UNUSABLE		(XHCI_S_ERROR | XHCI_S_OFFLINE)
+
+/*
+ * After a runtime reset the root hub reports each port as disconnected and
+ * then, once hubd acknowledges that, as newly connected. This drives hubd to
+ * tear down and re-create every child through its normal hotplug path.
+ */
+typedef enum xhci_port_fake {
+	XHCI_PORT_FAKE_NONE = 0,
+	XHCI_PORT_FAKE_DISCONNECT,
+	/*
+	 * Disconnect acknowledged, but a stale child on this port is not
+	 * freed yet.
+	 */
+	XHCI_PORT_FAKE_RECONNECT_WAIT,
+	XHCI_PORT_FAKE_RECONNECT
+} xhci_port_fake_t;
 
 typedef struct xhci {
 	dev_info_t		*xhci_dip;
@@ -663,6 +690,17 @@ typedef struct xhci {
 	kmutex_t		xhci_lock;
 	kcondvar_t		xhci_statecv;
 	xhci_state_flags_t	xhci_state;
+	/*
+	 * Bumped on every runtime reset. A device whose xd_gen differs lost
+	 * its slot in the controller and must not be touched in hardware.
+	 */
+	uint64_t		xhci_gen;
+	uint_t			xhci_reset_count;
+	hrtime_t		xhci_reset_first;
+	uint8_t			*xhci_port_fake;
+	uint16_t		*xhci_port_stale;
+	boolean_t		xhci_port_notify;
+	int			xhci_fatal_panic;
 	xhci_usba_t		xhci_usba;
 } xhci_t;
 
@@ -724,6 +762,7 @@ typedef struct xhci_polled {
  */
 extern xhci_t *xhci_hcdi_get_xhcip_from_dev(usba_device_t *);
 extern xhci_device_t *xhci_device_lookup_by_slot(xhci_t *, int);
+extern boolean_t xhci_device_stale(xhci_t *, xhci_device_t *);
 
 /*
  * Quirks related functions
@@ -784,7 +823,7 @@ extern void xhci_command_init(xhci_command_t *);
 extern void xhci_command_fini(xhci_command_t *);
 
 extern int xhci_command_enable_slot(xhci_t *, uint8_t *);
-extern int xhci_command_disable_slot(xhci_t *, uint8_t);
+extern int xhci_command_disable_slot(xhci_t *, xhci_device_t *);
 extern int xhci_command_set_address(xhci_t *, xhci_device_t *, boolean_t);
 extern int xhci_command_configure_endpoint(xhci_t *, xhci_device_t *);
 extern int xhci_command_evaluate_context(xhci_t *, xhci_device_t *);
@@ -852,6 +891,16 @@ extern void xhci_put64(xhci_t *, xhci_reg_type_t, uintptr_t, uint64_t);
  * Runtime FM related functions
  */
 extern void xhci_fm_runtime_reset(xhci_t *);
+extern void xhci_reset_task(void *);
+extern int xhci_controller_stop(xhci_t *);
+extern int xhci_controller_reset(xhci_t *);
+extern int xhci_controller_configure(xhci_t *);
+extern void xhci_controller_reroute(xhci_t *);
+extern int xhci_controller_start(xhci_t *);
+extern void xhci_command_ring_drain(xhci_t *);
+extern void xhci_hcdi_reset_drain(xhci_t *);
+extern void xhci_root_hub_reset_begin(xhci_t *);
+extern boolean_t xhci_root_hub_stale_child_freed(xhci_t *, uint32_t);
 
 /*
  * Endpoint related functions

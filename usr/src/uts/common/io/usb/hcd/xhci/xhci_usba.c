@@ -66,7 +66,8 @@ xhci_hcdi_pipe_open(usba_pipe_handle_data_t *ph, usb_flags_t usb_flags)
 	uint_t epid;
 
 	mutex_enter(&xhcip->xhci_lock);
-	if (xhcip->xhci_state & XHCI_S_ERROR) {
+	if ((xhcip->xhci_state & XHCI_S_UNUSABLE) &&
+	    ph->p_usba_device->usb_addr != ROOT_HUB_ADDR) {
 		mutex_exit(&xhcip->xhci_lock);
 		return (USB_HC_HARDWARE_ERROR);
 	}
@@ -118,6 +119,11 @@ xhci_hcdi_pipe_open(usba_pipe_handle_data_t *ph, usb_flags_t usb_flags)
 	 * can only be open once.
 	 */
 	mutex_enter(&xhcip->xhci_lock);
+	if (xhci_device_stale(xhcip, xd)) {
+		mutex_exit(&xhcip->xhci_lock);
+		kmem_free(pipe, sizeof (xhci_pipe_t));
+		return (USB_HC_HARDWARE_ERROR);
+	}
 	if (epid == XHCI_DEFAULT_ENDPOINT) {
 		xep = xd->xd_endpoints[epid];
 		VERIFY(xep != NULL);
@@ -126,6 +132,13 @@ xhci_hcdi_pipe_open(usba_pipe_handle_data_t *ph, usb_flags_t usb_flags)
 		mutex_exit(&xhcip->xhci_lock);
 		ret = xhci_endpoint_update_default(xhcip, xd, xep);
 		if (ret != USB_SUCCESS) {
+			/*
+			 * USBA destroys the pipe handle on failure, so the
+			 * endpoint must not keep pointing at it.
+			 */
+			mutex_enter(&xhcip->xhci_lock);
+			xep->xep_pipe = NULL;
+			mutex_exit(&xhcip->xhci_lock);
 			kmem_free(pipe, sizeof (xhci_pipe_t));
 			return (ret);
 		}
@@ -354,7 +367,8 @@ xhci_hcdi_periodic_free(xhci_t *xhcip, xhci_pipe_t *xp)
  * still free the transfer.
  */
 static void
-xhci_hcdi_pipe_flush(xhci_t *xhcip, xhci_endpoint_t *xep, int intr_code)
+xhci_hcdi_pipe_flush(xhci_t *xhcip, xhci_endpoint_t *xep, usb_cr_t xfer_code,
+    usb_cr_t intr_code)
 {
 	xhci_transfer_t *xt;
 
@@ -364,7 +378,7 @@ xhci_hcdi_pipe_flush(xhci_t *xhcip, xhci_endpoint_t *xep, int intr_code)
 		if (xhci_endpoint_is_periodic_in(xep) == B_FALSE ||
 		    XHCI_IS_ONESHOT_XFER(xt)) {
 			usba_hcdi_cb(xep->xep_pipe, xt->xt_usba_req,
-			    USB_CR_FLUSHED);
+			    xfer_code);
 			xhci_transfer_free(xhcip, xt);
 		}
 	}
@@ -379,6 +393,55 @@ xhci_hcdi_pipe_flush(xhci_t *xhcip, xhci_endpoint_t *xep, int intr_code)
 			xpp->xpp_usb_req = NULL;
 		}
 	}
+}
+
+/*
+ * Retire every transfer ahead of a controller reset. The hardware behind each
+ * endpoint is gone, so nothing here talks to the controller. Endpoints are
+ * marked for teardown so timeouts and the scheduler back off, and serialized
+ * states are cleared so waiters in xhci_endpoint_serialize() wake and find
+ * their device stale. USBA closes the pipes through the stale-device paths.
+ */
+void
+xhci_hcdi_reset_drain(xhci_t *xhcip)
+{
+	xhci_device_t *xd;
+
+	mutex_enter(&xhcip->xhci_lock);
+	for (xd = list_head(&xhcip->xhci_usba.xa_devices); xd != NULL;
+	    xd = list_next(&xhcip->xhci_usba.xa_devices, xd)) {
+		uint_t n;
+
+		for (n = 0; n < XHCI_NUM_ENDPOINTS; n++) {
+			xhci_endpoint_t *xep = xd->xd_endpoints[n];
+			xhci_transfer_t *xt;
+
+			if (xep == NULL)
+				continue;
+
+			xep->xep_state |= XHCI_ENDPOINT_TEARDOWN;
+			xep->xep_state &= ~(XHCI_ENDPOINT_QUIESCE |
+			    XHCI_ENDPOINT_TIMED_OUT);
+
+			/*
+			 * A pipe still being opened has no private data yet
+			 * and cannot have transfers queued.
+			 */
+			if (xep->xep_pipe != NULL &&
+			    xep->xep_pipe->p_hcd_private != NULL) {
+				xhci_hcdi_pipe_flush(xhcip, xep,
+				    USB_CR_HC_HARDWARE_ERR,
+				    USB_CR_HC_HARDWARE_ERR);
+			} else {
+				while ((xt = list_remove_head(
+				    &xep->xep_transfers)) != NULL) {
+					xhci_transfer_free(xhcip, xt);
+				}
+			}
+			cv_broadcast(&xep->xep_state_cv);
+		}
+	}
+	mutex_exit(&xhcip->xhci_lock);
 }
 
 /*
@@ -408,11 +471,6 @@ xhci_hcdi_pipe_poll_fini(usba_pipe_handle_data_t *ph, boolean_t is_close)
 	usb_opaque_t urp;
 
 	mutex_enter(&xhcip->xhci_lock);
-	if (xhcip->xhci_state & XHCI_S_ERROR) {
-		mutex_exit(&xhcip->xhci_lock);
-		return (USB_HC_HARDWARE_ERROR);
-	}
-
 	if (ph->p_usba_device->usb_addr == ROOT_HUB_ADDR) {
 		xhci_root_hub_intr_root_disable(xhcip);
 		ret = USB_SUCCESS;
@@ -444,6 +502,19 @@ xhci_hcdi_pipe_poll_fini(usba_pipe_handle_data_t *ph, boolean_t is_close)
 	 * Ensure that no other resets or time outs are going on right now.
 	 */
 	xhci_endpoint_serialize(xhcip, xep);
+
+	/*
+	 * A device that lost its slot in a controller reset has no ring to
+	 * stop. Its transfers were already returned by the reset drain. This
+	 * comes before the polling state gates because a quiesce that the
+	 * reset interrupted leaves the state at STOPPING.
+	 */
+	if (xhci_device_stale(xhcip, xd)) {
+		while (list_is_empty(&xep->xep_transfers) == 0)
+			(void) list_remove_head(&xep->xep_transfers);
+		mutex_exit(&xhcip->xhci_lock);
+		goto done;
+	}
 
 	if (xpp->xpp_poll_state == XHCI_PERIODIC_POLL_IDLE) {
 		mutex_exit(&xhcip->xhci_lock);
@@ -489,6 +560,7 @@ xhci_hcdi_pipe_poll_fini(usba_pipe_handle_data_t *ph, boolean_t is_close)
 		return (ret);
 	}
 
+done:
 	mutex_enter(&xhcip->xhci_lock);
 	urp = xpp->xpp_usb_req;
 	xpp->xpp_usb_req = NULL;
@@ -530,6 +602,7 @@ xhci_hcdi_pipe_close(usba_pipe_handle_data_t *ph, usb_flags_t usb_flags)
 	xhci_endpoint_t *xep;
 	int ret;
 	uint_t epid;
+	boolean_t stale;
 
 	if ((ph->p_ep.bmAttributes & USB_EP_ATTR_MASK) == USB_EP_ATTR_INTR &&
 	    xhcip->xhci_usba.xa_intr_cb_ph != NULL) {
@@ -570,30 +643,36 @@ xhci_hcdi_pipe_close(usba_pipe_handle_data_t *ph, usb_flags_t usb_flags)
 
 	/*
 	 * We clean up the endpoint by stopping it and cancelling any transfers
-	 * that were in flight at the time.
+	 * that were in flight at the time. A device that lost its slot in a
+	 * controller reset has no ring to stop, so only the software side is
+	 * cleaned up for it.
 	 */
 	xhci_endpoint_timeout_cancel(xhcip, xep);
-	xep->xep_state |= XHCI_ENDPOINT_QUIESCE;
-	if ((ret = xhci_endpoint_quiesce(xhcip, xd, xep)) != USB_SUCCESS) {
-		/*
-		 * If we cannot stop the ring, it is not safe to proceed and we
-		 * must keep the pipe open.
-		 */
-		xep->xep_state &=
-		    ~(XHCI_ENDPOINT_TEARDOWN | XHCI_ENDPOINT_QUIESCE);
-		cv_broadcast(&xep->xep_state_cv);
-		mutex_exit(&xhcip->xhci_lock);
-		xhci_error(xhcip, "asked to do close pipe on slot %d, "
-		    "port %d, endpoint: %d, but quiesce failed %d",
-		    xd->xd_slot, xd->xd_port, epid, ret);
-		return (USB_FAILURE);
+	stale = xhci_device_stale(xhcip, xd);
+	if (!stale) {
+		xep->xep_state |= XHCI_ENDPOINT_QUIESCE;
+		ret = xhci_endpoint_quiesce(xhcip, xd, xep);
+		if (ret != USB_SUCCESS) {
+			/*
+			 * If we cannot stop the ring, it is not safe to
+			 * proceed and we must keep the pipe open.
+			 */
+			xep->xep_state &=
+			    ~(XHCI_ENDPOINT_TEARDOWN | XHCI_ENDPOINT_QUIESCE);
+			cv_broadcast(&xep->xep_state_cv);
+			mutex_exit(&xhcip->xhci_lock);
+			xhci_error(xhcip, "asked to do close pipe on slot %d, "
+			    "port %d, endpoint: %d, but quiesce failed %d",
+			    xd->xd_slot, xd->xd_port, epid, ret);
+			return (USB_FAILURE);
+		}
 	}
 
 	/*
 	 * Now that we've stopped the endpoint, see if we need to flush any
 	 * transfers.
 	 */
-	xhci_hcdi_pipe_flush(xhcip, xep, USB_CR_PIPE_CLOSING);
+	xhci_hcdi_pipe_flush(xhcip, xep, USB_CR_FLUSHED, USB_CR_PIPE_CLOSING);
 	if ((ph->p_ep.bEndpointAddress & USB_EP_DIR_MASK) == USB_EP_DIR_IN) {
 		xhci_hcdi_periodic_free(xhcip, xp);
 	}
@@ -607,8 +686,8 @@ xhci_hcdi_pipe_close(usba_pipe_handle_data_t *ph, usb_flags_t usb_flags)
 	 * which inhibits the use of other devices, so we attempt to
 	 * unconfigure those here.
 	 */
-	if (xep->xep_type == USB_EP_ATTR_INTR ||
-	    xep->xep_type == USB_EP_ATTR_ISOCH) {
+	if (!stale && (xep->xep_type == USB_EP_ATTR_INTR ||
+	    xep->xep_type == USB_EP_ATTR_ISOCH)) {
 		if ((ret = xhci_endpoint_unconfigure(xhcip, xd, xep)) ==
 		    USB_SUCCESS) {
 			/*
@@ -662,7 +741,7 @@ xhci_hcdi_pipe_reset(usba_pipe_handle_data_t *ph, usb_flags_t usb_flags)
 	int ret;
 
 	mutex_enter(&xhcip->xhci_lock);
-	if (xhcip->xhci_state & XHCI_S_ERROR) {
+	if (xhcip->xhci_state & XHCI_S_UNUSABLE) {
 		mutex_exit(&xhcip->xhci_lock);
 		return (USB_HC_HARDWARE_ERROR);
 	}
@@ -688,6 +767,18 @@ xhci_hcdi_pipe_reset(usba_pipe_handle_data_t *ph, usb_flags_t usb_flags)
 	 * Ensure that no other resets or time outs are going on right now.
 	 */
 	xhci_endpoint_serialize(xhcip, xep);
+
+	/*
+	 * A device that lost its slot in a controller reset cannot be reset
+	 * in hardware. Return its transfers and report the controller error.
+	 */
+	if (xhci_device_stale(xhcip, xd)) {
+		xhci_hcdi_pipe_flush(xhcip, xep, USB_CR_FLUSHED,
+		    USB_CR_PIPE_RESET);
+		xep->xep_state &= ~XHCI_ENDPOINT_PERIODIC;
+		mutex_exit(&xhcip->xhci_lock);
+		return (USB_HC_HARDWARE_ERROR);
+	}
 
 	xep->xep_state |= XHCI_ENDPOINT_QUIESCE;
 	ret = xhci_endpoint_quiesce(xhcip, xd, xep);
@@ -721,7 +812,7 @@ xhci_hcdi_pipe_reset(usba_pipe_handle_data_t *ph, usb_flags_t usb_flags)
 	}
 
 	mutex_enter(&xhcip->xhci_lock);
-	xhci_hcdi_pipe_flush(xhcip, xep, USB_CR_PIPE_RESET);
+	xhci_hcdi_pipe_flush(xhcip, xep, USB_CR_FLUSHED, USB_CR_PIPE_RESET);
 
 	/*
 	 * We need to remove the periodic flag as part of resetting, as if this
@@ -790,22 +881,31 @@ xhci_hcdi_pipe_ctrl_xfer(usba_pipe_handle_data_t *ph, usb_ctrl_req_t *ucrp,
 
 	xhci_t *xhcip = xhci_hcdi_get_xhcip(ph);
 
+	/*
+	 * The root hub is answered from software, so it keeps working while
+	 * the controller is being reset or has been taken offline. That is how
+	 * hubd learns to remove the children.
+	 */
 	mutex_enter(&xhcip->xhci_lock);
-	if (xhcip->xhci_state & XHCI_S_ERROR) {
-		mutex_exit(&xhcip->xhci_lock);
-		return (USB_HC_HARDWARE_ERROR);
-	}
-
 	if (ph->p_usba_device->usb_addr == ROOT_HUB_ADDR) {
 		ret = xhci_root_hub_ctrl_req(xhcip, ph, ucrp);
 		mutex_exit(&xhcip->xhci_lock);
 		return (ret);
 	}
 
+	if (xhcip->xhci_state & XHCI_S_UNUSABLE) {
+		mutex_exit(&xhcip->xhci_lock);
+		return (USB_HC_HARDWARE_ERROR);
+	}
+
 	/*
 	 * Determine the device and endpoint.
 	 */
 	xd = usba_hcdi_get_device_private(ph->p_usba_device);
+	if (xhci_device_stale(xhcip, xd)) {
+		mutex_exit(&xhcip->xhci_lock);
+		return (USB_HC_HARDWARE_ERROR);
+	}
 	ep = xhci_endpoint_pipe_to_epid(ph);
 	if (xd->xd_endpoints[ep] == NULL) {
 		mutex_exit(&xhcip->xhci_lock);
@@ -957,7 +1057,7 @@ xhci_hcdi_pipe_bulk_xfer(usba_pipe_handle_data_t *ph, usb_bulk_req_t *ubrp,
 	xhci_t *xhcip = xhci_hcdi_get_xhcip(ph);
 
 	mutex_enter(&xhcip->xhci_lock);
-	if (xhcip->xhci_state & XHCI_S_ERROR) {
+	if (xhcip->xhci_state & XHCI_S_UNUSABLE) {
 		mutex_exit(&xhcip->xhci_lock);
 		return (USB_HC_HARDWARE_ERROR);
 	}
@@ -968,6 +1068,10 @@ xhci_hcdi_pipe_bulk_xfer(usba_pipe_handle_data_t *ph, usb_bulk_req_t *ubrp,
 	}
 
 	xd = usba_hcdi_get_device_private(ph->p_usba_device);
+	if (xhci_device_stale(xhcip, xd)) {
+		mutex_exit(&xhcip->xhci_lock);
+		return (USB_HC_HARDWARE_ERROR);
+	}
 	epid = xhci_endpoint_pipe_to_epid(ph);
 	if (xd->xd_endpoints[epid] == NULL) {
 		mutex_exit(&xhcip->xhci_lock);
@@ -1099,12 +1203,16 @@ xhci_hcdi_periodic_init(xhci_t *xhcip, usba_pipe_handle_data_t *ph,
 	xhci_periodic_pipe_t *xpp;
 
 	mutex_enter(&xhcip->xhci_lock);
-	if (xhcip->xhci_state & XHCI_S_ERROR) {
+	if (xhcip->xhci_state & XHCI_S_UNUSABLE) {
 		mutex_exit(&xhcip->xhci_lock);
 		return (USB_HC_HARDWARE_ERROR);
 	}
 
 	xd = usba_hcdi_get_device_private(ph->p_usba_device);
+	if (xhci_device_stale(xhcip, xd)) {
+		mutex_exit(&xhcip->xhci_lock);
+		return (USB_HC_HARDWARE_ERROR);
+	}
 	epid = xhci_endpoint_pipe_to_epid(ph);
 	if (xd->xd_endpoints[epid] == NULL) {
 		xhci_error(xhcip, "asked to do periodic transfer on slot %d, "
@@ -1233,12 +1341,16 @@ xhci_hcdi_intr_oneshot(xhci_t *xhcip, usba_pipe_handle_data_t *ph,
 	mblk_t *mp = NULL;
 
 	mutex_enter(&xhcip->xhci_lock);
-	if (xhcip->xhci_state & XHCI_S_ERROR) {
+	if (xhcip->xhci_state & XHCI_S_UNUSABLE) {
 		mutex_exit(&xhcip->xhci_lock);
 		return (USB_HC_HARDWARE_ERROR);
 	}
 
 	xd = usba_hcdi_get_device_private(ph->p_usba_device);
+	if (xhci_device_stale(xhcip, xd)) {
+		mutex_exit(&xhcip->xhci_lock);
+		return (USB_HC_HARDWARE_ERROR);
+	}
 	epid = xhci_endpoint_pipe_to_epid(ph);
 	if (xd->xd_endpoints[epid] == NULL) {
 		xhci_error(xhcip, "asked to do interrupt transfer on slot %d, "
@@ -1408,12 +1520,16 @@ xhci_hcdi_isoc_oneshot(xhci_t *xhcip, usba_pipe_handle_data_t *ph,
 	}
 
 	mutex_enter(&xhcip->xhci_lock);
-	if (xhcip->xhci_state & XHCI_S_ERROR) {
+	if (xhcip->xhci_state & XHCI_S_UNUSABLE) {
 		mutex_exit(&xhcip->xhci_lock);
 		return (USB_HC_HARDWARE_ERROR);
 	}
 
 	xd = usba_hcdi_get_device_private(ph->p_usba_device);
+	if (xhci_device_stale(xhcip, xd)) {
+		mutex_exit(&xhcip->xhci_lock);
+		return (USB_HC_HARDWARE_ERROR);
+	}
 	epid = xhci_endpoint_pipe_to_epid(ph);
 	if (xd->xd_endpoints[epid] == NULL) {
 		xhci_error(xhcip, "asked to do isochronous transfer on slot "
@@ -1663,6 +1779,13 @@ xhci_hcdi_device_init(usba_device_t *ud, usb_port_t port, void **hcdpp)
 	size_t isize, osize, incr;
 	uint32_t route, rp, info, info2, tt;
 
+	mutex_enter(&xhcip->xhci_lock);
+	if (xhcip->xhci_state & XHCI_S_UNUSABLE) {
+		mutex_exit(&xhcip->xhci_lock);
+		return (USB_HC_HARDWARE_ERROR);
+	}
+	mutex_exit(&xhcip->xhci_lock);
+
 	xd = kmem_zalloc(sizeof (xhci_device_t), KM_SLEEP);
 	xd->xd_port = port;
 	xd->xd_usbdev = ud;
@@ -1720,6 +1843,20 @@ xhci_hcdi_device_init(usba_device_t *ud, usb_port_t port, void **hcdpp)
 	}
 
 	/*
+	 * The generation is the controller that granted the slot. If a reset
+	 * is in flight now, the grant came from a controller that is gone and
+	 * there is nothing to give back.
+	 */
+	mutex_enter(&xhcip->xhci_lock);
+	if (xhcip->xhci_state & XHCI_S_UNUSABLE) {
+		mutex_exit(&xhcip->xhci_lock);
+		xhci_hcdi_device_free(xd);
+		return (USB_HC_HARDWARE_ERROR);
+	}
+	xd->xd_gen = xhcip->xhci_gen;
+	mutex_exit(&xhcip->xhci_lock);
+
+	/*
 	 * These are the default slot context and the endpoint zero context that
 	 * we're enabling. See 4.3.3.
 	 */
@@ -1731,6 +1868,7 @@ xhci_hcdi_device_init(usba_device_t *ud, usb_port_t port, void **hcdpp)
 	 * alternate MTT interface.
 	 */
 	xhci_hcdi_device_route(ud, &route, &rp);
+	xd->xd_root_port = rp;
 	info = XHCI_SCTX_SET_ROUTE(route) | XHCI_SCTX_SET_DCI(1);
 	switch (ud->usb_port_status) {
 	case USBA_LOW_SPEED_DEV:
@@ -1756,27 +1894,40 @@ xhci_hcdi_device_init(usba_device_t *ud, usb_port_t port, void **hcdpp)
 	xd->xd_slotin->xsc_tt = LE_32(tt);
 
 	if ((ret = xhci_endpoint_init(xhcip, xd, NULL)) != 0) {
-		(void) xhci_command_disable_slot(xhcip, xd->xd_slot);
+		(void) xhci_command_disable_slot(xhcip, xd);
 		xhci_hcdi_device_free(xd);
 		return (USB_HC_HARDWARE_ERROR);
 	}
 
 	if (xhci_context_slot_output_init(xhcip, xd) != B_TRUE) {
-		(void) xhci_command_disable_slot(xhcip, xd->xd_slot);
+		(void) xhci_command_disable_slot(xhcip, xd);
 		xhci_endpoint_fini(xd, 0);
 		xhci_hcdi_device_free(xd);
 		return (USB_HC_HARDWARE_ERROR);
 	}
 
 	if ((ret = xhci_command_set_address(xhcip, xd, B_TRUE)) != 0) {
-		(void) xhci_command_disable_slot(xhcip, xd->xd_slot);
-		xhci_context_slot_output_fini(xhcip, xd);
+		(void) xhci_command_disable_slot(xhcip, xd);
+		mutex_enter(&xhcip->xhci_lock);
+		if (!xhci_device_stale(xhcip, xd))
+			xhci_context_slot_output_fini(xhcip, xd);
+		mutex_exit(&xhcip->xhci_lock);
 		xhci_endpoint_fini(xd, 0);
 		xhci_hcdi_device_free(xd);
 		return (ret);
 	}
 
+	/*
+	 * A reset that landed after the slot was granted took the slot and
+	 * the DCBAA entry with it. Nothing in hardware is ours to undo.
+	 */
 	mutex_enter(&xhcip->xhci_lock);
+	if (xhci_device_stale(xhcip, xd)) {
+		mutex_exit(&xhcip->xhci_lock);
+		xhci_endpoint_fini(xd, 0);
+		xhci_hcdi_device_free(xd);
+		return (USB_HC_HARDWARE_ERROR);
+	}
 	list_insert_tail(&xhcip->xhci_usba.xa_devices, xd);
 	mutex_exit(&xhcip->xhci_lock);
 
@@ -1794,6 +1945,7 @@ xhci_hcdi_device_fini(usba_device_t *ud, void *hcdp)
 	xhci_endpoint_t *xep;
 	xhci_device_t *xd;
 	xhci_t *xhcip;
+	boolean_t stale, notify = B_FALSE;
 
 	/*
 	 * Right now, it's theoretically possible that USBA may try and call
@@ -1816,21 +1968,51 @@ xhci_hcdi_device_fini(usba_device_t *ud, void *hcdp)
 	mutex_exit(&xhcip->xhci_lock);
 	(void) untimeout(xep->xep_timeout);
 
+	mutex_enter(&xhcip->xhci_lock);
+	stale = xhci_device_stale(xhcip, xd);
+	mutex_exit(&xhcip->xhci_lock);
+
 	/*
 	 * Go ahead and disable the slot. There's no reason to do anything
 	 * special about the default endpoint as it will be disabled as a part
 	 * of the slot disabling. However, if this all fails, we'll leave this
 	 * sitting here in a failed state, eating up a device slot. It is
 	 * unlikely this will occur.
+	 *
+	 * A device that lost its slot in a controller reset has nothing to
+	 * disable; the reset already did that.
 	 */
-	ret = xhci_command_disable_slot(xhcip, xd->xd_slot);
-	if (ret != USB_SUCCESS) {
-		xhci_error(xhcip, "failed to disable slot %d: %d",
-		    xd->xd_slot, ret);
-		return;
+	if (!stale) {
+		ret = xhci_command_disable_slot(xhcip, xd);
+		if (ret != USB_SUCCESS) {
+			xhci_error(xhcip, "failed to disable slot %d: %d",
+			    xd->xd_slot, ret);
+			return;
+		}
 	}
 
-	xhci_context_slot_output_fini(xhcip, xd);
+	/*
+	 * A reset can land between the steps above and here. The reset
+	 * cleared the whole DCBAA and a new device may already own this slot
+	 * number, so the check is repeated under the lock right before the
+	 * entry is touched. A stale device instead reports that one more
+	 * child of its root port is gone, which may release the synthetic
+	 * reconnect for that port.
+	 */
+	mutex_enter(&xhcip->xhci_lock);
+	if (!xhci_device_stale(xhcip, xd)) {
+		xhci_context_slot_output_fini(xhcip, xd);
+	} else {
+		notify = xhci_root_hub_stale_child_freed(xhcip,
+		    xd->xd_root_port);
+	}
+
+	/*
+	 * Leave the device list under the lock before the endpoints are
+	 * freed, so the reset drain can never walk into them.
+	 */
+	list_remove(&xhcip->xhci_usba.xa_devices, xd);
+	mutex_exit(&xhcip->xhci_lock);
 
 	/*
 	 * Once the slot is disabled, we can free any endpoints that were
@@ -1842,11 +2024,10 @@ xhci_hcdi_device_fini(usba_device_t *ud, void *hcdp)
 		}
 	}
 
-	mutex_enter(&xhcip->xhci_lock);
-	list_remove(&xhcip->xhci_usba.xa_devices, xd);
-	mutex_exit(&xhcip->xhci_lock);
-
 	xhci_hcdi_device_free(xd);
+
+	if (notify)
+		xhci_root_hub_psc_callback(xhcip);
 }
 
 /*
@@ -1862,6 +2043,10 @@ xhci_hcdi_device_address(usba_device_t *ud)
 	xhci_endpoint_t *xep;
 
 	mutex_enter(&xhcip->xhci_lock);
+	if (xhci_device_stale(xhcip, xd)) {
+		mutex_exit(&xhcip->xhci_lock);
+		return (USB_HC_HARDWARE_ERROR);
+	}
 
 	/*
 	 * This device may already be addressed from the perspective of the xhci
@@ -1918,6 +2103,13 @@ xhci_hcdi_hub_update(usba_device_t *ud, uint8_t nports, uint8_t tt)
 	if (ud->usb_hubdi == NULL) {
 		return (USB_FAILURE);
 	}
+
+	mutex_enter(&xhcip->xhci_lock);
+	if (xhci_device_stale(xhcip, xd)) {
+		mutex_exit(&xhcip->xhci_lock);
+		return (USB_HC_HARDWARE_ERROR);
+	}
+	mutex_exit(&xhcip->xhci_lock);
 
 	mutex_enter(&xd->xd_imtx);
 
