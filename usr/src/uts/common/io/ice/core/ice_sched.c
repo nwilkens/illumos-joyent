@@ -224,6 +224,17 @@ ice_sched_add_node(struct ice_port_info *pi, u8 layer,
 		}
 	}
 
+	/* illumos: the parent's children array is sized by max_children. */
+	if (parent->num_children >= hw->max_children[parent->tx_sched_layer]) {
+		ice_debug(hw, ICE_DBG_SCHED, "parent 0x%x has no child slot\n",
+			  LE32_TO_CPU(info->parent_teid));
+		if (node->children)
+			ice_free(hw, node->children);
+		if (!prealloc_node)
+			ice_free(hw, node);
+		return ICE_ERR_PARAM;
+	}
+
 	node->in_use = true;
 	node->parent = parent;
 	node->tx_sched_layer = layer;
@@ -1368,6 +1379,15 @@ int ice_sched_init_port(struct ice_port_info *pi)
 	for (i = 0; i < num_branches; i++) {
 		num_elems = LE16_TO_CPU(buf[i].hdr.num_elems);
 
+		/* illumos: every branch count is firmware data; bound each. */
+		if (num_elems < 1 || num_elems > ICE_AQC_TOPO_MAX_LEVEL_NUM) {
+			ice_debug(hw, ICE_DBG_SCHED,
+				  "branch %d num_elems unexpected %d\n",
+				  i, num_elems);
+			status = ICE_ERR_PARAM;
+			goto err_init_port;
+		}
+
 		/* Skip root element as already inserted */
 		for (j = 1; j < num_elems; j++) {
 			/* update the sw entry point */
@@ -1451,6 +1471,14 @@ int ice_sched_query_res_alloc(struct ice_hw *hw)
 	status = ice_aq_query_sched_res(hw, sizeof(*buf), buf, NULL);
 	if (status)
 		goto sched_query_out;
+
+	/* illumos: the level count indexes the fixed response array. */
+	if (LE16_TO_CPU(buf->sched_props.logical_levels) < 1 ||
+	    LE16_TO_CPU(buf->sched_props.logical_levels) >
+	    ICE_AQC_TOPO_MAX_LEVEL_NUM) {
+		status = ICE_ERR_AQ_ERROR;
+		goto sched_query_out;
+	}
 
 	hw->num_tx_sched_layers =
 		(u8)LE16_TO_CPU(buf->sched_props.logical_levels);

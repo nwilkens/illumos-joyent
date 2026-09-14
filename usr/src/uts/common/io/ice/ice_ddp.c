@@ -41,6 +41,12 @@
  */
 #define	ICE_DDP_PKG_MAX		(16 * 1024 * 1024)
 
+/* Field vector width in words per block; must match blk_sizes[].fvw. */
+#define	ICE_DDP_FVW_SW		48
+#define	ICE_DDP_FVW_ACL		32
+#define	ICE_DDP_FVW_FD		24
+CTASSERT(ICE_DDP_FVW_SW == ICE_MAX_FV_WORDS);
+
 static void
 ice_ddp_safe_mode(ice_t *ice)
 {
@@ -81,7 +87,8 @@ ice_ddp_seg_hdr(const uint8_t *pkg, uint64_t len, uint32_t seg_count,
  * every count is read only once the terms ahead of it are known to fit.
  */
 static boolean_t
-ice_ddp_cfg_seg_bufs(const struct ice_generic_seg_hdr *hdr, uint64_t *cntp)
+ice_ddp_cfg_seg_bufs(const struct ice_generic_seg_hdr *hdr, uint64_t *cntp,
+    const struct ice_buf_table **bufsp)
 {
 	const struct ice_seg *seg = (const struct ice_seg *)hdr;
 	const struct ice_nvm_table *nvms;
@@ -112,6 +119,152 @@ ice_ddp_cfg_seg_bufs(const struct ice_generic_seg_hdr *hdr, uint64_t *cntp)
 		return (B_FALSE);
 
 	*cntp = cnt;
+	if (bufsp != NULL)
+		*bufsp = bufs;
+	return (B_TRUE);
+}
+
+/*
+ * The bytes a typed section must hold before the core reads its fixed header
+ * and counted array.  ice_pkg_enum_section() checks only that a section lies
+ * inside its 4 KiB buffer; the consumers then read a fixed struct, or index an
+ * array by the section's own count, without comparing either to the section
+ * size.  The metadata read happens before the signature check, so a corrupt
+ * file must fail here instead of reading past the package allocation.
+ * Sections the driver never enumerates need no minimum.
+ */
+static uint64_t
+ice_ddp_sect_min(const uint8_t *sect, uint32_t size, uint32_t type)
+{
+	__le16 raw;
+	uint16_t count = 0;
+
+	/* A section too short for its count still owes its fixed header. */
+	if (size >= sizeof (raw)) {
+		bcopy(sect, &raw, sizeof (raw));
+		count = LE16_TO_CPU(raw);
+	}
+
+	switch (type) {
+	case ICE_SID_METADATA:
+		return (sizeof (struct ice_meta_sect));
+	case ICE_SID_XLT1_SW:
+	case ICE_SID_XLT1_ACL:
+	case ICE_SID_XLT1_FD:
+	case ICE_SID_XLT1_RSS:
+	case ICE_SID_XLT1_PE:
+		return (offsetof(struct ice_xlt1_section, value) +
+		    (uint64_t)count * sizeof (uint8_t));
+	case ICE_SID_XLT2_SW:
+	case ICE_SID_XLT2_ACL:
+	case ICE_SID_XLT2_FD:
+	case ICE_SID_XLT2_RSS:
+	case ICE_SID_XLT2_PE:
+		return (offsetof(struct ice_xlt2_section, value) +
+		    (uint64_t)count * sizeof (__le16));
+	case ICE_SID_PROFID_TCAM_SW:
+	case ICE_SID_PROFID_TCAM_ACL:
+	case ICE_SID_PROFID_TCAM_FD:
+	case ICE_SID_PROFID_TCAM_RSS:
+	case ICE_SID_PROFID_TCAM_PE:
+		return (offsetof(struct ice_prof_id_section, entry) +
+		    (uint64_t)count * sizeof (struct ice_prof_tcam_entry));
+	case ICE_SID_PROFID_REDIR_SW:
+	case ICE_SID_PROFID_REDIR_ACL:
+	case ICE_SID_PROFID_REDIR_FD:
+	case ICE_SID_PROFID_REDIR_RSS:
+	case ICE_SID_PROFID_REDIR_PE:
+		return (offsetof(struct ice_prof_redir_section, redir_value) +
+		    (uint64_t)count * sizeof (uint8_t));
+	/*
+	 * Field vector entries are fvw words wide per block (ice_flex_pipe.c
+	 * blk_sizes): only the switch block uses the full struct ice_fv.
+	 */
+	case ICE_SID_FLD_VEC_SW:
+		return (offsetof(struct ice_sw_fv_section, fv) +
+		    (uint64_t)count * ICE_DDP_FVW_SW *
+		    sizeof (struct ice_fv_word));
+	case ICE_SID_FLD_VEC_ACL:
+		return (offsetof(struct ice_sw_fv_section, fv) +
+		    (uint64_t)count * ICE_DDP_FVW_ACL *
+		    sizeof (struct ice_fv_word));
+	case ICE_SID_FLD_VEC_FD:
+	case ICE_SID_FLD_VEC_RSS:
+	case ICE_SID_FLD_VEC_PE:
+		return (offsetof(struct ice_sw_fv_section, fv) +
+		    (uint64_t)count * ICE_DDP_FVW_FD *
+		    sizeof (struct ice_fv_word));
+	case ICE_SID_RXPARSER_BOOST_TCAM:
+		return (offsetof(struct ice_boost_tcam_section, tcam) +
+		    (uint64_t)count * sizeof (struct ice_boost_tcam_entry));
+	/*
+	 * The only label section the driver enumerates.  Other label types
+	 * use different entry layouts (PTYPE_META entries are 34 bytes).
+	 */
+	case ICE_SID_LBL_RXPARSER_TMEM:
+		return (offsetof(struct ice_label_section, label) +
+		    (uint64_t)count * sizeof (struct ice_label));
+	default:
+		return (0);
+	}
+}
+
+/*
+ * Repeat ice_pkg_val_buf() and ice_pkg_enum_section()'s bounds on every
+ * section table entry, then require each typed section to hold what its
+ * consumer reads.  The whole buffer is inside the segment, so the section
+ * table and every extent below ICE_PKG_BUF_SIZE are addressable here.
+ */
+static boolean_t
+ice_ddp_buf_ok(const struct ice_buf *buf)
+{
+	const struct ice_buf_hdr *hdr = (const struct ice_buf_hdr *)buf->buf;
+	uint32_t count, data_end, i;
+
+	count = LE16_TO_CPU(hdr->section_count);
+	data_end = LE16_TO_CPU(hdr->data_end);
+	if (count < ICE_MIN_S_COUNT || count > ICE_MAX_S_COUNT ||
+	    data_end < ICE_MIN_S_DATA_END || data_end > ICE_MAX_S_DATA_END)
+		return (B_FALSE);
+	if (offsetof(struct ice_buf_hdr, section_entry) +
+	    (uint64_t)count * sizeof (hdr->section_entry[0]) > ICE_PKG_BUF_SIZE)
+		return (B_FALSE);
+
+	for (i = 0; i < count; i++) {
+		const struct ice_section_entry *ent = &hdr->section_entry[i];
+		uint32_t type = LE32_TO_CPU(ent->type);
+		uint32_t off = LE16_TO_CPU(ent->offset);
+		uint32_t size = LE16_TO_CPU(ent->size);
+		uint64_t need;
+
+		if (off < ICE_MIN_S_OFF || off > ICE_MAX_S_OFF ||
+		    size < ICE_MIN_S_SZ || size > ICE_MAX_S_SZ ||
+		    off + size > ICE_PKG_BUF_SIZE)
+			return (B_FALSE);
+
+		need = ice_ddp_sect_min(buf->buf + off, size, type);
+		if (need > size)
+			return (B_FALSE);
+	}
+
+	return (B_TRUE);
+}
+
+static boolean_t
+ice_ddp_cfg_seg_ok(const struct ice_generic_seg_hdr *hdr)
+{
+	const struct ice_buf_table *bufs;
+	uint64_t cnt, i;
+
+	if (!ice_ddp_cfg_seg_bufs(hdr, &cnt, &bufs))
+		return (B_FALSE);
+	/* The core reads buf_array[0] before consulting the count. */
+	if (cnt == 0)
+		return (B_FALSE);
+	for (i = 0; i < cnt; i++) {
+		if (!ice_ddp_buf_ok(&bufs->buf_array[i]))
+			return (B_FALSE);
+	}
 	return (B_TRUE);
 }
 
@@ -160,7 +313,7 @@ ice_ddp_sign_seg_ok(const uint8_t *pkg, uint64_t len, uint32_t seg_count,
 		return (B_FALSE);
 	}
 
-	if (!ice_ddp_cfg_seg_bufs(cfg, &bufs))
+	if (!ice_ddp_cfg_seg_bufs(cfg, &bufs, NULL))
 		return (B_FALSE);
 
 	start = LE32_TO_CPU(sign->signed_buf_start);
@@ -171,11 +324,12 @@ ice_ddp_sign_seg_ok(const uint8_t *pkg, uint64_t len, uint32_t seg_count,
  * The vendored parser bounds the package header, the segment offset array and
  * each segment's declared extent, but nothing inside a segment: it forms the
  * buffer table pointer from ice_seg->device_table_count and
- * ice_nvm_table->table_count without first proving either is in bounds.  That
- * dereference happens in ice_init_pkg_info(), ahead of every version,
- * compatibility and signature gate, so a corrupt file would panic instead of
- * falling back to safe mode.  All arithmetic here is 64 bit, which also
- * removes the u32 overflow in the core's own segment extent test.
+ * ice_nvm_table->table_count without first proving either is in bounds, and
+ * its typed section consumers never compare a section's size to what they
+ * read.  Those dereferences start in ice_init_pkg_info(), ahead of every
+ * version, compatibility and signature gate, so a corrupt file would panic
+ * instead of falling back to safe mode.  All arithmetic here is 64 bit, which
+ * also removes the u32 overflow in the core's own segment extent test.
  */
 static boolean_t
 ice_ddp_pkg_valid(const uint8_t *pkg, uint64_t len)
@@ -193,7 +347,6 @@ ice_ddp_pkg_valid(const uint8_t *pkg, uint64_t len)
 
 	for (i = 0; i < seg_count; i++) {
 		const struct ice_generic_seg_hdr *seg;
-		uint64_t bufs;
 
 		seg = ice_ddp_seg_hdr(pkg, len, seg_count, i);
 		if (seg == NULL)
@@ -202,7 +355,7 @@ ice_ddp_pkg_valid(const uint8_t *pkg, uint64_t len)
 		switch (LE32_TO_CPU(seg->seg_type)) {
 		case SEGMENT_TYPE_ICE_E810:
 		case SEGMENT_TYPE_ICE_E830:
-			if (!ice_ddp_cfg_seg_bufs(seg, &bufs))
+			if (!ice_ddp_cfg_seg_ok(seg))
 				return (B_FALSE);
 			break;
 		case SEGMENT_TYPE_SIGNING:

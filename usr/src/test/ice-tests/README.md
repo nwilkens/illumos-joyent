@@ -45,6 +45,7 @@ with limits of 30 seconds for compilation and 15 seconds per executable case.
 | `vsi_stats.py` | Hardware VSI index bounds, missing contexts, and preservation of cached counters |
 | `tx_frame_limit.py` | MTU bounds for ordinary frames and individual LSO segments, including VLAN header allowance |
 | `rx_intr_route.py` | Register composition across lifecycle routing and MAC poll-mode transitions |
+| `ddp_sections.py` | DDP buffer and typed-section bounds, including the shipped package and truncation rejection |
 
 Individual behavioral runners provide source-file overrides and, where
 supported, case selection. Use a runner's `--help` for its options. Alternate
@@ -66,6 +67,19 @@ across firmware polling without holding the interrupt-priority `ice_lock`.
 The RX routing fixture exercises the production register writer with controlled
 registers and locks; it does not exercise live interrupt delivery or reset
 timing. The transceiver and MDD checks inspect source structure.
+
+`ddp_sections.py` executes the production package validator with constructed
+section tables. It checks every configuration buffer, section extents and
+typed minimum sizes, per-block field-vector widths, and zero-buffer segments.
+When `firmware/ice.pkg` is present, it also verifies that the shipped package
+is accepted and that truncating it is rejected. Use `--package` to select a
+different package. The fixture does not load firmware or exercise AQ commands.
+
+`core_counts.py` checks the source guards for firmware-supplied capability,
+switch, package, topology, scheduler-layer, and parent child-slot counts.
+These local imported-core changes are recorded in
+[`core/README.illumos`](../../uts/common/io/ice/core/README.illumos). The check
+does not execute firmware responses or scheduler allocation paths.
 
 ## Hardware tests
 

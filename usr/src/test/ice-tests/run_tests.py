@@ -11,7 +11,9 @@ import sys
 TESTS = (
     "runner_checks.py",
     "admin_interrupt.py",
+    "core_counts.py",
     "detach_quiesce.py",
+    "ddp_sections.py",
     "dma_lifetime.py",
     "filter_requests.py",
     "fma_dma.py",
