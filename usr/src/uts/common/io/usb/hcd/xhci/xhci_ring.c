@@ -125,6 +125,27 @@ xhci_ring_free(xhci_ring_t *xrp)
 }
 
 /*
+ * Report whether a physical address names a TRB that belongs to this ring.
+ * Used to tell a late completion for a retired transfer apart from an event
+ * that points at memory we never gave the controller.
+ */
+boolean_t
+xhci_ring_trb_in_ring(xhci_ring_t *xrp, uint64_t pa)
+{
+	uint64_t base;
+
+	if (xrp->xr_trb == NULL || xrp->xr_ntrb == 0)
+		return (B_FALSE);
+
+	base = xhci_dma_pa(&xrp->xr_dma);
+	if (pa < base || pa >= base + (uint64_t)xrp->xr_ntrb *
+	    sizeof (xhci_trb_t))
+		return (B_FALSE);
+
+	return (((pa - base) % sizeof (xhci_trb_t)) == 0);
+}
+
+/*
  * Initialize a ring that hasn't been used and set up its link pointer back to
  * it.
  */

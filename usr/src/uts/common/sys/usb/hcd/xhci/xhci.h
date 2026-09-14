@@ -821,6 +821,7 @@ extern xhci_trb_t *xhci_ring_event_advance(xhci_ring_t *);
  */
 extern boolean_t xhci_ring_trb_tail_valid(xhci_ring_t *, uint64_t);
 extern int xhci_ring_trb_valid_range(xhci_ring_t *, uint64_t, uint_t);
+extern boolean_t xhci_ring_trb_in_ring(xhci_ring_t *, uint64_t);
 
 extern boolean_t xhci_ring_trb_space(xhci_ring_t *, uint_t);
 extern void xhci_ring_trb_fill(xhci_ring_t *, uint_t, xhci_trb_t *, uint64_t *,

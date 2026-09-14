@@ -1656,29 +1656,38 @@ xhci_endpoint_transfer_callback(xhci_t *xhcip, xhci_trb_t *trb)
 		break;
 	}
 
+	/*
+	 * A completion can arrive after the device or endpoint it names has
+	 * been torn down: Disable Slot and a queued transfer event can cross
+	 * during hot removal. That is not a controller fault. Log it to the
+	 * message buffer and drop it.
+	 */
 	mutex_enter(&xhcip->xhci_lock);
 	xd = xhci_device_lookup_by_slot(xhcip, slot);
 	if (xd == NULL) {
-		xhci_error(xhcip, "received transfer trb with code %d for "
-		    "unknown slot %d and endpoint %d: resetting device", code,
-		    slot, endpoint);
 		mutex_exit(&xhcip->xhci_lock);
-		xhci_fm_runtime_reset(xhcip);
-		return (B_FALSE);
+		xhci_error(xhcip, "!dropping transfer trb with code %d for "
+		    "unknown slot %d and endpoint %d", code, slot, endpoint);
+		return (B_TRUE);
 	}
 
 	/*
 	 * Endpoint IDs are indexed based on their Device Context Index, which
 	 * means that we need to subtract one to get the actual ID that we use.
+	 * A DCI of zero is not a valid endpoint.
 	 */
+	if (endpoint < 1 || endpoint > XHCI_NUM_ENDPOINTS) {
+		mutex_exit(&xhcip->xhci_lock);
+		xhci_error(xhcip, "!dropping transfer trb with code %d for "
+		    "slot %d and invalid endpoint %d", code, slot, endpoint);
+		return (B_TRUE);
+	}
 	xep = xd->xd_endpoints[endpoint - 1];
 	if (xep == NULL) {
-		xhci_error(xhcip, "received transfer trb with code %d, slot "
-		    "%d, and unknown endpoint %d: resetting device", code,
-		    slot, endpoint);
 		mutex_exit(&xhcip->xhci_lock);
-		xhci_fm_runtime_reset(xhcip);
-		return (B_FALSE);
+		xhci_error(xhcip, "!dropping transfer trb with code %d for "
+		    "slot %d and unknown endpoint %d", code, slot, endpoint);
+		return (B_TRUE);
 	}
 
 	/*
@@ -1688,21 +1697,43 @@ xhci_endpoint_transfer_callback(xhci_t *xhcip, xhci_trb_t *trb)
 	 * corresponds to. If this is an error, then we need to make sure that
 	 * the generating ring has been cleaned up.
 	 *
-	 * TRBs should be delivered in order, based on the ring. If for some
-	 * reason we find something that doesn't add up here, then we need to
-	 * assume that something has gone horribly wrong in the system and issue
-	 * a runtime reset. We issue the runtime reset rather than just trying
-	 * to stop and flush the ring, because it's unclear if we could stop
-	 * the ring in time.
+	 * TRBs should be delivered in order, based on the ring. An event that
+	 * names a TRB in this endpoint's ring but matches no queued transfer is
+	 * a late completion for a transfer we already retired, typically an
+	 * error reported after a pipe close or reset flushed the transfer
+	 * list during hot removal. Record any halt it implies and drop it.
+	 * Only an event that points outside the ring means the controller has
+	 * lost track of the memory we gave it, and that is fatal.
 	 */
 	if ((xt = xhci_endpoint_determine_transfer(xhcip, xep, trb, &off)) ==
 	    NULL) {
-		xhci_error(xhcip, "received transfer trb with code %d, slot "
-		    "%d, and endpoint %d, but does not match current transfer "
-		    "for endpoint: resetting device", code, slot, endpoint);
+		if (XHCI_TRB_GET_ED(LE_32(trb->trb_flags)) == 0 &&
+		    !xhci_ring_trb_in_ring(&xep->xep_ring,
+		    LE_64(trb->trb_addr))) {
+			mutex_exit(&xhcip->xhci_lock);
+			xhci_error(xhcip, "received transfer trb with code "
+			    "%d, slot %d, and endpoint %d that points outside "
+			    "the endpoint ring: resetting device", code, slot,
+			    endpoint);
+			xhci_fm_runtime_reset(xhcip);
+			return (B_FALSE);
+		}
+
+		switch (code) {
+		case XHCI_CODE_STALL:
+		case XHCI_CODE_BABBLE:
+		case XHCI_CODE_TXERR:
+		case XHCI_CODE_SPLITERR:
+			xep->xep_state |= XHCI_ENDPOINT_HALTED;
+			break;
+		default:
+			break;
+		}
 		mutex_exit(&xhcip->xhci_lock);
-		xhci_fm_runtime_reset(xhcip);
-		return (B_FALSE);
+		xhci_error(xhcip, "!dropping transfer trb with code %d for "
+		    "slot %d and endpoint %d that matches no queued transfer",
+		    code, slot, endpoint);
+		return (B_TRUE);
 	}
 
 	transfer_done = B_FALSE;
