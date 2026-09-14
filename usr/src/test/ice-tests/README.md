@@ -43,6 +43,8 @@ with limits of 30 seconds for compilation and 15 seconds per executable case.
 | `lso_context.py` | IPv4/IPv6 metadata, MSS boundaries, context fields, and unsupported-request rejection |
 | `tx_bind_threshold.py` | Copy/bind selection, zero-filled short frames, descriptor limits, fallback, and partial-allocation cleanup |
 | `vsi_stats.py` | Hardware VSI index bounds, missing contexts, and preservation of cached counters |
+| `tx_frame_limit.py` | MTU bounds for ordinary frames and individual LSO segments, including VLAN header allowance |
+| `rx_intr_route.py` | Register composition across lifecycle routing and MAC poll-mode transitions |
 
 Individual behavioral runners provide source-file overrides and, where
 supported, case selection. Use a runner's `--help` for its options. Alternate
@@ -55,6 +57,15 @@ ownership, statistics, and build integration. These checks do not execute the
 kernel driver. Neither source checks nor the C fixtures replace a native
 module build or hardware testing. Controlled interfaces do not establish
 device DMA isolation, CPU memory ordering, wire checksums, or performance.
+
+`tx_frame_limit.py` also checks that frame admission precedes DMA binding and
+accounts rejected frames in `tx_oversize_drops`. `reset_oicr.py` checks that
+the MDD handler clears TDPU detection registers and attributes PF events.
+`transceiver_lock.py` checks that transceiver reads hold the lifecycle lock
+across firmware polling without holding the interrupt-priority `ice_lock`.
+The RX routing fixture exercises the production register writer with controlled
+registers and locks; it does not exercise live interrupt delivery or reset
+timing. The transceiver and MDD checks inspect source structure.
 
 ## Hardware tests
 

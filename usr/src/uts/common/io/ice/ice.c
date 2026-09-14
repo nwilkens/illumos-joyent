@@ -699,7 +699,7 @@ ice_queues_intr_map(ice_t *ice)
 	for (i = 0; i < ice->ice_num_txr; i++)
 		ice_map_txq_vector(ice, &ice->ice_txr[i]);
 	for (i = 0; i < ice->ice_num_rxr; i++) {
-		ice_map_rxq_vector(ice, &ice->ice_rxr[i]);
+		ice_rx_ring_intr_route(&ice->ice_rxr[i], ICE_RX_INTR_MAP);
 		ice_cfg_itr(ice, ice->ice_rxr[i].irxr_vec);
 	}
 }
@@ -713,7 +713,7 @@ ice_queues_intr_unmap(ice_t *ice)
 	for (i = 0; i < ice->ice_num_txr; i++)
 		wr32(hw, QINT_TQCTL(ice->ice_txr[i].itxr_index), 0);
 	for (i = 0; i < ice->ice_num_rxr; i++)
-		wr32(hw, QINT_RQCTL(ice->ice_rxr[i].irxr_index), 0);
+		ice_rx_ring_intr_route(&ice->ice_rxr[i], ICE_RX_INTR_UNMAP);
 	ice_flush(hw);
 }
 
@@ -746,10 +746,7 @@ ice_queues_intr_dissociate(ice_t *ice)
 	for (i = 0; i < ice->ice_num_rxr; i++) {
 		ice_rx_ring_t *irr = &ice->ice_rxr[i];
 
-		reg = rd32(hw, QINT_RQCTL(irr->irxr_index));
-		reg &= ~QINT_RQCTL_CAUSE_ENA_M;
-		wr32(hw, QINT_RQCTL(irr->irxr_index), reg);
-		ice_flush(hw);
+		ice_rx_ring_intr_route(irr, ICE_RX_INTR_DISSOCIATE);
 		wr32(hw, GLINT_DYN_CTL(irr->irxr_vec),
 		    GLINT_DYN_CTL_SWINT_TRIG_M | GLINT_DYN_CTL_INTENA_MSK_M);
 	}

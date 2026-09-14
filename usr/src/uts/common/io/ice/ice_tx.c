@@ -88,6 +88,8 @@ ice_tx_kstat_init(ice_t *ice, ice_tx_ring_t *itr)
 	kstat_named_init(&txs->ictxs_no_pkt_cache, "tx_no_pkt_cache",
 	    KSTAT_DATA_UINT64);
 	kstat_named_init(&txs->ictxs_drops, "tx_drops", KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_oversize_drops, "tx_oversize_drops",
+	    KSTAT_DATA_UINT64);
 	kstat_named_init(&txs->ictxs_blocked, "tx_blocked", KSTAT_DATA_UINT64);
 	kstat_named_init(&txs->ictxs_lso_packets, "tx_lso_packets",
 	    KSTAT_DATA_UINT64);
@@ -1011,9 +1013,27 @@ ice_tx_context(mblk_t *mp, ice_tx_ctx_t *ctx)
 
 	ctx->itc_mss = mss;
 	ctx->itc_tsolen = (uint32_t)tsolen;
+	ctx->itc_hdrlen = (uint32_t)hdrlen;
 	ASSERT3U(ctx->itc_mss, <=, ICE_TXD_CTX_MAX_MSS);
 
 	return (ICE_TX_BUILD_OK);
+}
+
+/*
+ * MAC does not bound a client's frame against the link SDU, and the hardware
+ * reports a packet above its programmed maximum as a malicious-driver event
+ * that halts every client of this function.  Every packet, and every segment
+ * an LSO request would produce, must fit the frame the MTU permits: a VLAN
+ * tag is allowed (mac m_margin), the FCS is appended by hardware.
+ */
+static boolean_t
+ice_tx_frame_fits(uint32_t mtu, const ice_tx_ctx_t *ctx, size_t msglen)
+{
+	size_t limit = (size_t)mtu + sizeof (struct ether_vlan_header);
+
+	if (!ctx->itc_use_ctx)
+		return (msglen <= limit);
+	return ((size_t)ctx->itc_hdrlen + ctx->itc_mss <= limit);
 }
 
 /*
@@ -1666,6 +1686,11 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 	if (res == ICE_TX_BUILD_OK && ctx.itc_use_ctx &&
 	    !ice->ice_tx_lso_enable)
 		res = ICE_TX_BUILD_DROP;
+	if (res == ICE_TX_BUILD_OK &&
+	    !ice_tx_frame_fits(ice->ice_mtu, &ctx, msglen)) {
+		itr->itxr_stats.ictxs_oversize_drops.value.ui64++;
+		res = ICE_TX_BUILD_DROP;
+	}
 	if (res != ICE_TX_BUILD_OK) {
 		freemsg(mp);
 		itr->itxr_stats.ictxs_drops.value.ui64++;

@@ -1022,23 +1022,23 @@ ice_transceiver_read(void *arg, uint_t id, uint_t page, void *buf,
 	/*
 	 * ice_rebuild_lock is the outermost lock: hold it across the
 	 * admin-queue SFF reads so a reset rebuild cannot tear the control
-	 * queue down underneath ice_aq_sff_eeprom().
+	 * queue down underneath ice_aq_sff_eeprom().  ice_lock is not taken:
+	 * it is an interrupt-priority mutex, each command can poll firmware
+	 * for up to a second, and any /dev/dld user in the link's zone can
+	 * issue this read.  The core's sq_lock serializes the commands.
 	 */
 	mutex_enter(&ice->ice_rebuild_lock);
-	mutex_enter(&ice->ice_lock);
 	for (i = 0; i < nbytes; ) {
 		uint8_t len = (uint8_t)MIN(nbytes - i, ICE_SFF_READ_CHUNK);
 
 		if (ice_aq_sff_eeprom(hw, 0, (uint8_t)page,
 		    (uint16_t)(offset + i), 0, 0, &out[i], len, false,
 		    NULL) != ICE_SUCCESS) {
-			mutex_exit(&ice->ice_lock);
 			mutex_exit(&ice->ice_rebuild_lock);
 			return (EIO);
 		}
 		i += len;
 	}
-	mutex_exit(&ice->ice_lock);
 	mutex_exit(&ice->ice_rebuild_lock);
 
 	*nread = nbytes;

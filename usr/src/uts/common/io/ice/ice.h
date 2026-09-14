@@ -270,6 +270,7 @@ typedef struct ice_tx_ctx_t {
 	boolean_t		itc_use_ctx;
 	uint32_t		itc_mss;
 	uint32_t		itc_tsolen;
+	uint32_t		itc_hdrlen;	/* L2+L3+L4, LSO only */
 } ice_tx_ctx_t;
 
 struct ice_tx_ring;
@@ -293,6 +294,7 @@ typedef struct ice_txq_stat {
 	kstat_named_t		ictxs_bind_fails;
 	kstat_named_t		ictxs_no_pkt_cache;
 	kstat_named_t		ictxs_drops;
+	kstat_named_t		ictxs_oversize_drops;
 	kstat_named_t		ictxs_blocked;
 	kstat_named_t		ictxs_lso_packets;
 	kstat_named_t		ictxs_lso_drops;
@@ -376,6 +378,8 @@ typedef struct ice_rx_ring {
 	boolean_t		irxr_shutdown;
 	boolean_t		irxr_started;	/* irxr_lock */
 	boolean_t		irxr_intr_poll;	/* mac is polling this ring */
+	boolean_t		irxr_intr_routed; /* QINT_RQCTL vector programmed */
+	boolean_t		irxr_intr_armed; /* lifecycle permits CAUSE_ENA */
 	boolean_t		irxr_intr_busy;	/* ISR is in mac_rx_ring */
 
 	kmutex_t		irxr_lock;
@@ -687,7 +691,16 @@ extern boolean_t ice_rx_rings_alloc(ice_t *);
 extern void ice_rx_rings_free(ice_t *);
 extern int ice_rx_ring_program(ice_t *, ice_rx_ring_t *);
 extern int ice_rx_ring_unprogram(ice_t *, ice_rx_ring_t *);
-extern void ice_map_rxq_vector(ice_t *, ice_rx_ring_t *);
+/*
+ * Lifecycle transitions of an rx queue's interrupt cause routing.  MAC's
+ * poll-mode callbacks share the same register; see ice_rx_ring_intr_program().
+ */
+typedef enum ice_rx_intr_route {
+	ICE_RX_INTR_UNMAP,	/* clear routing and cause (reset, teardown) */
+	ICE_RX_INTR_DISSOCIATE,	/* keep routing, clear cause (queue disable) */
+	ICE_RX_INTR_MAP		/* route and arm; MAC's poll state still wins */
+} ice_rx_intr_route_t;
+extern void ice_rx_ring_intr_route(ice_rx_ring_t *, ice_rx_intr_route_t);
 extern void ice_cfg_itr(ice_t *, uint32_t);
 
 /*
