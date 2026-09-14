@@ -122,8 +122,6 @@ typedef int64_t		s64;
 
 extern void ice_usec_delay(u32, bool);
 extern void ice_msec_delay(u32, bool);
-extern void ice_msec_pause(u32);
-extern void ice_msec_spin(u32);
 
 /*
  * Bit helpers.  highbit()/highbit64() return the 1-based index of the most

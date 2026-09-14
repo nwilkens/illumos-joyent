@@ -256,7 +256,6 @@ ice_tx_ring_alloc(ice_t *ice, ice_tx_ring_t *itr, uint_t index)
 	for (i = 0; i < itr->itxr_size; i++) {
 		ice_tx_ctrl_block_t *itcb = &itr->itxr_tcb_area[i];
 
-		itcb->itcb_ring = itr;
 		itcb->itcb_type = ITCB_NOT_USED;
 		if (!ice_tcb_handles_alloc(ice, itcb)) {
 			ice_error(ice, "failed to allocate tx ring %u bind "

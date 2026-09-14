@@ -284,18 +284,6 @@ ice_msec_delay(u32 time, bool sleep)
 		drv_usecwait((clock_t)time * 1000);
 }
 
-void
-ice_msec_pause(u32 time)
-{
-	ice_msec_delay(time, true);
-}
-
-void
-ice_msec_spin(u32 time)
-{
-	ice_msec_delay(time, false);
-}
-
 /*PRINTFLIKE3*/
 void
 ice_debug(struct ice_hw *hw, u64 mask, char *fmt, ...)

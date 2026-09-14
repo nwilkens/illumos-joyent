@@ -29,6 +29,16 @@ manifest, or pass script names to select checks. See
 [REGRESSIONS.md](REGRESSIONS.md) for runner failure/timeout behavior,
 reproducible negative controls, and the pending hardware acceptance matrix.
 
+## Control-plane setup regression
+
+`control_setup.py` executes the production link-event and RSS setup functions.
+Seventeen scenarios check the event mask, missing-port handling, safe-mode
+skip, invalid table sizes, each firmware failure stage, and successful RSS
+key/table/flow programming. It checks round-robin entries and allocation
+cleanup; removing unused link/RSS bookkeeping leaves these results unchanged.
+Temporary source controls with a wrong event mask, zero-filled RSS table, or
+symmetric hashing each compile and fail at runtime.
+
 ## Filter callback and recovery regression
 
 ```

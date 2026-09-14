@@ -12,6 +12,7 @@ TESTS = (
     "runner_checks.py",
     "admin_interrupt.py",
     "buf_pool.py",
+    "control_setup.py",
     "core_counts.py",
     "detach_quiesce.py",
     "ddp_sections.py",

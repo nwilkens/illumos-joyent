@@ -466,5 +466,16 @@ unchanged.
   use the existing exclusive lifecycle fences. Sizes, counts, allocation order,
   optional LSO reserve, and the two-lock layout are preserved. The executable
   regression fails on the previous allocation-under-lock behavior and passes
-  27 lifecycle cases. Full portable suite: 49/49. Native build follows the
-  atomic commit; hardware qualification remains pending.
+  27 lifecycle cases. Full portable suite: 49/49. Commit `af0758c6a9` passed
+  the native ICE build and all 20 configured GCC/smatch compilation pairs;
+  module linking and CTF generation completed. Hardware qualification remains
+  pending.
+
+- **A2 — Unused glue surface and write-only state: implemented.** Removed the
+  uncalled `ice_msec_pause()`/`ice_msec_spin()` wrappers, unused TCB ring pointer,
+  write-only link-event enable flag, and write-only RSS completion flag. The
+  imported core has no dependency on the removed wrappers; FreeBSD uses one
+  from its OS-specific glue, which this driver does not import. Kept the actual
+  link-update synchronization, firmware return handling, diagnostic DDP state,
+  and debugger reset hook. `control_setup.py` exercises the unchanged link/RSS
+  behavior in 17 scenarios; the native module link checks remaining callers.

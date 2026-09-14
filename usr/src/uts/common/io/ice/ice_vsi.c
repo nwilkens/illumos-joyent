@@ -391,10 +391,8 @@ ice_rss_setup(ice_t *ice)
 	 * rather than fail attach: a missing package is not fatal.  A non-zero
 	 * but implausible size is still rejected as a hostile value.
 	 */
-	if (ice->ice_safe_mode) {
-		vsi->vi_rss_set = B_FALSE;
+	if (ice->ice_safe_mode)
 		return (ICE_SUCCESS);
-	}
 	if (lut_size == 0 || lut_size > ICE_LUT_PF_SIZE) {
 		ice_error(ice, "implausible RSS table size %u", lut_size);
 		return (ICE_ERR_CFG);
@@ -442,7 +440,6 @@ ice_rss_setup(ice_t *ice)
 		}
 	}
 
-	vsi->vi_rss_set = B_TRUE;
 	return (ICE_SUCCESS);
 }
 

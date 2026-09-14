@@ -186,7 +186,6 @@ typedef enum ice_state {
 } ice_state_t;
 
 /* ice_lse_flags bits (protected by ice_lse_lock). */
-#define	ICE_LSE_F_ENABLE	(1 << 0)	/* link status events wanted */
 #define	ICE_LSE_F_UPDATING	(1 << 1)	/* an update is in flight */
 
 /*
@@ -236,8 +235,6 @@ typedef struct ice_vsi {
 	kmutex_t		vi_mac_lock;
 	list_t			vi_macs;	/* for teardown */
 
-	boolean_t		vi_rss_set;
-
 	uint16_t		vi_max_frame;	/* posted rx frame size */
 } ice_vsi_t;
 
@@ -284,9 +281,7 @@ typedef struct ice_tx_ctx_t {
 	uint32_t		itc_hdrlen;	/* L2+L3+L4, LSO only */
 } ice_tx_ctx_t;
 
-struct ice_tx_ring;
 typedef struct ice_tx_ctrl_block {
-	struct ice_tx_ring	*itcb_ring;
 	ice_tcb_type_t		itcb_type;
 	uint32_t		itcb_len;
 	ice_dma_buffer_t	*itcb_buf;	/* copy buffer (pool) */

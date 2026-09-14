@@ -1051,10 +1051,6 @@ ice_set_link_events(ice_t *ice)
 	    ~(ICE_AQ_LINK_EVENT_UPDOWN | ICE_AQ_LINK_EVENT_MEDIA_NA |
 	    ICE_AQ_LINK_EVENT_MODULE_QUAL_FAIL));
 
-	mutex_enter(&ice->ice_lse_lock);
-	ice->ice_lse_flags |= ICE_LSE_F_ENABLE;
-	mutex_exit(&ice->ice_lse_lock);
-
 	rc = ice_aq_set_event_mask(hw, pi->lport, mask, NULL);
 	if (rc != 0) {
 		ice_error(ice, "failed to set link event mask: %d", rc);
