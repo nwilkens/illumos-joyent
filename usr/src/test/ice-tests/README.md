@@ -39,6 +39,19 @@ cleanup; removing unused link/RSS bookkeeping leaves these results unchanged.
 Temporary source controls with a wrong event mask, zero-filled RSS table, or
 symmetric hashing each compile and fail at runtime.
 
+## Lifecycle interface regression
+
+`lifecycle_api.py` executes the actual MAC adapters, lifecycle start/stop,
+link publication, and TX/RX stop composition. Sixteen scenarios cover detach,
+terminal and owed-reset admission, queue/RX startup failures, new errors during
+startup, successful publication, loan retention, failed-disable recovery, and
+restart with the lock already held. Four source mutations compile and fail
+runtime checks for admission, barrier handling, programming errors, and lost
+asynchronous errors. Paired `--source` and `--gld-source` paths also exercise
+pre-refactor revisions. `lifecycle_boundary.py` rejects external calls to
+private queue/startup operations and checks that MAC callbacks delegate intent.
+These controlled boundaries do not emulate hardware DMA or interrupt delivery.
+
 ## Filter callback and recovery regression
 
 ```

@@ -604,10 +604,9 @@ extern void ice_error(ice_t *, const char *, ...);
 extern int ice_check_acc_handle(ice_t *, ddi_acc_handle_t);
 extern int ice_status_to_errno(ice_t *, int);
 extern void ice_update_mtu(ice_t *);
-extern int ice_queues_program(ice_t *);
-extern boolean_t ice_queues_disable(ice_t *);
-extern void ice_queues_intr_map(ice_t *);
-extern void ice_queues_intr_dissociate(ice_t *);
+/* MAC lifecycle intent; these acquire ice_rebuild_lock internally. */
+extern int ice_start(ice_t *);
+extern void ice_stop(ice_t *);
 extern void ice_reset_task(void *);
 extern void ice_reset_redispatch(ice_t *);
 #ifdef DEBUG
@@ -740,7 +739,6 @@ extern boolean_t ice_mac_register(ice_t *);
 extern int ice_mac_unregister(ice_t *);
 extern void ice_link_state_publish(ice_t *);
 extern link_state_t ice_link_state_effective(ice_t *, link_state_t);
-extern int ice_start_datapath(ice_t *);
 
 /*
  * Hardware statistics (ice_stats.c).

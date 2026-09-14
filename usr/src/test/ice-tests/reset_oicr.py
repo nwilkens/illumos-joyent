@@ -8,7 +8,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[4]
 HEADER = REPO / "usr/src/uts/common/io/ice/ice.h"
 INTR_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_intr.c"
-GLD_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_gld.c"
 ICE_SOURCE = REPO / "usr/src/uts/common/io/ice/ice.c"
 
 
@@ -142,8 +141,8 @@ def main() -> None:
 
     # mac start refuses while a reset failed terminally or a rebuild is owed,
     # so a replumb cannot re-open the datapath on stale hardware.
-    gld = GLD_SOURCE.read_text(encoding="utf-8")
-    start = function(gld, "ice_m_start(void *arg)\n{", "\nstatic void\nice_m_stop")
+    lifecycle = ICE_SOURCE.read_text(encoding="utf-8")
+    start = function(lifecycle, "ice_start(ice_t *ice)\n{", "\nvoid\nice_stop")
     assert "ICE_STATE_RESET_FAILED" in start
     assert "ICE_STATE_PFR_REQ" in start
     assert "ICE_STATE_RESET_PENDING" in start

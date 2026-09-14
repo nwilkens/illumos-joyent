@@ -507,6 +507,18 @@ creation in an isolated native build.
   boundary check rejects the old split ownership; existing actual-C tests still
   pass all 30 callback scenarios and seven attach/rebuild selections, including
   command failures and terminal retirement. Full portable suite: 51/51.
+  Commit `bf1026bd43` passes all 21 configured GCC/smatch compilation pairs,
+  module link, and CTF generation in an isolated native build.
+
+- **A5 — Lifecycle ownership in the MAC adapter: implemented.** `ice.c` owns
+  start/stop admission and sequencing alongside reset/detach. GLD submits
+  start/stop intent. The startup primitive and four queue helpers are private;
+  reset keeps its lock-held restart and separate request/RX-resume policy.
+  `lifecycle_api.py` executes the real policy and adapters in 16 scenarios,
+  preserving the existing DMA barriers and failed-stop ownership. Four runtime
+  negative controls cover admission, queue failures, and asynchronous ERROR
+  preservation. A structural regression rejects the old exported helper
+  boundary. Full portable suite: 53/53.
 
 Native builds run from an isolated committed source snapshot after each atomic
 commit. No hardware or throughput qualification is implied.

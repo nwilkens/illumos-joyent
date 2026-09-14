@@ -77,6 +77,13 @@ their pooled buffers before unregister. Attach failure has no admitted TX.
 
 ## Start, stop, and reset
 
+`ice.c` owns start/stop admission and queue orchestration alongside reset and
+detach. GLD callbacks submit intent through `ice_start()` and `ice_stop()`,
+which acquire the lifecycle lock. Queue programming, interrupt association,
+and the shared startup primitive are private to that owner. Reset calls the
+private startup operation with the lock held and retains its own request
+completion and RX-ring resume sequence; it does not re-enter MAC start.
+
 `ICE_STATE_STARTED` records a successful softc start and whether reset should
 restore that datapath. It is not evidence that every per-ring MAC start has
 completed, that carrier is present, or that hardware DMA has stopped.

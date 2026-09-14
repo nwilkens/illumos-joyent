@@ -12,6 +12,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=DRIVER / "ice_intr.c")
     parser.add_argument("--gld-source", type=Path, default=DRIVER / "ice_gld.c")
+    parser.add_argument("--lifecycle-source", type=Path, default=DRIVER / "ice.c")
     args = parser.parse_args()
     source = args.source.read_text()
     header = DRIVER / "ice.h"
@@ -32,6 +33,10 @@ def main():
             continue
         bodies.append(extract(source,
             rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}", args.source))
+    lifecycle = args.lifecycle_source.read_text()
+    if "return (ice_start(arg));" in args.gld_source.read_text():
+        bodies.append(extract(lifecycle,
+            r"^int\nice_start\([\s\S]*?^}", args.lifecycle_source))
     for name in ("ice_m_start", "ice_m_getprop"):
         bodies.append(extract(args.gld_source.read_text(),
             rf"^static int\n{name}\([\s\S]*?^}}", args.gld_source))

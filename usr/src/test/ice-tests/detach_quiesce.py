@@ -31,6 +31,9 @@ def main():
     for name in names:
         fragments.append(extract(source,
             rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}", args.source))
+    if "\nice_start(ice_t *ice)" in source:
+        fragments.append(extract(source,
+            r"^int\nice_start\([\s\S]*?^}", args.source))
     fragments.append(extract(args.gld_source.read_text(),
         r"^static int\nice_m_start\([\s\S]*?^}", args.gld_source))
     # Some stubs are needed only by the old implementation.

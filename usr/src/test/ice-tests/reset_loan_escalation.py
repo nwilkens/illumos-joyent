@@ -74,9 +74,7 @@ def main() -> None:
     # ...and ICE_STATE_ERROR is recoverable: it is not in ice_m_start()'s
     # blocked mask, and a replumb clears it.  That is the recovery story the
     # terminal path did not have.
-    gld = (REPO / "usr/src/uts/common/io/ice/ice_gld.c").read_text(
-        encoding="utf-8")
-    m_start = function(gld, "ice_m_start(void *arg)\n{", "\nstatic void\nice_m_stop")
+    m_start = function(ice, "ice_start(ice_t *ice)\n{", "\nvoid\nice_stop")
     blocked = m_start[m_start.index("blocked ="):m_start.index(";", m_start.index("blocked ="))]
     assert "ICE_STATE_ERROR" not in blocked
     assert "~ICE_STATE_ERROR" in m_start

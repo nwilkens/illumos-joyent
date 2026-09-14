@@ -34,11 +34,12 @@ def main() -> None:
     # factored ice_start_datapath.
     gld = GLD_SOURCE.read_text(encoding="utf-8")
     filters = (GLD_SOURCE.parent / "ice_filter.c").read_text()
-    start = function(gld, "ice_m_start(void *arg)\n{", "\nstatic void\nice_m_stop")
+    lifecycle = ATTACH_SOURCE.read_text(encoding="utf-8")
+    start = function(lifecycle, "ice_start(ice_t *ice)\n{", "\nvoid\nice_stop")
     assert "mutex_enter(&ice->ice_rebuild_lock)" in start
     assert "mutex_exit(&ice->ice_rebuild_lock)" in start
     assert "ice_start_datapath(ice)" in start
-    stop = function(gld, "ice_m_stop(void *arg)\n{", "\nstatic int\nice_m_promisc")
+    stop = function(lifecycle, "ice_stop(ice_t *ice)\n{", "\nstatic void\nice_unconfigure")
     assert "mutex_enter(&ice->ice_rebuild_lock)" in stop
     assert "mutex_exit(&ice->ice_rebuild_lock)" in stop
 

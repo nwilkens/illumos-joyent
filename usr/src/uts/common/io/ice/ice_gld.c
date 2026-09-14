@@ -394,121 +394,16 @@ ice_m_ioctl(void *arg, queue_t *q, mblk_t *mp)
  * MAC callbacks.
  */
 
-/*
- * Program and enable the queues, post rx buffers, and admit traffic.  Factored
- * from ice_m_start so the reset rebuild can restore the datapath directly.
- * Programming on each start resets the hardware ring head in lockstep with the
- * software pointers.
- */
-int
-ice_start_datapath(ice_t *ice)
-{
-	/*
-	 * Re-arm the queue interrupt causes first: ice_m_stop() cleared
-	 * CAUSE_ENA to dissociate them for the queue disable, and nothing else
-	 * restores it.  Idempotent, and inert until a queue is enabled below.
-	 */
-	ice_queues_intr_map(ice);
-
-	if (ice_queues_program(ice) != ICE_SUCCESS)
-		return (EIO);
-	if (!ice_rx_start(ice)) {
-		(void) ice_queues_disable(ice);
-		return (EIO);
-	}
-	ice_tx_start(ice);
-	atomic_or_32(&ice->ice_state, ICE_STATE_STARTED);
-
-	return (0);
-}
-
 static int
 ice_m_start(void *arg)
 {
-	ice_t *ice = arg;
-	uint32_t blocked = ICE_STATE_RESET_FAILED | ICE_STATE_PFR_REQ |
-	    ICE_STATE_RESET_PENDING;
-	int ret;
-
-	/*
-	 * ice_rebuild_lock is the outermost lock and is uncontended in normal
-	 * operation; it brackets the callback so a reset rebuild cannot
-	 * interleave with a plumb.
-	 */
-	mutex_enter(&ice->ice_rebuild_lock);
-
-	/*
-	 * Refuse to start while the hardware is untrustworthy: a terminally
-	 * failed reset (reload needed), or a fatal cause or reset still owed a
-	 * rebuild.  A replumb must not clear the fail-closed state or reprogram
-	 * queues on stale hardware; the rebuild alone clears these bits.
-	 */
-	if (ice->ice_detaching || (ice->ice_state & blocked) != 0) {
-		mutex_exit(&ice->ice_rebuild_lock);
-		return (EIO);
-	}
-
-	/*
-	 * Clear any latched datapath error: mac start fully re-programs the
-	 * queues and rings below, so it is the recovery point for a device that
-	 * faulted while plumbed and was then replumbed.
-	 */
-	atomic_and_32(&ice->ice_state, ~ICE_STATE_ERROR);
-
-	ret = ice_start_datapath(ice);
-	if (ret != 0)
-		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
-	ice_link_state_publish(ice);
-	mutex_exit(&ice->ice_rebuild_lock);
-
-	return (ret);
+	return (ice_start(arg));
 }
 
 static void
 ice_m_stop(void *arg)
 {
-	ice_t *ice = arg;
-	boolean_t disabled;
-
-	mutex_enter(&ice->ice_rebuild_lock);
-
-	/*
-	 * Mark the device stopped, dissociate the queues from their interrupt
-	 * causes, then disable the queues so hardware stops touching
-	 * descriptors and buffers.
-	 */
-	atomic_and_32(&ice->ice_state, ~ICE_STATE_STARTED);
-	ice_queues_intr_dissociate(ice);
-	disabled = ice_queues_disable(ice);
-
-	if (disabled) {
-		ice_tx_stop(ice);
-		/*
-		 * mac stop cannot fail and cannot wait forever.  A loan the
-		 * stack never returns leaves ice_rx_stop() short of a full
-		 * drain; it deliberately leaves that ring's pool intact rather
-		 * than freeing buffers still held upstream, and ice_rx_start()
-		 * re-checks before reusing it.
-		 */
-		(void) ice_rx_stop(ice);
-	} else {
-		/*
-		 * A queue that did not confirm the disable can still master
-		 * into the rings, so nothing may be released (datasheet
-		 * 10.4.3.1.2 step 9).  mac stop cannot fail, but it can
-		 * decline to reclaim: quiesce the software side only and
-		 * request a PF reset, which is the barrier ice_rebuild()
-		 * reclaims behind, as the reset path already does.
-		 */
-		ice_tx_quiesce(ice);
-		(void) ice_rx_quiesce(ice);
-		atomic_or_32(&ice->ice_state,
-		    ICE_STATE_ERROR | ICE_STATE_PFR_REQ);
-		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
-		ice_reset_redispatch(ice);
-	}
-
-	mutex_exit(&ice->ice_rebuild_lock);
+	ice_stop(arg);
 }
 
 static int
