@@ -214,11 +214,6 @@ typedef enum ice_attach_state {
 /* The driver-chosen software handle for the single PF data VSI. */
 #define	ICE_PF_VSI_HANDLE	0
 
-typedef struct ice_mac_filter {
-	list_node_t		imf_node;
-	uint8_t			imf_addr[ETHERADDRL];
-} ice_mac_filter_t;
-
 /*
  * The PF data VSI.  vi_handle is the driver-chosen software index into
  * hw->vsi_ctx[]; vi_hw_num is the firmware-assigned hardware VSI number,
@@ -232,6 +227,7 @@ typedef struct ice_vsi {
 	uint16_t		vi_nrxq;
 	uint16_t		vi_ntxq;
 
+	/* Owned by ice_filter.c; other modules use the filter interface. */
 	kmutex_t		vi_mac_lock;
 	list_t			vi_macs;	/* for teardown */
 
@@ -639,12 +635,23 @@ extern void ice_link_report(ice_t *, link_state_t);
 /*
  * ice_vsi.c
  */
-struct ice_fltr_list_entry;
-extern void ice_fltr_entry_init(struct ice_fltr_list_entry *, uint16_t,
-    const uint8_t *);
 extern boolean_t ice_vsi_init(ice_t *);
 extern void ice_vsi_fini(ice_t *);
 extern int ice_vsi_rebuild(ice_t *);
+
+/*
+ * ice_filter.c: setup and address replay return ICE status; setters and
+ * promiscuous replay return errno.
+ * Init/setup/fini run with exclusive lifecycle ownership.  Replay operations
+ * require ice_rebuild_lock; callback setters acquire it themselves.
+ */
+extern void ice_filters_init(ice_t *);
+extern void ice_filters_fini(ice_t *);
+extern int ice_filters_setup(ice_t *);
+extern int ice_filters_replay(ice_t *);
+extern int ice_filters_replay_promisc(ice_t *);
+extern int ice_filters_set_mac(ice_t *, const uint8_t *, boolean_t);
+extern int ice_filters_set_promisc(ice_t *, boolean_t);
 
 /*
  * ice_ddp.c
@@ -734,7 +741,6 @@ extern int ice_mac_unregister(ice_t *);
 extern void ice_link_state_publish(ice_t *);
 extern link_state_t ice_link_state_effective(ice_t *, link_state_t);
 extern int ice_start_datapath(ice_t *);
-extern int ice_promisc_apply(ice_t *, boolean_t);
 
 /*
  * Hardware statistics (ice_stats.c).

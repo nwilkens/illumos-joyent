@@ -94,7 +94,7 @@ def main() -> None:
     setup = function(
         vsi_source,
         "ice_vsi_setup(ice_t *ice)\n{",
-        "\nstatic int\nice_add_mac_filters",
+        "\nstatic int\nice_rss_setup",
     )
     assert "vsi->vi_nrxq = ice->ice_nqueues;" in setup
     assert "vsi->vi_ntxq = ice->ice_nqueues;" in setup

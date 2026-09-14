@@ -33,10 +33,6 @@
 #include "ice_switch.h"
 #include "ice_flow.h"
 
-static const uint8_t ice_bcast_addr[ETHERADDRL] = {
-	0xff, 0xff, 0xff, 0xff, 0xff, 0xff
-};
-
 /*
  * The flow types hashed for RSS: TCP and UDP over IPv4 and IPv6, plus plain
  * IPv4/IPv6 so non-TCP/UDP traffic still spreads across queues instead of all
@@ -55,36 +51,6 @@ static const struct {
 };
 
 /*
- * Initialize a caller-owned, unlinked MAC filter entry.  This shared request
- * shape is used by GLD, attach, reset replay, and teardown.  No allocation,
- * locking, or firmware I/O occurs here; callers own insertion and submission.
- */
-void
-ice_fltr_entry_init(struct ice_fltr_list_entry *e, uint16_t handle,
-    const uint8_t *addr)
-{
-	bzero(e, sizeof (*e));
-	e->fltr_info.flag = ICE_FLTR_TX;
-	e->fltr_info.lkup_type = ICE_SW_LKUP_MAC;
-	e->fltr_info.fltr_act = ICE_FWD_TO_VSI;
-	e->fltr_info.vsi_handle = handle;
-	e->fltr_info.src_id = ICE_SRC_ID_VSI;
-	bcopy(addr, e->fltr_info.l_data.mac.mac_addr, ETHERADDRL);
-}
-
-static void
-ice_mac_filter_track(ice_vsi_t *vsi, const uint8_t *addr)
-{
-	ice_mac_filter_t *imf;
-
-	imf = kmem_zalloc(sizeof (*imf), KM_SLEEP);
-	bcopy(addr, imf->imf_addr, ETHERADDRL);
-	mutex_enter(&vsi->vi_mac_lock);
-	list_insert_tail(&vsi->vi_macs, imf);
-	mutex_exit(&vsi->vi_mac_lock);
-}
-
-/*
  * Tear down everything ice_vsi_setup() may have created.  Safe to call on a
  * partially-initialized VSI: each step is gated on the state it undoes.  The
  * Tx scheduler nodes reserved by ice_cfg_vsi_lan() and the switch filter state
@@ -97,40 +63,8 @@ ice_vsi_teardown(ice_t *ice)
 {
 	struct ice_hw *hw = &ice->ice_hw;
 	ice_vsi_t *vsi = &ice->ice_pf_vsi;
-	struct ice_fltr_list_entry *ents = NULL;
-	ice_mac_filter_t *imf;
-	uint_t n = 0, i = 0;
 
-	/*
-	 * Build the removal list under the lock, but issue the (blocking) admin
-	 * queue command with the lock dropped.
-	 */
-	mutex_enter(&vsi->vi_mac_lock);
-	for (imf = list_head(&vsi->vi_macs); imf != NULL;
-	    imf = list_next(&vsi->vi_macs, imf))
-		n++;
-	if (n > 0) {
-		struct LIST_HEAD_TYPE rm;
-
-		ents = kmem_zalloc(n * sizeof (*ents), KM_SLEEP);
-		INIT_LIST_HEAD(&rm);
-		for (imf = list_head(&vsi->vi_macs); imf != NULL;
-		    imf = list_next(&vsi->vi_macs, imf)) {
-			ice_fltr_entry_init(&ents[i], vsi->vi_handle,
-			    imf->imf_addr);
-			LIST_ADD(&ents[i].list_entry, &rm);
-			i++;
-		}
-		mutex_exit(&vsi->vi_mac_lock);
-
-		(void) ice_remove_mac(hw, &rm);
-		kmem_free(ents, n * sizeof (*ents));
-
-		mutex_enter(&vsi->vi_mac_lock);
-	}
-	while ((imf = list_remove_head(&vsi->vi_macs)) != NULL)
-		kmem_free(imf, sizeof (*imf));
-	mutex_exit(&vsi->vi_mac_lock);
+	ice_filters_fini(ice);
 
 	if (vsi->vi_added) {
 		struct ice_vsi_ctx *ctx = ice_get_vsi_ctx(hw, vsi->vi_handle);
@@ -336,45 +270,6 @@ ice_vsi_setup(ice_t *ice)
 }
 
 static int
-ice_add_mac_filters(ice_t *ice)
-{
-	struct ice_hw *hw = &ice->ice_hw;
-	ice_vsi_t *vsi = &ice->ice_pf_vsi;
-	struct ice_fltr_list_entry uc, bc;
-	struct LIST_HEAD_TYPE m_list;
-	const uint8_t *mac;
-	int status;
-
-	mac = hw->port_info->mac.perm_addr;
-	if (IS_ZERO_ETHER_ADDR(mac)) {
-		ice_error(ice, "firmware reported a zero station MAC address");
-		return (ICE_ERR_PARAM);
-	}
-
-	INIT_LIST_HEAD(&m_list);
-	ice_fltr_entry_init(&uc, vsi->vi_handle, mac);
-	ice_fltr_entry_init(&bc, vsi->vi_handle, ice_bcast_addr);
-	LIST_ADD(&uc.list_entry, &m_list);
-	LIST_ADD(&bc.list_entry, &m_list);
-
-	/*
-	 * ice_add_mac()'s return is the authoritative result for the batch.
-	 * On failure roll back any rule it did install (best effort; the VSI
-	 * free and ice_deinit_hw() reclaim the rest).
-	 */
-	status = ice_add_mac(hw, &m_list);
-	if (status != ICE_SUCCESS) {
-		ice_error(ice, "failed to add MAC filters: %d", status);
-		(void) ice_remove_mac(hw, &m_list);
-		return (status);
-	}
-
-	ice_mac_filter_track(vsi, mac);
-	ice_mac_filter_track(vsi, ice_bcast_addr);
-	return (ICE_SUCCESS);
-}
-
-static int
 ice_rss_setup(ice_t *ice)
 {
 	struct ice_hw *hw = &ice->ice_hw;
@@ -446,15 +341,11 @@ ice_rss_setup(ice_t *ice)
 boolean_t
 ice_vsi_init(ice_t *ice)
 {
-	ice_vsi_t *vsi = &ice->ice_pf_vsi;
-
-	mutex_init(&vsi->vi_mac_lock, NULL, MUTEX_DRIVER, NULL);
-	list_create(&vsi->vi_macs, sizeof (ice_mac_filter_t),
-	    offsetof(ice_mac_filter_t, imf_node));
+	ice_filters_init(ice);
 
 	if (ice_vsi_setup(ice) != ICE_SUCCESS)
 		goto fail;
-	if (ice_add_mac_filters(ice) != ICE_SUCCESS)
+	if (ice_filters_setup(ice) != ICE_SUCCESS)
 		goto fail;
 	if (ice_rss_setup(ice) != ICE_SUCCESS)
 		goto fail;
@@ -463,37 +354,27 @@ ice_vsi_init(ice_t *ice)
 
 fail:
 	ice_vsi_teardown(ice);
-	list_destroy(&vsi->vi_macs);
-	mutex_destroy(&vsi->vi_mac_lock);
 	return (B_FALSE);
 }
 
 void
 ice_vsi_fini(ice_t *ice)
 {
-	ice_vsi_t *vsi = &ice->ice_pf_vsi;
-
 	ice_vsi_teardown(ice);
-	list_destroy(&vsi->vi_macs);
-	mutex_destroy(&vsi->vi_mac_lock);
 }
 
 /*
  * Recreate the PF data VSI and its filters after a reset.  A reset clears the
  * VSI, its switch filters, and the RSS configuration; this rebuilds them from
- * the software state.  The vi_macs list is the authoritative record and is
- * replayed into hardware but never modified here.  The list_create()/mutex_init
- * done once in ice_vsi_init() is not repeated.  Called from ice_rebuild() under
+ * the software state.  ice_filter.c owns the authoritative accepted
+ * policy and replays it without changing ownership.  Its software state is
+ * initialized only once by ice_vsi_init().  Called from ice_rebuild() under
  * ice_rebuild_lock.
  */
 int
 ice_vsi_rebuild(ice_t *ice)
 {
 	struct ice_hw *hw = &ice->ice_hw;
-	ice_vsi_t *vsi = &ice->ice_pf_vsi;
-	struct ice_fltr_list_entry *ents = NULL;
-	ice_mac_filter_t *imf;
-	uint_t n = 0, i = 0;
 	int status;
 
 	status = ice_vsi_setup(ice);
@@ -517,46 +398,16 @@ ice_vsi_rebuild(ice_t *ice)
 		goto done;
 	}
 
-	/*
-	 * Replay every tracked MAC filter.  Build the list under the lock but
-	 * issue the blocking admin-queue command with it dropped, matching
-	 * ice_vsi_teardown().
-	 */
-	mutex_enter(&vsi->vi_mac_lock);
-	for (imf = list_head(&vsi->vi_macs); imf != NULL;
-	    imf = list_next(&vsi->vi_macs, imf))
-		n++;
-	if (n > 0) {
-		struct LIST_HEAD_TYPE add;
-
-		ents = kmem_zalloc(n * sizeof (*ents), KM_SLEEP);
-		INIT_LIST_HEAD(&add);
-		for (imf = list_head(&vsi->vi_macs); imf != NULL;
-		    imf = list_next(&vsi->vi_macs, imf)) {
-			ice_fltr_entry_init(&ents[i], vsi->vi_handle,
-			    imf->imf_addr);
-			LIST_ADD(&ents[i].list_entry, &add);
-			i++;
-		}
-		mutex_exit(&vsi->vi_mac_lock);
-
-		status = ice_add_mac(hw, &add);
-		kmem_free(ents, n * sizeof (*ents));
-		if (status != ICE_SUCCESS) {
-			ice_error(ice, "failed to replay MAC filters: %d",
-			    status);
-			goto done;
-		}
-	} else {
-		mutex_exit(&vsi->vi_mac_lock);
-	}
+	status = ice_filters_replay(ice);
+	if (status != ICE_SUCCESS)
+		goto done;
 
 	status = ice_rss_setup(ice);
 	if (status != ICE_SUCCESS)
 		goto done;
 
 	/* Restore promiscuous mode if it was enabled before the reset. */
-	if (ice->ice_promisc_on && ice_promisc_apply(ice, B_TRUE) != 0)
+	if (ice_filters_replay_promisc(ice) != 0)
 		status = ICE_ERR_CFG;
 
 done:

@@ -244,7 +244,7 @@ lifecycle_requests(void)
 	ice.ice_hw.port_info = &port;
 	ice.ice_nqueues = 1;
 	require_rebuild_lock = B_FALSE;
-	CHECK(ice_add_mac_filters(&ice) == 0);
+	CHECK(ice_filters_setup(&ice) == 0);
 	CHECK(nrequests == 1 && requests[0].count == 2 && requests[0].add);
 	same_request(&gld_uc, request_entry(0, unicast));
 	attach_bc = *request_entry(0, ice_bcast_addr);
@@ -287,7 +287,7 @@ attach_rollback(void)
 	ice.ice_nqueues = 1;
 	ice.ice_hw.result = -1;
 	require_rebuild_lock = B_FALSE;
-	CHECK(ice_add_mac_filters(&ice) == -1);
+	CHECK(ice_filters_setup(&ice) == -1);
 	CHECK(nrequests == 2 && requests[0].add && !requests[1].add);
 	CHECK(requests[0].count == 2 && requests[1].count == 2);
 	same_request(request_entry(0, unicast), request_entry(1, unicast));

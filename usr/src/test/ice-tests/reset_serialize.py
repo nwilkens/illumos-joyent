@@ -33,11 +33,12 @@ def main() -> None:
     # rebuild cannot interleave with a plumb, and start goes through the
     # factored ice_start_datapath.
     gld = GLD_SOURCE.read_text(encoding="utf-8")
+    filters = (GLD_SOURCE.parent / "ice_filter.c").read_text()
     start = function(gld, "ice_m_start(void *arg)\n{", "\nstatic void\nice_m_stop")
     assert "mutex_enter(&ice->ice_rebuild_lock)" in start
     assert "mutex_exit(&ice->ice_rebuild_lock)" in start
     assert "ice_start_datapath(ice)" in start
-    stop = function(gld, "ice_m_stop(void *arg)\n{", "\nint\nice_promisc_apply")
+    stop = function(gld, "ice_m_stop(void *arg)\n{", "\nstatic int\nice_m_promisc")
     assert "mutex_enter(&ice->ice_rebuild_lock)" in stop
     assert "mutex_exit(&ice->ice_rebuild_lock)" in stop
 
@@ -45,31 +46,31 @@ def main() -> None:
     # ice_rebuild_lock across it, so a reset rebuild's ice_deinit_hw/ice_hw_init
     # cannot destroy the control queue underneath the command.
     setmac = function(
-        gld,
-        "ice_gld_set_mac(ice_t *ice, const uint8_t *addr, boolean_t add)\n{",
-        "\n/*\n * Ring callbacks.",
+        filters,
+        "ice_filters_set_mac(ice_t *ice, const uint8_t *addr, boolean_t add)\n{",
+        "\n/*\n * Apply or clear",
     )
     assert "mutex_enter(&ice->ice_rebuild_lock)" in setmac
     assert "mutex_exit(&ice->ice_rebuild_lock)" in setmac
-    assert "ice_gld_set_mac_locked(ice, addr, add)" in setmac
+    assert "ice_filters_set_mac_locked(ice, addr, add)" in setmac
 
     promisc = function(
-        gld, "ice_m_promisc(void *arg, boolean_t on)\n{", "\nstatic int\nice_m_multicst"
+        filters, "ice_filters_set_promisc(ice_t *ice, boolean_t on)\n{", "\n/* Reapply accepted policy"
     )
     assert "mutex_enter(&ice->ice_rebuild_lock)" in promisc
     assert "mutex_exit(&ice->ice_rebuild_lock)" in promisc
 
-    # ice_promisc_apply must NOT take the lock: ice_vsi_rebuild calls it while
+    # ice_filters_promisc_apply must NOT take the lock: ice_vsi_rebuild calls it while
     # already holding ice_rebuild_lock.  It asserts the lock instead, and owns
     # ice_promisc_on as the accepted policy used by the rebuild.
     apply = function(
-        gld, "ice_promisc_apply(ice_t *ice, boolean_t on)\n{", "\nstatic int\nice_m_promisc"
+        filters, "ice_filters_promisc_apply(ice_t *ice, boolean_t on)\n{", "\nint\nice_filters_set_promisc"
     )
     assert "mutex_enter(&ice->ice_rebuild_lock)" not in apply
     assert "mutex_exit(&ice->ice_rebuild_lock)" not in apply
     assert "ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));" in apply
     assert "ice->ice_promisc_on = prev;" in apply
-    assert "ice_gld_filter_recover(ice);" in apply
+    assert "ice_filters_recover(ice);" in apply
 
     # A failed enable rolls the same mask back so a retry is not rejected with
     # ICE_ERR_ALREADY_EXISTS, and the errno is decoded before the rollback
@@ -80,12 +81,12 @@ def main() -> None:
     )
 
     setmac_locked = function(
-        gld,
-        "ice_gld_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)\n{",
+        filters,
+        "ice_filters_set_mac_locked(ice_t *ice, const uint8_t *addr, boolean_t add)\n{",
         "\n/*\n * ice_rebuild_lock is the outermost",
     )
     assert setmac_locked.index("int error = ice_status_to_errno(ice, status);") < (
-        setmac_locked.index("ice_gld_filter_recover(ice);"))
+        setmac_locked.index("ice_filters_recover(ice);"))
     assert "return (error);" in setmac_locked
 
     lbset = function(

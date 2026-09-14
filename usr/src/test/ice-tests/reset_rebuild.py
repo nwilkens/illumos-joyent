@@ -230,11 +230,9 @@ def main() -> None:
     vsi = VSI_SOURCE.read_text(encoding="utf-8")
     vrebuild = vsi[vsi.index("ice_vsi_rebuild(ice_t *ice)\n{"):]
     assert "ice_vsi_setup(ice)" in vrebuild
-    assert "ice_fltr_entry_init(" in vrebuild
-    assert "ice_add_mac(hw, &add)" in vrebuild
+    assert "ice_filters_replay(ice)" in vrebuild
     assert "ice_rss_setup(ice)" in vrebuild
-    assert "ice->ice_promisc_on" in vrebuild
-    assert "ice_promisc_apply(ice, B_TRUE)" in vrebuild
+    assert "ice_filters_replay_promisc(ice)" in vrebuild
 
     # The quiesce/reclaim split is behavioural, not cosmetic: the waiting half
     # must release nothing, and the composite the unplumb path uses must still

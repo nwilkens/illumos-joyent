@@ -7,6 +7,11 @@ records addresses accepted for replay or retirement, including station and
 broadcast defaults installed at attach until those addresses are retired.
 It is neither a per-client reference table nor hardware readback.
 
+`ice_filter.c` owns that set, its lock, accepted promiscuous policy, and all
+request construction. GLD callbacks submit intent through the filter setters;
+VSI attach, rebuild, and teardown use explicit filter lifecycle operations.
+Other modules do not walk the address list or construct imported filter types.
+
 The imported switch code owns separate `filt_rules` entries, firmware rule
 IDs, and VSI-list membership maps. Callback request entries are temporary;
 the imported code copies the information needed into its own allocations.
@@ -35,8 +40,10 @@ to multicast or promiscuous rules can return `ICE_ERR_ALREADY_EXISTS`.
 count; the driver needs only a boolean. The policy comprises unicast and
 multicast rules in RX and TX. Broadcast uses the ordinary broadcast filter.
 A same-state callback succeeds without repeating the four-rule operation.
-Rebuild calls `ice_promisc_apply()` directly so an accepted enabled policy is
-programmed again even though its boolean is unchanged.
+Rebuild calls `ice_filters_replay_promisc()` so an accepted enabled policy is
+programmed again even though its boolean is unchanged. Callback setters acquire
+the lifecycle lock; replay requires it already held. Setup and address replay
+return imported ICE status; setters and promiscuous replay return errno.
 
 ## Uncertain commands and ownership retirement
 
@@ -100,18 +107,19 @@ imported `ice_replay_vsi()` dispatcher. A newly arriving reset request remains
 owed and does not suppress the current worker's direct replay. Reconstruction
 failure is terminal; the driver's address set remains available for retirement.
 
-Final VSI teardown attempts switch removal and VSI release, then frees driver
-address records regardless of command status. `ice_deinit_hw()` frees imported
+Final VSI teardown asks the filter owner to attempt switch removal and destroy
+its address records and lock, then releases the hardware VSI. Software records
+are disposed of regardless of command status. `ice_deinit_hw()` frees imported
 bookkeeping and locks. Software disposal is not a firmware acknowledgment;
 detach establishes packet DMA isolation separately before irreversible MAC
 unregister and resource release.
 
 ## Source and validation
 
-The ownership boundaries are implemented by `ice_gld_set_mac_locked()`,
-`ice_gld_filter_recover()`, `ice_m_promisc()`, and `ice_promisc_apply()` in
-[ice_gld.c](ice_gld.c), and the setup, attach, replay, and teardown functions in
-[ice_vsi.c](ice_vsi.c). Imported creation/removal is in
+The ownership boundaries are implemented in [ice_filter.c](ice_filter.c).
+[ice_gld.c](ice_gld.c) adapts MAC callbacks; [ice_vsi.c](ice_vsi.c) sequences
+filter lifecycle operations around VSI and RSS programming. Imported
+creation/removal is in
 [core/ice_switch.c](core/ice_switch.c); replay preparation and common teardown
 are in [core/ice_common.c](core/ice_common.c).
 
@@ -121,10 +129,13 @@ client teardown in [../mac/mac_datapath_setup.c](../mac/mac_datapath_setup.c),
 and final multicast deletion in [../mac/mac_bcast.c](../mac/mac_bcast.c).
 
 The portable `terminal_filters.py` and `filter_requests.py` regressions execute
-actual callback, setup, attach, replay, and teardown C bodies with controlled
+actual callback, filter policy, setup, attach, replay, and teardown C bodies
+with controlled
 imported-core boundaries. They verify ownership decisions, late reset requests,
 original errno, command counts, lock boundaries, and replay selection. They do
-not emulate the device or prove firmware reset/deletion completion. Hardware
+not emulate the device or prove firmware reset/deletion completion.
+`mac_filter.py` also enforces that only the filter module accesses private
+policy or constructs imported switch requests. Hardware
 acceptance must inject partial switch/AQ failures with active clients, close
 clients during owed and terminal recovery, verify the post-reset receive set,
 and detach without leaked MAC ownership or DMA access.

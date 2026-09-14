@@ -140,7 +140,7 @@ def main() -> None:
     setup = function(
         vsi,
         "ice_vsi_setup(ice_t *ice)\n{",
-        "\nstatic int\nice_add_mac_filters",
+        "\nstatic int\nice_rss_setup",
     )
     add_at = setup.index("ice_add_vsi(hw, vsi->vi_handle, &ctx, NULL)")
     resync = setup.index("->info = ctx.info", add_at)

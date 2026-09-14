@@ -52,6 +52,11 @@ that callback must finish before its MAC/ring storage can be freed. TX likewise
 waits for admitted calls and notifications to return. These waits are software
 ownership fences, not hardware queue-stop acknowledgments.
 
+The filter module owns accepted address/promiscuous policy and its list lock.
+GLD setters acquire the lifecycle lock within that module; VSI replay passes
+its already-held lock through the filter lifecycle interface. Imported filter
+request types and list operations stay private to `ice_filter.c`.
+
 ## TX copy-buffer pools
 
 The small, ordinary, and LSO copy pools share one stack implementation. Each

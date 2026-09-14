@@ -44,7 +44,8 @@ def main() -> None:
     # The drain has to precede every rule-programming call, otherwise the
     # replay collides with the pre-reset entries.
     drain_at = rebuild.index(drain)
-    for token in ("ice_add_mac(hw", "ice_rss_setup(ice)", "ice_promisc_apply"):
+    for token in ("ice_filters_replay(ice)", "ice_rss_setup(ice)",
+                  "ice_filters_replay_promisc(ice)"):
         assert token in rebuild, "rebuild no longer calls " + token
         assert rebuild.index(token) > drain_at, token + " runs before the drain"
 

@@ -445,7 +445,7 @@ late_filter_request(uint32_t state, boolean_t multi, boolean_t add)
 	latch_ice = &ice;
 	latch_state = state;
 	ret = multi ? ice_m_multicst(&ice, add, multicast) :
-	    ice_gld_set_mac(&ice, unicast, add);
+	    ice_filters_set_mac(&ice, unicast, add);
 	CHECK(latch_ice == NULL && ice.ice_state == state);
 	CHECK(ret == (add ? EIO : 0));
 	CHECK(allocations == 0 && ice.ice_hw.calls == (add ? 0U : 1U));
@@ -544,11 +544,11 @@ promisc_replay(void)
 	CHECK(ice_m_promisc(&ice, B_TRUE) == 0);
 	/* Replay must program even when the remembered policy is unchanged. */
 	mutex_enter(&ice.ice_rebuild_lock);
-	CHECK(ice_promisc_apply(&ice, B_TRUE) == 0);
+	CHECK(ice_filters_replay_promisc(&ice) == 0);
 	CHECK(ice.ice_hw.calls == 2 && ice.ice_promisc_on);
 	/* A later request does not suppress the current worker's replay. */
 	ice.ice_state = ICE_STATE_ERROR | ICE_STATE_PFR_REQ;
-	CHECK(ice_promisc_apply(&ice, B_TRUE) == 0);
+	CHECK(ice_filters_replay_promisc(&ice) == 0);
 	mutex_exit(&ice.ice_rebuild_lock);
 	CHECK(ice.ice_hw.calls == 3 && ice.ice_promisc_on);
 	CHECK(ice_m_promisc(&ice, B_FALSE) == 0);

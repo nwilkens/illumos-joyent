@@ -493,6 +493,20 @@ unchanged.
   address, TCB placement, rollback, and handle selection. Hardware validation
   remains pending.
 
-Validation after A3: full portable suite passes 51/51; source/style checks
-pass. Native builds are run from an isolated committed source snapshot after
-each atomic commit. No hardware or throughput qualification is implied.
+Validation after A3: full portable suite passes 51/51. Commit `ff8cbf6a0d`
+passed all 20 configured GCC/smatch compilation pairs, module link, and CTF
+creation in an isolated native build.
+
+- **A4 — Filter ownership across GLD and VSI: implemented.** `ice_filter.c`
+  owns accepted addresses, promiscuous policy, list lifetime, imported request
+  construction, and recovery decisions. GLD submits intent; VSI sequences
+  filter initialization, setup, replay, and finalization around hardware
+  programming. The request record and constructor are private. Reset no longer
+  calls into GLD to restore promiscuous mode. Software disposal finishes before
+  hardware VSI release, with callbacks and reset already drained. The new
+  boundary check rejects the old split ownership; existing actual-C tests still
+  pass all 30 callback scenarios and seven attach/rebuild selections, including
+  command failures and terminal retirement. Full portable suite: 51/51.
+
+Native builds run from an isolated committed source snapshot after each atomic
+commit. No hardware or throughput qualification is implied.

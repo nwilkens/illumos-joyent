@@ -45,8 +45,9 @@ symmetric hashing each compile and fail at runtime.
 python3 usr/src/test/ice-tests/terminal_filters.py
 ```
 
-The runner extracts the actual filter callbacks from `ice_gld.c`, the shared
-request constructor from `ice_vsi.c`, and the state enum from `ice.h`, then
+The runner extracts the MAC adapters from `ice_gld.c`, filter operations and
+the private request constructor from `ice_filter.c`, and the state enum from
+`ice.h`, then
 compiles their bodies unchanged with boundary stubs in `terminal_filters.c`.
 Thirty scenarios cover accepted ownership, failed unicast/multicast commands,
 promiscuous rollback and retirement, owed/terminal recovery, duplicate/missing
@@ -56,8 +57,8 @@ A successful recorded-rule rollback still requests reset because an AQ error
 can leave an unrecorded hardware rule. Direct replay must program an accepted
 enabled policy even when its boolean is unchanged.
 
-Use `--source /path/to/ice_gld.c` and `--vsi-source /path/to/ice_vsi.c` for paired
-source revisions. The pre-recovery source at `79bd14d475` compiles with this
+Use `--source /path/to/ice_gld.c`, `--vsi-source /path/to/ice_vsi.c`, and
+`--filter-source /path/to/ice_filter.c` for matching source revisions. The pre-recovery source at `79bd14d475` compiles with this
 fixture and fails at runtime because a failed add does not request recovery.
 This test does not load the driver or establish hardware isolation. The
 [filter contract](../../uts/common/io/ice/FILTERS.md) records these ownership
@@ -69,8 +70,8 @@ and recovery rules.
 python3 usr/src/test/ice-tests/filter_requests.py
 ```
 
-The runner compiles the actual GLD filter callbacks and VSI attach, replay,
-and teardown functions. It reuses the terminal-filter fixtures and captures
+The runner compiles the actual GLD adapters, filter owner operations, and
+VSI attach, replay, and teardown functions. It reuses the terminal-filter fixtures and captures
 requests at the imported-core boundary. Unicast, multicast, and broadcast
 requests retain the same TX direction, MAC lookup, VSI forwarding/source,
 software handle, and address fields across add, remove, attach, replay, and
@@ -92,8 +93,8 @@ recovery admits new ownership again. Core calls are controlled boundaries;
 this checks the driver's replay decisions, not hardware cleanup.
 
 The `requests` scenario checks constructor equivalence and current callback
-policy. Select paired source files with `--gld-source` and `--vsi-source`, and
-a single scenario with `--scenario`. Before the VSI setup ownership fix, each
+policy. Select matching source files with `--gld-source`, `--vsi-source`, and
+`--filter-source`, and a single scenario with `--scenario`. Before the VSI setup ownership fix, each
 `rebuild_*` scenario fails because setup drains the desired list. Mutations
 that omit TX direction or replay an unowned promiscuous policy fail request
 checks at runtime. Firmware encoding and device programming remain outside
@@ -328,7 +329,9 @@ common-code control-queue allocations, and retains datapath handle checks.
 explicit bound flag rather than physical address zero, while preserving the
 common-code-visible `va`/`pa`/`size` structure prefix.
 
-`mac_filter.py` verifies identical MAC filter construction for add and remove.
+`mac_filter.py` verifies private request construction and runs
+`filter_boundary.py`, which rejects filter policy or imported switch-request
+access outside the filter module.
 
 `vsi_tx_vlan.py` verifies that the PF data VSI admits tagged and untagged Tx.
 
