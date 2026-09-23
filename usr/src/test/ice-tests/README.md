@@ -171,9 +171,10 @@ read and set levels by module ID, and a set must keep every other module's
 level. A module the reply does not list fails GET and SET with ENOENT, and
 ICE_FWLOG_MODULE_ALL fails with ENOENT when none is listed; the Set command
 carries exactly the listed modules, never one firmware did not report. A
-count above 32, or a listed entry with a repeated or out-of-range module ID
-or a level above the maximum, fails GET and SET with EIO before any
-configuration is sent; entries past the count are not read.
+count above 32 or larger than the returned length holds, or a listed entry
+with a repeated or out-of-range module ID or a level above the maximum, fails
+GET and SET with EIO before any configuration is sent; entries past the count
+are not read.
 
 ## mdb module check
 
@@ -395,7 +396,10 @@ management callback (`ddi_cb_register(DDI_CB_FLAG_INTR)`), which left the
 driver 7 queue pairs. `intr_irm.py` compiles the actual `ice_alloc_intrs()`,
 `ice_free_intrs()` and the callback against a model of that limit. With the
 callback the default 16 queue pairs get 17 vectors; if registration fails the
-driver logs it and runs with 7. The callback declines offers and reclaims.
+driver logs it and runs with 7. The callback declines offers and reclaims,
+so the driver keeps its vectors as a driver without a callback does; a
+partial grant cuts the request to the grant with `ddi_intr_set_nreq()`, so
+IRM does not hold back vectors for an offer the driver would decline.
 Every failure after registration unregisters, and teardown frees the vectors
 before it unregisters. The source check requires the registration to precede
 the first vector count.

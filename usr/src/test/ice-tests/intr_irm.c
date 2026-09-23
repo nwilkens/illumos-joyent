@@ -92,6 +92,7 @@ static int ncpus = 40, max_ncpus = 40, boot_max_ncpus = -1;
 static struct {
 	boolean_t fail_register, fail_alloc;
 	int registered, unregisters, allocated, errors, notes;
+	int grant, nreq;
 	ddi_cb_func_t cb;
 	void *cb_arg;
 } m;
@@ -191,10 +192,23 @@ ddi_intr_alloc(dev_info_t *dip, ddi_intr_handle_t *h, int type, int inum,
 	if (m.fail_alloc)
 		return (DDI_FAILURE);
 	(void) ddi_intr_get_navail(dip, type, &navail);
+	if (m.grant != 0)
+		navail = MIN(navail, m.grant);
 	*actual = MIN(count, navail);
+	m.nreq = count;
 	for (i = 0; i < *actual; i++)
 		h[i] = &handle_token;
 	m.allocated += *actual;
+	return (DDI_SUCCESS);
+}
+
+/* An IRM request cut to the grant draws no later offer. */
+static int
+ddi_intr_set_nreq(dev_info_t *dip, int nreq)
+{
+	(void) dip;
+	assert(m.registered && nreq >= 1 && nreq <= m.allocated);
+	m.nreq = nreq;
 	return (DDI_SUCCESS);
 }
 
@@ -297,6 +311,16 @@ main(void)
 	ice_free_intrs(&dev);
 	assert(m.allocated == 0 && m.unregisters == 1 && !m.registered);
 	assert(dev.ice_intr_cb == NULL && dev.ice_intr_handles == NULL);
+
+	/* A partial grant cuts the request to what was granted. */
+	reset(1024);
+	m.grant = 9;
+	assert(ice_alloc_intrs(&dev));
+	assert(dev.ice_intr_count == 9 && dev.ice_nqueues == 8 && m.nreq == 9);
+	ice_free_intrs(&dev);
+	reset(1024);
+	assert(ice_alloc_intrs(&dev) && m.nreq == 17);
+	ice_free_intrs(&dev);
 
 	/* Without it the platform default of 8 leaves 7 queue pairs. */
 	reset(1024);

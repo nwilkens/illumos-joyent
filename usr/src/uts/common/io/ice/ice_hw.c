@@ -486,7 +486,8 @@ ice_queue_limit(ice_t *ice)
 /*
  * Interrupt resource management calls this to offer or reclaim vectors.  The
  * rings are bound one to one to the vectors allocated at attach, so the
- * driver keeps what it has.
+ * driver keeps what it has, as a driver without a callback does; IRM logs a
+ * declined reclaim.  The request is cut to the grant, so no offer comes.
  */
 static int
 ice_intr_cb(dev_info_t *dip, ddi_cb_action_t action, void *cbarg, void *arg1,
@@ -599,6 +600,8 @@ ice_alloc_intrs(ice_t *ice)
 	/* Set before ice_free_intrs() so cleanup frees the real handles. */
 	ice->ice_intr_count = actual;
 	ice->ice_intr_type = DDI_INTR_TYPE_MSIX;
+	if (ice->ice_intr_cb != NULL && actual < request)
+		(void) ddi_intr_set_nreq(dip, actual);
 
 	if (actual < ICE_INTR_MSIX_MIN) {
 		ice_error(ice, "too few MSI-X interrupts allocated: %d",
