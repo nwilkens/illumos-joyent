@@ -516,13 +516,46 @@ ice_free_intrs(ice_t *ice)
 	ice->ice_intr_pri = 0;
 }
 
+/*
+ * The queue pair count before the vector grant.  Each queue pair owns one
+ * MSI-X vector, and vector 0 serves the other causes.  The count follows the
+ * CPUs and need not be a power of two: the VSI TC map rounds it up
+ * (ice_vsi_ctx_fill()), but the rings and the RSS table use the exact count.
+ */
+static uint32_t
+ice_queue_limit(ice_t *ice)
+{
+	struct ice_hw_common_caps *c = &ice->ice_hw.func_caps.common_cap;
+	uint32_t n, cpus;
+
+	/*
+	 * Attach can observe one CPU before the rest of the boot CPUs are
+	 * online.
+	 */
+	cpus = (ncpus >= 2) ? (uint32_t)ncpus :
+	    ((boot_max_ncpus == -1) ? (uint32_t)max_ncpus :
+	    (uint32_t)boot_max_ncpus);
+
+	n = MIN(c->num_rxq, c->num_txq);
+	n = MIN(n, cpus);
+	if (c->num_msix_vectors > 1)
+		n = MIN(n, c->num_msix_vectors - 1);
+	/* A narrow RSS entry cannot name every queue. */
+	if (c->rss_table_entry_width > 0 && c->rss_table_entry_width < 8)
+		n = MIN(n, 1u << c->rss_table_entry_width);
+	n = MIN(n, ICE_MAX_QUEUES);
+	n = MIN(n, ice_prop_get_num_queues(ice));
+
+	return (MAX(n, 1));
+}
+
 static boolean_t
 ice_alloc_intrs(ice_t *ice)
 {
 	dev_info_t *dip = ice->ice_dip;
 	struct ice_hw *hw = &ice->ice_hw;
 	uint32_t nvec = hw->func_caps.common_cap.num_msix_vectors;
-	uint32_t qcap, cpus, vcap, nprop, nreq;
+	uint32_t nreq;
 	int types, nintrs, navail, actual, request, rc;
 
 	if (ddi_intr_get_supported_types(dip, &types) != DDI_SUCCESS ||
@@ -545,28 +578,14 @@ ice_alloc_intrs(ice_t *ice)
 		return (B_FALSE);
 	}
 
-	qcap = MIN(hw->func_caps.common_cap.num_rxq,
-	    hw->func_caps.common_cap.num_txq);
-	/*
-	 * Attach can observe one CPU before the rest of the boot CPUs are
-	 * online.
-	 */
-	cpus = (ncpus >= 2) ? (uint32_t)ncpus :
-	    ((boot_max_ncpus == -1) ? (uint32_t)max_ncpus :
-	    (uint32_t)boot_max_ncpus);
-	vcap = (nvec > 1) ? (uint32_t)nvec - 1 : 1;
-	nprop = ice_prop_get_num_queues(ice);
-	nreq = MIN(MIN(MIN(qcap, cpus),
-	    MIN(vcap, (uint32_t)ICE_MAX_INTR_QUEUES)), nprop);
-	nreq = (nreq < 1) ? 1 : (1u << ice_ilog2(nreq));
-	request = (int)(1 + nreq);
-	if (request < ICE_INTR_MSIX_MIN)
-		request = ICE_INTR_MSIX_MIN;
-	if (nvec < (uint32_t)request) {
+	if (nvec < ICE_INTR_MSIX_MIN) {
 		ice_error(ice, "firmware reports too few MSI-X vectors: %u",
 		    nvec);
 		return (B_FALSE);
 	}
+
+	nreq = ice_queue_limit(ice);
+	request = (int)MIN(1 + nreq, (uint32_t)MIN(nintrs, navail));
 	ice->ice_intr_size = request * sizeof (ddi_intr_handle_t);
 	ice->ice_intr_handles = kmem_zalloc(ice->ice_intr_size, KM_SLEEP);
 
@@ -590,8 +609,7 @@ ice_alloc_intrs(ice_t *ice)
 		ice_free_intrs(ice);
 		return (B_FALSE);
 	}
-	ice->ice_nqueues = (uint16_t)MIN(nreq,
-	    1u << ice_ilog2((uint32_t)actual - 1));
+	ice->ice_nqueues = (uint16_t)MIN(nreq, (uint32_t)actual - 1);
 
 	/*
 	 * The direct vector->ring ISR dispatch (ice_intr_queue) and the 1:1
@@ -1056,17 +1074,15 @@ ice_unconfigure(ice_t *ice)
 	ice->ice_attach_progress = 0;
 }
 
+/* The optional ice.conf ceiling on the queue pair count. */
 static uint32_t
 ice_prop_get_num_queues(ice_t *ice)
 {
 	int value;
 
 	value = ddi_prop_get_int(DDI_DEV_T_ANY, ice->ice_dip, 0, "num_queues",
-	    ICE_MAX_INTR_QUEUES);
-	value = MIN(MAX(value, 1), ICE_MAX_INTR_QUEUES);
-
-	/* A power-of-two count keeps the VSI TC encoding exact. */
-	return (1u << ice_ilog2((uint32_t)value));
+	    ICE_MAX_QUEUES);
+	return ((uint32_t)MIN(MAX(value, 1), ICE_MAX_QUEUES));
 }
 
 /*

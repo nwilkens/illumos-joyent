@@ -55,10 +55,17 @@ extern "C" {
  * link events, and errors); queue vectors begin at 1.
  */
 #define	ICE_INTR_MSIX_MIN	2
-#define	ICE_MAX_INTR_QUEUES	16
-
-CTASSERT((ICE_MAX_INTR_QUEUES & (ICE_MAX_INTR_QUEUES - 1)) == 0);
 CTASSERT(ICE_INTR_MSIX_MIN == 2);
+
+/*
+ * Fixed ceiling on the queue pair count; ice_queue_limit() applies the CPU,
+ * firmware and vector limits.  MAC keeps one SRS per rx ring plus one for
+ * software classification in an array of MAX_RINGS_PER_GROUP entries, and an
+ * RSS LUT entry is one byte.
+ */
+#define	ICE_MAX_QUEUES		(MAX_RINGS_PER_GROUP - 1)
+#define	ICE_RSS_LUT_MAX_QUEUES	256
+CTASSERT(ICE_MAX_QUEUES <= ICE_RSS_LUT_MAX_QUEUES);
 
 /*
  * Generous hardware sanity ceilings.  Capability counts arrive from firmware

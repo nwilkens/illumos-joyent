@@ -22,12 +22,10 @@ def function(source: str, signature: str, following: str) -> str:
 
 def main() -> None:
     header = HEADER.read_text(encoding="utf-8")
-    maximum = re.search(r"#define\s+ICE_MAX_INTR_QUEUES\s+(\d+)", header)
-    assert maximum is not None
-    queue_cap = int(maximum.group(1))
-    assert queue_cap > 0 and queue_cap & (queue_cap - 1) == 0
+    # queue_count.py executes the sizing; the ceiling stays below MAC's
+    # per-group ring array.
+    assert "#define\tICE_MAX_QUEUES\t\t(MAX_RINGS_PER_GROUP - 1)" in header
     assert "uint16_t\t\tice_nqueues;" in header
-    assert "ICE_MAX_INTR_QUEUES - 1)) == 0);" in header
     assert "CTASSERT(ICE_INTR_MSIX_MIN == 2);" in header
 
     progress = [
@@ -66,20 +64,15 @@ def main() -> None:
         "\nstatic void\nice_rem_intr_handlers",
     )
     assert '"num_queues"' in attach
-    rounded = allocator.index(
-        "nreq = (nreq < 1) ? 1 : (1u << ice_ilog2(nreq));"
-    )
-    requested = allocator.index("request = (int)(1 + nreq);")
-    assert rounded < requested
+    limited = allocator.index("nreq = ice_queue_limit(ice);")
+    requested = allocator.index("request = (int)MIN(1 + nreq,")
+    assert limited < requested
     assert "ddi_intr_alloc" in allocator
     actual_guard = allocator.index("if (actual < ICE_INTR_MSIX_MIN)")
     final_count = allocator.index("ice->ice_nqueues")
     assert allocator.index("ddi_intr_alloc") < actual_guard < final_count
-    assert re.search(
-        r"ice->ice_nqueues\s*=.*ice_ilog2\(\(uint32_t\)actual - 1\)",
-        allocator,
-        re.DOTALL,
-    )
+    assert "ice->ice_nqueues = (uint16_t)MIN(nreq, (uint32_t)actual - 1);" \
+        in allocator
     # The direct-index ISR dispatch requires a 1:1 ring<->vector map; the
     # sizing site must assert it so a future vector-cap change fails loudly.
     assert re.search(
