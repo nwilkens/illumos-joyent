@@ -131,7 +131,11 @@ CTASSERT(ICE_MAX_FRAME_SIZE <= UINT16_MAX);
 #define	ICE_TX_MAX_LSO_DESC	32		/* data descs per LSO packet */
 /* The refetched header is the eighth descriptor in each hardware segment. */
 #define	ICE_TX_LSO_SEG_DESCS	7		/* payload descs per segment */
-#define	ICE_TX_LSO_MIN_MSS	64
+/*
+ * Datasheet 10.5.8.4.4: the device treats an MSS below 88 bytes as a
+ * malicious-driver event and stops the queue.
+ */
+#define	ICE_TX_LSO_MIN_MSS	88
 /* Datasheet 10.5.8.4.1: TSO header (L2+L3+L4) maximum, in bytes. */
 #define	ICE_TX_LSO_MAX_HDRLEN	512
 #define	ICE_LSO_MAXLEN		(64 * 1024)

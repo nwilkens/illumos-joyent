@@ -109,8 +109,9 @@ check_protocol(boolean_t ipv6)
 {
 	/* Include the old MTU downgrade boundary and a jumbo-sized request. */
 	const size_t lengths[] = { 128, 1500, 1501, 1514, 9000 };
-	const uint32_t rejected[] = { 0, 1, 63, 9669 };
-	const uint32_t accepted[] = { 64, 9668 };
+	/* 64 through 87 once passed and triggered a malicious-driver event. */
+	const uint32_t rejected[] = { 0, 1, 63, 64, 87, 9669 };
+	const uint32_t accepted[] = { 88, 9668 };
 	ice_tx_ctx_t ctx;
 	mblk_t mp;
 	size_t i, j;

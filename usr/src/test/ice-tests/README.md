@@ -201,6 +201,10 @@ MSS rejection regardless of packet length, accepted MSS boundaries, TSO
 context fields, ordinary checksum requests, and invalid metadata. The LSO
 marker remains set on rejection for drop accounting.
 
+MSS values from 64 through 87 are rejected: the datasheet (10.5.8.4.4) makes
+an MSS below 88 a malicious-driver event, and an earlier minimum of 64 let
+those requests reach the queue.
+
 Use `--source /path/to/ice_tx.c` to run the same regression against an earlier
 implementation. The reviewed baseline fails the small-MSS case. The test does
 not emulate the NIC or establish wire checksum correctness; LSO remains off
