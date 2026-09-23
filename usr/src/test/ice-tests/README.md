@@ -460,9 +460,9 @@ and compile-time descriptor-layout checks. The `tx_lso_enable` integer driver
 property remains zero by default and should be set in `/kernel/drv/ice.conf`
 only for hardware validation.
 
-`rss.py` verifies that interrupt allocation selects a power-of-two data-queue
-count within the property, CPU, firmware queue, MSI-X vector, and driver caps;
-that the granted vector count controls the final queue count; that the 1:1
+`rss.py` verifies that interrupt allocation takes its data-queue count from
+`ice_queue_limit()` (executed by `queue_count.py`); that the granted vector
+count can only lower the final queue count; that the 1:1
 ring-to-vector invariant is asserted at sizing and the MSI-X vector accounting
 is logged; that the queue ISR dispatches by vector index rather than scanning
 rings; and that the VSI, RSS LUT, and GLDv3 receive-ring interrupt handle use
