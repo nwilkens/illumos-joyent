@@ -164,10 +164,16 @@ resolution and flag validation, UART option preservation, the log ring
 returned length), the allowed debug dump clusters for E810 and E830, and a
 firmware length larger than the buffer. Replies must replace every byte of
 the caller's structure. The test also requires that no reset ioctl exists.
-Firmware lists log modules in its own order: a reply in reverse order must
+The admin queue stub models the firmware's Query and Set FW Logging
+commands. Firmware lists log modules in its own order and need not list all
+of them: the driver uses the count it returns, a reply in reverse order must
 read and set levels by module ID, and a set must keep every other module's
-level. A reply with a repeated or out-of-range module ID, or a level above
-the maximum, fails GET and SET with EIO before any configuration is sent.
+level. A module the reply does not list fails GET and SET with ENOENT, and
+ICE_FWLOG_MODULE_ALL fails with ENOENT when none is listed; the Set command
+carries exactly the listed modules, never one firmware did not report. A
+count above 32, or a listed entry with a repeated or out-of-range module ID
+or a level above the maximum, fails GET and SET with EIO before any
+configuration is sent; entries past the count are not read.
 
 ## mdb module check
 

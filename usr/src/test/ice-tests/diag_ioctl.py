@@ -15,6 +15,9 @@ def main():
     source = args.source.read_text()
     body = re.findall(r"^#define\tICE_FWDUMP_MASK_\w+\t.*$", source,
                       re.MULTILINE)
+    body.append(extract(source,
+        r"^typedef struct ice_diag_fwlog \{[\s\S]*?^} ice_diag_fwlog_t;",
+        args.source))
     names = re.findall(r"^(ice_diag_\w+)\(", source, re.MULTILINE)
     assert "ice_diag_ioctl" in names and "ice_diag_priv" in names
     for name in names:

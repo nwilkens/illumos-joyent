@@ -39,31 +39,61 @@ typedef int zoneid_t;
 #define	ICE_SUCCESS		0
 #define	ICE_ERR_NOT_SUPPORTED	-4
 #define	ICE_ERR_CFG		-12
+#define	ICE_ERR_DOES_NOT_EXIST	-15
 #define	ICE_ERR_AQ_ERROR	-100
 #define	GLOBAL_ZONEID		0
 #define	KM_SLEEP		0
 #define	MUTEX_DRIVER		0
 #define	MIN(a, b)		((a) < (b) ? (a) : (b))
+#define	ASSERT(x)		assert(x)
+#define	ASSERT3U(a, op, b)	assert((a) op(b))
+#define	MUTEX_HELD(m)		(*(m) != 0)
+#define	LE16_TO_CPU(x)		(x)
+#define	CPU_TO_LE16(x)		(x)
+#define	ICE_AQ_MAX_BUF_LEN	4096
+#define	ICE_AQ_FLAG_RD		0x0400
+#define	ICE_AQ_FLAG_SI		0x2000
+#define	ice_aqc_opc_fw_logs_config	0xFF30
+#define	ice_aqc_opc_fw_logs_query	0xFF32
+#define	ICE_AQC_FW_LOG_CONF_UART_EN	0x01
+#define	ICE_AQC_FW_LOG_CONF_AQ_EN	0x02
+#define	ICE_AQC_FW_LOG_QUERY_REGISTERED	0x04
+#define	ICE_AQC_FW_LOG_CONF_SET_VALID	0x08
+#define	ICE_AQC_FW_LOG_AQ_QUERY		0x04
 #undef	bcopy
 #undef	bzero
 #define	bcopy(s, d, n)		memmove((d), (s), (n))
 #define	bzero(p, n)		memset((p), 0, (n))
-#define	ICE_FWLOG_OPTION_ARQ_ENA	0x1
-#define	ICE_FWLOG_OPTION_UART_ENA	0x2
-#define	ICE_FWLOG_OPTION_IS_REGISTERED	0x8
 #define	ICE_AQC_DBG_DUMP_CLUSTER_ID_SW_E810	0
 #define	ICE_AQC_DBG_DUMP_CLUSTER_ID_SW_E830	100
 
 #include "ice_ioctl.h"
 
-struct ice_fwlog_module_entry {
-	u16 module_id;
-	u8 log_level;
+struct ice_aqc_fw_log {
+	u8 cmd_flags;
+	u8 rsp_flag;
+	u16 fw_rt_msb;
+	union {
+		struct {
+			u16 log_resolution;
+			u16 mdl_cnt;
+		} cfg;
+	} ops;
+	u32 addr_high;
+	u32 addr_low;
 };
-struct ice_fwlog_cfg {
-	struct ice_fwlog_module_entry module_entries[ICE_FWLOG_NMODULES];
-	u16 options;
-	u16 log_resolution;
+struct ice_aq_desc {
+	u16 flags;
+	u16 opcode;
+	u16 datalen;
+	union {
+		struct ice_aqc_fw_log fw_log;
+	} params;
+};
+struct ice_aqc_fw_log_cfg_resp {
+	u16 module_identifier;
+	u8 log_level;
+	u8 rsvd0;
 };
 struct ice_hw {
 	bool e830;
@@ -95,9 +125,9 @@ typedef struct ice {
 } ice_t;
 
 static ice_t dev;
-static struct ice_fwlog_cfg firmware;
 static int fw_status, dump_status;
 static unsigned fw_calls, registers, unregisters, acks, naks, allocs;
+static unsigned configs;
 static int nak_error;
 static u16 dump_len;
 static unsigned errors;
@@ -110,30 +140,70 @@ ice_error(ice_t *ice, const char *fmt, ...)
 	errors++;
 }
 
-/* Firmware lists module IDs in its own order: here, reversed. */
+/*
+ * The firmware: the modules it lists, in its own order, and the count it
+ * reports.  A hostile count may exceed what it lists.
+ */
+#define	FW_SLOTS	40
+static struct {
+	bool supported;
+	u16 n;
+	u16 count;
+	u16 ids[FW_SLOTS];
+	u8 levels[FW_SLOTS];
+	u16 resolution;
+	u8 flags;
+} fw;
+
+/* Every module, in reverse order. */
 static void
 firmware_modules(void)
 {
 	unsigned i;
 
+	memset(&fw, 0, sizeof (fw));
+	fw.supported = true;
+	fw.n = fw.count = ICE_FWLOG_NMODULES;
+	fw.resolution = 1;
 	for (i = 0; i < ICE_FWLOG_NMODULES; i++) {
-		firmware.module_entries[i].module_id =
-		    (u16)(ICE_FWLOG_NMODULES - 1 - i);
-		firmware.module_entries[i].log_level = (u8)(i % 5);
+		fw.ids[i] = (u16)(ICE_FWLOG_NMODULES - 1 - i);
+		fw.levels[i] = (u8)(i % 5);
 	}
+}
+
+/* A short reply: only these modules, as newer or older firmware may send. */
+static void
+firmware_short(const u16 *ids, unsigned n)
+{
+	unsigned i;
+
+	firmware_modules();
+	fw.n = fw.count = (u16)n;
+	for (i = 0; i < n; i++) {
+		fw.ids[i] = ids[i];
+		fw.levels[i] = (u8)((i + 1) % 5);
+	}
+}
+
+static int
+firmware_slot(unsigned module)
+{
+	unsigned i;
+
+	for (i = 0; i < fw.n; i++) {
+		if (fw.ids[i] == module)
+			return ((int)i);
+	}
+	return (-1);
 }
 
 static u8
 firmware_level(unsigned module)
 {
-	unsigned i;
+	int slot = firmware_slot(module);
 
-	for (i = 0; i < ICE_FWLOG_NMODULES; i++) {
-		if (firmware.module_entries[i].module_id == module)
-			return (firmware.module_entries[i].log_level);
-	}
-	assert(0);
-	return (0);
+	assert(slot >= 0);
+	return (fw.levels[slot]);
 }
 
 static void
@@ -174,6 +244,12 @@ kmem_zalloc(size_t n, int f)
 	assert(p != NULL);
 	allocs++;
 	return (p);
+}
+
+static void *
+kmem_alloc(size_t n, int f)
+{
+	return (kmem_zalloc(n, f));
 }
 
 static void
@@ -237,36 +313,86 @@ ice_is_e830(struct ice_hw *hw)
 	return (hw->e830);
 }
 
-/* Installed by ice_fwlog_get() to model a concurrent enable. */
+/* Installed by the query to model a concurrent enable. */
 static uint8_t *race;
 
-static int
-ice_fwlog_get(struct ice_hw *hw, struct ice_fwlog_cfg *cfg)
+static bool
+ice_fwlog_supported(struct ice_hw *hw)
 {
 	(void) hw;
+	return (fw.supported);
+}
+
+static void
+ice_fill_dflt_direct_cmd_desc(struct ice_aq_desc *desc, u16 opcode)
+{
+	memset(desc, 0, sizeof (*desc));
+	desc->opcode = opcode;
+	desc->flags = ICE_AQ_FLAG_SI;
+}
+
+/*
+ * Query (0xFF32) and configure (0xFF30).  A configuration may carry only
+ * modules the firmware listed, each once.
+ */
+static int
+ice_aq_send_cmd(struct ice_hw *hw, struct ice_aq_desc *desc, void *buf,
+    u16 size, void *cd)
+{
+	struct ice_aqc_fw_log *cmd = &desc->params.fw_log;
+	struct ice_aqc_fw_log_cfg_resp *mods = buf;
+	unsigned i, n;
+	uint32_t sent = 0;
+
+	(void) hw;
+	(void) cd;
 	assert(dev.ice_rebuild_lock == 1);
 	if (race != NULL) {
 		dev.ice_fwlog_buf = race;
 		race = NULL;
 	}
 	fw_calls++;
-	if (fw_status == ICE_SUCCESS)
-		*cfg = firmware;
-	return (fw_status);
-}
+	if (fw_status != ICE_SUCCESS)
+		return (fw_status);
 
-static int
-ice_fwlog_set(struct ice_hw *hw, struct ice_fwlog_cfg *cfg)
-{
-	unsigned i;
+	switch (desc->opcode) {
+	case ice_aqc_opc_fw_logs_query:
+		assert(cmd->cmd_flags == ICE_AQC_FW_LOG_AQ_QUERY);
+		assert(size == ICE_AQ_MAX_BUF_LEN && buf != NULL);
+		n = MIN(fw.n, size / sizeof (*mods));
+		for (i = 0; i < FW_SLOTS && i < size / sizeof (*mods); i++) {
+			/* Past the listed count the buffer holds garbage. */
+			mods[i].module_identifier = i < n ? fw.ids[i] : 3;
+			mods[i].log_level = i < n ? fw.levels[i] : 0xff;
+		}
+		cmd->ops.cfg.mdl_cnt = fw.count;
+		cmd->ops.cfg.log_resolution = fw.resolution;
+		cmd->cmd_flags = fw.flags;
+		return (ICE_SUCCESS);
+	case ice_aqc_opc_fw_logs_config:
+		assert((desc->flags & ICE_AQ_FLAG_RD) != 0);
+		assert((cmd->cmd_flags & ICE_AQC_FW_LOG_CONF_SET_VALID) != 0);
+		n = cmd->ops.cfg.mdl_cnt;
+		assert(n > 0 && n == fw.n && size == n * sizeof (*mods));
+		for (i = 0; i < n; i++) {
+			int slot = firmware_slot(mods[i].module_identifier);
 
-	(void) hw;
-	assert(dev.ice_rebuild_lock == 1);
-	for (i = 0; i < ICE_FWLOG_NMODULES; i++)
-		assert(cfg->module_entries[i].module_id == i);
-	fw_calls++;
-	firmware = *cfg;
-	return (ICE_SUCCESS);
+			assert(slot >= 0);
+			assert((sent & (1u << slot)) == 0);
+			assert(mods[i].log_level <= ICE_FWLOG_LEVEL_MAX);
+			sent |= 1u << slot;
+			fw.levels[slot] = mods[i].log_level;
+		}
+		fw.resolution = cmd->ops.cfg.log_resolution;
+		fw.flags = (u8)((fw.flags & ICE_AQC_FW_LOG_QUERY_REGISTERED) |
+		    (cmd->cmd_flags & (ICE_AQC_FW_LOG_CONF_AQ_EN |
+		    ICE_AQC_FW_LOG_CONF_UART_EN)));
+		configs++;
+		return (ICE_SUCCESS);
+	default:
+		assert(0);
+		return (ICE_ERR_AQ_ERROR);
+	}
 }
 
 static int
@@ -275,7 +401,7 @@ ice_fwlog_register(struct ice_hw *hw)
 	(void) hw;
 	assert(dev.ice_rebuild_lock == 1);
 	registers++;
-	firmware.options |= ICE_FWLOG_OPTION_IS_REGISTERED;
+	fw.flags |= ICE_AQC_FW_LOG_QUERY_REGISTERED;
 	return (ICE_SUCCESS);
 }
 
@@ -285,7 +411,7 @@ ice_fwlog_unregister(struct ice_hw *hw)
 	(void) hw;
 	assert(dev.ice_rebuild_lock == 1);
 	unregisters++;
-	firmware.options &= ~ICE_FWLOG_OPTION_IS_REGISTERED;
+	fw.flags &= ~ICE_AQC_FW_LOG_QUERY_REGISTERED;
 	return (ICE_SUCCESS);
 }
 
@@ -401,9 +527,20 @@ check_access(void)
 	assert(fw_calls == 0);
 }
 
+static int
+get(uint32_t module)
+{
+	memset(&req.u, 0xaa, sizeof (req.u));
+	req.u.cfg.ifc_module = module;
+	return (call(ICE_IOC_FWLOG_GET, &root, sizeof (req.u.cfg)));
+}
+
 static void
 check_fwlog_cfg(void)
 {
+	unsigned i, calls;
+
+	firmware_modules();
 	fw_calls = 0;
 	assert(set(ICE_FWLOG_NMODULES, 1, 0, 1) == EINVAL);
 	assert(set(0, ICE_FWLOG_LEVEL_MAX + 1, 0, 1) == EINVAL);
@@ -411,49 +548,70 @@ check_fwlog_cfg(void)
 	assert(set(0, 1, 0, ICE_FWLOG_RES_MAX + 1) == EINVAL);
 	assert(set(0, 1, ICE_FWLOG_F_REGISTERED, 1) == EINVAL);
 	assert(set(0, 1, 0x80000000u, 1) == EINVAL);
+	assert(get(ICE_FWLOG_NMODULES) == EINVAL);
+	assert(get(ICE_FWLOG_MODULE_ALL) == EINVAL);
 	assert(fw_calls == 0 && allocs == 0);
 
 	/* Firmware UART logging is preserved; ARQ follows the request. */
-	firmware_modules();
-	firmware.options = ICE_FWLOG_OPTION_UART_ENA;
+	fw.flags = ICE_AQC_FW_LOG_CONF_UART_EN;
 	assert(set(ICE_FWLOG_MODULE_ALL, 4, ICE_FWLOG_F_ARQ, 10) == 0);
 	assert(registers == 1 && dev.ice_fwlog_buf != NULL && allocs == 1);
-	assert(firmware.module_entries[31].log_level == 4);
-	assert(firmware.log_resolution == 10);
-	assert(firmware.options ==
-	    (ICE_FWLOG_OPTION_UART_ENA | ICE_FWLOG_OPTION_ARQ_ENA |
-	    ICE_FWLOG_OPTION_IS_REGISTERED));
+	for (i = 0; i < ICE_FWLOG_NMODULES; i++)
+		assert(fw.levels[i] == 4);
+	assert(fw.resolution == 10 && configs == 1);
+	assert(fw.flags == (ICE_AQC_FW_LOG_CONF_UART_EN |
+	    ICE_AQC_FW_LOG_CONF_AQ_EN | ICE_AQC_FW_LOG_QUERY_REGISTERED));
 
 	assert(set(3, 1, 0, 1) == 0);
-	assert(unregisters == 1 && firmware.module_entries[3].log_level == 1);
-	assert(firmware.module_entries[4].log_level == 4);
+	assert(unregisters == 1 && firmware_level(3) == 1);
+	assert(firmware_level(4) == 4);
+
+	/* A reply in another order is read and rewritten by module ID. */
+	firmware_modules();
+	assert(get(3) == 0 && req.u.cfg.ifc_level == firmware_level(3) &&
+	    req.u.cfg.ifc_level == (28 % 5));
+	assert(set(3, 4, 0, 1) == 0);
+	for (i = 0; i < ICE_FWLOG_NMODULES; i++)
+		assert(fw.levels[i] == (fw.ids[i] == 3 ? 4 : i % 5));
 
 	/*
-	 * A reply in another order is read and rewritten by module ID: the
-	 * set changes module 3 alone and keeps every other module's level.
+	 * A short reply is used as given: the listed modules read and set,
+	 * the others are ENOENT and nothing is sent for them.
 	 */
-	firmware_modules();
-	memset(&req.u, 0xaa, sizeof (req.u));
-	req.u.cfg.ifc_module = 3;
-	assert(call(ICE_IOC_FWLOG_GET, &root, sizeof (req.u.cfg)) == 0);
-	assert(req.u.cfg.ifc_level == firmware_level(3) &&
-	    req.u.cfg.ifc_level == (28 % 5));
 	{
-		struct ice_fwlog_cfg before = firmware;
-		unsigned i;
+		static const u16 ids[] = { 9, 2, 17, 30, 4 };
+		unsigned n = sizeof (ids) / sizeof (ids[0]);
 
-		assert(set(3, 4, 0, 1) == 0);
-		for (i = 0; i < ICE_FWLOG_NMODULES; i++) {
-			u8 want = (u8)((ICE_FWLOG_NMODULES - 1 - i) % 5);
-
-			assert(before.module_entries[ICE_FWLOG_NMODULES - 1 -
-			    i].log_level == want);
-			assert(firmware.module_entries[i].log_level ==
-			    (i == 3 ? 4 : want));
+		firmware_short(ids, n);
+		assert(get(2) == 0 && req.u.cfg.ifc_level == 2);
+		assert(get(4) == 0 && req.u.cfg.ifc_level == 0);
+		calls = configs;
+		errors = 0;
+		assert(get(0) == ENOENT && get(3) == ENOENT);
+		assert(set(0, 1, 0, 1) == ENOENT && set(31, 1, 0, 1) == ENOENT);
+		assert(configs == calls && errors == 0);
+		assert(set(17, 4, 0, 1) == 0 && configs == calls + 1);
+		for (i = 0; i < n; i++) {
+			assert(fw.levels[i] ==
+			    (ids[i] == 17 ? 4 : (i + 1) % 5));
 		}
+		assert(set(ICE_FWLOG_MODULE_ALL, 3, 0, 2) == 0);
+		for (i = 0; i < n; i++)
+			assert(fw.levels[i] == 3);
+		assert(fw.resolution == 2 && configs == calls + 2);
+
+		/* No modules at all: nothing to read or set. */
+		firmware_short(ids, 0);
+		assert(get(9) == ENOENT);
+		assert(set(ICE_FWLOG_MODULE_ALL, 1, 0, 1) == ENOENT);
+		assert(configs == calls + 2);
 	}
 
-	/* A duplicate or out-of-range ID or level fails before any set. */
+	/*
+	 * A count past the module space, a duplicate or unknown ID, or a
+	 * level out of range in a listed entry fails before any set.
+	 * Entries past the count are not read.
+	 */
 	{
 		static const struct {
 			unsigned slot;
@@ -465,29 +623,30 @@ check_fwlog_cfg(void)
 			{ 9, 0xffff, 0 },
 			{ 2, 29, ICE_FWLOG_LEVEL_MAX + 1 },
 		};
-		unsigned i, calls;
+		static const u16 two[] = { 6, 8 };
 
-		for (i = 0; i < sizeof (bad) / sizeof (bad[0]); i++) {
-			struct ice_fwlog_cfg good;
-
+		for (i = 0; i <= sizeof (bad) / sizeof (bad[0]); i++) {
 			firmware_modules();
-			firmware.module_entries[bad[i].slot].module_id =
-			    bad[i].id;
-			firmware.module_entries[bad[i].slot].log_level =
-			    bad[i].level;
-			good = firmware;
+			if (i < sizeof (bad) / sizeof (bad[0])) {
+				fw.ids[bad[i].slot] = bad[i].id;
+				fw.levels[bad[i].slot] = bad[i].level;
+			} else {
+				fw.n = ICE_FWLOG_NMODULES;
+				fw.count = ICE_FWLOG_NMODULES + 1;
+			}
 			errors = 0;
-			calls = fw_calls;
+			calls = configs;
 			assert(set(1, 1, 0, 1) == EIO);
-			assert(fw_calls == calls + 1 && errors == 1);
-			assert(memcmp(&good, &firmware, sizeof (good)) == 0);
-			req.u.cfg.ifc_module = 1;
-			assert(call(ICE_IOC_FWLOG_GET, &root,
-			    sizeof (req.u.cfg)) == EIO);
+			assert(errors == 1 && configs == calls);
+			assert(get(1) == EIO);
 		}
+
+		firmware_short(two, 2);
+		assert(get(6) == 0 && get(8) == 0);
+		assert(set(8, 2, 0, 1) == 0);
 	}
+
 	firmware_modules();
-	assert((firmware.options & ICE_FWLOG_OPTION_ARQ_ENA) == 0);
 	/* The ring stays until detach; a second enable does not leak. */
 	assert(set(3, 2, ICE_FWLOG_F_ARQ, 1) == 0 && allocs == 1);
 	/* An enable that loses the race frees its own ring. */
@@ -500,21 +659,21 @@ check_fwlog_cfg(void)
 		assert(dev.ice_fwlog_buf == kept && allocs == 1);
 	}
 
-	memset(&req.u, 0xaa, sizeof (req.u));
-	req.u.cfg.ifc_module = 3;
-	assert(call(ICE_IOC_FWLOG_GET, &root, sizeof (req.u.cfg)) == 0);
+	assert(get(3) == 0);
 	assert(req.u.cfg.ifc_level == 2 && req.u.cfg.ifc_resolution == 1);
 	assert(req.u.cfg.ifc_flags ==
 	    (ICE_FWLOG_F_ARQ | ICE_FWLOG_F_REGISTERED));
-	req.u.cfg.ifc_module = ICE_FWLOG_MODULE_ALL;
-	assert(call(ICE_IOC_FWLOG_GET, &root, sizeof (req.u.cfg)) ==
-	    EINVAL);
 
 	/* Unsupported firmware logging reports ENOTSUP, not EIO. */
+	fw.supported = false;
+	calls = fw_calls;
+	assert(set(0, 1, 0, 1) == ENOTSUP && get(0) == ENOTSUP);
+	assert(fw_calls == calls);
+	fw.supported = true;
 	fw_status = ICE_ERR_NOT_SUPPORTED;
 	assert(set(0, 1, 0, 1) == ENOTSUP);
 	fw_status = ICE_ERR_AQ_ERROR;
-	assert(set(0, 1, 0, 1) == EIO);
+	assert(set(0, 1, 0, 1) == EIO && get(0) == EIO);
 	fw_status = ICE_SUCCESS;
 }
 

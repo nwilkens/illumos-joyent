@@ -123,76 +123,171 @@ ice_diag_fwlog_read(ice_t *ice, ice_ioc_fwlog_read_t *rd)
 }
 
 /*
- * Index the module levels firmware returned by module ID; firmware need not
- * list the modules in order.  The reply must name each module once, so an
- * ID out of range or repeated, or a level out of range, rejects it.
+ * The logging configuration firmware reports, limited to the modules it
+ * listed.  The common code's ice_fwlog_get() fills the entries it was not
+ * given with module 0, so the driver issues the query itself to learn the
+ * count.
  */
-static boolean_t
-ice_diag_fwlog_levels(ice_t *ice, const struct ice_fwlog_cfg *fw,
-    uint8_t *levels)
+typedef struct ice_diag_fwlog {
+	uint16_t	idf_nmods;
+	uint16_t	idf_ids[ICE_FWLOG_NMODULES];
+	uint8_t		idf_levels[ICE_FWLOG_NMODULES];
+	uint16_t	idf_resolution;
+	uint8_t		idf_flags;	/* ICE_AQC_FW_LOG_CONF_* */
+} ice_diag_fwlog_t;
+
+/* Look up a module in the reply; -1 if firmware did not list it. */
+static int
+ice_diag_fwlog_find(const ice_diag_fwlog_t *q, uint32_t module)
 {
-	uint32_t seen = 0;
 	uint_t i;
 
-	for (i = 0; i < ICE_FWLOG_NMODULES; i++) {
-		uint16_t id = fw->module_entries[i].module_id;
-		uint8_t level = fw->module_entries[i].log_level;
+	for (i = 0; i < q->idf_nmods; i++) {
+		if (q->idf_ids[i] == module)
+			return ((int)i);
+	}
+	return (-1);
+}
+
+/*
+ * Query the firmware logging configuration (0xFF32).  Firmware need not list
+ * the modules in order or list all of them, but each one it lists must be a
+ * known module, listed once, at a known level.
+ */
+static int
+ice_diag_fwlog_query(ice_t *ice, uint8_t *buf, ice_diag_fwlog_t *q)
+{
+	struct ice_hw *hw = &ice->ice_hw;
+	const struct ice_aqc_fw_log_cfg_resp *resp =
+	    (const struct ice_aqc_fw_log_cfg_resp *)buf;
+	struct ice_aqc_fw_log *cmd;
+	struct ice_aq_desc desc;
+	uint32_t seen = 0;
+	uint_t i;
+	int status;
+
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+	if (!ice_fwlog_supported(hw))
+		return (ICE_ERR_NOT_SUPPORTED);
+
+	bzero(buf, ICE_AQ_MAX_BUF_LEN);
+	ice_fill_dflt_direct_cmd_desc(&desc, ice_aqc_opc_fw_logs_query);
+	cmd = &desc.params.fw_log;
+	cmd->cmd_flags = ICE_AQC_FW_LOG_AQ_QUERY;
+	status = ice_aq_send_cmd(hw, &desc, buf, ICE_AQ_MAX_BUF_LEN, NULL);
+	if (status != ICE_SUCCESS)
+		return (status);
+
+	bzero(q, sizeof (*q));
+	q->idf_nmods = LE16_TO_CPU(cmd->ops.cfg.mdl_cnt);
+	q->idf_resolution = LE16_TO_CPU(cmd->ops.cfg.log_resolution);
+	q->idf_flags = cmd->cmd_flags;
+	if (q->idf_nmods > ICE_FWLOG_NMODULES) {
+		ice_error(ice, "firmware lists %u log modules", q->idf_nmods);
+		return (ICE_ERR_CFG);
+	}
+
+	for (i = 0; i < q->idf_nmods; i++) {
+		uint16_t id = LE16_TO_CPU(resp[i].module_identifier);
+		uint8_t level = resp[i].log_level;
 
 		if (id >= ICE_FWLOG_NMODULES || (seen & (1u << id)) != 0 ||
 		    level > ICE_FWLOG_LEVEL_MAX) {
 			ice_error(ice, "firmware log configuration has an "
 			    "invalid entry: module %u level %u", id, level);
-			return (B_FALSE);
+			return (ICE_ERR_CFG);
 		}
 		seen |= 1u << id;
-		levels[id] = level;
+		q->idf_ids[i] = id;
+		q->idf_levels[i] = level;
 	}
 
-	return (B_TRUE);
+	return (ICE_SUCCESS);
+}
+
+/* Set Firmware Logging Configuration (0xFF30) for the listed modules only. */
+static int
+ice_diag_fwlog_config(ice_t *ice, uint8_t *buf, const ice_diag_fwlog_t *q)
+{
+	struct ice_hw *hw = &ice->ice_hw;
+	struct ice_aqc_fw_log_cfg_resp *mods =
+	    (struct ice_aqc_fw_log_cfg_resp *)buf;
+	struct ice_aqc_fw_log *cmd;
+	struct ice_aq_desc desc;
+	uint_t i;
+
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+	ASSERT3U(q->idf_nmods, >, 0);
+	ASSERT3U(q->idf_nmods, <=, ICE_FWLOG_NMODULES);
+
+	bzero(buf, q->idf_nmods * sizeof (*mods));
+	for (i = 0; i < q->idf_nmods; i++) {
+		mods[i].module_identifier = CPU_TO_LE16(q->idf_ids[i]);
+		mods[i].log_level = q->idf_levels[i];
+	}
+
+	ice_fill_dflt_direct_cmd_desc(&desc, ice_aqc_opc_fw_logs_config);
+	desc.flags |= CPU_TO_LE16(ICE_AQ_FLAG_RD);
+	cmd = &desc.params.fw_log;
+	cmd->cmd_flags = ICE_AQC_FW_LOG_CONF_SET_VALID |
+	    (q->idf_flags & (ICE_AQC_FW_LOG_CONF_AQ_EN |
+	    ICE_AQC_FW_LOG_CONF_UART_EN));
+	cmd->ops.cfg.log_resolution = CPU_TO_LE16(q->idf_resolution);
+	cmd->ops.cfg.mdl_cnt = CPU_TO_LE16(q->idf_nmods);
+
+	return (ice_aq_send_cmd(hw, &desc, buf,
+	    (uint16_t)(q->idf_nmods * sizeof (*mods)), NULL));
 }
 
 static int
 ice_diag_fwlog_get(ice_t *ice, ice_ioc_fwlog_cfg_t *cfg)
 {
-	struct ice_fwlog_cfg fw;
-	uint8_t levels[ICE_FWLOG_NMODULES] = { 0 };
+	ice_diag_fwlog_t q;
 	uint32_t module = cfg->ifc_module;
-	int status;
+	uint8_t *buf;
+	int status, slot;
 
 	if (module >= ICE_FWLOG_NMODULES)
 		return (EINVAL);
 
+	buf = kmem_alloc(ICE_AQ_MAX_BUF_LEN, KM_SLEEP);
 	mutex_enter(&ice->ice_rebuild_lock);
-	status = ice_fwlog_get(&ice->ice_hw, &fw);
+	status = ice_diag_fwlog_query(ice, buf, &q);
 	mutex_exit(&ice->ice_rebuild_lock);
+	kmem_free(buf, ICE_AQ_MAX_BUF_LEN);
 	if (status == ICE_ERR_NOT_SUPPORTED)
 		return (ENOTSUP);
-	if (status != ICE_SUCCESS || !ice_diag_fwlog_levels(ice, &fw, levels))
+	if (status != ICE_SUCCESS)
 		return (EIO);
+	if ((slot = ice_diag_fwlog_find(&q, module)) < 0)
+		return (ENOENT);
 
 	bzero(cfg, sizeof (*cfg));
 	cfg->ifc_module = module;
-	cfg->ifc_level = levels[module];
-	cfg->ifc_resolution = fw.log_resolution;
-	if ((fw.options & ICE_FWLOG_OPTION_ARQ_ENA) != 0)
+	cfg->ifc_level = q.idf_levels[slot];
+	cfg->ifc_resolution = q.idf_resolution;
+	if ((q.idf_flags & ICE_AQC_FW_LOG_CONF_AQ_EN) != 0)
 		cfg->ifc_flags |= ICE_FWLOG_F_ARQ;
-	if ((fw.options & ICE_FWLOG_OPTION_IS_REGISTERED) != 0)
+	if ((q.idf_flags & ICE_AQC_FW_LOG_QUERY_REGISTERED) != 0)
 		cfg->ifc_flags |= ICE_FWLOG_F_REGISTERED;
 
 	return (0);
 }
 
+/*
+ * Only the modules firmware listed are sent.  A module it did not list is
+ * ENOENT, and so is ICE_FWLOG_MODULE_ALL when it listed none.
+ */
 static int
 ice_diag_fwlog_set(ice_t *ice, const ice_ioc_fwlog_cfg_t *cfg)
 {
 	struct ice_hw *hw = &ice->ice_hw;
-	struct ice_fwlog_cfg fw;
-	uint8_t levels[ICE_FWLOG_NMODULES] = { 0 };
+	ice_diag_fwlog_t q;
 	boolean_t arq = (cfg->ifc_flags & ICE_FWLOG_F_ARQ) != 0;
 	uint8_t level = (uint8_t)cfg->ifc_level;
-	uint8_t *ring = NULL;
+	uint8_t *ring = NULL, *buf;
+	int status, slot;
 	uint_t i;
-	int status;
 
 	if ((cfg->ifc_module >= ICE_FWLOG_NMODULES &&
 	    cfg->ifc_module != ICE_FWLOG_MODULE_ALL) ||
@@ -205,30 +300,33 @@ ice_diag_fwlog_set(ice_t *ice, const ice_ioc_fwlog_cfg_t *cfg)
 	/* Allocate before the lock; the ring then lives until detach. */
 	if (arq && ice->ice_fwlog_buf == NULL)
 		ring = kmem_zalloc(ICE_FWLOG_RING_SIZE, KM_SLEEP);
+	buf = kmem_alloc(ICE_AQ_MAX_BUF_LEN, KM_SLEEP);
 
 	mutex_enter(&ice->ice_rebuild_lock);
-	status = ice_fwlog_get(hw, &fw);
+	status = ice_diag_fwlog_query(ice, buf, &q);
 	if (status != ICE_SUCCESS)
 		goto out;
-	if (!ice_diag_fwlog_levels(ice, &fw, levels)) {
-		status = ICE_ERR_CFG;
-		goto out;
-	}
 
-	for (i = 0; i < ICE_FWLOG_NMODULES; i++) {
-		fw.module_entries[i].module_id = (uint16_t)i;
-		if (cfg->ifc_module == ICE_FWLOG_MODULE_ALL ||
-		    cfg->ifc_module == i)
-			fw.module_entries[i].log_level = level;
-		else
-			fw.module_entries[i].log_level = levels[i];
+	if (cfg->ifc_module == ICE_FWLOG_MODULE_ALL) {
+		if (q.idf_nmods == 0) {
+			status = ICE_ERR_DOES_NOT_EXIST;
+			goto out;
+		}
+		for (i = 0; i < q.idf_nmods; i++)
+			q.idf_levels[i] = level;
+	} else {
+		if ((slot = ice_diag_fwlog_find(&q, cfg->ifc_module)) < 0) {
+			status = ICE_ERR_DOES_NOT_EXIST;
+			goto out;
+		}
+		q.idf_levels[slot] = level;
 	}
-	fw.log_resolution = (uint16_t)cfg->ifc_resolution;
-	fw.options &= ~ICE_FWLOG_OPTION_ARQ_ENA;
+	q.idf_resolution = (uint16_t)cfg->ifc_resolution;
+	q.idf_flags &= ~ICE_AQC_FW_LOG_CONF_AQ_EN;
 	if (arq)
-		fw.options |= ICE_FWLOG_OPTION_ARQ_ENA;
+		q.idf_flags |= ICE_AQC_FW_LOG_CONF_AQ_EN;
 
-	status = ice_fwlog_set(hw, &fw);
+	status = ice_diag_fwlog_config(ice, buf, &q);
 	if (status != ICE_SUCCESS)
 		goto out;
 
@@ -244,11 +342,14 @@ ice_diag_fwlog_set(ice_t *ice, const ice_ioc_fwlog_cfg_t *cfg)
 
 out:
 	mutex_exit(&ice->ice_rebuild_lock);
+	kmem_free(buf, ICE_AQ_MAX_BUF_LEN);
 	if (ring != NULL)
 		kmem_free(ring, ICE_FWLOG_RING_SIZE);
 
 	if (status == ICE_ERR_NOT_SUPPORTED)
 		return (ENOTSUP);
+	if (status == ICE_ERR_DOES_NOT_EXIST)
+		return (ENOENT);
 	return (status == ICE_SUCCESS ? 0 : EIO);
 }
 

@@ -34,6 +34,8 @@
  *			with ICE_FWLOG_MODULE_ALL, the minimum number of log
  *			entries per event, and whether firmware sends log
  *			events to this PF.  A device reset clears the setting.
+ *			Both fail with ENOENT for a module that firmware does
+ *			not report.
  * ICE_IOC_FWLOG_READ	Take up to ICE_IOC_BUFSZ bytes of queued log event
  *			data.  The driver queues at most ICE_FWLOG_RING_SIZE
  *			bytes; events that do not fit are dropped and counted.

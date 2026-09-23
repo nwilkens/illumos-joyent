@@ -96,6 +96,7 @@ main(void)
 	static ice_ioc_fwdump_t dump;
 	ice_ioc_fwlog_cfg_t cfg;
 	char path[128];
+	uint32_t m;
 	int fd, ret;
 
 	if (link == NULL) {
@@ -107,10 +108,17 @@ main(void)
 	if ((fd = open(path, O_RDWR)) == -1)
 		err(EXIT_FAILURE, "open %s", path);
 
-	/* Firmware without logging support answers ENOTSUP. */
-	(void) memset(&cfg, 0, sizeof (cfg));
-	ret = diag(fd, ICE_IOC_FWLOG_GET, &cfg, sizeof (cfg));
-	expect("FWLOG_GET module 0", ret, 0, ENOTSUP);
+	/*
+	 * Firmware without logging support answers ENOTSUP, and a module it
+	 * does not report answers ENOENT.
+	 */
+	ret = ENOENT;
+	for (m = 0; m < ICE_FWLOG_NMODULES && ret == ENOENT; m++) {
+		(void) memset(&cfg, 0, sizeof (cfg));
+		cfg.ifc_module = m;
+		ret = diag(fd, ICE_IOC_FWLOG_GET, &cfg, sizeof (cfg));
+	}
+	expect("FWLOG_GET a reported module", ret, 0, ENOTSUP);
 	if (ret == 0 && cfg.ifc_level > ICE_FWLOG_LEVEL_MAX) {
 		(void) printf("FAIL: level %u out of range\n", cfg.ifc_level);
 		failures++;
