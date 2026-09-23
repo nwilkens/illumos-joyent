@@ -23,24 +23,46 @@ def main() -> None:
         "ice_tx_emit(ice_tx_ring_t *itr,",
         "\nstatic boolean_t\nice_tx_desc_done",
     )
+    doorbell = function(
+        tx,
+        "ice_tx_doorbell(ice_tx_ring_t *itr)\n{",
+        "\n}\n",
+    )
 
-    # the doorbell is still rung, and still FM-checked
-    assert "wr32(hw, QTX_COMM_DBELL(itr->itxr_index), tail);" in emit
-    assert "ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle)" in emit
+    # the doorbell writes the tail, and is still FM-checked
+    assert "QTX_COMM_DBELL(itr->itxr_index), itr->itxr_tail);" in doorbell
+    assert "ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle)" in \
+        doorbell
+    assert "ASSERT(MUTEX_HELD(&itr->itxr_lock));" in doorbell
+    assert doorbell.index("itxr_unposted == 0") < doorbell.index("wr32(")
+
+    # emit only counts, and posts once a batch is written
+    assert "wr32(" not in emit
+    assert emit.index("itr->itxr_tail = tail;") < \
+        emit.index("itr->itxr_unposted += ndesc;") < \
+        emit.index("ice_tx_doorbell(itr);")
+    assert "ICE_TX_DOORBELL_BATCH" in emit
+
+    # every return from the send entry point posts what it wrote
+    ring_tx = function(tx, "\nice_ring_tx(void *arg, mblk_t *mp)\n{",
+                       "\n}\n")
+    tail = ring_tx[ring_tx.rindex("mutex_enter(&itr->itxr_lock);"):]
+    assert tail.index("ice_tx_doorbell(itr);") < \
+        tail.index("--itr->itxr_tx_active") < tail.index("return (mp);")
+    assert ring_tx.count("return (") == 3
 
     # no per-packet MMIO readback
-    assert "ice_flush(" not in emit
+    assert "ice_flush(" not in emit and "ice_flush(" not in doorbell
 
     # no whole-ring sync; only the descriptors written are pushed
     assert "ddi_dma_sync(itr->itxr_dma.idb_dma_handle, 0, 0" not in emit
     assert "ice_tx_sync_descs(itr, itr->itxr_tail, written);" in emit
     assert "ice_check_dma_handle(itr->itxr_dma.idb_dma_handle)" in emit
 
-    # the sync happens before the doorbell, and before itxr_tail advances
+    # the sync happens before itxr_tail advances, so before any doorbell
     sync = emit.index("ice_tx_sync_descs(itr, itr->itxr_tail, written);")
     advance = emit.index("itr->itxr_tail = tail;")
-    doorbell = emit.index("wr32(hw, QTX_COMM_DBELL(")
-    assert sync < advance < doorbell
+    assert sync < advance
 
     # the helper covers wrap and uses descriptor-sized offsets
     helper = function(

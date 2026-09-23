@@ -55,7 +55,7 @@ def main() -> None:
     lso_copy = function(tx, "ice_tx_lso_copy(ice_tx_ring_t *itr,",
                         "\n}\n")
     # a ring without an LSO pool drops rather than blocking for good
-    missing = lso_copy[:lso_copy.index("ice_tcb_alloc(itr)")]
+    missing = lso_copy[:lso_copy.index("ice_tcb_alloc(itr,")]
     assert "itxr_lso_pool.ibp_nbufs == 0" in missing
     assert "ICE_TX_BUILD_DROP" in missing
 

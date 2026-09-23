@@ -194,7 +194,29 @@ ice_tcb_lso_handles_free(ice_tx_ring_t *itr)
 void ice_buf_fini(ice_t *);
 boolean_t ice_tx_lso_alloc(ice_t *);
 void ice_tx_lso_free(ice_t *);
+ice_dma_buffer_t *ice_buf_take(ice_buf_pool_t *);
+void ice_buf_put(ice_dma_buffer_t *);
 #include "ice_pool_code.h"
+
+/* The TX path takes and returns buffers under the pool (TCB) lock. */
+static ice_dma_buffer_t *
+take(ice_buf_pool_t *pool)
+{
+	ice_dma_buffer_t *buf;
+
+	mutex_enter(pool->ibp_lock);
+	buf = ice_buf_take(pool);
+	mutex_exit(pool->ibp_lock);
+	return (buf);
+}
+
+static void
+put(ice_dma_buffer_t *buf)
+{
+	mutex_enter(buf->idb_pool->ibp_lock);
+	ice_buf_put(buf);
+	mutex_exit(buf->idb_pool->ibp_lock);
+}
 
 static ice_t *
 make(uint_t nrings, uint16_t size)
@@ -294,25 +316,24 @@ check_stacks(void)
 	n = a->itxr_copy_pool.ibp_nbufs;
 	assert(n == ICE_TX_COPY_BUFS_RING);
 	for (i = 0; i < n; i++) {
-		held[i] = ice_buf_alloc(a);
+		held[i] = take(&a->itxr_copy_pool);
 		assert(held[i] != NULL);
 		assert(held[i]->idb_len == ICE_TX_COPY_BUFSZ);
 	}
 	/* One ring's empty pool leaves the other ring's pool alone. */
-	assert(ice_buf_alloc(a) == NULL);
-	other = ice_buf_alloc(b);
+	assert(take(&a->itxr_copy_pool) == NULL);
+	other = take(&b->itxr_copy_pool);
 	assert(other != NULL && other->idb_pool == &b->itxr_copy_pool);
-	small = ice_small_buf_alloc(a);
+	small = take(&a->itxr_small_pool);
 	assert(small != NULL && small->idb_len == ICE_TX_SMALL_PKT);
 	/* No LSO pool exists before MAC start. */
-	assert(ice_lso_buf_alloc(a) == NULL);
-	ice_buf_free(NULL);
-	ice_buf_free(other);
+	assert(take(&a->itxr_lso_pool) == NULL);
+	put(other);
 	assert(b->itxr_copy_pool.ibp_nfree == n);
 	assert(a->itxr_copy_pool.ibp_nfree == 0);
-	ice_buf_free(small);
+	put(small);
 	for (i = 0; i < n; i++) {
-		ice_buf_free(held[i]);
+		put(held[i]);
 		assert(a->itxr_copy_pool.ibp_nfree == i + 1);
 	}
 	assert(locks == 0);
@@ -382,9 +403,9 @@ check_lso_alloc(void)
 			assert(itr->itxr_lso_pool.ibp_nbufs == n);
 			assert(itr->itxr_lso_pool.ibp_nfree == n);
 			assert(itr->lso_handles);
-			lso = ice_lso_buf_alloc(itr);
+			lso = take(&itr->itxr_lso_pool);
 			assert(lso != NULL && lso->idb_len == ICE_TX_LSO_BUFSZ);
-			ice_buf_free(lso);
+			put(lso);
 		}
 
 		/* A rebuild restarts with the pools it kept. */
@@ -397,7 +418,7 @@ check_lso_alloc(void)
 		for (i = 0; i < nrings; i++) {
 			assert(ice->ice_txr[i].itxr_lso_pool.ibp_bufs == NULL);
 			assert(!ice->ice_txr[i].lso_handles);
-			assert(ice_lso_buf_alloc(&ice->ice_txr[i]) == NULL);
+			assert(take(&ice->ice_txr[i].itxr_lso_pool) == NULL);
 		}
 		ice_tx_lso_free(ice);
 

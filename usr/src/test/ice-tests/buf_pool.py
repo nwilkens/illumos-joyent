@@ -22,9 +22,8 @@ def main():
                                          types, re.MULTILINE)]
     fragments.append(extract(types, r"^#define\tICE_TX_SMALL_ALIGN\t.*$",
                              header))
-    names = ("ice_buf_pool_fini", "ice_buf_pool_init", "ice_buf_pool_alloc",
-             "ice_buf_alloc", "ice_lso_buf_alloc", "ice_small_buf_alloc",
-             "ice_buf_free", "ice_tx_pool_bufs", "ice_buf_init",
+    names = ("ice_buf_pool_fini", "ice_buf_pool_init", "ice_buf_take",
+             "ice_buf_put", "ice_tx_pool_bufs", "ice_buf_init",
              "ice_tx_lso_fini", "ice_tx_lso_alloc", "ice_tx_lso_free",
              "ice_buf_fini")
     bodies = [extract(dma, rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}", source)

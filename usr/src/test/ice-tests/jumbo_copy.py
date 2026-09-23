@@ -75,10 +75,11 @@ def main() -> None:
             "ice_tx_copy_packet(ice_tx_ring_t *itr, mblk_t *mp, size_t msglen,"
         ),
     )
-    small = copy_packet.index("ice_small_buf_alloc(itr)")
-    assert copy_packet.index("ice_buf_alloc(itr)", small) > small
+    small = copy_packet.index("ice_tcb_alloc(itr, &itr->itxr_small_pool)")
+    assert copy_packet.index("ice_tcb_alloc(itr, &itr->itxr_copy_pool)",
+                             small) > small
     # The general pool must be usable with ice_tx_lso_enable off.
-    assert "ice_lso_buf_alloc(" not in copy_packet
+    assert "itxr_lso_pool" not in copy_packet
 
     max_frame = re.search(
         r"#define\s+ICE_AQ_SET_MAC_FRAME_SIZE_MAX\s+(\d+)", adminq

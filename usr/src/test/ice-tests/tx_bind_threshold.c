@@ -42,6 +42,10 @@ typedef struct mblk {
 	uint_t cookies;
 } mblk_t;
 
+struct ice_buf_pool {
+	int unused;
+};
+typedef struct ice_buf_pool ice_buf_pool_t;
 #include "ice_tx_types.h"
 
 typedef struct ice {
@@ -53,6 +57,7 @@ typedef struct ice {
 typedef struct ice_tx_ring {
 	ice_t *itxr_ice;
 	ice_txq_stat_t itxr_stats;
+	ice_buf_pool_t itxr_small_pool, itxr_copy_pool, itxr_lso_pool;
 } ice_tx_ring_t;
 
 /* Substitute pool and DMA allocation; copy/build behavior is actual C. */
@@ -61,16 +66,30 @@ static int used[16];
 static uint_t nbinds, nfrees;
 static int fail_bind;
 
+/* A TCB and, from a pool, a buffer: both or neither. */
 static ice_tx_ctrl_block_t *
-ice_tcb_alloc(ice_tx_ring_t *itr)
+ice_tcb_alloc(ice_tx_ring_t *itr, ice_buf_pool_t *pool)
 {
+	ice_t *ice = itr->itxr_ice;
+	ice_dma_buffer_t *buf = NULL;
 	size_t i;
 
-	(void) itr;
+	assert(pool == NULL || pool == &itr->itxr_small_pool ||
+	    pool == &itr->itxr_copy_pool);
+	if (pool == &itr->itxr_small_pool) {
+		if (!ice->small_available)
+			return (NULL);
+		buf = &ice->small;
+	} else if (pool == &itr->itxr_copy_pool) {
+		if (!ice->general_available)
+			return (NULL);
+		buf = &ice->general;
+	}
 	for (i = 0; i < 16; i++) {
 		if (!used[i]) {
 			used[i] = 1;
 			(void) memset(&blocks[i], 0, sizeof (blocks[i]));
+			blocks[i].itcb_buf = buf;
 			return (&blocks[i]);
 		}
 	}
@@ -88,23 +107,6 @@ ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
 	nfrees++;
 }
 
-/* The pools belong to the ring that sends the packet. */
-static ice_dma_buffer_t *
-ice_small_buf_alloc(ice_tx_ring_t *itr)
-{
-	ice_t *ice = itr->itxr_ice;
-
-	return (ice->small_available ? &ice->small : NULL);
-}
-
-static ice_dma_buffer_t *
-ice_buf_alloc(ice_tx_ring_t *itr)
-{
-	ice_t *ice = itr->itxr_ice;
-
-	return (ice->general_available ? &ice->general : NULL);
-}
-
 static ice_tx_ctrl_block_t *
 ice_tx_bind_fragment(ice_tx_ring_t *itr, mblk_t *mp, uint_t *ncookies)
 {
@@ -113,7 +115,7 @@ ice_tx_bind_fragment(ice_tx_ring_t *itr, mblk_t *mp, uint_t *ncookies)
 	nbinds++;
 	if (fail_bind)
 		return (NULL);
-	tcb = ice_tcb_alloc(itr);
+	tcb = ice_tcb_alloc(itr, NULL);
 	assert(tcb != NULL);
 	tcb->itcb_type = ITCB_BIND;
 	tcb->itcb_len = MBLKL(mp);

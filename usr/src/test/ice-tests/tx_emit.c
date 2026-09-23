@@ -96,7 +96,7 @@ typedef struct ice_tx_ring {
 	ice_t *itxr_ice;
 	boolean_t itxr_lock, itxr_tcb_lock;
 	boolean_t itxr_quiesce, itxr_blocked;
-	uint16_t itxr_size, itxr_head, itxr_tail, itxr_avail;
+	uint16_t itxr_size, itxr_head, itxr_tail, itxr_avail, itxr_unposted;
 	uint16_t itxr_rs_pidx, itxr_rs_cidx;
 	uint16_t itxr_rsq[RING_SIZE];
 	uint_t itxr_index, itxr_tcb_nfree;
@@ -186,11 +186,13 @@ ddi_dma_unbind_handle(ddi_dma_handle_t handle)
 	return (0);
 }
 
+/* A buffer goes back with its TCB, under the TCB lock. */
 static void
-ice_buf_free(ice_dma_buffer_t *buf)
+ice_buf_put(ice_dma_buffer_t *buf)
 {
 	uint_t index;
 
+	assert(f.ring.itxr_tcb_lock);
 	assert(buf == &f.buffers[0] || buf == &f.buffers[1]);
 	index = (buf == &f.buffers[1]);
 	assert(++f.returns[index] == 1);
@@ -395,7 +397,8 @@ check_emitted(void)
 		    DDI_DMA_SYNC_FORDEV);
 	}
 	assert(f.nsyncs == (first_span == f.ndesc ? 4U : 5U));
-	assert(f.doorbells == 1 && f.mp.frees == 0);
+	assert(f.doorbells == 1 && f.ring.itxr_unposted == 0);
+	assert(f.mp.frees == 0);
 	assert(f.ring.itxr_tcb_nfree == 0 && f.active->unbinds == 0);
 }
 
@@ -476,11 +479,34 @@ success_cases(void)
 				    bound_last);
 				assert(ice_tx_emit(&f.ring, f.chain, 3, f.ndesc,
 				    &f.mp, &f.ctx));
+				/* The end of the chain posts it. */
+				assert(f.doorbells == 0 &&
+				    f.ring.itxr_unposted == f.ndesc);
+				ice_tx_doorbell(&f.ring);
+				ice_tx_doorbell(&f.ring);
 				check_emitted();
 				assert(f.impacts == 0 && f.ice.ice_state == 0);
 				complete_packet();
 			}
 		}
+	}
+}
+
+/* A long chain posts once it has written ICE_TX_DOORBELL_BATCH descriptors. */
+static void
+batch_cases(void)
+{
+	uint_t below;
+
+	for (below = 0; below < 2; below++) {
+		setup(ITCB_COPY, B_FALSE, 1, B_FALSE);
+		f.ring.itxr_unposted = ICE_TX_DOORBELL_BATCH - f.ndesc - below;
+		assert(ice_tx_emit(&f.ring, f.chain, 3, f.ndesc, &f.mp,
+		    &f.ctx));
+		assert(f.doorbells == (below ? 0U : 1U));
+		ice_tx_doorbell(&f.ring);
+		check_emitted();
+		complete_packet();
 	}
 }
 
@@ -497,7 +523,9 @@ failure_cases(void)
 			    &f.dma[0])->fault = B_TRUE;
 			assert(!ice_tx_emit(&f.ring, f.chain, 3, f.ndesc,
 			    &f.mp, &f.ctx));
+			ice_tx_doorbell(&f.ring);
 			assert(f.doorbells == 0 && f.ring.itxr_tail == f.start);
+			assert(f.ring.itxr_unposted == 0);
 			assert(f.ring.itxr_avail == RING_SIZE);
 			assert(f.ring.itxr_rs_pidx == RING_SIZE - 1);
 			assert(f.ring.itxr_rs_cidx == RING_SIZE - 1);
@@ -520,6 +548,8 @@ failure_cases(void)
 		f.access_fault = B_TRUE;
 		assert(ice_tx_emit(&f.ring, f.chain, 3, f.ndesc,
 		    &f.mp, &f.ctx));
+		assert(f.impacts == 0);
+		ice_tx_doorbell(&f.ring);
 		check_emitted();
 		assert(f.impacts == 1 &&
 		    (f.ice.ice_state & ICE_STATE_ERROR) != 0);
@@ -531,6 +561,7 @@ int
 main(void)
 {
 	success_cases();
+	batch_cases();
 	failure_cases();
 	(void) puts("PASS: ICE TX cookies, wrap, completion ownership "
 	    "and failures");

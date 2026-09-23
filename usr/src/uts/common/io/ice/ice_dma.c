@@ -305,55 +305,33 @@ ice_buf_pool_init(ice_t *ice, ice_buf_pool_t *pool, uint_t n, size_t size)
 	return (B_TRUE);
 }
 
-static ice_dma_buffer_t *
-ice_buf_pool_alloc(ice_buf_pool_t *pool)
+/*
+ * The caller holds the pool lock, which is the ring's TCB lock, so a TCB and
+ * its buffer move under one hold.
+ */
+ice_dma_buffer_t *
+ice_buf_take(ice_buf_pool_t *pool)
 {
 	ice_dma_buffer_t *buf;
 
-	mutex_enter(pool->ibp_lock);
-	if (pool->ibp_nfree == 0) {
-		mutex_exit(pool->ibp_lock);
+	ASSERT(MUTEX_HELD(pool->ibp_lock));
+	if (pool->ibp_nfree == 0)
 		return (NULL);
-	}
 	buf = pool->ibp_free[--pool->ibp_nfree];
 	pool->ibp_free[pool->ibp_nfree] = NULL;
-	mutex_exit(pool->ibp_lock);
 	return (buf);
-}
-
-ice_dma_buffer_t *
-ice_buf_alloc(ice_tx_ring_t *itr)
-{
-	return (ice_buf_pool_alloc(&itr->itxr_copy_pool));
-}
-
-ice_dma_buffer_t *
-ice_lso_buf_alloc(ice_tx_ring_t *itr)
-{
-	return (ice_buf_pool_alloc(&itr->itxr_lso_pool));
-}
-
-ice_dma_buffer_t *
-ice_small_buf_alloc(ice_tx_ring_t *itr)
-{
-	return (ice_buf_pool_alloc(&itr->itxr_small_pool));
 }
 
 /* The allocation records its owner; callers never choose a return pool. */
 void
-ice_buf_free(ice_dma_buffer_t *buf)
+ice_buf_put(ice_dma_buffer_t *buf)
 {
-	ice_buf_pool_t *pool;
+	ice_buf_pool_t *pool = buf->idb_pool;
 
-	if (buf == NULL)
-		return;
-	pool = buf->idb_pool;
 	ASSERT3P(pool, !=, NULL);
-
-	mutex_enter(pool->ibp_lock);
+	ASSERT(MUTEX_HELD(pool->ibp_lock));
 	ASSERT3U(pool->ibp_nfree, <, pool->ibp_nbufs);
 	pool->ibp_free[pool->ibp_nfree++] = buf;
-	mutex_exit(pool->ibp_lock);
 }
 
 /* Buffers per ring in one pool: the per-ring count, within the cap. */

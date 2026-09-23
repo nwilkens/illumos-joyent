@@ -527,15 +527,22 @@ ice_tx_ring_next(const ice_tx_ring_t *itr, uint16_t idx)
 	return (idx);
 }
 
+/*
+ * Take a TCB and, unless pool is NULL, a buffer from pool.  Both or neither:
+ * NULL means one of them is exhausted.
+ */
 static ice_tx_ctrl_block_t *
-ice_tcb_alloc(ice_tx_ring_t *itr)
+ice_tcb_alloc(ice_tx_ring_t *itr, ice_buf_pool_t *pool)
 {
 	ice_tx_ctrl_block_t *tcb = NULL;
 
 	mutex_enter(&itr->itxr_tcb_lock);
-	if (itr->itxr_tcb_nfree > 0) {
+	if (itr->itxr_tcb_nfree > 0 &&
+	    (pool == NULL || pool->ibp_nfree > 0)) {
 		tcb = itr->itxr_tcb_free_list[--itr->itxr_tcb_nfree];
 		itr->itxr_tcb_free_list[itr->itxr_tcb_nfree] = NULL;
+		if (pool != NULL)
+			tcb->itcb_buf = ice_buf_take(pool);
 	}
 	mutex_exit(&itr->itxr_tcb_lock);
 
@@ -559,24 +566,15 @@ ice_tcb_bind_handle(const ice_tx_ctrl_block_t *tcb)
 static void
 ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
 {
+	ice_dma_buffer_t *buf;
+
 	if (tcb == NULL)
 		return;
 
-	switch (tcb->itcb_type) {
-	case ITCB_NOT_USED:
-		break;
-	case ITCB_SMALL_COPY:
-	case ITCB_COPY:
-	case ITCB_LSO_COPY:
-		ice_buf_free(tcb->itcb_buf);
-		tcb->itcb_buf = NULL;
-		break;
-	case ITCB_BIND:
-	case ITCB_LSO_BIND:
+	if (tcb->itcb_type == ITCB_BIND || tcb->itcb_type == ITCB_LSO_BIND)
 		(void) ddi_dma_unbind_handle(ice_tcb_bind_handle(tcb));
-		break;
-	}
-
+	buf = tcb->itcb_buf;
+	tcb->itcb_buf = NULL;
 	tcb->itcb_type = ITCB_NOT_USED;
 	tcb->itcb_len = 0;
 	if (tcb->itcb_mp != NULL) {
@@ -585,6 +583,8 @@ ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
 	}
 
 	mutex_enter(&itr->itxr_tcb_lock);
+	if (buf != NULL)
+		ice_buf_put(buf);
 	ASSERT3U(itr->itxr_tcb_nfree, <, itr->itxr_size);
 	itr->itxr_tcb_free_list[itr->itxr_tcb_nfree++] = tcb;
 	mutex_exit(&itr->itxr_tcb_lock);
@@ -603,7 +603,7 @@ ice_tx_bind_fragment(ice_tx_ring_t *itr, mblk_t *mp, uint_t *ncookiesp)
 	uint_t ncookies;
 	int ret;
 
-	tcb = ice_tcb_alloc(itr);
+	tcb = ice_tcb_alloc(itr, NULL);
 	if (tcb == NULL)
 		return (NULL);
 
@@ -642,7 +642,7 @@ ice_tx_bind_lso_fragment(ice_tx_ring_t *itr, caddr_t addr, size_t len,
 	if (len == 0 || len > ICE_LSO_MAXLEN)
 		return (NULL);
 
-	tcb = ice_tcb_alloc(itr);
+	tcb = ice_tcb_alloc(itr, NULL);
 	if (tcb == NULL)
 		return (NULL);
 
@@ -692,19 +692,12 @@ ice_tx_copy_packet(ice_tx_ring_t *itr, mblk_t *mp, size_t msglen,
 	mblk_t *cmp;
 	caddr_t dst;
 
-	tcb = ice_tcb_alloc(itr);
-	if (tcb == NULL) {
-		*resp = ICE_TX_BUILD_NORES;
-		return (NULL);
-	}
-
 	if (msglen <= ICE_TX_SMALL_PKT &&
-	    (tcb->itcb_buf = ice_small_buf_alloc(itr)) != NULL) {
+	    (tcb = ice_tcb_alloc(itr, &itr->itxr_small_pool)) != NULL) {
 		tcb->itcb_type = ITCB_SMALL_COPY;
-	} else if ((tcb->itcb_buf = ice_buf_alloc(itr)) != NULL) {
+	} else if ((tcb = ice_tcb_alloc(itr, &itr->itxr_copy_pool)) != NULL) {
 		tcb->itcb_type = ITCB_COPY;
 	} else {
-		ice_tcb_free(itr, tcb);
 		*resp = ICE_TX_BUILD_NORES;
 		return (NULL);
 	}
@@ -839,16 +832,9 @@ ice_tx_lso_copy(ice_tx_ring_t *itr, mblk_t **mpp, size_t *offp, size_t len,
 		return (NULL);
 	}
 
-	tcb = ice_tcb_alloc(itr);
+	tcb = ice_tcb_alloc(itr, header ? &itr->itxr_small_pool :
+	    &itr->itxr_lso_pool);
 	if (tcb == NULL) {
-		*resp = ICE_TX_BUILD_NORES;
-		return (NULL);
-	}
-
-	tcb->itcb_buf = header ? ice_small_buf_alloc(itr) :
-	    ice_lso_buf_alloc(itr);
-	if (tcb->itcb_buf == NULL) {
-		ice_tcb_free(itr, tcb);
 		*resp = ICE_TX_BUILD_NORES;
 		return (NULL);
 	}
@@ -1455,17 +1441,40 @@ ice_tx_sync_tcb(ice_t *ice, ice_tx_ctrl_block_t *tcb)
 }
 
 /*
- * Lay a fully-built TCB chain onto the ring and ring the doorbell.  The caller
- * holds itxr_lock and has confirmed itxr_avail >= ndesc.  EOP|RS is set only on
- * the final descriptor so hardware reports the whole packet's completion once.
- * Returns B_FALSE on a fatal DMA error (packet dropped, ring left consistent).
+ * Give hardware every descriptor written since the last doorbell.  The
+ * descriptors are already parked, so a faulted write only latches the error
+ * (stopping further tx until replumb); nothing is unwound.
+ */
+static void
+ice_tx_doorbell(ice_tx_ring_t *itr)
+{
+	ice_t *ice = itr->itxr_ice;
+
+	ASSERT(MUTEX_HELD(&itr->itxr_lock));
+	if (itr->itxr_unposted == 0)
+		return;
+	itr->itxr_unposted = 0;
+	wr32(&ice->ice_hw, QTX_COMM_DBELL(itr->itxr_index), itr->itxr_tail);
+	if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
+	    DDI_FM_OK) {
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
+		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
+	}
+}
+
+/*
+ * Lay a fully-built TCB chain onto the ring.  The caller holds itxr_lock and
+ * has confirmed itxr_avail >= ndesc.  EOP|RS is set only on the final
+ * descriptor so hardware reports the whole packet's completion once.  The
+ * doorbell waits for ICE_TX_DOORBELL_BATCH descriptors or the end of the
+ * chain (ice_ring_tx()).  Returns B_FALSE on a fatal DMA error (packet
+ * dropped, ring left consistent).
  */
 static boolean_t
 ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs, uint_t ntcb,
     uint_t ndesc, mblk_t *mp, const ice_tx_ctx_t *ctx)
 {
 	ice_t *ice = itr->itxr_ice;
-	struct ice_hw *hw = &ice->ice_hw;
 	uint16_t tail = itr->itxr_tail;
 	uint16_t last = tail;
 	uint_t written = 0;
@@ -1572,19 +1581,9 @@ ice_tx_emit(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **tcbs, uint_t ntcb,
 
 	itr->itxr_tail = tail;
 	itr->itxr_avail -= ndesc;
-
-	wr32(hw, QTX_COMM_DBELL(itr->itxr_index), tail);
-
-	/*
-	 * The descriptors are already parked, so a faulted doorbell write only
-	 * latches the error (stopping further tx until replumb); it must not
-	 * unwind the TCBs the caller would otherwise free a second time.
-	 */
-	if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
-	    DDI_FM_OK) {
-		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_DEGRADED);
-		atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
-	}
+	itr->itxr_unposted += ndesc;
+	if (itr->itxr_unposted >= ICE_TX_DOORBELL_BATCH)
+		ice_tx_doorbell(itr);
 
 	return (B_TRUE);
 }
@@ -1916,7 +1915,9 @@ ice_ring_tx(void *arg, mblk_t *mp)
 		mp = next;
 	}
 
+	/* Every exit, a full ring included, must post what this call wrote. */
 	mutex_enter(&itr->itxr_lock);
+	ice_tx_doorbell(itr);
 	if (--itr->itxr_tx_active == 0)
 		cv_signal(&itr->itxr_cv);
 	mutex_exit(&itr->itxr_lock);
@@ -1940,6 +1941,7 @@ ice_tx_start(ice_t *ice)
 		mutex_enter(&itr->itxr_lock);
 		itr->itxr_head = 0;
 		itr->itxr_tail = 0;
+		itr->itxr_unposted = 0;
 		itr->itxr_avail = itr->itxr_size;
 		itr->itxr_rs_pidx = 0;
 		itr->itxr_rs_cidx = 0;
@@ -2003,6 +2005,7 @@ ice_tx_reclaim(ice_t *ice)
 
 		itr->itxr_head = 0;
 		itr->itxr_tail = 0;
+		itr->itxr_unposted = 0;
 		itr->itxr_avail = itr->itxr_size;
 		itr->itxr_rs_pidx = 0;
 		itr->itxr_rs_cidx = 0;

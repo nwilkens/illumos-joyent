@@ -615,19 +615,26 @@ them. The TX path never waits on an LSO allocation, and an LSO payload copy
 on a ring without an LSO pool is dropped rather than blocking the ring.
 
 `tx_emit.py` compiles the actual descriptor writers, emission, DMA sync,
-TCB cleanup, and completion walk. Twenty cases cover ordinary/LSO bindings,
-all copy-buffer types, ring wrap, context and RS descriptors, exactly-once
-ownership, pre-doorbell DMA failures, and doorbell errors. Descriptor fields
+TCB cleanup, doorbell, and completion walk. Twenty-two cases cover
+ordinary/LSO bindings, all copy-buffer types, ring wrap, context and RS
+descriptors, exactly-once ownership, pre-doorbell DMA failures, doorbell
+errors, and a chain that reaches the doorbell batch mid-way. A packet leaves
+emit unposted; the doorbell posts it once and a second call writes nothing.
+A copy buffer goes back to its pool under the TCB lock, with its TCB. Descriptor fields
 are decoded independently of the writers. Controls with wrong addresses,
 TCB placement, rollback, or bind-handle selection fail at runtime. Pool and
 DDI operations are boundary substitutes, not hardware validation.
 
 `tx_doorbell.py` verifies the descriptor-sync and doorbell sequence: only the
 descriptors the packet wrote are synced, split at ring wrap with
-descriptor-sized offsets; the sync precedes the tail advance and the doorbell;
-the doorbell write is FM-checked; there is no per-packet MMIO readback or
-whole-ring sync; and the control paths keep their flush while recycle keeps its
-`DDI_DMA_SYNC_FORKERNEL` sync.
+descriptor-sized offsets; the sync precedes the tail advance and so any
+doorbell; emit only counts the descriptors it wrote and rings the doorbell
+once `ICE_TX_DOORBELL_BATCH` are unposted; `ice_ring_tx()` rings it on its
+way out, under the ring lock and before it drops its in-flight count, so a
+chain that fills the ring still posts what it wrote; the doorbell writes the
+current tail and is FM-checked; there is no per-packet MMIO readback or
+whole-ring sync; and the control paths keep their flush while recycle keeps
+its `DDI_DMA_SYNC_FORKERNEL` sync.
 
 `vlan_rx.py` checks descriptor tag/decode ordering and in-place insertion
 bounds. `rx_layout.py` executes the production copy, loan, descriptor posting,
@@ -659,8 +666,10 @@ allocates nothing on a rebuild that kept them. A buffer or handle failure on
 any ring returns failure with no ring holding part of a pool.
 `ice_tx_lso_free()` releases them all, and detach releases pools a stop left.
 The test also covers failure at every DMA allocation, repeated cleanup, and
-per-ring exhaustion and returns. The source must keep no TX taskq and no LSO
-state machine. Allocation and release boundaries assert that
+per-ring exhaustion and returns; the TX path takes and returns buffers with
+`ice_buf_take()` and `ice_buf_put()`, which require the pool's lock (the
+ring's TCB lock) so a TCB and its buffer move under one hold. The source must
+keep no TX taskq and no LSO state machine. Allocation and release boundaries assert that
 no pool or ring lock is held. These controlled boundaries do not exercise
 real DMA.
 

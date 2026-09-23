@@ -37,7 +37,7 @@ def main() -> None:
     dma = DMA_SOURCE.read_text(encoding="utf-8")
     assert "dma_attr_count_max = ICE_TX_MAX_BUFSZ - 1" in dma
     assert "ICE_TX_LSO_BUFSZ" in dma
-    assert "ice_lso_buf_alloc" in dma
+    assert "itxr_lso_pool" in dma
 
     gld = GLD_SOURCE.read_text(encoding="utf-8")
     cap = function(gld, "case MAC_CAPAB_LSO: {", "\n\tdefault:")
@@ -97,7 +97,7 @@ def main() -> None:
     assert "fraglen, B_FALSE," in lso_build
     copy = function(tx, "ice_tx_lso_copy(ice_tx_ring_t *itr, mblk_t **mpp,",
                     "\n/*\n * Push only the descriptors")
-    assert "header ? ice_small_buf_alloc(itr) :" in copy
+    assert "header ? &itr->itxr_small_pool :" in copy
     assert "CTASSERT(ICE_TX_LSO_MAX_HDRLEN <= ICE_TX_SMALL_PKT);" in header
 
     print("PASS: ice LSO source invariants")

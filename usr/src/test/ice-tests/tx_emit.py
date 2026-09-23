@@ -27,7 +27,7 @@ def main():
         alias = name if name.endswith("_t") else name + "_t"
         types.append(extract_file(header,
             rf"^typedef struct {name} \{{[\s\S]*?^}} {alias};"))
-    for name in ("ICE_DMA_PA", "ICE_TX_MAX_BUFSZ"):
+    for name in ("ICE_DMA_PA", "ICE_TX_MAX_BUFSZ", "ICE_TX_DOORBELL_BATCH"):
         types.append(extract_file(header,
             rf"^#define\s+{name}(?:\([^\n]*|\s+[^\n]*)"))
     types.append(extract(source,
@@ -35,7 +35,8 @@ def main():
 
     names = ["ice_tx_ring_next", "ice_tcb_free", "ice_tx_sync_descs",
              "ice_tx_write_desc", "ice_tx_write_ctx_desc", "ice_tx_sync_tcb",
-             "ice_tx_emit", "ice_tx_desc_done", "ice_tx_recycle"]
+             "ice_tx_doorbell", "ice_tx_emit", "ice_tx_desc_done",
+             "ice_tx_recycle"]
     # The same behavioral cases also run before the bind-handle consolidation.
     if re.search(r"^ice_tcb_bind_handle\(", source, re.MULTILINE):
         names.insert(0, "ice_tcb_bind_handle")

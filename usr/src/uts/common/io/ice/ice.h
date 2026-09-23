@@ -164,6 +164,8 @@ CTASSERT(ICE_MAX_FRAME_SIZE <= UINT16_MAX);
 #define	ICE_TX_SMALL_ALIGN	128
 /* GLCOMM_MIN_MAX_PKT.MIHDL reset value; a shorter frame is a TCLAN MDD. */
 #define	ICE_TX_MIN_LEN		17
+/* Descriptors written before a sender rings the doorbell mid-chain. */
+#define	ICE_TX_DOORBELL_BATCH	32
 
 CTASSERT(sizeof (struct ice_tx_ctx_desc) == sizeof (struct ice_tx_desc));
 /* Runts take the copy path; the pad fits the smallest pool buffer. */
@@ -404,6 +406,7 @@ typedef struct ice_tx_ring {
 	uint16_t		itxr_avail;
 	uint16_t		itxr_head;
 	uint16_t		itxr_tail;
+	uint16_t		itxr_unposted;	/* written since the doorbell */
 	/* Slot of each in-flight packet's RS descriptor, in transmit order. */
 	uint16_t		*itxr_rsq;	/* [itxr_size] */
 	uint16_t		itxr_rs_pidx;
@@ -801,10 +804,8 @@ extern boolean_t ice_dma_alloc(ice_t *, ice_dma_buffer_t *, ddi_dma_attr_t *,
 extern void ice_dma_free(ice_dma_buffer_t *);
 extern int ice_check_dma_handle(ddi_dma_handle_t);
 extern uint_t ice_tx_pool_bufs(uint_t, uint_t, uint_t);
-extern ice_dma_buffer_t *ice_buf_alloc(ice_tx_ring_t *);
-extern void ice_buf_free(ice_dma_buffer_t *);
-extern ice_dma_buffer_t *ice_lso_buf_alloc(ice_tx_ring_t *);
-extern ice_dma_buffer_t *ice_small_buf_alloc(ice_tx_ring_t *);
+extern ice_dma_buffer_t *ice_buf_take(ice_buf_pool_t *);
+extern void ice_buf_put(ice_dma_buffer_t *);
 extern boolean_t ice_buf_init(ice_t *);
 extern void ice_buf_fini(ice_t *);
 extern boolean_t ice_tx_lso_alloc(ice_t *);
