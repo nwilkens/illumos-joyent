@@ -35,6 +35,7 @@ TESTS = (
     "link_state.py",
     "loan_wait.py",
     "loopback.py",
+    "manpage.py",
     "mac_family.py",
     "lso.py",
     "lso_context.py",

@@ -416,6 +416,11 @@ The following descriptions identify what each source check establishes.
 `core_readme.py` requires `core/README.illumos` to name every core file
 and function that carries an `illumos:` marker, and no file without one.
 
+`manpage.py` checks that `ice(4D)` names every device ID the package binds,
+marks every family except E810 as not validated on hardware, documents each
+`ice.conf` property with the driver's default, and passes `mandoc -Tlint` at
+the error level when mandoc is installed.
+
 `cstyle_glue.py` runs `usr/src/tools/scripts/cstyle.pl -pP` over the driver
 glue sources and the mdb module. It does not check the vendored `core/` code.
 It reports SKIP when perl is not installed.

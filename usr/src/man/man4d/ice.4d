@@ -11,12 +11,12 @@
 .\"
 .\" Copyright 2026 Edgecast Cloud LLC.
 .\"
-.Dd July 18, 2026
+.Dd September 23, 2026
 .Dt ICE 4D
 .Os
 .Sh NAME
 .Nm ice
-.Nd Intel E810 Ethernet Device Driver
+.Nd Intel Ethernet 800 Series Device Driver
 .Sh SYNOPSIS
 .Pa /dev/net/ice*
 .Sh DESCRIPTION
@@ -25,11 +25,10 @@ The
 driver is a GLDv3, multi-threaded, clonable, loadable device driver that
 supports the Data Link Provider Interface,
 .Xr dlpi 4P ,
-on the Intel E810 family of Ethernet controllers.
-.Pp
-The controller negotiates its rate with the attached media and supported
-speeds range from 1 GbE through 100 GbE depending on the installed
-transceiver or cable.
+on the Intel Ethernet 800 series controllers.
+Each PCI physical function is a separate instance.
+The link speed follows the attached media and ranges from 100 Mb/s to
+200 Gb/s, depending on the controller family and the transceiver or cable.
 .Pp
 In addition to basic device initialization and the sending and receiving of
 frames, the driver supports the following features:
@@ -44,81 +43,253 @@ and
 .It
 IPv4 header checksum offload.
 .It
-IPv4 and IPv6 TCP, UDP checksum offload.
+IPv4 and IPv6 TCP and UDP checksum offload.
 .It
-Receive Side Scaling
+IPv4 and IPv6 TCP segmentation offload
+.Pq LSO .
+.It
+Receive side scaling
 .Pq RSS
-across multiple hardware queues.
+across one receive and transmit queue pair per CPU.
 .It
-TCP Segmentation Offload
-.Pq LSO ,
-disabled by default; see
-.Sx PROPERTIES .
+Transceiver presence and module data.
 .It
-Transceiver information through
-.Xr dladm 8 .
+A port identification LED.
+.It
+Internal MAC loopback through the
+.Sy LB_SET_MODE
+loopback ioctls.
 .El
 .Pp
 The
 .Nm
-driver does not currently support hardware VLAN filtering offload, energy
-efficient Ethernet
+driver does not support hardware VLAN filtering, energy efficient Ethernet
 .Pq EEE ,
-SR-IOV, or hardware flow control through pause frames.
+flow control through pause frames, data center bridging
+.Pq DCB ,
+the precision time protocol
+.Pq PTP ,
+or SR-IOV.
+.Sh SUPPORTED DEVICES
+The driver binds every device ID that the Intel common code maps to a
+controller family.
+Only the E810-C for QSFP
+.Pq Sy pciex8086,1592
+has been tested on hardware.
+The other families are supported by the same code, but they have not been
+validated on hardware.
+.Bl -tag -width Ds
+.It Sy E810
+E810-C and E810-XXV:
+.Sy pciex8086,1591 ,
+.Sy 1592 ,
+.Sy 1593 ,
+.Sy 1599 ,
+.Sy 159a ,
+.Sy 159b .
+.It Sy E822
+E822-C and E822-L:
+.Sy pciex8086,1890
+through
+.Sy 1894
+and
+.Sy 1897
+through
+.Sy 189a .
+Not validated on hardware.
+.It Sy E823
+E823-C and E823-L:
+.Sy pciex8086,124c
+through
+.Sy 124f ,
+.Sy 151d ,
+and
+.Sy 188a
+through
+.Sy 188e .
+Not validated on hardware.
+.It Sy E825-C
+.Sy pciex8086,579c
+through
+.Sy 579f .
+Not validated on hardware.
+.It Sy E830 No and Sy E835
+.Sy pciex8086,12d1 ,
+.Sy 12d2 ,
+.Sy 12d3 ,
+.Sy 12d5 ,
+.Sy 12d8 ,
+.Sy 12da ,
+.Sy 12dc ,
+.Sy 12dd ,
+.Sy 12de ,
+.Sy 1248 ,
+.Sy 1249 ,
+.Sy 124a ,
+.Sy 1261
+through
+.Sy 1263 ,
+and
+.Sy 1265
+through
+.Sy 1267 .
+Not validated on hardware.
+.El
+.Sh APPLICATION PROGRAMMING INTERFACE
+For each instance, a character-special file
+.Pa /dev/net/ice Ns Ar N
+is created, where
+.Ar N
+is the instance number.
+The file supports the Data Link Provider Interface
+.Pq DLPI ,
+which is documented in
+.Xr dlpi 4P .
+Most consumers should use
+.Xr libdlpi 3LIB .
+.Pp
+The driver also accepts private firmware diagnostic ioctls on this file:
+firmware log configuration and log reading, and firmware debug data.
+These are not a stable interface.
+Only a process in the global zone with the
+.Brq Sy PRIV_SYS_DEVICES
+and
+.Brq Sy PRIV_SYS_CONFIG
+privileges can use them, even when a non-global zone owns the link.
 .Sh CONFIGURATION
 The
 .Nm
-driver is configured by defining properties in its
+driver always uses auto-negotiation.
+Link properties, such as the MTU, are set with
+.Xr dladm 8 .
+Driver properties are set in the
 .Xr driver.conf 5
 file
-.Pa /kernel/drv/ice.conf .
-Values there apply to all
-.Nm
-instances; the properties are described in
-.Sx PROPERTIES .
-The maximum transmission unit and other data-link properties may also be set
-at runtime with
-.Xr dladm 8 .
+.Pa /kernel/drv/ice.conf
+and apply to every instance when it attaches.
 .Pp
-The driver requires the Dynamic Device Personalization
+The driver loads the Dynamic Device Personalization
 .Pq DDP
-package installed at
-.Pa /kernel/firmware/ice/ice.pkg .
-If the package cannot be loaded the device enters a reduced-function safe mode
-with a single queue.
+package
+.Pa /kernel/firmware/ice/ice.pkg
+at attach.
+The package enables the full receive and transmit pipeline.
+If the package is missing or the device rejects it, the driver enters
+.Em safe mode :
+it uses one queue pair and withholds checksum offload, LSO and RSS.
+The system log records the package that is active.
 .Sh PROPERTIES
-The following properties may be set in the
-.Nm
-.Xr driver.conf 5
-file.
+The following properties may be set in
+.Pa /kernel/drv/ice.conf .
 .Bl -tag -width Ds
 .It Sy num_queues
-The number of receive and transmit data queues to allocate.
-The value is clamped to the number of online CPUs and the number of MSI-X
-interrupt vectors the platform grants, and is rounded down to a power of two.
-The default is the driver maximum.
+A ceiling on the number of receive and transmit queue pairs.
+The driver uses one queue pair per CPU, limited by the queues and MSI-X
+vectors that the firmware gives the function, by the vectors that the system
+grants, and by 127, the largest ring count that MAC allows in a group.
+The count need not be a power of two.
+The default is no ceiling beyond those limits.
+Each queue pair has its own receive buffers, so a large count uses more
+memory.
 .It Sy tx_lso_enable
-When set to a non-zero value, the driver advertises TCP large-send (LSO/TSO)
-segmentation offload.
-The default is
+Set to
 .Sy 0
-.Pq disabled .
+to withhold TCP segmentation offload.
+The default is
+.Sy 1 .
+LSO is never offered in safe mode.
+The driver drops an LSO request whose MSS is below 88 bytes, the hardware
+minimum.
 .It Sy default_mtu
-The initial maximum transmission unit, in bytes.
-The MTU may also be changed at runtime with
-.Xr dladm 8 .
+The initial MTU in bytes.
+The MTU can also be changed with
+.Xr dladm 8
+while the link is not in use.
 The default is
 .Sy 1500 .
 .It Sy rx_limit_per_intr
-The maximum number of frames processed per receive ring in a single interrupt
-before the driver yields interrupt context and schedules a throttled software
-interrupt to process the remainder.
-The value is clamped to the range
-.Bq 16 , 4096 .
+The largest number of frames that one receive ring processes in a single
+interrupt before it schedules a throttled software interrupt for the rest.
+The value is clamped to the range 16 to 4096.
 The default is
-.Sy 256
-and is not generally expected to need tuning.
+.Sy 256 .
 .El
+.Sh FIRMWARE
+The controller runs firmware from its NVM.
+The driver reports the controller family, the firmware version and the
+admin queue API version in the system log at attach.
+.Pp
+If the firmware is in recovery mode, the device cannot be used.
+The driver posts an
+.Sy ereport.io.device.fw_corrupt
+event, marks the service as lost, logs a message, and does not attach.
+It does the same when the firmware enters recovery mode after a device
+reset, and the instance then stays down until the driver is reloaded.
+To repair the device, update the NVM with the Intel NVM update tool and
+power cycle the system.
+If the firmware admin queue API is newer or older than the driver supports,
+the driver logs a message and does not attach.
+.Sh LED
+The port identification LED can blink to locate a port, or follow the link
+state under firmware control
+.Pq the default .
+The driver does not support holding the LED on or off.
+The mode is restored after a device reset, and the LED returns to firmware
+control when the driver detaches.
+.Sh STATISTICS
+The driver provides the standard MAC and Ethernet statistics, and the
+following
+.Xr kstat 8
+entries in module
+.Sy ice .
+These names are not a stable interface.
+.Bl -tag -width Ds
+.It Sy pfstats
+Physical port counters: bytes and packets by type, CRC and length errors,
+undersize, oversize and jabber frames, MAC faults, and pause frames.
+These count every function on the port.
+.It Sy vsistats
+Counters for the function's own traffic: bytes and packets by type, receive
+discards, descriptor shortages, and receive and transmit errors.
+.It Sy rx_ring_ Ns Ar N
+Per receive ring: bytes and packets, copied and loaned buffers, descriptor
+errors, and the checksum verdicts
+.Sy rx_hck_v4hdr_ok ,
+.Sy rx_hck_v4hdr_err ,
+.Sy rx_hck_outer_err ,
+.Sy rx_hck_l4_ok ,
+.Sy rx_hck_l4_err ,
+.Sy rx_hck_v6exthdr ,
+.Sy rx_hck_nol4 ,
+.Sy rx_hck_unprocessed ,
+and
+.Sy rx_hck_unknown .
+.It Sy tx_ring_ Ns Ar N
+Per transmit ring: bytes and packets, copied and bound buffers, drops,
+blocked transmits, LSO packets, and the reasons for refused offload requests
+.Sy tx_hck_hdrlen ,
+.Sy tx_hck_nol3 ,
+.Sy tx_hck_nol4 ,
+.Sy tx_hck_badl4 ,
+.Sy tx_lso_nohck ,
+.Sy tx_lso_badhdr ,
+and
+.Sy tx_lso_badmss .
+.El
+.Sh FAULT MANAGEMENT
+The driver checks register and DMA access with the fault management
+framework and posts PCI ereports.
+A fatal hardware error, a malicious driver event on this function, or a
+failed queue stop causes a function reset; the link reports down until the
+reset completes.
+If the reset cannot complete, the service is marked lost and the instance
+stays down until the driver is reloaded.
+.Sh ARCHITECTURE
+The
+.Nm
+driver is supported on
+.Sy x86
+systems only.
 .Sh FILES
 .Bl -tag -width Pa
 .It Pa /dev/net/ice*
@@ -130,9 +301,16 @@ Device driver
 Driver configuration file.
 .It Pa /kernel/firmware/ice/ice.pkg
 Dynamic Device Personalization package.
+.It Pa /usr/lib/mdb/kvm/amd64/ice.so
+.Xr mdb 1
+module.
 .El
 .Sh SEE ALSO
+.Xr mdb 1 ,
+.Xr libdlpi 3LIB ,
 .Xr dlpi 4P ,
 .Xr driver.conf 5 ,
 .Xr dladm 8 ,
+.Xr fmadm 8 ,
+.Xr kstat 8 ,
 .Xr snoop 8
