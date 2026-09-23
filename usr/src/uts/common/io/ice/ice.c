@@ -171,9 +171,9 @@
  *
  * Each tx ring has its own copy-buffer pools, sized for the copied packets
  * it can have in flight rather than for its descriptors, within a cap per
- * instance.  A ring's LSO pool and LSO bind handles are allocated on a taskq
- * for its first LSO packet, which waits with the ring blocked, and are freed
- * at MAC stop.
+ * instance.  With LSO enabled, MAC start allocates each ring's LSO pool and
+ * LSO bind handles before it opens the rings, and fails if it cannot; MAC
+ * stop frees them.  A rebuild keeps them.
  *
  * Checksum offload and LSO are advertised unless the DDP package is missing
  * (safe mode), which also leaves one queue pair.  For LSO the MSS comes from
@@ -543,16 +543,27 @@ ice_start_datapath(ice_t *ice)
 	 */
 	ice_queues_intr_map(ice);
 
+	if (!ice_tx_lso_alloc(ice))
+		return (ENOMEM);
 	if (ice_queues_program(ice) != ICE_SUCCESS)
-		return (EIO);
+		goto fail;
 	if (!ice_rx_start(ice)) {
 		(void) ice_queues_disable(ice);
-		return (EIO);
+		goto fail;
 	}
 	ice_tx_start(ice);
 	atomic_or_32(&ice->ice_state, ICE_STATE_STARTED);
 
 	return (0);
+
+fail:
+	/*
+	 * No tx ring opened, so no LSO buffer is on a queue.  A rebuild keeps
+	 * the pools for the MAC stop still to come.
+	 */
+	if ((ice->ice_state & ICE_STATE_STARTED) == 0)
+		ice_tx_lso_free(ice);
+	return (EIO);
 }
 
 int
@@ -984,8 +995,9 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	else if (mtu > ICE_MAX_MTU)
 		mtu = ICE_MAX_MTU;
 	ice->ice_mtu = mtu;
-	ice->ice_tx_lso_enable = ddi_prop_get_int(DDI_DEV_T_ANY,
-	    ice->ice_dip, DDI_PROP_DONTPASS, "tx_lso_enable", 1) != 0;
+	ice->ice_tx_lso_enable = !ice->ice_safe_mode &&
+	    ddi_prop_get_int(DDI_DEV_T_ANY, ice->ice_dip, DDI_PROP_DONTPASS,
+	    "tx_lso_enable", 1) != 0;
 	limit = ddi_prop_get_int(DDI_DEV_T_ANY, ice->ice_dip,
 	    DDI_PROP_DONTPASS, "rx_limit_per_intr", ICE_DEF_RX_LIMIT_PER_INTR);
 	if (limit < ICE_MIN_RX_LIMIT_PER_INTR)
@@ -1388,10 +1400,13 @@ ice_rebuild(ice_t *ice, uint32_t requests)
 	 * contexts.  E810 has no MMIO tx queue disable, so this is the first
 	 * point at which releasing packet DMA is safe; ice_prepare_for_reset()
 	 * deliberately only quiesced.  Both are no-ops when the datapath was
-	 * already down.
+	 * already down.  A stop whose queue disable failed also left the LSO
+	 * pools for this point.
 	 */
 	ice_tx_reclaim(ice);
 	ice_rx_reclaim(ice);
+	if ((ice->ice_state & ICE_STATE_STARTED) == 0)
+		ice_tx_lso_free(ice);
 
 	/*
 	 * Every step below rides the admin queue, which soft-fails with
@@ -1539,7 +1554,7 @@ ice_rebuild(ice_t *ice, uint32_t requests)
 
 	/*
 	 * The reset closed the rings without telling MAC, so a ring that was
-	 * blocked, or waiting on its LSO pool, needs a wakeup.
+	 * blocked needs a wakeup.
 	 */
 	if ((ice->ice_state & ICE_STATE_STARTED) != 0)
 		ice_tx_wake(ice);

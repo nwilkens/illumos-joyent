@@ -61,7 +61,7 @@ def main() -> None:
     buf_init = function(
         dma_source,
         "ice_buf_init(ice_t *ice)\n{",
-        "\n/*\n * Release a ring's LSO pool",
+        "\n}\n",
     )
     assert re.search(
         r"ice_buf_pool_init\(ice,\s*&itr->itxr_copy_pool,\s*ncopy,\s*"

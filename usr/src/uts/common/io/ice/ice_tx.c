@@ -123,7 +123,7 @@ ice_tx_kstat_init(ice_t *ice, ice_tx_ring_t *itr)
  * costs a kmem_cache_alloc, a mutex pair and an insert into the single
  * per-devinfo FM handle cache on every transmit.  A handle is fixed to its
  * attributes at allocation, so the two sgllens need two handles.  The LSO
- * handles come with the ring's LSO pool (ice_tx_lso_task()).
+ * handles come with the ring's LSO pool (ice_tx_lso_alloc()).
  */
 static boolean_t
 ice_tcb_handles_alloc(ice_t *ice, ice_tx_ctrl_block_t *itcb)
@@ -140,10 +140,7 @@ ice_tcb_handles_alloc(ice_t *ice, ice_tx_ctrl_block_t *itcb)
 	return (B_TRUE);
 }
 
-/*
- * The TX path reads an LSO handle only once the ring's LSO state is READY,
- * and a stop frees the handles only after every TCB is reclaimed.
- */
+/* A stop frees the handles only after every TCB is reclaimed. */
 boolean_t
 ice_tcb_lso_handles_alloc(ice_t *ice, ice_tx_ring_t *itr)
 {
@@ -633,8 +630,7 @@ ice_tx_bind_fragment(ice_tx_ring_t *itr, mblk_t *mp, uint_t *ncookiesp)
 
 /*
  * LSO binds may span more cookies than ordinary frames, so they use the
- * handle carrying the wider sgllen.  ice_tx_one() reaches this path only
- * after ice_tx_lso_resources() found the ring's LSO handles ready.
+ * handle carrying the wider sgllen.
  */
 static ice_tx_ctrl_block_t *
 ice_tx_bind_lso_fragment(ice_tx_ring_t *itr, caddr_t addr, size_t len,
@@ -837,6 +833,12 @@ ice_tx_lso_copy(ice_tx_ring_t *itr, mblk_t **mpp, size_t *offp, size_t len,
     boolean_t header, ice_tx_build_t *resp)
 {
 	ice_tx_ctrl_block_t *tcb;
+
+	/* Without a pool this would block the ring for good. */
+	if (!header && itr->itxr_lso_pool.ibp_nbufs == 0) {
+		*resp = ICE_TX_BUILD_DROP;
+		return (NULL);
+	}
 
 	tcb = ice_tcb_alloc(itr);
 	if (tcb == NULL) {
@@ -1704,11 +1706,6 @@ ice_tx_recycle(ice_tx_ring_t *itr)
 }
 
 /*
- * Transmit a single packet.  Returns B_TRUE if the packet was placed on the
- * ring (mp consumed/retained), B_FALSE if the ring is full and the caller must
- * back off (mp left intact for the caller to return to MAC).
- */
-/*
  * Count a refused packet, with the reason ice_tx_context() recorded.  Only
  * the drop path pays for the reason lookup.
  */
@@ -1749,50 +1746,10 @@ ice_tx_count_drop(ice_tx_ring_t *itr, const ice_tx_ctx_t *ctx)
 }
 
 /*
- * The ring's LSO pool is allocated for its first LSO packet.  Until it is
- * ready the ring stays blocked, and ice_tx_lso_task() wakes MAC.
+ * Transmit a single packet.  Returns B_TRUE if the packet was placed on the
+ * ring (mp consumed/retained), B_FALSE if the ring is full and the caller must
+ * back off (mp left intact for the caller to return to MAC).
  */
-static ice_tx_build_t
-ice_tx_lso_resources(ice_tx_ring_t *itr)
-{
-	ice_t *ice = itr->itxr_ice;
-	ice_tx_build_t res = ICE_TX_BUILD_NORES;
-	boolean_t dispatch = B_FALSE;
-
-	if (itr->itxr_lso_state == ICE_TX_LSO_READY) {
-		membar_consumer();
-		return (ICE_TX_BUILD_OK);
-	}
-
-	mutex_enter(&itr->itxr_lock);
-	switch (itr->itxr_lso_state) {
-	case ICE_TX_LSO_READY:
-		res = ICE_TX_BUILD_OK;
-		break;
-	case ICE_TX_LSO_FAILED:
-		res = ICE_TX_BUILD_DROP;
-		break;
-	case ICE_TX_LSO_NONE:
-		itr->itxr_lso_state = ICE_TX_LSO_PENDING;
-		dispatch = B_TRUE;
-		/* FALLTHROUGH */
-	case ICE_TX_LSO_PENDING:
-		itr->itxr_blocked = B_TRUE;
-		itr->itxr_stats.ictxs_blocked.value.ui64++;
-		itr->itxr_stats.ictxs_lso_nores.value.ui64++;
-		break;
-	}
-	mutex_exit(&itr->itxr_lock);
-
-	/* The entry is idle: only the NONE to PENDING step queues it. */
-	if (dispatch) {
-		taskq_dispatch_ent(ice->ice_tx_taskq, ice_tx_lso_task, itr, 0,
-		    &itr->itxr_lso_ent);
-	}
-
-	return (res);
-}
-
 static boolean_t
 ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 {
@@ -1822,15 +1779,6 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 	}
 
 	if (ctx.itc_use_ctx) {
-		res = ice_tx_lso_resources(itr);
-		if (res == ICE_TX_BUILD_NORES)
-			return (B_FALSE);
-		if (res == ICE_TX_BUILD_DROP) {
-			freemsg(mp);
-			itr->itxr_stats.ictxs_drops.value.ui64++;
-			itr->itxr_stats.ictxs_lso_drops.value.ui64++;
-			return (B_TRUE);
-		}
 		res = ice_tx_lso_chain(itr, mp, &ctx, tcbs, &ntcb, &ndesc,
 		    &txmp);
 		if (res == ICE_TX_BUILD_OK) {
@@ -1998,8 +1946,6 @@ ice_tx_start(ice_t *ice)
 		itr->itxr_rs_cidx = 0;
 		itr->itxr_quiesce = B_FALSE;
 		itr->itxr_blocked = B_FALSE;
-		if (itr->itxr_lso_state == ICE_TX_LSO_FAILED)
-			itr->itxr_lso_state = ICE_TX_LSO_NONE;
 		mutex_exit(&itr->itxr_lock);
 	}
 }
@@ -2075,13 +2021,9 @@ ice_tx_reclaim(ice_t *ice)
 void
 ice_tx_stop(ice_t *ice)
 {
-	uint_t i;
-
 	ice_tx_quiesce(ice);
-	taskq_wait(ice->ice_tx_taskq);
 	ice_tx_reclaim(ice);
-	for (i = 0; i < ice->ice_num_txr; i++)
-		ice_tx_lso_fini(&ice->ice_txr[i]);
+	ice_tx_lso_free(ice);
 }
 
 /*

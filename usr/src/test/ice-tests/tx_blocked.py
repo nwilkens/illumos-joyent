@@ -50,20 +50,14 @@ def main() -> None:
         drop.index("ice_tx_recycle(itr)") < \
         drop.index("mutex_exit(&itr->itxr_lock)")
 
-    # an LSO packet waits, blocked, for the ring's LSO pool
-    lso = one[one.index("if (ctx.itc_use_ctx) {"):
-              one.index("ice_tx_lso_chain(itr, mp")]
-    assert "res = ice_tx_lso_resources(itr);" in lso
-    assert lso.index("ICE_TX_BUILD_NORES") < lso.index("return (B_FALSE);")
-    res = function(tx, "ice_tx_lso_resources(ice_tx_ring_t *itr)\n{",
-                   "\nstatic boolean_t\nice_tx_one")
-    locked = res[res.index("mutex_enter(&itr->itxr_lock)"):
-                 res.index("mutex_exit(&itr->itxr_lock)")]
-    assert "itr->itxr_blocked = B_TRUE;" in locked
-    assert "itr->itxr_lso_state = ICE_TX_LSO_PENDING;" in locked
-    assert "taskq_dispatch_ent(" not in locked
-    assert res.index("mutex_exit(&itr->itxr_lock)") < \
-        res.index("taskq_dispatch_ent(")
+    # the TX path never waits on an LSO allocation: MAC start made the pool
+    assert "ice_tx_lso_resources" not in tx and "taskq" not in tx
+    lso_copy = function(tx, "ice_tx_lso_copy(ice_tx_ring_t *itr,",
+                        "\n}\n")
+    # a ring without an LSO pool drops rather than blocking for good
+    missing = lso_copy[:lso_copy.index("ice_tcb_alloc(itr)")]
+    assert "itxr_lso_pool.ibp_nbufs == 0" in missing
+    assert "ICE_TX_BUILD_DROP" in missing
 
     # after a reset every ring is woken by its own handle
     wake = function(tx, "ice_tx_wake(ice_t *ice)\n{", "\n}\n")

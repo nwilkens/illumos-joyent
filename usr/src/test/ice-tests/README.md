@@ -43,12 +43,15 @@ symmetric hashing each compile and fail at runtime.
 ## Lifecycle interface regression
 
 `lifecycle_api.py` executes the actual MAC adapters, lifecycle start/stop,
-link publication, and TX/RX stop composition. Sixteen scenarios cover detach,
-terminal and owed-reset admission, queue/RX startup failures, new errors during
-startup, successful publication, loan retention, failed-disable recovery, and
-restart with the lock already held. A stop that confirmed the queue disable
-waits for the LSO task and then frees each ring's LSO pool after the reclaim;
-a stop that did not keeps them. Four source mutations compile and fail
+link publication, and TX/RX stop composition. Eighteen scenarios cover
+detach, terminal and owed-reset admission, queue/RX startup failures, new
+errors during startup, successful publication, loan retention, failed-disable
+recovery, and restart with the lock already held. MAC start allocates the LSO
+pools before it programs a queue or opens a ring; if it cannot, the start
+fails with ENOMEM and programs nothing. A start that fails later frees the
+pools, and a rebuild restart that fails keeps them for MAC stop. A stop that
+confirmed the queue disable frees the pools after the reclaim; a stop that
+did not keeps them. Four source mutations compile and fail
 runtime checks for admission, barrier handling, programming errors, and lost
 asynchronous errors. Paired `--source` and `--gld-source` paths also exercise
 pre-refactor revisions. `lifecycle_boundary.py` rejects external calls to
@@ -274,10 +277,12 @@ worker waits, after the reset barrier, at interrupt rearm, and during atomic
 completion. Assertions check reset counts and type, deferred work, request
 retention, datapath restart suppression, and terminal handling. A slow EMPR
 (E825-C and E830) must wait once before the reset-complete poll; a PF reset
-issued by the driver must not wait. A rebuild that restarts the datapath
-calls `ice_tx_wake()` once, since the reset closed the rings without telling
-MAC; `tx_blocked.py` requires that it wake each ring by its own MAC handle. A PHY firmware load still running after
-the reset leaves the PHY setup pending, and an unreadable PHY firmware state
+issued by the driver must not wait. A stopped device frees its LSO pools
+after the reset barrier; a started one keeps them. A rebuild that restarts
+the datapath calls `ice_tx_wake()` once, since the reset closed the rings
+without telling MAC; `tx_blocked.py` requires that it wake each ring by its
+own MAC handle. A PHY firmware load still running after the reset leaves the
+PHY setup pending, and an unreadable PHY firmware state
 fails the rebuild closed.
 
 Use `--source /path/to/ice.c --intr-source /path/to/ice_intr.c` for an earlier
@@ -580,8 +585,8 @@ completion interrupt cannot stay blocked at MAC; the chain is returned for MAC
 to retry; and both exits of the recycle path own the wakeup. A packet dropped
 after its build returned TCBs or buffers re-drives reclaim when the ring is
 blocked, since the pools are per ring and another sender may have blocked on
-them. An LSO packet on a ring without its LSO pool blocks the ring under the
-lock and queues the allocation task after dropping it.
+them. The TX path never waits on an LSO allocation, and an LSO payload copy
+on a ring without an LSO pool is dropped rather than blocking the ring.
 
 `tx_emit.py` compiles the actual descriptor writers, emission, DMA sync,
 TCB cleanup, and completion walk. Twenty cases cover ordinary/LSO bindings,
@@ -613,19 +618,20 @@ peeks and repost, plus data-buffer and register faults. Copy/loan cases
 verify delivery suppression, counter/tail behavior, and cleanup outside
 the ring lock; healthy controls retain ordinary delivery.
 
-`buf_pool.py` compiles the actual TX pool functions, the pool sizing, the
-LSO allocation task and the TX path's `ice_tx_lso_resources()`. For 1 to 127
+`buf_pool.py` compiles the actual TX pool functions, the pool sizing, and
+the LSO pool allocation and release that MAC start and stop run. For 1 to 127
 rings and 64 to 4096 descriptors per ring, each ring's copy and small pools
 take `MIN(per-ring count, cap / rings)` buffers whatever the descriptor count,
 the instance totals stay within the caps, and every ring at 127 queues still
 has LSO buffers for its largest packet. No LSO buffer or LSO bind handle
-exists after `ice_buf_init()`. The first LSO packet blocks its ring and
-queues the task once; later packets wait on it. The task allocates only that
-ring's LSO pool, publishes READY, and wakes MAC unless the ring was closed;
-an allocation that fails publishes FAILED, wakes MAC, and the LSO packets then
-drop until a stop. `ice_tx_lso_fini()` releases the pool and resets the state.
+exists after `ice_buf_init()`. `ice_tx_lso_alloc()` gives every ring its LSO
+pool and handles under the lifecycle lock, does nothing with LSO off, and
+allocates nothing on a rebuild that kept them. A buffer or handle failure on
+any ring returns failure with no ring holding part of a pool.
+`ice_tx_lso_free()` releases them all, and detach releases pools a stop left.
 The test also covers failure at every DMA allocation, repeated cleanup, and
-per-ring exhaustion and returns. Allocation and release boundaries assert that
+per-ring exhaustion and returns. The source must keep no TX taskq and no LSO
+state machine. Allocation and release boundaries assert that
 no pool or ring lock is held. These controlled boundaries do not exercise
 real DMA.
 
@@ -633,7 +639,9 @@ real DMA.
 is created at the negotiated interrupt priority before the pools and destroyed
 after them, and that the old per-instance pools and locks are gone.
 Construction and unwind rely on exclusive lifecycle ownership rather than
-holding the lock, and the LSO task allocates before it takes the ring lock.
+holding the lock. `ice_tx_lso_alloc()` takes no ring lock, and MAC start
+calls it before it programs the queues and opens the rings; `ice_tx_stop()`
+frees the pools only after the reclaim.
 
 `jumbo_copy.py` verifies that the transmit copy pool can hold any MTU-legal
 frame: the general pool buffer is page-rounded from `ICE_MAX_FRAME_SIZE`, a

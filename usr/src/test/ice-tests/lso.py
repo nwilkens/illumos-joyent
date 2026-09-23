@@ -31,6 +31,8 @@ def main() -> None:
     attach = ATTACH_SOURCE.read_text(encoding="utf-8")
     # LSO is on by default; the property can only withhold it.
     assert '"tx_lso_enable", 1) != 0' in attach
+    # Safe mode withholds LSO, so no LSO packet reaches a ring without a pool.
+    assert "ice->ice_tx_lso_enable = !ice->ice_safe_mode &&" in attach
 
     dma = DMA_SOURCE.read_text(encoding="utf-8")
     assert "dma_attr_count_max = ICE_TX_MAX_BUFSZ - 1" in dma

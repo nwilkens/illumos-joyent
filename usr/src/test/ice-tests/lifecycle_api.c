@@ -34,34 +34,24 @@ typedef unsigned int uint_t;
 
 #include "ice_lifecycle_types.h"
 
-typedef int taskq_t;
-typedef struct ice_tx_ring {
-	unsigned int lso_finis;
-} ice_tx_ring_t;
-
 typedef struct ice {
 	uint32_t ice_state;
 	boolean_t ice_detaching;
 	kmutex_t ice_rebuild_lock, ice_lse_lock;
 	link_state_t ice_link_state;
 	void *ice_mac_hdl, *ice_dip;
-	taskq_t *ice_tx_taskq;
-	unsigned int ice_num_txr;
-	ice_tx_ring_t *ice_txr;
 } ice_t;
-
-static taskq_t tx_taskq;
-static ice_tx_ring_t tx_rings[2];
 
 static ice_t device;
 static struct {
 	int program_status;
-	boolean_t rx_start_ok, disable_ok, rx_drained;
+	boolean_t rx_start_ok, disable_ok, rx_drained, lso_alloc_ok;
 	boolean_t mapped, dissociated, dma_live, tx_closed, rx_closed;
+	boolean_t lso_pools;
 	unsigned int tx_buffers, rx_buffers;
 	unsigned int maps, programs, rx_starts, tx_starts, disables;
 	unsigned int tx_quiesces, rx_quiesces, tx_reclaims, rx_reclaims;
-	unsigned int publications, impacts, resets, lso_waits;
+	unsigned int publications, impacts, resets, lso_allocs, lso_frees;
 	uint32_t inject_during_start;
 	link_state_t published;
 } fixture;
@@ -116,11 +106,40 @@ ice_queues_intr_map(ice_t *ice)
 	fixture.maps++;
 }
 
+/* The pools exist before any queue is programmed or ring opened. */
+static boolean_t
+ice_tx_lso_alloc(ice_t *ice)
+{
+	check_owner(ice);
+	assert(fixture.mapped && fixture.programs == 0);
+	assert(fixture.tx_closed && fixture.tx_starts == 0);
+	fixture.lso_allocs++;
+	if (fixture.lso_alloc_ok)
+		fixture.lso_pools = B_TRUE;
+	return (fixture.lso_alloc_ok);
+}
+
+/*
+ * Freed only from closed rings: after the reclaim of a confirmed disable, or
+ * from a start that never opened a ring.
+ */
+static void
+ice_tx_lso_free(ice_t *ice)
+{
+	check_owner(ice);
+	assert(fixture.tx_closed);
+	assert((fixture.tx_reclaims == 1 && !fixture.dma_live &&
+	    fixture.tx_buffers == 0) ||
+	    (fixture.lso_allocs == 1 && fixture.tx_starts == 0));
+	fixture.lso_frees++;
+	fixture.lso_pools = B_FALSE;
+}
+
 static int
 ice_queues_program(ice_t *ice)
 {
 	check_owner(ice);
-	assert(fixture.mapped);
+	assert(fixture.mapped && fixture.lso_allocs == 1 && fixture.lso_pools);
 	assert(fixture.rx_starts == 0 && fixture.tx_starts == 0);
 	fixture.programs++;
 	if (fixture.program_status == ICE_SUCCESS)
@@ -144,6 +163,7 @@ ice_tx_start(ice_t *ice)
 {
 	check_owner(ice);
 	assert(fixture.rx_starts == 1 && fixture.rx_start_ok);
+	assert(fixture.lso_pools);
 	fixture.tx_closed = B_FALSE;
 	fixture.tx_starts++;
 }
@@ -193,25 +213,6 @@ ice_tx_reclaim(ice_t *ice)
 	assert(!fixture.dma_live && fixture.tx_closed);
 	fixture.tx_buffers = 0;
 	fixture.tx_reclaims++;
-}
-
-/* The LSO allocation task is drained before the LSO pools are freed. */
-static void
-taskq_wait(taskq_t *tq)
-{
-	check_owner(&device);
-	assert(tq == &tx_taskq && fixture.tx_closed);
-	assert(fixture.tx_reclaims == 0);
-	fixture.lso_waits++;
-}
-
-static void
-ice_tx_lso_fini(ice_tx_ring_t *itr)
-{
-	check_owner(&device);
-	assert(fixture.lso_waits == 1 && fixture.tx_reclaims == 1);
-	assert(!fixture.dma_live && fixture.tx_buffers == 0);
-	itr->lso_finis++;
 }
 
 static void
@@ -268,15 +269,12 @@ reset(void)
 	check_unlocked();
 	memset(&device, 0, sizeof (device));
 	memset(&fixture, 0, sizeof (fixture));
-	memset(tx_rings, 0, sizeof (tx_rings));
-	device.ice_tx_taskq = &tx_taskq;
-	device.ice_num_txr = ARRAY_SIZE(tx_rings);
-	device.ice_txr = tx_rings;
 	device.ice_state = ICE_STATE_ATTACHED;
 	device.ice_link_state = LINK_STATE_UP;
 	device.ice_mac_hdl = &device;
 	device.ice_dip = &device;
 	fixture.rx_start_ok = fixture.disable_ok = fixture.rx_drained = B_TRUE;
+	fixture.lso_alloc_ok = B_TRUE;
 	fixture.tx_closed = fixture.rx_closed = B_TRUE;
 	fixture.tx_buffers = 3;
 	fixture.rx_buffers = 4;
@@ -327,6 +325,7 @@ startup(void)
 		    (ICE_STATE_ATTACHED | ICE_STATE_STARTED | injected[i]));
 		assert(fixture.maps == 1 && fixture.programs == 1);
 		assert(fixture.rx_starts == 1 && fixture.tx_starts == 1);
+		assert(fixture.lso_allocs == 1 && fixture.lso_frees == 0);
 		assert(fixture.disables == 0 && fixture.publications == 1);
 		assert(fixture.published ==
 		    (injected[i] != 0 ? LINK_STATE_DOWN : LINK_STATE_UP));
@@ -334,11 +333,24 @@ startup(void)
 		check_unlocked();
 	}
 
+	/* MAC start fails whole when a ring cannot get its LSO pool. */
+	reset();
+	fixture.lso_alloc_ok = B_FALSE;
+	assert(ice_m_start(&device) == ENOMEM);
+	assert(device.ice_state == (ICE_STATE_ATTACHED | ICE_STATE_ERROR));
+	assert(fixture.maps == 1 && fixture.lso_allocs == 1);
+	assert(fixture.programs == 0 && fixture.disables == 0);
+	assert(fixture.rx_starts == 0 && fixture.tx_starts == 0);
+	assert(!fixture.lso_pools && fixture.publications == 1);
+	assert(fixture.published == LINK_STATE_DOWN);
+	check_unlocked();
+
 	reset();
 	fixture.program_status = -23;
 	assert(ice_m_start(&device) == EIO);
 	assert(device.ice_state == (ICE_STATE_ATTACHED | ICE_STATE_ERROR));
 	assert(fixture.maps == 1 && fixture.programs == 1);
+	assert(fixture.lso_frees == 1 && !fixture.lso_pools);
 	assert(fixture.rx_starts == 0 && fixture.tx_starts == 0);
 	assert(fixture.disables == 0 && fixture.publications == 1);
 	assert(fixture.published == LINK_STATE_DOWN);
@@ -352,6 +364,7 @@ startup(void)
 		assert(device.ice_state ==
 		    (ICE_STATE_ATTACHED | ICE_STATE_ERROR));
 		assert(fixture.rx_starts == 1 && fixture.tx_starts == 0);
+		assert(fixture.lso_frees == 1 && !fixture.lso_pools);
 		assert(fixture.disables == 1 && fixture.publications == 1);
 		assert(fixture.published == LINK_STATE_DOWN);
 		assert(fixture.tx_reclaims == 0 && fixture.rx_reclaims == 0);
@@ -367,6 +380,7 @@ stop_case(boolean_t disabled, boolean_t drained)
 	reset();
 	device.ice_state |= ICE_STATE_STARTED;
 	fixture.dma_live = B_TRUE;
+	fixture.lso_pools = B_TRUE;
 	fixture.tx_closed = fixture.rx_closed = B_FALSE;
 	fixture.disable_ok = disabled;
 	fixture.rx_drained = drained;
@@ -381,8 +395,7 @@ stop_case(boolean_t disabled, boolean_t drained)
 		assert(fixture.rx_buffers == (drained ? 0U : 4U));
 		assert(fixture.tx_reclaims == 1);
 		assert(fixture.rx_reclaims == 1);
-		assert(tx_rings[0].lso_finis == 1);
-		assert(tx_rings[1].lso_finis == 1);
+		assert(fixture.lso_frees == 1 && !fixture.lso_pools);
 		assert(fixture.resets == 0 && fixture.impacts == 0);
 		assert(device.ice_state == ICE_STATE_ATTACHED);
 	} else {
@@ -391,7 +404,7 @@ stop_case(boolean_t disabled, boolean_t drained)
 		assert(fixture.tx_reclaims == 0);
 		assert(fixture.rx_reclaims == 0);
 		/* A queue that may still be live keeps its LSO pool too. */
-		assert(fixture.lso_waits == 0 && tx_rings[0].lso_finis == 0);
+		assert(fixture.lso_frees == 0 && fixture.lso_pools);
 		assert(fixture.resets == 1 && fixture.impacts == 1);
 		assert(device.ice_state == (ICE_STATE_ATTACHED |
 		    ICE_STATE_ERROR | ICE_STATE_PFR_REQ));
@@ -410,7 +423,19 @@ restart_locked(void)
 	assert(device.ice_state == (ICE_STATE_ATTACHED | ICE_STATE_STARTED));
 	assert(fixture.maps == 1 && fixture.programs == 1);
 	assert(fixture.rx_starts == 1 && fixture.tx_starts == 1);
+	assert(fixture.lso_allocs == 1 && fixture.lso_pools);
 	assert(fixture.publications == 0);
+	mutex_exit(&device.ice_rebuild_lock);
+	check_unlocked();
+
+	/* A failed rebuild restart leaves the pools for MAC stop. */
+	reset();
+	device.ice_state |= ICE_STATE_STARTED;
+	fixture.program_status = -23;
+	mutex_enter(&device.ice_rebuild_lock);
+	assert(ice_start_datapath(&device) == EIO);
+	assert(fixture.lso_allocs == 1 && fixture.lso_frees == 0);
+	assert(fixture.lso_pools && fixture.tx_starts == 0);
 	mutex_exit(&device.ice_rebuild_lock);
 	check_unlocked();
 }
@@ -425,6 +450,6 @@ main(void)
 	stop_case(B_FALSE, B_TRUE);
 	stop_case(B_FALSE, B_FALSE);
 	restart_locked();
-	(void) puts("PASS: ICE lifecycle start/stop boundary (16 scenarios)");
+	(void) puts("PASS: ICE lifecycle start/stop boundary (18 scenarios)");
 	return (0);
 }

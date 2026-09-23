@@ -27,7 +27,6 @@
 #include <sys/modctl.h>
 #include <sys/pci.h>
 #include <sys/list.h>
-#include <sys/taskq_impl.h>
 #include <sys/ethernet.h>
 #include <sys/mac_provider.h>
 #include <sys/mac_ether.h>
@@ -250,7 +249,7 @@ typedef enum ice_attach_state {
 	ICE_ATTACH_VSI		= 1 << 10,
 	ICE_ATTACH_RINGS	= 1 << 11,	/* ring DMA allocated */
 	ICE_ATTACH_QUEUE_INTR	= 1 << 12,	/* queue->vector wired */
-	ICE_ATTACH_BUFS		= 1 << 13,	/* tx pools and taskq */
+	ICE_ATTACH_BUFS		= 1 << 13,	/* tx copy-buffer pools */
 	ICE_ATTACH_STATS	= 1 << 14,	/* hardware stat kstats */
 	ICE_ATTACH_MAC		= 1 << 15	/* mac_register done */
 } ice_attach_state_t;
@@ -368,13 +367,6 @@ typedef struct ice_txq_stat {
 	kstat_named_t		ictxs_lso_badmss;
 } ice_txq_stat_t;
 
-typedef enum ice_tx_lso_state {
-	ICE_TX_LSO_NONE,	/* no LSO pool or bind handles */
-	ICE_TX_LSO_PENDING,	/* ice_tx_lso_task() is queued */
-	ICE_TX_LSO_READY,
-	ICE_TX_LSO_FAILED	/* allocation failed; LSO packets drop */
-} ice_tx_lso_state_t;
-
 typedef struct ice_tx_ring {
 	struct ice		*itxr_ice;	/* RO */
 	uint32_t		itxr_index;	/* absolute HW tx queue index */
@@ -413,15 +405,13 @@ typedef struct ice_tx_ring {
 	uint16_t		itxr_tcb_nfree;
 
 	/*
-	 * Copy-buffer pools; itxr_tcb_lock guards their free stacks.  The
-	 * LSO pool and the TCBs' LSO bind handles exist only from the first
-	 * LSO packet after a start until the next stop.
+	 * Copy-buffer pools; itxr_tcb_lock guards their free stacks.  With
+	 * LSO enabled, the LSO pool and the TCBs' LSO bind handles exist from
+	 * MAC start until MAC stop.
 	 */
 	ice_buf_pool_t		itxr_copy_pool;
 	ice_buf_pool_t		itxr_small_pool;
 	ice_buf_pool_t		itxr_lso_pool;
-	ice_tx_lso_state_t	itxr_lso_state;	/* itxr_lock */
-	taskq_ent_t		itxr_lso_ent;
 
 	kstat_t			*itxr_kstat;
 	ice_txq_stat_t		itxr_stats;
@@ -641,7 +631,7 @@ typedef struct ice {
 	uint32_t		ice_loopback_mode;
 
 	uint32_t		ice_mtu;
-	boolean_t		ice_tx_lso_enable;
+	boolean_t		ice_tx_lso_enable;	/* LSO advertised */
 	boolean_t		ice_led_ident;		/* ice_rebuild_lock */
 	/* E830 PHY setup waits for the PHY firmware; ice_rebuild_lock. */
 	boolean_t		ice_phy_fw_pending;
@@ -661,9 +651,6 @@ typedef struct ice {
 	uint32_t		ice_tx_ring_size;
 	uint32_t		ice_rx_ring_size;
 	uint32_t		ice_rx_limit_per_intr;
-
-	/* Allocates each ring's LSO resources; see ice_tx_lso_task(). */
-	taskq_t			*ice_tx_taskq;
 
 	/* DDP firmware. */
 	/* Attach-only: MAC caches mi_capab at mac_register(). */
@@ -809,8 +796,8 @@ extern ice_dma_buffer_t *ice_lso_buf_alloc(ice_tx_ring_t *);
 extern ice_dma_buffer_t *ice_small_buf_alloc(ice_tx_ring_t *);
 extern boolean_t ice_buf_init(ice_t *);
 extern void ice_buf_fini(ice_t *);
-extern void ice_tx_lso_task(void *);
-extern void ice_tx_lso_fini(ice_tx_ring_t *);
+extern boolean_t ice_tx_lso_alloc(ice_t *);
+extern void ice_tx_lso_free(ice_t *);
 
 /*
  * ice_tx.c

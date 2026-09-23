@@ -14,8 +14,8 @@
  */
 
 /*
- * Run the actual TX pool sizing, per-ring pool lifetime, and the deferred LSO
- * allocation with DDI, taskq and MAC boundaries substituted.
+ * Run the actual TX pool sizing, per-ring pool lifetime, and the LSO pool
+ * allocation at MAC start with the DDI boundaries substituted.
  */
 #include <assert.h>
 #include <stdint.h>
@@ -32,15 +32,9 @@ typedef void *ddi_dma_handle_t;
 typedef struct { uint64_t dmac_laddress; } ddi_dma_cookie_t;
 typedef int ddi_dma_attr_t;
 typedef int ddi_device_acc_attr_t;
-typedef int taskq_t;
-typedef int taskq_ent_t;
-typedef void *mac_handle_t;
-typedef void *mac_ring_handle_t;
 #define	B_TRUE 1
 #define	B_FALSE 0
 #define	KM_SLEEP 1
-#define	TASKQ_PREPOPULATE 1
-#define	minclsyspri 60
 #define	MIN(a, b) ((a) < (b) ? (a) : (b))
 #define	ICE_TX_SMALL_PKT 512
 #define	ICE_TX_COPY_BUFSZ 12288
@@ -53,45 +47,31 @@ typedef void *mac_ring_handle_t;
 #define	VERIFY3U(a, op, b) assert((a) op(b))
 #define	ASSERT3P(a, op, b) assert((a) op(b))
 #define	ASSERT(x) assert(x)
+#define	MUTEX_HELD(p) (*(p) != 0)
 #include "ice_pool_types.h"
 
 typedef struct ice_tx_ring {
 	struct ice *itxr_ice;
 	uint32_t itxr_index;
 	uint16_t itxr_size;
-	kmutex_t itxr_lock;
 	kmutex_t itxr_tcb_lock;
-	boolean_t itxr_blocked;
-	boolean_t itxr_quiesce;
-	mac_ring_handle_t itxr_mactxring;
 	ice_buf_pool_t itxr_copy_pool;
 	ice_buf_pool_t itxr_small_pool;
 	ice_buf_pool_t itxr_lso_pool;
-	ice_tx_lso_state_t itxr_lso_state;
-	taskq_ent_t itxr_lso_ent;
-	struct {
-		struct {
-			struct {
-				uint64_t ui64;
-			} value;
-		} ictxs_blocked, ictxs_lso_nores;
-	} itxr_stats;
 	/* Test bookkeeping. */
 	boolean_t lso_handles;
-	unsigned wakes;
 } ice_tx_ring_t;
 
 typedef struct ice {
 	int ice_instance;
 	uint_t ice_num_txr;
 	ice_tx_ring_t *ice_txr;
-	taskq_t *ice_tx_taskq;
-	mac_handle_t ice_mac_hdl;
+	boolean_t ice_tx_lso_enable;
+	kmutex_t ice_rebuild_lock;
 } ice_t;
 
 static unsigned locks, allocations, dma_live, attempts, fail_at;
-static unsigned handle_fail, taskqs, errors;
-static taskq_t the_taskq;
+static unsigned handle_fail, errors;
 
 static void
 mutex_enter(kmutex_t *lock)
@@ -107,11 +87,6 @@ mutex_exit(kmutex_t *lock)
 	assert(*lock == 1 && locks > 0);
 	*lock = 0;
 	locks--;
-}
-
-static void
-membar_producer(void)
-{
 }
 
 static void *
@@ -188,45 +163,15 @@ ice_dma_free(ice_dma_buffer_t *buf)
 	}
 }
 
-static taskq_t *
-taskq_create_instance(const char *name, int instance, int nthreads, int pri,
-    int minalloc, int maxalloc, uint_t flags)
-{
-	(void) name;
-	(void) instance;
-	(void) pri;
-	(void) minalloc;
-	(void) maxalloc;
-	assert(nthreads == 1 && flags == TASKQ_PREPOPULATE && taskqs == 0);
-	taskqs++;
-	return (&the_taskq);
-}
-
 static ice_t *current;
 
-/* The task finishes before any pool is freed. */
-static void
-taskq_destroy(taskq_t *tq)
-{
-	uint_t i;
-
-	assert(tq == &the_taskq && taskqs == 1);
-	for (i = 0; i < current->ice_num_txr; i++) {
-		ice_tx_ring_t *itr = &current->ice_txr[i];
-
-		assert(itr->itxr_lso_state != ICE_TX_LSO_PENDING);
-		assert(itr->itxr_copy_pool.ibp_nfree ==
-		    itr->itxr_copy_pool.ibp_nbufs);
-	}
-	taskqs--;
-}
-
+/* handle_fail names the ring, plus one, whose handles cannot be had. */
 static boolean_t
 ice_tcb_lso_handles_alloc(ice_t *ice, ice_tx_ring_t *itr)
 {
-	(void) ice;
+	assert(ice == current && MUTEX_HELD(&ice->ice_rebuild_lock));
 	assert(locks == 0 && !itr->lso_handles);
-	if (handle_fail)
+	if (handle_fail == itr->itxr_index + 1)
 		return (B_FALSE);
 	itr->lso_handles = B_TRUE;
 	return (B_TRUE);
@@ -239,43 +184,9 @@ ice_tcb_lso_handles_free(ice_tx_ring_t *itr)
 	itr->lso_handles = B_FALSE;
 }
 
-static void
-mac_tx_ring_update(mac_handle_t mh, mac_ring_handle_t rh)
-{
-	ice_tx_ring_t *itr = rh;
-
-	assert(mh == current && itr->itxr_lock == 1);
-	itr->wakes++;
-}
-
-static void
-membar_consumer(void)
-{
-}
-
-typedef void (task_func_t)(void *);
-static task_func_t *queued_func;
-static void *queued_arg;
-static unsigned dispatches;
-
-/* The entry is dispatched once, outside the ring lock. */
-static void
-taskq_dispatch_ent(taskq_t *tq, task_func_t func, void *arg, uint_t flags,
-    taskq_ent_t *ent)
-{
-	ice_tx_ring_t *itr = arg;
-
-	assert(tq == &the_taskq && flags == 0 && locks == 0);
-	assert(ent == &itr->itxr_lso_ent && queued_func == NULL);
-	assert(itr->itxr_lso_state == ICE_TX_LSO_PENDING);
-	queued_func = func;
-	queued_arg = arg;
-	dispatches++;
-}
-
 void ice_buf_fini(ice_t *);
-void ice_tx_lso_fini(ice_tx_ring_t *);
-void ice_tx_lso_task(void *);
+boolean_t ice_tx_lso_alloc(ice_t *);
+void ice_tx_lso_free(ice_t *);
 #include "ice_pool_code.h"
 
 static ice_t *
@@ -288,12 +199,11 @@ make(uint_t nrings, uint16_t size)
 	ice->ice_num_txr = nrings;
 	ice->ice_txr = calloc(nrings, sizeof (*ice->ice_txr));
 	assert(ice->ice_txr != NULL);
-	ice->ice_mac_hdl = ice;
+	ice->ice_tx_lso_enable = B_TRUE;
 	for (i = 0; i < nrings; i++) {
 		ice->ice_txr[i].itxr_ice = ice;
 		ice->ice_txr[i].itxr_index = i;
 		ice->ice_txr[i].itxr_size = size;
-		ice->ice_txr[i].itxr_mactxring = &ice->ice_txr[i];
 	}
 	current = ice;
 	return (ice);
@@ -348,8 +258,7 @@ check_sizing(void)
 				    nsmall);
 				assert(itr->itxr_lso_pool.ibp_nbufs == 0);
 				assert(itr->itxr_lso_pool.ibp_bufs == NULL);
-				assert(itr->itxr_lso_state ==
-				    ICE_TX_LSO_NONE && !itr->lso_handles);
+				assert(!itr->lso_handles);
 				assert(itr->itxr_copy_pool.ibp_lock ==
 				    &itr->itxr_tcb_lock);
 				assert(itr->itxr_small_pool.ibp_lock ==
@@ -359,7 +268,6 @@ check_sizing(void)
 			}
 			ice_buf_fini(ice);
 			assert(dma_live == 0 && allocations == 0);
-			assert(taskqs == 0 && ice->ice_tx_taskq == NULL);
 			destroy(ice);
 		}
 	}
@@ -389,7 +297,7 @@ check_stacks(void)
 	assert(other != NULL && other->idb_pool == &b->itxr_copy_pool);
 	small = ice_small_buf_alloc(a);
 	assert(small != NULL && small->idb_len == ICE_TX_SMALL_PKT);
-	/* No LSO pool exists before the first LSO packet. */
+	/* No LSO pool exists before MAC start. */
 	assert(ice_lso_buf_alloc(a) == NULL);
 	ice_buf_free(NULL);
 	ice_buf_free(other);
@@ -421,7 +329,7 @@ check_failures(void)
 		errors = 0;
 		assert(!ice_buf_init(ice));
 		assert(errors == 1);
-		assert(dma_live == 0 && allocations == 0 && taskqs == 0);
+		assert(dma_live == 0 && allocations == 0);
 		/* Cleanup is repeatable. */
 		ice_buf_fini(ice);
 		destroy(ice);
@@ -429,127 +337,102 @@ check_failures(void)
 }
 
 /*
- * The first LSO packet queues the task.  It allocates the pool and handles,
- * publishes READY and wakes MAC unless the ring was closed meanwhile; a
- * failure publishes FAILED and still wakes MAC so the packet is dropped.
+ * MAC start gives every ring its LSO pool and handles under the lifecycle
+ * lock, a rebuild finds them present, and any failure leaves no ring with
+ * part of one.  MAC stop frees them all.
  */
 static void
-check_lso_task(void)
+check_lso_alloc(void)
 {
-	uint_t n, fail, quiesce;
+	static const uint_t rings[] = { 1, 4, 16, 127 };
+	uint_t r, i, n, nrings, base, failure, bad;
 
-	for (fail = 0; fail <= 3; fail++) {
-		for (quiesce = 0; quiesce <= 1; quiesce++) {
-			ice_t *ice = make(16, 1024);
-			ice_tx_ring_t *itr = &ice->ice_txr[3];
+	for (r = 0; r < sizeof (rings) / sizeof (rings[0]); r++) {
+		ice_t *ice;
 
-			attempts = fail_at = 0;
-			assert(ice_buf_init(ice));
-			n = ice_tx_pool_bufs(ICE_TX_LSO_BUFS_RING,
-			    ICE_TX_LSO_BUFS_MAX, 16);
-			itr->itxr_lso_state = ICE_TX_LSO_PENDING;
-			itr->itxr_blocked = B_TRUE;
-			itr->itxr_quiesce = (boolean_t)quiesce;
-			attempts = 0;
-			fail_at = fail == 1 ? 1 : fail == 2 ? n : 0;
-			handle_fail = fail == 3;
-			errors = 0;
-			ice_tx_lso_task(itr);
-			assert(locks == 0 && itr->itxr_lock == 0);
-			if (fail == 0) {
-				assert(itr->itxr_lso_state ==
-				    ICE_TX_LSO_READY);
-				assert(itr->itxr_lso_pool.ibp_nbufs == n);
-				assert(itr->itxr_lso_pool.ibp_nfree == n);
-				assert(itr->lso_handles && errors == 0);
-				{
-					ice_dma_buffer_t *lso;
+		nrings = rings[r];
+		ice = make(nrings, 1024);
+		n = ice_tx_pool_bufs(ICE_TX_LSO_BUFS_RING,
+		    ICE_TX_LSO_BUFS_MAX, nrings);
+		attempts = fail_at = handle_fail = errors = 0;
+		assert(ice_buf_init(ice));
+		base = dma_live;
+		ice->ice_rebuild_lock = 1;
 
-					lso = ice_lso_buf_alloc(itr);
-					assert(lso->idb_len ==
-					    ICE_TX_LSO_BUFSZ);
-					ice_buf_free(lso);
-				}
-			} else {
-				assert(itr->itxr_lso_state ==
-				    ICE_TX_LSO_FAILED);
-				assert(itr->itxr_lso_pool.ibp_bufs == NULL);
-				assert(!itr->lso_handles && errors == 1);
-			}
-			assert(itr->wakes == (quiesce ? 0u : 1u));
-			assert(itr->itxr_blocked == (boolean_t)quiesce);
-			/* Only the ring that sent LSO has LSO buffers. */
-			assert(ice->ice_txr[2].itxr_lso_pool.ibp_bufs ==
-			    NULL);
+		/* LSO off: nothing to allocate. */
+		ice->ice_tx_lso_enable = B_FALSE;
+		attempts = 0;
+		assert(ice_tx_lso_alloc(ice) && attempts == 0);
+		assert(dma_live == base);
+		ice->ice_tx_lso_enable = B_TRUE;
 
-			/* Stop releases the pool and resets the state. */
-			ice_tx_lso_fini(itr);
-			assert(itr->itxr_lso_state == ICE_TX_LSO_NONE);
-			assert(itr->itxr_lso_pool.ibp_bufs == NULL);
-			assert(!itr->lso_handles);
+		assert(ice_tx_lso_alloc(ice));
+		assert(dma_live == base + nrings * n && errors == 0);
+		for (i = 0; i < nrings; i++) {
+			ice_tx_ring_t *itr = &ice->ice_txr[i];
+			ice_dma_buffer_t *lso;
 
-			/* Detach releases a ready pool as well. */
-			if (fail == 0) {
-				itr->itxr_lso_state = ICE_TX_LSO_PENDING;
-				attempts = fail_at = 0;
-				ice_tx_lso_task(itr);
-				assert(itr->itxr_lso_state ==
-				    ICE_TX_LSO_READY);
-			}
-			handle_fail = 0;
-			ice_buf_fini(ice);
-			assert(dma_live == 0 && allocations == 0);
-			assert(!itr->lso_handles && taskqs == 0);
-			destroy(ice);
+			assert(itr->itxr_lso_pool.ibp_nbufs == n);
+			assert(itr->itxr_lso_pool.ibp_nfree == n);
+			assert(itr->lso_handles);
+			lso = ice_lso_buf_alloc(itr);
+			assert(lso != NULL && lso->idb_len == ICE_TX_LSO_BUFSZ);
+			ice_buf_free(lso);
 		}
+
+		/* A rebuild restarts with the pools it kept. */
+		attempts = 0;
+		assert(ice_tx_lso_alloc(ice) && attempts == 0);
+		assert(dma_live == base + nrings * n);
+
+		ice_tx_lso_free(ice);
+		assert(dma_live == base);
+		for (i = 0; i < nrings; i++) {
+			assert(ice->ice_txr[i].itxr_lso_pool.ibp_bufs == NULL);
+			assert(!ice->ice_txr[i].lso_handles);
+			assert(ice_lso_buf_alloc(&ice->ice_txr[i]) == NULL);
+		}
+		ice_tx_lso_free(ice);
+
+		/* Every buffer allocation failure unwinds every ring. */
+		for (failure = 1; failure <= nrings * n;
+		    failure += (nrings > 4 ? n - 1 : 1)) {
+			attempts = 0;
+			fail_at = failure;
+			errors = 0;
+			assert(!ice_tx_lso_alloc(ice));
+			assert(errors == 1 && dma_live == base);
+			for (i = 0; i < nrings; i++) {
+				assert(ice->ice_txr[i].itxr_lso_pool.ibp_bufs ==
+				    NULL);
+				assert(!ice->ice_txr[i].lso_handles);
+			}
+		}
+		fail_at = 0;
+
+		/* So does a handle failure on any ring. */
+		for (bad = 1; bad <= nrings; bad += (nrings > 4 ? 7 : 1)) {
+			handle_fail = bad;
+			errors = 0;
+			assert(!ice_tx_lso_alloc(ice));
+			assert(errors == 1 && dma_live == base);
+			for (i = 0; i < nrings; i++) {
+				assert(ice->ice_txr[i].itxr_lso_pool.ibp_bufs ==
+				    NULL);
+				assert(!ice->ice_txr[i].lso_handles);
+			}
+		}
+		handle_fail = 0;
+
+		/* Detach releases pools a stop left in place. */
+		assert(ice_tx_lso_alloc(ice));
+		ice->ice_rebuild_lock = 0;
+		ice_buf_fini(ice);
+		assert(dma_live == 0 && allocations == 0 && locks == 0);
+		for (i = 0; i < nrings; i++)
+			assert(!ice->ice_txr[i].lso_handles);
+		destroy(ice);
 	}
-}
-
-/*
- * The TX path's view: LSO packets block the ring until the task has run once,
- * then pass; a failed allocation drops them.
- */
-static void
-check_lso_admission(void)
-{
-	ice_t *ice = make(4, 1024);
-	ice_tx_ring_t *itr = &ice->ice_txr[1];
-
-	attempts = fail_at = 0;
-	dispatches = 0;
-	assert(ice_buf_init(ice));
-	assert(ice_tx_lso_resources(itr) == ICE_TX_BUILD_NORES);
-	assert(dispatches == 1 && itr->itxr_blocked);
-	assert(itr->itxr_lso_pool.ibp_bufs == NULL);
-	/* Later packets wait on the same queued task. */
-	assert(ice_tx_lso_resources(itr) == ICE_TX_BUILD_NORES);
-	assert(dispatches == 1);
-	assert(itr->itxr_stats.ictxs_blocked.value.ui64 == 2);
-	assert(itr->itxr_stats.ictxs_lso_nores.value.ui64 == 2);
-
-	queued_func(queued_arg);
-	queued_func = NULL;
-	assert(itr->wakes == 1 && !itr->itxr_blocked);
-	assert(ice_tx_lso_resources(itr) == ICE_TX_BUILD_OK);
-	assert(itr->itxr_lso_pool.ibp_nbufs ==
-	    ice_tx_pool_bufs(ICE_TX_LSO_BUFS_RING, ICE_TX_LSO_BUFS_MAX, 4));
-	assert(dispatches == 1 && locks == 0);
-	assert(ice->ice_txr[0].itxr_lso_pool.ibp_bufs == NULL);
-
-	/* After a stop the next LSO packet allocates again. */
-	ice_tx_lso_fini(itr);
-	handle_fail = 1;
-	assert(ice_tx_lso_resources(itr) == ICE_TX_BUILD_NORES);
-	queued_func(queued_arg);
-	queued_func = NULL;
-	assert(dispatches == 2 && itr->wakes == 2);
-	assert(ice_tx_lso_resources(itr) == ICE_TX_BUILD_DROP);
-	assert(dispatches == 2 && !itr->itxr_blocked);
-	handle_fail = 0;
-
-	ice_buf_fini(ice);
-	assert(dma_live == 0 && allocations == 0);
-	destroy(ice);
 }
 
 int
@@ -558,9 +441,8 @@ main(void)
 	check_sizing();
 	check_stacks();
 	check_failures();
-	check_lso_task();
-	check_lso_admission();
-	(void) printf("PASS: TX pools sized per ring within caps; LSO pool "
-	    "allocated on first use\n");
+	check_lso_alloc();
+	(void) printf("PASS: TX pools sized per ring within caps; LSO pools "
+	    "allocated at MAC start\n");
 	return (0);
 }

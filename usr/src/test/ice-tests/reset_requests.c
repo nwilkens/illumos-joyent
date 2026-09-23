@@ -63,7 +63,7 @@ typedef struct ice {
 #include "ice_reset_types.h"
 
 static ice_phy_fw_state_t phy_fw_state;
-static unsigned phy_setups, tx_wakes;
+static unsigned phy_setups, tx_wakes, lso_frees;
 
 static ice_phy_fw_state_t
 ice_phy_fw_state(ice_t *ice)
@@ -368,6 +368,16 @@ ice_tx_wake(ice_t *ice)
 	tx_wakes++;
 }
 
+/* Only a stopped device gives its LSO pools back at the reset barrier. */
+static void
+ice_tx_lso_free(ice_t *ice)
+{
+	assert(ice == &device && device.ice_rebuild_lock);
+	assert((device.ice_state & ICE_STATE_STARTED) == 0);
+	assert(global_waits + pfrs > 0);
+	lso_frees++;
+}
+
 #include "ice_reset_body.h"
 
 static void
@@ -375,7 +385,7 @@ reset(void)
 {
 	(void) memset(&device, 0, sizeof (device));
 	device.ice_safe_mode = B_TRUE;
-	tx_wakes = 0;
+	tx_wakes = lso_frees = 0;
 	queued = prepared = pfrs = global_waits = starts = errors = 0;
 	slow_empr = 0;
 	slow_waits = 0;
@@ -407,6 +417,7 @@ check_coalescing(void)
 	at_lock = ICE_STATE_PFR_REQ;
 	run_one();
 	assert(queued == 0 && prepared == 1 && pfrs == 1 && tx_wakes == 0);
+	assert(lso_frees == 1);
 	assert(!device.ice_reset_pending && (device.ice_state & OWED) == 0);
 
 	/* A stale callback must not prepare or reset the hardware. */
@@ -430,6 +441,8 @@ check_new_requests(void)
 	assert(pfrs == 2 && queued == 0 && starts == 1);
 	/* The restarted rings wake MAC; the deferred pass did not. */
 	assert(tx_wakes == 1);
+	/* A started device keeps its LSO pools across the rebuild. */
+	assert(lso_frees == 0);
 
 	reset();
 	device.ice_state = ICE_STATE_STARTED;

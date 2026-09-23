@@ -34,8 +34,7 @@ def main() -> None:
                     "\nboolean_t\nice_tx_rings_alloc")
     init = ring[ring.index("mutex_init(&itr->itxr_tcb_lock,"):]
     assert "DDI_INTR_PRI(ice->ice_intr_pri)" in init[:init.index(";")]
-    buf_init = function(dma, "ice_buf_init(ice_t *ice)\n{",
-                        "\n/*\n * Release a ring's LSO pool")
+    buf_init = function(dma, "ice_buf_init(ice_t *ice)\n{", "\n}\n")
     for pool in ("itxr_copy_pool", "itxr_small_pool", "itxr_lso_pool"):
         assert f"itr->{pool}.ibp_lock = &itr->itxr_tcb_lock;" in buf_init
     # Pool construction has exclusive lifecycle ownership.
@@ -51,13 +50,20 @@ def main() -> None:
     assert teardown.index("ice_buf_fini(ice)") < \
         teardown.index("ice_tx_rings_free(ice)")
 
-    # The LSO task runs without the ring lock while it allocates.
-    task = function(dma, "ice_tx_lso_task(void *arg)\n{",
-                    "\n/*\n * Destroying the taskq")
-    assert task.index("ice_buf_pool_init(") < \
-        task.index("mutex_enter(&itr->itxr_lock)")
-    assert task.index("ice_tcb_lso_handles_alloc(") < \
-        task.index("mutex_enter(&itr->itxr_lock)")
+    # MAC start allocates the LSO pools under the lifecycle lock only, before
+    # any queue is programmed or ring opened; stop frees them after reclaim.
+    alloc = function(dma, "ice_tx_lso_alloc(ice_t *ice)\n{", "\n}\n")
+    assert "ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));" in alloc
+    assert "mutex_enter(" not in alloc
+    assert "ice_buf_pool_init(" in alloc and \
+        "ice_tcb_lso_handles_alloc(" in alloc
+    start = function(lifecycle, "\nice_start_datapath(ice_t *ice)\n{",
+                     "\n}\n")
+    assert start.index("ice_tx_lso_alloc(ice)") < \
+        start.index("ice_queues_program(ice)") < start.index("ice_tx_start(ice)")
+    stop = function(tx, "\nice_tx_stop(ice_t *ice)\n{", "\n}\n")
+    assert stop.index("ice_tx_quiesce(ice)") < \
+        stop.index("ice_tx_reclaim(ice)") < stop.index("ice_tx_lso_free(ice)")
 
     print("PASS: ice tx pool lock and lifetime invariants")
 
