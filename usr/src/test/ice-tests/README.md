@@ -148,6 +148,15 @@ returned length), the allowed debug dump clusters for E810 and E830, and a
 firmware length larger than the buffer. Replies must replace every byte of
 the caller's structure. The test also requires that no reset ioctl exists.
 
+## mdb module check
+
+`mdb_module.py` checks the `ice` mdb module in
+`usr/src/cmd/mdb/common/modules/ice`. The descriptor fields it copies from
+the imported core must keep the core's values, its state bits must match
+`ice_state_t`, and every member its CTF mirror types read must exist in the
+driver structure. It also checks the dcmd and walker tables, the x86 module
+list, and the package entries for the kmdb and mdb modules.
+
 ## Shared MAC filter request regression
 
 ```
