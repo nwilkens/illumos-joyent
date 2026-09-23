@@ -121,6 +121,19 @@ every rx and tx checksum counter has a kstat name. `lso_context.py` checks
 the reason `ice_tx_context()` records for each refused request, which feeds
 the `tx_hck_*` and `tx_lso_*` counters.
 
+## Firmware recovery regression
+
+`fw_recovery.py` compiles `ice_fw_recovery_mode()` and
+`ice_fw_recovery_report()` with the imported `ice_get_fw_mode()`. Recovery
+is detected for the recovery bit alone and with the debug bit (which the core
+reports as DBG), within the two-bit E830 field, and not for normal, debug,
+rollback, or a faulted all-ones read. The report posts one
+`ereport.io.device.fw_corrupt`, marks the service lost, and tells the
+operator to update the NVM. The test also requires the check to run before
+the first admin queue command at attach, and right after the reset completes
+in the rebuild. `reset_requests.py` runs the rebuild with recovery firmware
+and requires a terminal, fail-closed result with no control queue restart.
+
 ## Shared MAC filter request regression
 
 ```

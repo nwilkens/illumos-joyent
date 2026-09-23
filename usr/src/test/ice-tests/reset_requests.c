@@ -209,10 +209,36 @@ ice_check_reset(struct ice_hw *hw)
 	return (fail_reset);
 }
 
+static int fw_recovery;
+static unsigned recovery_reports, ctrlq_inits;
+
+static int
+ice_fw_recovery_mode(ice_t *ice, uint32_t *fwsmp)
+{
+	(void) ice;
+	*fwsmp = fw_recovery ? 2 : 0;
+	return (fw_recovery);
+}
+
+static void
+ice_fw_recovery_report(ice_t *ice, uint32_t fwsm)
+{
+	(void) ice;
+	assert(fwsm == 2);
+	recovery_reports++;
+}
+
+static int
+ice_init_all_ctrlq(struct ice_hw *hw)
+{
+	(void) hw;
+	ctrlq_inits++;
+	return (0);
+}
+
 /* BEGIN CSTYLED */
 #define	HW_OK(name) static int name(struct ice_hw *hw) \
 	{ (void) hw; return (0); }
-HW_OK(ice_init_all_ctrlq)
 HW_OK(ice_sched_query_res_alloc)
 HW_OK(ice_clear_pf_cfg)
 HW_OK(ice_get_caps)
@@ -327,6 +353,8 @@ reset(void)
 	queued = prepared = pfrs = global_waits = starts = errors = 0;
 	slow_empr = 0;
 	slow_waits = 0;
+	fw_recovery = 0;
+	recovery_reports = ctrlq_inits = 0;
 	fail_dispatch = fail_reset = start_result = 0;
 	resume_ok = 1;
 	down_reports = 0;
@@ -426,6 +454,30 @@ check_slow_empr(void)
 }
 
 static void
+check_fw_recovery(void)
+{
+	/*
+	 * Firmware left in recovery mode by a reset ends the rebuild before
+	 * the control queues come back, and the failure is terminal.
+	 */
+	reset();
+	device.ice_state = ICE_STATE_STARTED;
+	fw_recovery = 1;
+	request(ICE_STATE_RESET_PENDING);
+	run_one();
+	assert(recovery_reports == 1 && ctrlq_inits == 0 && starts == 0);
+	assert((device.ice_state & ICE_STATE_RESET_FAILED) != 0);
+	assert((device.ice_state & ICE_STATE_ERROR) != 0);
+	assert(queued == 0);
+
+	/* Normal firmware rebuilds as before. */
+	reset();
+	request(ICE_STATE_PFR_REQ);
+	run_one();
+	assert(recovery_reports == 0 && ctrlq_inits == 1);
+}
+
+static void
 check_gates(void)
 {
 	unsigned gate;
@@ -494,6 +546,7 @@ main(void)
 	check_new_requests();
 	check_gates();
 	check_slow_empr();
+	check_fw_recovery();
 	check_restart_failure();
 	(void) puts("PASS: ICE reset ownership and rebuild interleavings");
 	return (0);

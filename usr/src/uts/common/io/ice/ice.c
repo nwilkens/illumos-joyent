@@ -427,6 +427,58 @@ ice_set_ctrlq_len(struct ice_hw *hw)
 	hw->sbq.sq_buf_size = ICE_SBQ_MAX_BUF_LEN;
 }
 
+/* GL_MNG_FWSM.FW_MODES bit 1: firmware runs in recovery mode. */
+#define	ICE_FWSM_MODE_RECOVERY	BIT(1)
+
+/*
+ * Report whether firmware runs in recovery mode.  ice_get_fw_mode() tests the
+ * debug bit first, so a device in both debug and recovery mode reads as DBG;
+ * the recovery bit is tested as well, within the per-MAC width of the field.
+ * A failed read proves nothing, and the caller's access check fails it.
+ */
+static boolean_t
+ice_fw_recovery_mode(ice_t *ice, uint32_t *fwsmp)
+{
+	struct ice_hw *hw = &ice->ice_hw;
+	uint32_t fwsm;
+
+	fwsm = rd32(hw, GL_MNG_FWSM);
+	*fwsmp = fwsm;
+	if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
+	    DDI_FM_OK)
+		return (B_FALSE);
+
+	return (ice_get_fw_mode(hw) == ICE_FW_MODE_REC ||
+	    (fwsm & GL_MNG_FWSM_FW_MODES_M_BY_MAC(hw) &
+	    ICE_FWSM_MODE_RECOVERY) != 0);
+}
+
+/*
+ * Firmware in recovery mode cannot run the device; only an NVM update can
+ * repair it.  Post one ereport, mark the service lost, and tell the operator
+ * what to do.  The callers then fail closed.
+ */
+static void
+ice_fw_recovery_report(ice_t *ice, uint32_t fwsm)
+{
+	char class[FM_MAX_CLASS];
+
+	if (DDI_FM_EREPORT_CAP(ice->ice_fm_caps)) {
+		(void) snprintf(class, sizeof (class), "%s.%s", DDI_FM_DEVICE,
+		    DDI_FM_DEVICE_FW_CORRUPT);
+		ddi_fm_ereport_post(ice->ice_dip, class,
+		    fm_ena_generate(0, FM_ENA_FMT1), DDI_NOSLEEP,
+		    FM_VERSION, DATA_TYPE_UINT8, FM_EREPORT_VERS0,
+		    "fw_mode", DATA_TYPE_STRING, "recovery",
+		    "mng_fwsm", DATA_TYPE_UINT32, fwsm, NULL);
+	}
+	ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
+	dev_err(ice->ice_dip, CE_WARN, "firmware is in recovery mode "
+	    "(GL_MNG_FWSM 0x%x); the device is not usable.  Update the NVM "
+	    "with the Intel NVM update tool, then power cycle the system",
+	    fwsm);
+}
+
 /*
  * Name the family for messages.  The common code keys each family difference
  * on hw->mac_type.  Only the E822 and E823 parts share a MAC type, and the
@@ -455,6 +507,7 @@ ice_hw_init(ice_t *ice)
 {
 	struct ice_hw *hw = &ice->ice_hw;
 	const char *family;
+	uint32_t fwsm;
 	int rc;
 
 	/*
@@ -470,6 +523,16 @@ ice_hw_init(ice_t *ice)
 		return (B_FALSE);
 	}
 
+	/*
+	 * Recovery firmware does not accept the normal initialization, and
+	 * nothing the driver builds on it is usable.  Detect it before any
+	 * admin queue work.
+	 */
+	if (ice_fw_recovery_mode(ice, &fwsm)) {
+		ice_fw_recovery_report(ice, fwsm);
+		return (B_FALSE);
+	}
+
 	ice_set_ctrlq_len(hw);
 
 	/*
@@ -478,6 +541,12 @@ ice_hw_init(ice_t *ice)
 	 * own state, so ice_deinit_hw() must not be called.
 	 */
 	rc = ice_init_hw(hw);
+	if (rc == ICE_ERR_FW_API_VER) {
+		dev_err(ice->ice_dip, CE_WARN, "firmware API version %u.%u is "
+		    "not supported by this driver; update the NVM or the "
+		    "driver", hw->api_maj_ver, hw->api_min_ver);
+		return (B_FALSE);
+	}
 	if (rc != 0) {
 		ice_error(ice, "hardware initialization failed: %d", rc);
 		return (B_FALSE);
@@ -1694,6 +1763,7 @@ static void
 ice_rebuild(ice_t *ice, uint32_t requests)
 {
 	struct ice_hw *hw = &ice->ice_hw;
+	uint32_t fwsm;
 	int rc;
 
 	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
@@ -1714,6 +1784,15 @@ ice_rebuild(ice_t *ice, uint32_t requests)
 	}
 	if (rc != 0) {
 		ice_error(ice, "device never came out of reset: %d", rc);
+		goto reset_failed;
+	}
+
+	/*
+	 * An EMPR can leave the firmware in recovery mode.  The rebuild then
+	 * stops here, fail-closed, before any queue or filter programming.
+	 */
+	if (ice_fw_recovery_mode(ice, &fwsm)) {
+		ice_fw_recovery_report(ice, fwsm);
 		goto reset_failed;
 	}
 

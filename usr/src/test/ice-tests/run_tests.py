@@ -22,6 +22,7 @@ TESTS = (
     "exception_lists.py",
     "filter_requests.py",
     "fma_dma.py",
+    "fw_recovery.py",
     "hw_stats.py",
     "jumbo_copy.py",
     "jumbo_rx.py",
