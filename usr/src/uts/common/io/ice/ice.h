@@ -529,7 +529,6 @@ typedef struct ice {
 	ice_attach_state_t	ice_attach_progress;
 
 	kmutex_t		ice_lock;
-	list_node_t		ice_glink;
 
 	int			ice_fm_caps;
 	/* Error-only atomic accounting protects detach's MMIO polling proof. */

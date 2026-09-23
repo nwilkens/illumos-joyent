@@ -59,14 +59,6 @@ static uint32_t ice_prop_get_num_queues(ice_t *);
 
 static void *ice_state_p;
 
-/*
- * All attached instances.  The driver currently drives a single PF per device;
- * the list is maintained so that per-device state shared across the PFs of a
- * multi-function device has a home, but nothing consumes it yet.
- */
-static kmutex_t ice_glock;
-static list_t ice_glist;
-
 static char ice_ident[] = "Intel E800 Series Ethernet";
 
 static struct cb_ops ice_cb_ops = {
@@ -125,16 +117,11 @@ _init(void)
 	if (status != DDI_SUCCESS)
 		return (status);
 
-	mutex_init(&ice_glock, NULL, MUTEX_DRIVER, NULL);
-	list_create(&ice_glist, sizeof (ice_t), offsetof(ice_t, ice_glink));
-
 	mac_init_ops(&ice_dev_ops, ICE_MODULE_NAME);
 
 	status = mod_install(&ice_modlinkage);
 	if (status != DDI_SUCCESS) {
 		mac_fini_ops(&ice_dev_ops);
-		list_destroy(&ice_glist);
-		mutex_destroy(&ice_glock);
 		ddi_soft_state_fini(&ice_state_p);
 	}
 
@@ -155,8 +142,6 @@ _fini(void)
 	status = mod_remove(&ice_modlinkage);
 	if (status == DDI_SUCCESS) {
 		mac_fini_ops(&ice_dev_ops);
-		list_destroy(&ice_glist);
-		mutex_destroy(&ice_glock);
 		ddi_soft_state_fini(&ice_state_p);
 	}
 
@@ -1440,10 +1425,6 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		goto fail;
 	ice->ice_attach_progress |= ICE_ATTACH_MAC;
 
-	mutex_enter(&ice_glock);
-	list_insert_tail(&ice_glist, ice);
-	mutex_exit(&ice_glock);
-
 	/*
 	 * Refresh carrier after registration and interrupt setup, before
 	 * opening the instance to rebuilds.  The lifecycle lock serializes
@@ -1580,10 +1561,6 @@ ice_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 
 	ice_loopback_fini(ice);
 	ice_led_fini(ice);
-
-	mutex_enter(&ice_glock);
-	list_remove(&ice_glist, ice);
-	mutex_exit(&ice_glock);
 
 	ice_unconfigure(ice);
 	ddi_soft_state_free(ice_state_p, instance);

@@ -50,8 +50,6 @@ typedef struct ice {
 
 static ice_t device;
 static void *ice_state_p;
-static kmutex_t ice_glock;
-static int ice_glist;
 static struct {
 	boolean_t drained, disabled, reset_ok, access_ok, unregister_ok;
 	boolean_t quiet, tx_closed, rx_closed, freed;
@@ -262,13 +260,6 @@ ice_loopback_fini(ice_t *p)
 static void
 ice_led_fini(ice_t *p)
 {
-	assert(p->ice_detaching);
-}
-
-static void
-list_remove(int *list, ice_t *p)
-{
-	(void) list;
 	assert(p->ice_detaching);
 }
 

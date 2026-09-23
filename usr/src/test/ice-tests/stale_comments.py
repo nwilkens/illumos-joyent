@@ -77,9 +77,10 @@ def main() -> None:
             assert token in states, "%s: no such progress bit %s" % (
                 name, token)
 
-    # 3. The multi-PF limitation is genuine and must stay recorded: the
-    # instance list has no consumer yet.
-    assert "multi-function" in sources["ice.c"]
+    # 3. The PFs of one device share no driver state, so no global instance
+    # list may come back without a consumer (see the theory statement).
+    for name, text in sources.items():
+        assert "ice_glist" not in text and "ice_glock" not in text, name
 
     print("PASS: ice glue comments match the implemented driver")
 
