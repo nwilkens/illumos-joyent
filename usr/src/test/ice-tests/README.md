@@ -134,6 +134,20 @@ the first admin queue command at attach, and right after the reset completes
 in the rebuild. `reset_requests.py` runs the rebuild with recovery firmware
 and requires a terminal, fail-closed result with no control queue restart.
 
+## Diagnostic ioctl regression
+
+`diag_ioctl.py` compiles every function in `ice_ioctl.c` with stub admin
+queue, credential and STREAMS boundaries and attacks the firmware logging and
+debug dump ioctls. A zone caller fails with EPERM even with every privilege,
+as does a global-zone caller without `{PRIV_SYS_DEVICES}` or
+`{PRIV_SYS_CONFIG}`; TRANSPARENT and wrongly sized requests fail with EINVAL;
+no firmware command runs for a refused request. It checks module, level,
+resolution and flag validation, UART option preservation, the log ring
+(whole-event drops, wrap-around, drop counts, and no stale bytes after the
+returned length), the allowed debug dump clusters for E810 and E830, and a
+firmware length larger than the buffer. Replies must replace every byte of
+the caller's structure. The test also requires that no reset ioctl exists.
+
 ## Shared MAC filter request regression
 
 ```

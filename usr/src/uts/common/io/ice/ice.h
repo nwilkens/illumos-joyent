@@ -648,6 +648,16 @@ typedef struct ice {
 	kstat_t			*ice_pf_kstat;
 	kstat_t			*ice_vsi_kstat;
 
+	/*
+	 * Firmware log events queued for ICE_IOC_FWLOG_READ (ice_ioctl.c).
+	 * The ring is allocated when log delivery is first enabled.
+	 */
+	kmutex_t		ice_fwlog_lock;
+	uint8_t			*ice_fwlog_buf;
+	size_t			ice_fwlog_head;
+	size_t			ice_fwlog_len;
+	uint32_t		ice_fwlog_dropped;
+
 	mac_handle_t		ice_mac_hdl;	/* set by mac_register() */
 } ice_t;
 
@@ -805,6 +815,14 @@ extern int ice_transceiver_read(void *, uint_t, uint_t, void *, size_t, off_t,
 extern int ice_led_set(void *, mac_led_mode_t, uint_t);
 extern void ice_led_replay(ice_t *);
 extern void ice_led_fini(ice_t *);
+
+/*
+ * ice_ioctl.c: firmware diagnostic ioctls.
+ */
+extern void ice_diag_init(ice_t *);
+extern void ice_diag_fini(ice_t *);
+extern void ice_diag_fwlog_event(ice_t *, const uint8_t *, size_t);
+extern boolean_t ice_diag_ioctl(ice_t *, queue_t *, mblk_t *);
 
 /*
  * Hardware statistics (ice_stats.c).

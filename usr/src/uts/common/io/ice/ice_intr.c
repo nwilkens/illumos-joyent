@@ -687,6 +687,9 @@ ice_oicr_task(void *arg)
 				ice_setup_link(ice);
 			ice_phy_caps_update(ice);
 			break;
+		case ice_aqc_opc_fw_logs_event:
+			ice_diag_fwlog_event(ice, evt.msg_buf, evt.msg_len);
+			break;
 		default:
 			break;
 		}

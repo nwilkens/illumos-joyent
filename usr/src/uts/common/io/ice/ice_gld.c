@@ -374,6 +374,9 @@ ice_m_ioctl(void *arg, queue_t *q, mblk_t *mp)
 		error = ice_loopback_mode_set(ice, mode);
 		break;
 	default:
+		/* The firmware diagnostics reply to the message themselves. */
+		if (ice_diag_ioctl(ice, q, mp))
+			return;
 		error = EINVAL;
 		break;
 	}

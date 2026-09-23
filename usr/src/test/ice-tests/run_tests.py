@@ -17,6 +17,7 @@ TESTS = (
     "core_readme.py",
     "cstyle_glue.py",
     "detach_quiesce.py",
+    "diag_ioctl.py",
     "ddp_sections.py",
     "dma_lifetime.py",
     "exception_lists.py",
