@@ -230,7 +230,8 @@ ice_phy_types_to_speeds(const struct ice_aqc_get_phy_caps_data *pcaps)
 		ICE_AQ_LINK_SPEED_25GB,
 		ICE_AQ_LINK_SPEED_40GB,
 		ICE_AQ_LINK_SPEED_50GB,
-		ICE_AQ_LINK_SPEED_100GB
+		ICE_AQ_LINK_SPEED_100GB,
+		ICE_AQ_LINK_SPEED_200GB
 	};
 	u64 caps_low = LE64_TO_CPU(pcaps->phy_type_low);
 	u64 caps_high = LE64_TO_CPU(pcaps->phy_type_high);
@@ -474,8 +475,8 @@ ice_oicr_mdd(ice_t *ice)
 
 	if (rd32(hw, GL_MDET_TX_PQM) != 0)
 		wr32(hw, GL_MDET_TX_PQM, 0xffffffff);
-	if (rd32(hw, GL_MDET_TX_TCLAN) != 0)
-		wr32(hw, GL_MDET_TX_TCLAN, 0xffffffff);
+	if (rd32(hw, ICE_GL_MDET_TX_TCLAN(hw)) != 0)
+		wr32(hw, ICE_GL_MDET_TX_TCLAN(hw), 0xffffffff);
 	if (rd32(hw, GL_MDET_TX_TDPU) != 0)
 		wr32(hw, GL_MDET_TX_TDPU, 0xffffffff);
 	if (rd32(hw, GL_MDET_RX) != 0)
@@ -485,8 +486,9 @@ ice_oicr_mdd(ice_t *ice)
 		wr32(hw, PF_MDET_TX_PQM, 0xffffffff);
 		pf_mdd = B_TRUE;
 	}
-	if ((rd32(hw, PF_MDET_TX_TCLAN) & PF_MDET_TX_TCLAN_VALID_M) != 0) {
-		wr32(hw, PF_MDET_TX_TCLAN, 0xffffffff);
+	if ((rd32(hw, ICE_PF_MDET_TX_TCLAN(hw)) &
+	    PF_MDET_TX_TCLAN_VALID_M) != 0) {
+		wr32(hw, ICE_PF_MDET_TX_TCLAN(hw), 0xffffffff);
 		pf_mdd = B_TRUE;
 	}
 	if ((rd32(hw, PF_MDET_TX_TDPU) & PF_MDET_TX_TDPU_VALID_M) != 0) {

@@ -43,7 +43,7 @@ def main() -> None:
     assert "ice_phy_caps_update(ice)" in oicr
     assert "ice_update_phy_type" in intr
     speeds = function(intr, "ice_phy_types_to_speeds(", "\n}\n")
-    for bit in ("100MB", "1000MB", "100GB"):
+    for bit in ("100MB", "1000MB", "100GB", "200GB"):
         assert f"ICE_AQ_LINK_SPEED_{bit}," in speeds or \
             f"ICE_AQ_LINK_SPEED_{bit}\n" in speeds
 
@@ -63,8 +63,8 @@ def main() -> None:
         "ice_m_stat(void *arg, uint_t stat, uint64_t *val)\n{",
         "\n/*\n * SFF module",
     )
-    # E822 and E823 SGMII ports link at 100 Mb/s.
-    for rate in ("100", "25G", "40G", "100G"):
+    # E822 and E823 SGMII ports link at 100 Mb/s; E830 reaches 200 Gb/s.
+    for rate in ("100", "25G", "40G", "100G", "200G"):
         assert f"ETHER_STAT_CAP_{rate}FDX" in mstat
         assert f"ETHER_STAT_ADV_CAP_{rate}FDX" in mstat
     assert "ice->ice_phy_speeds_adv & speed" in mstat
@@ -76,6 +76,7 @@ def main() -> None:
         "\nstatic void\nice_m_propinfo",
     )
     assert "MAC_PROP_ADV_40GFDX_CAP" in getprop
+    assert "advertised = pr_num == MAC_PROP_ADV_200GFDX_CAP" in getprop
     assert "advertised = pr_num == MAC_PROP_ADV_40GFDX_CAP" in getprop
     assert "ice->ice_phy_speeds_adv &" in getprop
     assert "ice->ice_phy_speeds_supp &" in getprop

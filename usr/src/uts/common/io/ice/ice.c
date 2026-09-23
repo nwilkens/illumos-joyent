@@ -49,6 +49,10 @@
 /* Extra settle time for an EMPR on E825-C and E830; see ice_rebuild(). */
 #define	ICE_EMPR_SLOW_WAIT_SEC	20
 
+/* Bound on the E830 PHY firmware load wait; see ice_phy_fw_wait(). */
+#define	ICE_PHY_FW_WAIT_MS	30000
+#define	ICE_PHY_FW_POLL_MS	100
+
 static int ice_attach(dev_info_t *, ddi_attach_cmd_t);
 static int ice_detach(dev_info_t *, ddi_detach_cmd_t);
 static uint32_t ice_prop_get_num_queues(ice_t *);
@@ -1089,6 +1093,37 @@ ice_reset_redispatch(ice_t *ice)
 		ice_reset_dispatch(ice);
 }
 
+/*
+ * E830 firmware loads the PHY firmware after the PF comes up, and PHY
+ * configuration fails until the load completes.  No interrupt reports the
+ * completion, so poll for a bounded time as Linux does (ice_wait_fw_load()).
+ * A timeout is logged and attach continues; ice_setup_link() then reports
+ * its own failure.
+ */
+static void
+ice_phy_fw_wait(ice_t *ice)
+{
+	struct ice_hw *hw = &ice->ice_hw;
+	uint_t waited = 0;
+
+	if (!ice_is_e830(hw))
+		return;
+
+	while ((rd32(hw, GL_MNG_FWSM) & GL_MNG_FWSM_FW_LOADING_M) != 0) {
+		/* A failed bus reads all ones; do not wait on it. */
+		if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
+		    DDI_FM_OK)
+			return;
+		if (waited >= ICE_PHY_FW_WAIT_MS) {
+			ice_error(ice, "PHY firmware still loading after %u ms",
+			    waited);
+			return;
+		}
+		delay(drv_usectohz(ICE_PHY_FW_POLL_MS * (MICROSEC / MILLISEC)));
+		waited += ICE_PHY_FW_POLL_MS;
+	}
+}
+
 static int
 ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 {
@@ -1231,6 +1266,7 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	ice_link_status_update(ice);
 
 	/* Enable the PHY; firmware will not bring the link up on its own. */
+	ice_phy_fw_wait(ice);
 	ice_setup_link(ice);
 	ice_phy_caps_update(ice);
 

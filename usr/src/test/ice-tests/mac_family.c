@@ -41,6 +41,20 @@ typedef unsigned int uint_t;
 #define	MAKEMASK(m, s)			((m) << (s))
 #define	ICE_ARQ_MAX_ELEMS		2048
 #define	ICE_RESET_EMPR			3
+#define	DDI_FM_OK			0
+#define	MICROSEC			1000000
+#define	MILLISEC			1000
+#define	BIT(n)				(1u << (n))
+#define	ICE_GET_LINK_STATUS_DATA_V1	1
+#define	ICE_GET_LINK_STATUS_DATA_V2	2
+#define	ICE_GET_LINK_STATUS_DATALEN_V1	32
+#define	ICE_GET_LINK_STATUS_DATALEN_V2	56
+#define	SEGMENT_TYPE_ICE_E810		0x00000010
+#define	SEGMENT_TYPE_ICE_E830		0x00000017
+#define	SEGMENT_SIGN_TYPE_RSA2K		0x00000001
+#define	SEGMENT_SIGN_TYPE_RSA3K		0x00000002
+#define	SEGMENT_SIGN_TYPE_RSA3K_SBB	0x00000003
+#define	SEGMENT_SIGN_TYPE_RSA3K_E825	0x00000005
 
 #include "ice_devids.h"
 #include "ice_family_regs.h"
@@ -71,18 +85,51 @@ struct ice_hw {
 
 typedef struct ice {
 	struct ice_hw ice_hw;
+	struct {
+		int ios_reg_handle;
+	} ice_osdep;
 } ice_t;
 
 /* Register and control-queue boundary. */
 static u32 rstat;
 static unsigned sbq_cleans, other_cleans;
+static unsigned fw_loading, fw_reads, delays, errors;
+static long delayed_us;
 
 static u32
 rd32(struct ice_hw *hw, u32 reg)
 {
 	(void) hw;
+	if (reg == GL_MNG_FWSM) {
+		fw_reads++;
+		if (fw_loading == 0)
+			return (0);
+		fw_loading--;
+		return (GL_MNG_FWSM_FW_LOADING_M);
+	}
 	assert(reg == GLGEN_RSTAT);
 	return (rstat);
+}
+
+static int
+ice_check_acc_handle(ice_t *ice, int handle)
+{
+	(void) ice;
+	(void) handle;
+	return (DDI_FM_OK);
+}
+
+static long
+drv_usectohz(long usec)
+{
+	return (usec);
+}
+
+static void
+delay(long ticks)
+{
+	delays++;
+	delayed_us += ticks;
 }
 
 static int
@@ -106,7 +153,7 @@ ice_error(ice_t *ice, const char *fmt, ...)
 {
 	(void) ice;
 	(void) fmt;
-	abort();
+	errors++;
 }
 
 #include "ice_family_body.h"
@@ -124,6 +171,7 @@ family_checks(struct ice_hw *hw, const char *want)
 	struct ice_rq_event_info evt;
 	bool slow = is(want, "E825-C") || is(want, "E830");
 	bool sbq = is(want, "E822") || is(want, "E823") || is(want, "E825-C");
+	bool e830 = is(want, "E830");
 
 	/* Only an EMPR is slow, and only on E825-C and E830. */
 	rstat = ICE_RESET_EMPR << GLGEN_RSTAT_RESET_TYPE_S;
@@ -135,10 +183,45 @@ family_checks(struct ice_hw *hw, const char *want)
 	(void) memset(&ice, 0, sizeof (ice));
 	ice.ice_hw = *hw;
 	ice.ice_hw.sbq.pending = 3;
-	sbq_cleans = other_cleans = 0;
+	sbq_cleans = other_cleans = errors = 0;
 	ice_sbq_drain(&ice, &evt);
-	assert(other_cleans == 0);
+	assert(other_cleans == 0 && errors == 0);
 	assert(sbq_cleans == (sbq ? 3u : 0u));
+
+	/* E830 moved the TCLAN detection registers. */
+	assert(ICE_GL_MDET_TX_TCLAN(hw) == (e830 ? 0x000FCCC0u : 0x000FC068u));
+	assert(ICE_PF_MDET_TX_TCLAN(hw) == (e830 ? 0x000FCC00u : 0x000FC000u));
+
+	/* Only E830 answers Get Link Status with the longer v2 data. */
+	assert(ice_get_link_status_datalen(hw) ==
+	    (e830 ? ICE_GET_LINK_STATUS_DATALEN_V2 :
+	    ICE_GET_LINK_STATUS_DATALEN_V1));
+
+	/* The core selects the package segment and signature per family. */
+	assert(ice_get_pkg_segment_id(hw->mac_type) ==
+	    (e830 ? SEGMENT_TYPE_ICE_E830 : SEGMENT_TYPE_ICE_E810));
+	assert(ice_get_pkg_sign_type(hw->mac_type) ==
+	    (e830 ? SEGMENT_SIGN_TYPE_RSA3K_SBB :
+	    is(want, "E825-C") ? SEGMENT_SIGN_TYPE_RSA3K_E825 :
+	    SEGMENT_SIGN_TYPE_RSA2K));
+
+	/* Only E830 waits for its PHY firmware, and the wait is bounded. */
+	fw_loading = 3;
+	fw_reads = delays = errors = 0;
+	delayed_us = 0;
+	ice_phy_fw_wait(&ice);
+	assert(delays == (e830 ? 3u : 0u) && errors == 0);
+	assert(fw_reads == (e830 ? 4u : 0u));
+	fw_loading = 1000000;
+	delays = errors = 0;
+	delayed_us = 0;
+	ice_phy_fw_wait(&ice);
+	if (e830) {
+		assert(errors == 1);
+		assert(delayed_us == (long)ICE_PHY_FW_WAIT_MS * 1000);
+	} else {
+		assert(delays == 0 && errors == 0);
+	}
 }
 
 static void

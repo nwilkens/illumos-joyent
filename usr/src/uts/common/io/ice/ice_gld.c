@@ -467,6 +467,9 @@ ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 	case ETHER_STAT_CAP_100GFDX:
 		speed = ICE_AQ_LINK_SPEED_100GB;
 		break;
+	case ETHER_STAT_CAP_200GFDX:
+		speed = ICE_AQ_LINK_SPEED_200GB;
+		break;
 	case ETHER_STAT_ADV_CAP_100FDX:
 		speed = ICE_AQ_LINK_SPEED_100MB;
 		advertised = B_TRUE;
@@ -501,6 +504,10 @@ ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 		break;
 	case ETHER_STAT_ADV_CAP_100GFDX:
 		speed = ICE_AQ_LINK_SPEED_100GB;
+		advertised = B_TRUE;
+		break;
+	case ETHER_STAT_ADV_CAP_200GFDX:
+		speed = ICE_AQ_LINK_SPEED_200GB;
 		advertised = B_TRUE;
 		break;
 	case ETHER_STAT_CAP_AUTONEG:
@@ -829,6 +836,11 @@ ice_m_getprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 		advertised = pr_num == MAC_PROP_ADV_100GFDX_CAP;
 		phy_speed = ICE_AQ_LINK_SPEED_100GB;
 		break;
+	case MAC_PROP_ADV_200GFDX_CAP:
+	case MAC_PROP_EN_200GFDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_200GFDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_200GB;
+		break;
 	case MAC_PROP_ADV_FEC_CAP:
 		if (pr_valsize < sizeof (link_fec_t)) {
 			ret = EOVERFLOW;
@@ -949,6 +961,11 @@ ice_m_propinfo(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 	case MAC_PROP_EN_100GFDX_CAP:
 		advertised = pr_num == MAC_PROP_ADV_100GFDX_CAP;
 		phy_speed = ICE_AQ_LINK_SPEED_100GB;
+		break;
+	case MAC_PROP_ADV_200GFDX_CAP:
+	case MAC_PROP_EN_200GFDX_CAP:
+		advertised = pr_num == MAC_PROP_ADV_200GFDX_CAP;
+		phy_speed = ICE_AQ_LINK_SPEED_200GB;
 		break;
 	case MAC_PROP_ADV_FEC_CAP:
 	case MAC_PROP_EN_FEC_CAP:

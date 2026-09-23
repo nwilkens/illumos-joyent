@@ -97,6 +97,18 @@ CTASSERT(ICE_MAX_FRAME_SIZE <= UINT16_MAX);
 	ICE_AQ_LINK_EVENT_TOPO_CONFLICT | ICE_AQ_LINK_EVENT_MEDIA_CONFLICT | \
 	ICE_AQ_LINK_EVENT_PHY_FW_LOAD_FAIL)
 
+/*
+ * E830 moved the TCLAN malicious-driver detection registers.  The imported
+ * core predates the move.  The offsets match E830_GL_MDET_TX_TCLAN and
+ * E830_PF_MDET_TX_TCLAN in upstream Linux and FreeBSD.
+ */
+#define	ICE_E830_GL_MDET_TX_TCLAN	0x000FCCC0
+#define	ICE_E830_PF_MDET_TX_TCLAN	0x000FCC00
+#define	ICE_GL_MDET_TX_TCLAN(hw)	\
+	(ice_is_e830(hw) ? ICE_E830_GL_MDET_TX_TCLAN : GL_MDET_TX_TCLAN)
+#define	ICE_PF_MDET_TX_TCLAN(hw)	\
+	(ice_is_e830(hw) ? ICE_E830_PF_MDET_TX_TCLAN : PF_MDET_TX_TCLAN)
+
 /* Standard netlb(4I) modes supported by ice_m_ioctl(). */
 #define	ICE_LB_NONE		0
 #define	ICE_LB_INTERNAL_MAC	1

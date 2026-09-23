@@ -88,9 +88,10 @@ def main() -> None:
     mdd = function(intr, "ice_oicr_mdd(ice_t *ice)\n{", "\nstatic void\nice_oicr_fatal")
     # TDPU is the transmit-data protection unit (oversized or malformed
     # packets); a set register nothing clears can reassert MAL_DETECT.
-    for reg in ("GL_MDET_TX_PQM", "GL_MDET_TX_TCLAN", "GL_MDET_TX_TDPU",
-                "GL_MDET_RX", "PF_MDET_TX_PQM", "PF_MDET_TX_TCLAN",
-                "PF_MDET_TX_TDPU", "PF_MDET_RX"):
+    # E830 moved TCLAN; mac_family.py checks the selection per family.
+    for reg in ("GL_MDET_TX_PQM", "ICE_GL_MDET_TX_TCLAN(hw)",
+                "GL_MDET_TX_TDPU", "GL_MDET_RX", "PF_MDET_TX_PQM",
+                "ICE_PF_MDET_TX_TCLAN(hw)", "PF_MDET_TX_TDPU", "PF_MDET_RX"):
         assert reg in mdd, reg
         assert f"wr32(hw, {reg}, 0xffffffff)" in mdd, reg
     assert "ICE_STATE_ERROR | ICE_STATE_PFR_REQ" in mdd

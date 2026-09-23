@@ -4,6 +4,7 @@
 import argparse
 from pathlib import Path
 import re
+import struct
 
 from c_test import DRIVER, REPO, TESTDIR, extract, run_c
 
@@ -91,12 +92,30 @@ def main():
     for name in ("ice_family_name", "ice_reset_empr_slow"):
         fragments.append(extract(source,
             rf"^static [\w *]+\n{name}\([\s\S]*?^}}", args.source))
+    for name in ("ice_phy_fw_wait",):
+        fragments.append(extract(source,
+            rf"^static [\w *]+\n{name}\([\s\S]*?^}}", args.source))
+    fragments.insert(0, "\n".join(re.findall(
+        r"^#define\tICE_PHY_FW_\w+\t+\d+$", source, re.MULTILINE)))
+    fragments.insert(0, extract(common,
+        r"^#define ice_get_link_status_data_ver[\s\S]*?^\}",
+        CORE / "ice_common.c"))
+    ddp = (CORE / "ice_ddp_common.c").read_text()
+    for name in ("ice_get_pkg_segment_id", "ice_get_pkg_sign_type"):
+        fragments.append(extract(ddp,
+            rf"^static u32 {name}\([\s\S]*?^\}}", CORE / "ice_ddp_common.c"))
+    header = (DRIVER / "ice.h").read_text()
+    fragments.insert(0, extract(header,
+        r"^#define\tICE_E830_GL_MDET_TX_TCLAN[\s\S]*?PF_MDET_TX_TCLAN\)$",
+        DRIVER / "ice.h"))
     intr = args.intr_source.read_text()
     fragments.append(extract(intr,
         r"^static void\nice_sbq_drain\([\s\S]*?^}", args.intr_source))
     autogen = (CORE / "ice_hw_autogen.h").read_text()
-    regs = "\n".join(re.findall(r"^#define GLGEN_RSTAT(?:_RESET_TYPE_[SM])?\s.*$",
-                                autogen, re.MULTILINE))
+    regs = "\n".join(re.findall(
+        r"^#define (?:GLGEN_RSTAT(?:_RESET_TYPE_[SM])?|GL_MNG_FWSM|"
+        r"GL_MNG_FWSM_FW_LOADING_M|GL_MDET_TX_TCLAN|PF_MDET_TX_TCLAN)\s.*$",
+        autogen, re.MULTILINE))
     cases = [f"{ids[name]:x}:{family(name)}" for name in mapping]
     cases.append(f"{ids['ICE_DEV_ID_E822_SI_DFLT']:x}:none")
     run_c(TESTDIR / "mac_family.c",
@@ -104,7 +123,35 @@ def main():
            "ice_family_regs.h": regs + "\n",
            "ice_devids.h": (CORE / "ice_devids.h").read_text()},
           cflags=("-Wno-unused-function",), cases=(tuple(cases),))
+    check_package()
     print(f"PASS: {len(bound)} aliases match the core MAC type mapping")
+
+
+# Configuration segment and signature each family loads (mac_family.c checks
+# that the core selects these).
+PACKAGE_NEEDS = {
+    "E810, E822, E823": (0x10, 1),
+    "E825-C": (0x10, 5),
+    "E830": (0x17, 3),
+}
+
+
+def check_package():
+    """The shipped DDP package must carry a signed segment for each family."""
+    data = (DRIVER / "firmware/ice.pkg").read_bytes()
+    count = struct.unpack_from("<I", data, 4)[0]
+    configs, signed = set(), set()
+    for i in range(count):
+        offset = struct.unpack_from("<I", data, 8 + 4 * i)[0]
+        seg_type = struct.unpack_from("<I", data, offset)[0]
+        if seg_type in (0x10, 0x17):
+            configs.add(seg_type)
+        elif seg_type == 0x1001:
+            # ice_sign_seg: 44-byte generic header, seg_id, sign_type
+            signed.add(struct.unpack_from("<II", data, offset + 44))
+    for family, (seg, sign) in PACKAGE_NEEDS.items():
+        assert seg in configs, f"{family}: no configuration segment {seg:#x}"
+        assert (seg, sign) in signed, f"{family}: no signature type {sign}"
 
 
 if __name__ == "__main__":
