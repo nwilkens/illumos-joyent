@@ -682,4 +682,14 @@ from both hosts to cover both traffic directions.
 Historical validation recorded in commit `60beba06389` (2026-07-18) reported
 boston<->hunter at MTU 1500 (9.36 Gbps) and 9000 (9.59 Gbps), with all checks
 green. Those earlier branch results do not validate the reviewed fixes.
-Hardware acceptance for this review revision remains pending.
+
+On 2026-09-23 this revision ran on boston (E810-C 0x1592, firmware 6.2.9,
+DDP 1.3.41.0) against hunter, which ran an older driver, in one direction
+only (boston transmits). The platform granted 8 MSI-X vectors, so the driver
+used 7 queue pairs, and all 7 receive rings took traffic. With LSO on,
+`datapath_accept.sh` passed every check at MTU 1500 (7.3 to 9.2 Gbps over
+four runs) and 9000 (9.88 Gbps); with `tx_lso_enable=0`, MTU 1500 reached
+5.3 to 5.9 Gbps. The on-system `attach`, `led` and `diag_ioctl.64` tests
+passed, detach and reattach with the LED in identify mode were clean, and
+the mdb module read the instance and its rings. The reverse direction, the
+other device families, reset and fault injection were not tested.
