@@ -107,6 +107,7 @@ typedef struct mdb_ice_rx_ring {
 	boolean_t	irxr_shutdown;
 	boolean_t	irxr_started;
 	boolean_t	irxr_intr_poll;
+	boolean_t	irxr_copy_only;
 	uintptr_t	irxr_descs;
 	uint16_t	irxr_size;
 	uint16_t	irxr_head;
@@ -323,11 +324,12 @@ ice_rxq_cb(uintptr_t addr, const void *data __unused, void *arg __unused)
 		return (WALK_ERR);
 	}
 
-	mdb_printf("%0?p %4u %4u %5u %5u %5u %5u %6u %s%s%s\n", addr,
+	mdb_printf("%0?p %4u %4u %5u %5u %5u %5u %6u %s%s%s%s\n", addr,
 	    rxr.irxr_index, rxr.irxr_vec, rxr.irxr_size, rxr.irxr_head,
 	    rxr.irxr_tail, rxr.irxr_nfree, rxr.irxr_nloaned,
 	    rxr.irxr_started ? "STARTED " : "",
 	    rxr.irxr_intr_poll ? "POLL " : "",
+	    rxr.irxr_copy_only ? "COPY " : "",
 	    rxr.irxr_shutdown ? "SHUTDOWN" : "");
 
 	return (WALK_NEXT);

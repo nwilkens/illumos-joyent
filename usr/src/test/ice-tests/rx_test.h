@@ -23,6 +23,8 @@
 
 typedef int boolean_t;
 typedef unsigned int uint_t;
+/* The host's clock_t can be unsigned; the kernel's is signed. */
+#define	clock_t	long
 typedef char *caddr_t;
 
 #define	B_TRUE	1
@@ -117,7 +119,9 @@ typedef struct {
 	kstat_named_t icrxs_copy_nomem, icrxs_copy_bytes, icrxs_copy_segs;
 	kstat_named_t icrxs_no_rcb, icrxs_bind_bytes, icrxs_bind_segs;
 	kstat_named_t icrxs_desc_error, icrxs_bytes, icrxs_packets;
-	kstat_named_t icrxs_intr_limit;
+	kstat_named_t icrxs_intr_limit, icrxs_orphan_pools, icrxs_orphan_loans;
+	kstat_named_t icrxs_copy_mode_enter, icrxs_copy_mode_exit;
+	kstat_named_t icrxs_copy_mode_segs;
 } ice_rxq_stat_t;
 struct ice_hw {
 	int unused;
@@ -133,6 +137,7 @@ typedef struct {
 	} ice_osdep;
 	uint32_t ice_state, ice_rx_limit_per_intr;
 	uint_t ice_num_rxr;
+	volatile uint32_t ice_rx_orphan_loans;
 	int ice_dip, ice_mac_hdl;
 } ice_t;
 typedef enum {
@@ -141,24 +146,21 @@ typedef enum {
 	IRXB_ONLOAN
 } ice_rcb_state_t;
 struct ice_rx_ring;
+struct ice_rx_pool;
 typedef struct {
 	mblk_t *ircb_mp;
 	struct ice_rx_ring *ircb_ring;
+	struct ice_rx_pool *ircb_pool;
 	ice_dma_buffer_t ircb_dma;
 	frtn_t ircb_free_rtn;
 	ice_rcb_state_t ircb_state;
 } ice_rx_ctrl_block_t;
-typedef struct {
-	ice_rx_ctrl_block_t *irp_area, **irp_free, **irp_slots;
+typedef struct ice_rx_pool {
+	ice_rx_ctrl_block_t **irp_free, **irp_slots;
 	uint_t irp_nrcb, irp_nfree, irp_nreserve, irp_nloaned;
 	uint16_t irp_size;
+	uint32_t irp_refs;
 } ice_rx_pool_t;
-typedef struct ice_rx_orphan {
-	struct ice_rx_orphan *iro_next;
-	ice_rx_ctrl_block_t *iro_area;
-	ice_rx_ctrl_block_t **iro_free;
-	uint_t iro_nrcb, iro_nloaned;
-} ice_rx_orphan_t;
 union ice_32b_rx_flex_desc {
 	struct {
 		uint64_t pkt_addr, hdr_addr;
@@ -177,14 +179,18 @@ typedef struct ice_rx_ring {
 	uint64_t irxr_rxgen;
 	ice_dma_buffer_t irxr_desc_dma;
 	union ice_32b_rx_flex_desc *irxr_descs;
-	ice_rx_ctrl_block_t **irxr_rcbs, *irxr_rcb_area, **irxr_free_rcbs;
+	ice_rx_ctrl_block_t **irxr_rcbs, **irxr_free_rcbs;
+	ice_rx_pool_t *irxr_pool;
+	boolean_t irxr_copy_only;
 	uint16_t irxr_size, irxr_head, irxr_tail;
 	uint_t irxr_nrcb, irxr_nfree, irxr_nreserve, irxr_nloaned;
-	ice_rx_orphan_t *irxr_orphans;
 	ice_rxq_stat_t irxr_stats;
 } ice_rx_ring_t;
 
 static unsigned live_mblks, live_dma, impacts, barriers, doorbells, delivered;
+static size_t live_kmem;
+static long lbolt;
+static void (*on_delay)(void);
 static int alloc_fail, desballoc_fail, acc_fail;
 static unsigned wb_reads, bad_wb_reads;
 static ice_rx_ring_t *active_ring;
@@ -264,21 +270,82 @@ ice_error(ice_t *ice, const char *fmt, unsigned index)
 	(void) index;
 }
 
+/* Each allocation records its size, and a free must give the same size. */
 static void *
 kmem_zalloc(size_t n, int flag)
 {
-	void *p = calloc(1, n);
+	size_t *p = calloc(1, n + sizeof (size_t));
 
 	(void) flag;
 	assert(p);
-	return (p);
+	*p = n;
+	live_kmem += n;
+	return (p + 1);
 }
 
 static void
-kmem_free(void *p, size_t n)
+kmem_free(void *v, size_t n)
 {
-	(void) n;
+	size_t *p = (size_t *)v - 1;
+
+	assert(*p == n && live_kmem >= n);
+	live_kmem -= n;
 	free(p);
+}
+
+static uint32_t
+atomic_dec_32_nv(volatile uint32_t *p)
+{
+	assert(*p > 0);
+	return (--*p);
+}
+
+static void
+atomic_dec_32(volatile uint32_t *p)
+{
+	assert(*p > 0);
+	--*p;
+}
+
+static void
+atomic_add_32(volatile uint32_t *p, uint32_t n)
+{
+	*p += n;
+}
+
+static void
+atomic_add_64(uint64_t *p, uint64_t n)
+{
+	*p += n;
+}
+
+static void
+atomic_dec_64(uint64_t *p)
+{
+	assert(*p > 0);
+	--*p;
+}
+
+static long
+ddi_get_lbolt(void)
+{
+	return (lbolt);
+}
+
+static long
+drv_usectohz(long us)
+{
+	return (us / 10000);
+}
+
+/* A wait lets the test return loans, then advances the clock. */
+static void
+delay(long ticks)
+{
+	assert(ticks > 0);
+	if (on_delay != NULL)
+		on_delay();
+	lbolt += ticks;
 }
 
 static void
@@ -463,13 +530,12 @@ mac_rx_ring(int handle, int ring, mblk_t *m, uint64_t generation)
 static void
 post_pool(ice_rx_ring_t *r)
 {
-	ice_rx_pool_t p;
+	ice_rx_pool_t *p;
 	unsigned i;
 
-	assert(ice_rx_pool_alloc(r, &p));
+	assert((p = ice_rx_pool_alloc(r)) != NULL);
 	mutex_enter(&r->irxr_lock);
-	ice_rx_pool_swap(r, &p);
-	assert(p.irp_area == NULL);
+	assert(ice_rx_pool_swap(r, p) == NULL);
 	for (i = 0; i < r->irxr_size; i++)
 		ice_rx_reset_desc(r, i, ice_rcb_alloc(r, B_FALSE));
 	mutex_exit(&r->irxr_lock);
@@ -484,6 +550,8 @@ setup(ice_rx_ring_t *r, ice_t *ice)
 	memset(r, 0, sizeof (*r));
 	memset(ice, 0, sizeof (*ice));
 	impacts = barriers = doorbells = delivered = 0;
+	lbolt = 0;
+	on_delay = NULL;
 	wb_reads = bad_wb_reads = 0;
 	alloc_fail = desballoc_fail = acc_fail = 0;
 	checksum_head = NULL;
@@ -504,11 +572,11 @@ setup(ice_rx_ring_t *r, ice_t *ice)
 static void
 teardown(ice_rx_ring_t *r)
 {
-	assert(r->irxr_nloaned == 0);
+	assert(r->irxr_nloaned == 0 && r->irxr_ice->ice_rx_orphan_loans == 0);
 	ice_rx_pool_release(r);
-	assert(r->irxr_rcb_area == NULL && r->irxr_rcbs == NULL);
+	assert(r->irxr_pool == NULL && r->irxr_rcbs == NULL);
 	ice_dma_free(&r->irxr_desc_dma);
-	assert(live_mblks == 0 && live_dma == 0);
+	assert(live_mblks == 0 && live_dma == 0 && live_kmem == 0);
 }
 
 static void

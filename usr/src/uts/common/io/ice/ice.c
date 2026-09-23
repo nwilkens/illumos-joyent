@@ -126,8 +126,9 @@
  * paths, and requests a PF reset.  Packet memory is reclaimed only after a
  * queue disable is confirmed or a reset completes.  An rx buffer loaned up the
  * stack can stay there for as long as a peer keeps its connection, so a start
- * sets aside a pool with loans outstanding and uses a new one; detach waits
- * for those loans.
+ * replaces a pool with loans outstanding, keeping only the loaned buffers, and
+ * detach waits for those loans.  While an instance holds ICE_RX_ORPHAN_BUDGET
+ * of them, its rings copy every frame instead of loaning.
  *
  * A reset request is an atomic cause bit: RESET_PENDING for a reset firmware
  * or another PF started, PFR_REQ for one the driver owes.  The reset worker

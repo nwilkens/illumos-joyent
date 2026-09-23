@@ -84,10 +84,10 @@ def main() -> None:
                        "\n}\n")
     assert release.index("mutex_enter(&irr->irxr_lock)") < \
         release.index("irxr_nloaned == 0") < \
-        release.index("ice_rx_pool_swap(irr, &p)") < \
+        release.index("ice_rx_pool_swap(irr, NULL)") < \
         release.index("mutex_exit(&irr->irxr_lock)") < \
-        release.index("ice_rx_pool_free(&p)")
-    assert rx.count("ice_rx_pool_swap(irr, &p)") == 2
+        release.index("ice_rx_pool_free(p)")
+    assert rx.count("ice_rx_pool_swap(irr, ") == 2
     free = function(rx, "ice_rx_pool_free(ice_rx_pool_t *p)\n{", "\n}\n")
     assert "ASSERT0(p->irp_nloaned)" in free
 
@@ -97,19 +97,22 @@ def main() -> None:
         "ice_rx_start(ice_t *ice)\n{",
         "\n/*\n * Tear down every rx ring",
     )
-    assert start.index("ice_rx_pool_alloc(irr, &p)") < \
+    assert start.index("ice_rx_pool_alloc(irr)") < \
         start.index("mutex_enter(&irr->irxr_lock)") < \
-        start.index("ice_rx_pool_swap(irr, &p)") < \
-        start.index("mutex_exit(&irr->irxr_lock)")
-    # A pool with loans outstanding is set aside, not a reason to fail.
-    assert start.index("ice_rx_pool_swap(irr, &p)") < \
-        start.index("p.irp_nloaned > 0") < \
-        start.index("ice_rx_orphan_adopt(irr, o, &p)")
+        start.index("ice_rx_pool_swap(irr, np)") < \
+        start.index("mutex_exit(&irr->irxr_lock)") < \
+        start.index("ice_rx_pool_retire(op)")
+    # A pool with loans outstanding is replaced, not a reason to fail.
+    assert start.index("ice_rx_pool_swap(irr, np)") < \
+        start.index("op->irp_nloaned > 0") < \
+        start.index("ice_rx_pool_orphan(irr, op)")
+    assert "ICE_RX_ORPHANS_MAX" not in rx
 
-    # Detach waits for the set-aside pools too, within the same bound.
+    # Detach waits for the replaced pools' loans too, within the same bound.
     drain = function(rx, "ice_rx_orphans_drain(ice_t *ice)\n{", "\n}\n")
-    assert "cv_timedwait(&irr->irxr_cv" in drain
+    assert "ice->ice_rx_orphan_loans != 0" in drain
     assert "ICE_RX_LOAN_WAIT_US" in drain
+    assert "return (B_FALSE);" in drain
     lifecycle = (Path(__file__).resolve().parents[2] /
                  "uts/common/io/ice/ice.c").read_text()
     assert "!ice_rx_quiesce(ice) || !ice_rx_orphans_drain(ice)" in lifecycle

@@ -107,7 +107,7 @@ reserve(void)
 {
 	const unsigned rings[] = { 1, 16, 127 };
 	ice_rx_ring_t ring;
-	ice_rx_pool_t p;
+	ice_rx_pool_t *p;
 	ice_t ice;
 	unsigned i, want;
 
@@ -115,17 +115,17 @@ reserve(void)
 		setup(&ring, &ice);
 		teardown(&ring);
 		ice.ice_num_rxr = rings[i];
-		assert(ice_rx_pool_alloc(&ring, &p));
+		assert((p = ice_rx_pool_alloc(&ring)) != NULL);
 		want = MIN(ICE_RX_LOAN_RESERVE,
 		    ICE_RX_LOAN_RESERVE_MAX / rings[i]);
-		assert(p.irp_nreserve == want && want >= 1);
+		assert(p->irp_nreserve == want && want >= 1);
 		assert(want * rings[i] <= ICE_RX_LOAN_RESERVE_MAX);
-		assert(p.irp_nrcb == ring.irxr_size + want);
-		assert(p.irp_nfree == p.irp_nrcb);
-		ice_rx_pool_free(&p);
+		assert(p->irp_nrcb == ring.irxr_size + want);
+		assert(p->irp_nfree == p->irp_nrcb);
+		ice_rx_pool_free(p);
 	}
 	assert(MIN(ICE_RX_LOAN_RESERVE, ICE_RX_LOAN_RESERVE_MAX / 16) == 1024);
-	assert(live_mblks == 0 && live_dma == 0);
+	assert(live_mblks == 0 && live_dma == 0 && live_kmem == 0);
 }
 
 int

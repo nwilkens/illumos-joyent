@@ -732,20 +732,24 @@ buffers: one absolute deadline is computed before the ring loop, the wait is a
 nor reposted, a pool leaves a ring only under the ring lock and only when its
 loan count is zero or to be set aside, pools are freed after the lock is
 dropped, a surviving pool is not clobbered on restart, and a single bounded
-stop serves both the unplumb and reset callers. A start sets a pool with
-loans outstanding aside instead of failing, and detach waits, within the same
-bound, for the loans of the pools set aside.
+stop serves both the unplumb and reset callers. A start replaces a pool with
+loans outstanding instead of failing, and detach waits, within the same
+bound, for the loans of the replaced pools.
 
-`rx_orphan.py` runs the actual pool functions and `ice_rx_start()` through
-the RX harness. A peer
-can keep a loaned frame in a TCP reassembly queue for as long as its
-connection lives, and a start used to refuse to run until every loan was
-back, which left the link down across a replumb or reset. Setting a pool aside
-keeps only its loaned buffers; a loan that returns goes to its own pool, never
-onto the new free list, and wakes a detach waiter; the pool is freed once its
-last loan returns; a loan from the new pool still returns to the new pool; and
-a ring holds at most `ICE_RX_ORPHANS_MAX` set-aside pools, after which a start
-fails and leaves the current pool alone.
+`rx_orphan.py` runs the actual pool functions, `ice_rx_start()`, the poll
+entry point and the detach wait through the RX harness, which accounts for
+every kernel allocation by size. A peer can keep a loaned frame in a TCP
+reassembly queue for as long as its connection lives, so a start replaces a
+pool with loans outstanding instead of waiting. The replaced pool's arrays and
+every block not on loan are freed at once; each loaned block is freed when it
+returns, never put on the new free list, and the last return frees the pool
+record, also when it races the start's sweep. A loan from the new pool still
+returns to the new pool. A peer that keeps one loan across 40 restarts never
+fails a start. Once the instance holds `ICE_RX_ORPHAN_BUDGET` such loans, the
+next drain copies a large frame instead of loaning it and counts the switch,
+restarts still succeed, and loaning resumes only below
+`ICE_RX_ORPHAN_LOWAT`. Detach's wait fails at the loan deadline while a loan
+is out, frees nothing, and succeeds as soon as the loans come back.
 
 `safe_mode.py` verifies that safe mode withholds the hardware offloads the DDP
 package would have provided: the checksum and LSO capabilities are refused

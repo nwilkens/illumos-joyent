@@ -63,7 +63,7 @@ def main() -> None:
         "ice_rx_ring_postable(ice_rx_ring_t *irr)\n{",
         "\nstatic int\nice_rx_ring_open_locked",
     )
-    assert "irxr_rcb_area != NULL" in postable
+    assert "irxr_pool != NULL" in postable
     assert "irxr_nfree == irr->irxr_nrcb" in postable
 
     # The generation number is recorded before the guard can short-circuit.
@@ -117,13 +117,13 @@ def main() -> None:
     # the rebuild no-op and leave hardware an empty ring.
     swap = function(
         rx,
-        "ice_rx_pool_swap(ice_rx_ring_t *irr, ice_rx_pool_t *p)\n{",
+        "ice_rx_pool_swap(ice_rx_ring_t *irr, ice_rx_pool_t *np)\n{",
         "\n}\n",
     )
     assert "ASSERT(!irr->irxr_started);" in swap
     start = function(rx, "ice_rx_start(ice_t *ice)\n{", "\n}\n")
     assert start.index("!irr->irxr_started") < \
-        start.index("ice_rx_pool_swap(irr, &p)")
+        start.index("ice_rx_pool_swap(irr, np)")
 
     # Those four bodies are the only places the flag is touched.  A fifth site
     # is not necessarily wrong, but it has to be reviewed for lock coverage and

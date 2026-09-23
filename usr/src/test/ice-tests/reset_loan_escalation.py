@@ -66,8 +66,8 @@ def main() -> None:
         reclaim.index("ice_rx_pool_swap(")
     start = function(
         rx, "ice_rx_start(ice_t *ice)\n{", "\n/*\n * Tear down every rx ring")
-    assert start.index("p.irp_nloaned > 0") < \
-        start.index("ice_rx_orphan_adopt(irr, o, &p)")
+    assert start.index("op->irp_nloaned > 0") < \
+        start.index("ice_rx_pool_orphan(irr, op)")
     assert "ice_start_datapath(ice)" in rebuild
     soft = rebuild[rebuild.index("ice_start_datapath(ice)"):]
     assert "ICE_STATE_ERROR" in soft

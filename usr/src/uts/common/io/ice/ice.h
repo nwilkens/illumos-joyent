@@ -200,9 +200,13 @@ CTASSERT(ISP2(ICE_TX_SMALL_ALIGN) && ICE_TX_SMALL_ALIGN < ICE_TX_SMALL_PKT);
  */
 #define	ICE_RX_LOAN_RESERVE	1024
 #define	ICE_RX_LOAN_RESERVE_MAX	16384
-/* Replaced pools a ring keeps for loans still up the stack. */
-#define	ICE_RX_ORPHANS_MAX	8
 CTASSERT(ICE_RX_LOAN_RESERVE_MAX / ICE_MAX_QUEUES >= 1);
+/*
+ * Loans of replaced pools an instance may hold before its rings stop loaning
+ * and copy every frame, and the count below which they loan again.
+ */
+#define	ICE_RX_ORPHAN_BUDGET	8192
+#define	ICE_RX_ORPHAN_LOWAT	(ICE_RX_ORPHAN_BUDGET / 2)
 /* ceil(ICE_AQ_SET_MAC_FRAME_SIZE_MAX / ICE_RX_BUF_SIZE) */
 #define	ICE_RX_MAX_DESC		5
 
@@ -440,35 +444,25 @@ typedef enum ice_rcb_state {
 } ice_rcb_state_t;
 
 struct ice_rx_ring;
-typedef struct ice_rx_ctrl_block ice_rx_ctrl_block_t;
+struct ice_rx_pool;
 
-/*
- * A control-block pool that a start replaced while the stack still held some
- * of its buffers.  It is freed once iro_nloaned reaches zero.
- */
-typedef struct ice_rx_orphan {
-	struct ice_rx_orphan	*iro_next;
-	ice_rx_ctrl_block_t	*iro_area;	/* [iro_nrcb] */
-	ice_rx_ctrl_block_t	**iro_free;	/* [iro_nrcb] */
-	uint_t			iro_nrcb;
-	uint_t			iro_nloaned;
-} ice_rx_orphan_t;
-
-struct ice_rx_ctrl_block {
+typedef struct ice_rx_ctrl_block {
 	mblk_t			*ircb_mp;
 	struct ice_rx_ring	*ircb_ring;
+	struct ice_rx_pool	*ircb_pool;	/* owner; set at allocation */
 	ice_dma_buffer_t	ircb_dma;
 	frtn_t			ircb_free_rtn;
 	ice_rcb_state_t		ircb_state;
-};
+} ice_rx_ctrl_block_t;
 
 /*
- * A ring's control-block pool as a unit, so that it is built and released
- * without irxr_lock and only exchanged under it.  Each block is on the free
- * stack, in a slot, or out on loan.
+ * A ring's control-block pool.  It is built and freed without irxr_lock and
+ * only exchanged under it; while a ring holds it, the ring's irxr_* fields
+ * carry its free stack and counts.  Each block is on the free stack, in a
+ * slot, or out on loan.  A pool replaced while loans were out keeps only those
+ * blocks, each freed as it returns, and the last reference frees the pool.
  */
 typedef struct ice_rx_pool {
-	ice_rx_ctrl_block_t	*irp_area;	/* [irp_nrcb] */
 	ice_rx_ctrl_block_t	**irp_free;	/* [irp_nrcb] free stack */
 	ice_rx_ctrl_block_t	**irp_slots;	/* [irp_size] posted, by slot */
 	uint_t			irp_nrcb;
@@ -476,6 +470,7 @@ typedef struct ice_rx_pool {
 	uint_t			irp_nreserve;
 	uint_t			irp_nloaned;
 	uint16_t		irp_size;
+	uint32_t		irp_refs;	/* replaced: loans + sweep */
 } ice_rx_pool_t;
 
 typedef struct ice_rxq_stat {
@@ -489,6 +484,11 @@ typedef struct ice_rxq_stat {
 	kstat_named_t		icrxs_copy_nomem;
 	kstat_named_t		icrxs_no_rcb;
 	kstat_named_t		icrxs_intr_limit;
+	kstat_named_t		icrxs_orphan_pools;
+	kstat_named_t		icrxs_orphan_loans;	/* still out */
+	kstat_named_t		icrxs_copy_mode_enter;
+	kstat_named_t		icrxs_copy_mode_exit;
+	kstat_named_t		icrxs_copy_mode_segs;
 	/* Receive checksum verdicts, one per delivered frame and layer. */
 	kstat_named_t		icrxs_hck_v4hdr_ok;
 	kstat_named_t		icrxs_hck_v4hdr_err;
@@ -513,6 +513,7 @@ typedef struct ice_rx_ring {
 	/* The lifecycle permits CAUSE_ENA. */
 	boolean_t		irxr_intr_armed;
 	boolean_t		irxr_intr_busy;	/* ISR is in mac_rx_ring */
+	boolean_t		irxr_copy_only;	/* no loans; irxr_lock */
 
 	kmutex_t		irxr_lock;
 	kcondvar_t		irxr_cv;	/* teardown waits on loans */
@@ -528,14 +529,13 @@ typedef struct ice_rx_ring {
 	uint16_t		irxr_tail;
 	uint32_t		irxr_dbuf;	/* posted data buffer size */
 
-	/* Control-block backing + spare free stack for loaned buffers. */
-	ice_rx_ctrl_block_t	*irxr_rcb_area;	/* [irxr_nrcb] backing */
+	/* The current pool and its free stack for loaned buffers. */
+	ice_rx_pool_t		*irxr_pool;
 	ice_rx_ctrl_block_t	**irxr_free_rcbs;
 	uint_t			irxr_nrcb;	/* size + reserve */
 	uint_t			irxr_nfree;
 	uint_t			irxr_nreserve;	/* loan high-water */
 	uint_t			irxr_nloaned;	/* outstanding loans */
-	ice_rx_orphan_t		*irxr_orphans;	/* irxr_lock */
 
 	kstat_t			*irxr_kstat;
 	ice_rxq_stat_t		irxr_stats;
@@ -692,6 +692,8 @@ typedef struct ice {
 	 */
 	uint_t			ice_num_txr;
 	uint_t			ice_num_rxr;
+	/* Loans of replaced rx pools still out; see ICE_RX_ORPHAN_BUDGET. */
+	volatile uint32_t	ice_rx_orphan_loans;
 	uint_t			ice_num_rx_groups;
 	ice_tx_ring_t		*ice_txr;	/* [ice_num_txr] */
 	ice_rx_ring_t		*ice_rxr;	/* [ice_num_rxr] */

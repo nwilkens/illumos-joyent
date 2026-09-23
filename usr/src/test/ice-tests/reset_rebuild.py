@@ -271,7 +271,7 @@ def main() -> None:
     release = function(
         rx, "ice_rx_pool_release(ice_rx_ring_t *irr)\n{", "\n}\n")
     assert release.index("irxr_nloaned == 0") < \
-        release.index("ice_rx_pool_swap(irr, &p)")
+        release.index("ice_rx_pool_swap(irr, NULL)")
     rx_stop = function(rx, "ice_rx_stop(ice_t *ice)\n{", "\n/*\n")
     assert rx_stop.index("ice_rx_quiesce(ice)") < rx_stop.index(
         "ice_rx_reclaim(ice)"
@@ -281,8 +281,8 @@ def main() -> None:
     # path too: it is the only reclaim for a ring that timed out.
     rx_start = function(
         rx, "ice_rx_start(ice_t *ice)\n{", "\n/*\n * Tear down every rx ring")
-    assert "irxr_nloaned == 0" in rx_start
-    assert "ice_rx_pool_free(&p)" in rx_start
+    assert "op->irp_nloaned > 0" in rx_start
+    assert "ice_rx_pool_retire(op)" in rx_start
 
     print("PASS: ice reset prepare/rebuild source invariants")
 
