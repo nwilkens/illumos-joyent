@@ -380,8 +380,10 @@ typedef struct ice_rx_ring {
 	boolean_t		irxr_shutdown;
 	boolean_t		irxr_started;	/* irxr_lock */
 	boolean_t		irxr_intr_poll;	/* mac is polling this ring */
-	boolean_t		irxr_intr_routed; /* QINT_RQCTL vector programmed */
-	boolean_t		irxr_intr_armed; /* lifecycle permits CAUSE_ENA */
+	/* QINT_RQCTL vector programmed */
+	boolean_t		irxr_intr_routed;
+	/* The lifecycle permits CAUSE_ENA. */
+	boolean_t		irxr_intr_armed;
 	boolean_t		irxr_intr_busy;	/* ISR is in mac_rx_ring */
 
 	kmutex_t		irxr_lock;

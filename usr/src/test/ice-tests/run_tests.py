@@ -14,6 +14,7 @@ TESTS = (
     "buf_pool.py",
     "control_setup.py",
     "core_counts.py",
+    "cstyle_glue.py",
     "detach_quiesce.py",
     "ddp_sections.py",
     "dma_lifetime.py",

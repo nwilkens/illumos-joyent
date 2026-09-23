@@ -326,6 +326,10 @@ The suite above includes all source checks. Individual scripts remain
 runnable, for example `python3 -B usr/src/test/ice-tests/rx_checksum.py`.
 The following descriptions identify what each source check establishes.
 
+`cstyle_glue.py` runs `usr/src/tools/scripts/cstyle.pl -pP` over the driver
+glue sources and the mdb module. It does not check the vendored `core/` code.
+It reports SKIP when perl is not installed.
+
 `rx_checksum.py` verifies that receive checksum metadata is captured before
 the descriptor is reposted and that all hardware-reported L3/L4 checksum error
 bits suppress checksum validation.
