@@ -27,6 +27,7 @@ TESTS = (
     "fma_dma.py",
     "fw_recovery.py",
     "hw_stats.py",
+    "intr_irm.py",
     "jumbo_copy.py",
     "jumbo_rx.py",
     "lifecycle_api.py",

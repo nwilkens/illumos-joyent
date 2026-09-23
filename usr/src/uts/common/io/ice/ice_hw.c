@@ -483,13 +483,38 @@ ice_queue_limit(ice_t *ice)
 	return (MAX(n, 1));
 }
 
+/*
+ * Interrupt resource management calls this to offer or reclaim vectors.  The
+ * rings are bound one to one to the vectors allocated at attach, so the
+ * driver keeps what it has.
+ */
+static int
+ice_intr_cb(dev_info_t *dip, ddi_cb_action_t action, void *cbarg, void *arg1,
+    void *arg2)
+{
+	_NOTE(ARGUNUSED(dip, action, cbarg, arg1, arg2));
+	return (DDI_ENOTSUP);
+}
+
+static void
+ice_intr_cb_fini(ice_t *ice)
+{
+	if (ice->ice_intr_cb != NULL) {
+		(void) ddi_cb_unregister(ice->ice_intr_cb);
+		ice->ice_intr_cb = NULL;
+	}
+}
+
+/* The vectors are freed before the callback, which IRM requires. */
 void
 ice_free_intrs(ice_t *ice)
 {
 	int i;
 
-	if (ice->ice_intr_handles == NULL)
+	if (ice->ice_intr_handles == NULL) {
+		ice_intr_cb_fini(ice);
 		return;
+	}
 
 	for (i = 0; i < ice->ice_intr_count; i++)
 		(void) ddi_intr_free(ice->ice_intr_handles[i]);
@@ -501,6 +526,7 @@ ice_free_intrs(ice_t *ice)
 	ice->ice_intr_type = 0;
 	ice->ice_intr_cap = 0;
 	ice->ice_intr_pri = 0;
+	ice_intr_cb_fini(ice);
 }
 
 boolean_t
@@ -518,10 +544,24 @@ ice_alloc_intrs(ice_t *ice)
 		return (B_FALSE);
 	}
 
+	/*
+	 * With APIX, a driver that has no IRM callback is limited to
+	 * ddi_msix_alloc_limit (8) vectors.  The callback must exist before
+	 * the vector count is read.  Without it the driver still works, with
+	 * fewer queues.
+	 */
+	if (ddi_cb_register(dip, DDI_CB_FLAG_INTR, ice_intr_cb, ice, NULL,
+	    &ice->ice_intr_cb) != DDI_SUCCESS) {
+		ice->ice_intr_cb = NULL;
+		dev_err(dip, CE_NOTE, "!no interrupt resource management; "
+		    "MSI-X vectors are limited by the platform default");
+	}
+
 	if (ddi_intr_get_nintrs(dip, DDI_INTR_TYPE_MSIX, &nintrs) !=
 	    DDI_SUCCESS || nintrs < ICE_INTR_MSIX_MIN) {
 		ice_error(ice, "too few MSI-X interrupts supported: %d",
 		    nintrs);
+		ice_intr_cb_fini(ice);
 		return (B_FALSE);
 	}
 
@@ -529,12 +569,14 @@ ice_alloc_intrs(ice_t *ice)
 	    DDI_SUCCESS || navail < ICE_INTR_MSIX_MIN) {
 		ice_error(ice, "too few MSI-X interrupts available: %d",
 		    navail);
+		ice_intr_cb_fini(ice);
 		return (B_FALSE);
 	}
 
 	if (nvec < ICE_INTR_MSIX_MIN) {
 		ice_error(ice, "firmware reports too few MSI-X vectors: %u",
 		    nvec);
+		ice_intr_cb_fini(ice);
 		return (B_FALSE);
 	}
 
@@ -550,6 +592,7 @@ ice_alloc_intrs(ice_t *ice)
 		kmem_free(ice->ice_intr_handles, ice->ice_intr_size);
 		ice->ice_intr_handles = NULL;
 		ice->ice_intr_size = 0;
+		ice_intr_cb_fini(ice);
 		return (B_FALSE);
 	}
 

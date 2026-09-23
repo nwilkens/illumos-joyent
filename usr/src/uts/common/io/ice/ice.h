@@ -592,6 +592,7 @@ typedef struct ice {
 	int			ice_intr_count;
 	size_t			ice_intr_size;
 	ddi_intr_handle_t	*ice_intr_handles;
+	ddi_cb_handle_t		ice_intr_cb;	/* IRM registration */
 	uint16_t		ice_nqueues;
 
 	/* OICR deferred async work; thread context, serialized via ice_lock. */

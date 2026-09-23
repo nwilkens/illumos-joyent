@@ -383,6 +383,23 @@ read path, which any process in the link's zone can reach through
 `DLDIOC_READTRAN`, holds only the adaptive lifecycle lock across its
 admin-queue polling.
 
+## MSI-X grant regression
+
+```
+python3 usr/src/test/ice-tests/intr_irm.py
+```
+
+With APIX, `i_ddi_intr_get_limit()` caps a device at `ddi_msix_alloc_limit`
+(8) MSI-X vectors unless its driver registered an interrupt resource
+management callback (`ddi_cb_register(DDI_CB_FLAG_INTR)`), which left the
+driver 7 queue pairs. `intr_irm.py` compiles the actual `ice_alloc_intrs()`,
+`ice_free_intrs()` and the callback against a model of that limit. With the
+callback the default 16 queue pairs get 17 vectors; if registration fails the
+driver logs it and runs with 7. The callback declines offers and reclaims.
+Every failure after registration unregisters, and teardown frees the vectors
+before it unregisters. The source check requires the registration to precede
+the first vector count.
+
 ## Firmware command lock check
 
 ```
