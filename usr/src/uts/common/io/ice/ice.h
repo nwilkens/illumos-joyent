@@ -608,6 +608,7 @@ typedef struct ice {
 	boolean_t		ice_led_ident;		/* ice_rebuild_lock */
 	/* E830 PHY setup waits for the PHY firmware; ice_rebuild_lock. */
 	boolean_t		ice_phy_fw_pending;
+	boolean_t		ice_phy_fw_fault;
 	boolean_t		ice_promisc_on;		/* replay on reset */
 	ice_vsi_t		ice_pf_vsi;		/* the PF's data VSI */
 
@@ -699,8 +700,13 @@ typedef enum ice_fw_state {
 extern ice_fw_state_t ice_fw_state(ice_t *, uint32_t *);
 extern void ice_fw_recovery_report(ice_t *, uint32_t);
 extern boolean_t ice_reset_empr_slow(struct ice_hw *);
-extern boolean_t ice_phy_fw_loading(ice_t *);
-extern boolean_t ice_phy_fw_wait(ice_t *);
+typedef enum ice_phy_fw_state {
+	ICE_PHY_FW_READY,
+	ICE_PHY_FW_LOADING,
+	ICE_PHY_FW_UNREADABLE	/* register access faulted */
+} ice_phy_fw_state_t;
+extern ice_phy_fw_state_t ice_phy_fw_state(ice_t *);
+extern ice_phy_fw_state_t ice_phy_fw_wait(ice_t *);
 extern boolean_t ice_alloc_intrs(ice_t *);
 extern void ice_free_intrs(ice_t *);
 extern boolean_t ice_add_intr_handlers(ice_t *);

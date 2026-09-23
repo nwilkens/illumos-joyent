@@ -86,8 +86,12 @@ set exactly. Subsystem IDs and the unmapped `0x1888` stay out. It then
 compiles the core mapping with the driver's `ice_family_name()` and the
 per-family helpers, and runs them for every device ID: the slow EMPR wait,
 the sideband receive drain, the E830 TCLAN detection registers, the E830 PHY
-firmware wait, its bound and the deferred setup the admin worker completes, the Get Link Status data length, and the DDP
-segment and signature type. It also parses `firmware/ice.pkg` and requires a
+firmware wait, its bound and the deferred setup the admin worker completes,
+the Get Link Status data length, and the DDP segment and signature type. A
+faulted `GL_MNG_FWSM` read must end the wait as unreadable, and in the admin
+worker it must keep the PHY setup pending, set the datapath error, and report
+the service loss once until a clean read. Attach must fail on an unreadable
+PHY firmware state. It also parses `firmware/ice.pkg` and requires a
 signed configuration segment for each family. The check covers the
 decisions that differ by family; it cannot show that an untested family
 passes traffic.
@@ -261,7 +265,9 @@ worker waits, after the reset barrier, at interrupt rearm, and during atomic
 completion. Assertions check reset counts and type, deferred work, request
 retention, datapath restart suppression, and terminal handling. A slow EMPR
 (E825-C and E830) must wait once before the reset-complete poll; a PF reset
-issued by the driver must not wait.
+issued by the driver must not wait. A PHY firmware load still running after
+the reset leaves the PHY setup pending, and an unreadable PHY firmware state
+fails the rebuild closed.
 
 Use `--source /path/to/ice.c --intr-source /path/to/ice_intr.c` for an earlier
 revision. The reviewed implementation fails duplicate-dispatch coalescing.

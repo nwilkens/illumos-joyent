@@ -941,7 +941,18 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	 * worker gate is still closed, so no lock is needed for the pending
 	 * flag yet.
 	 */
-	ice->ice_phy_fw_pending = !ice_phy_fw_wait(ice);
+	switch (ice_phy_fw_wait(ice)) {
+	case ICE_PHY_FW_READY:
+		ice->ice_phy_fw_pending = B_FALSE;
+		break;
+	case ICE_PHY_FW_LOADING:
+		ice->ice_phy_fw_pending = B_TRUE;
+		break;
+	default:
+		ddi_fm_service_impact(dip, DDI_SERVICE_LOST);
+		ice_error(ice, "cannot read the PHY firmware state");
+		goto fail;
+	}
 	ice_phy_setup(ice);
 
 	if (!ice_vsi_init(ice))
@@ -1485,7 +1496,19 @@ ice_rebuild(ice_t *ice, uint32_t requests)
 	 * but leave the setup to the admin worker.
 	 */
 	ice_link_status_update(ice);
-	ice->ice_phy_fw_pending = ice_phy_fw_loading(ice);
+	ice->ice_phy_fw_fault = B_FALSE;
+	switch (ice_phy_fw_state(ice)) {
+	case ICE_PHY_FW_READY:
+		ice->ice_phy_fw_pending = B_FALSE;
+		break;
+	case ICE_PHY_FW_LOADING:
+		ice->ice_phy_fw_pending = B_TRUE;
+		break;
+	default:
+		ice_error(ice, "cannot read the PHY firmware state after "
+		    "reset");
+		goto reset_failed;
+	}
 	ice_phy_setup(ice);
 
 	/* A later request keeps the datapath closed until its own rebuild. */

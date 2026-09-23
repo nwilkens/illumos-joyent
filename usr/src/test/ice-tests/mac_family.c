@@ -42,6 +42,9 @@ typedef unsigned int uint_t;
 #define	ICE_ARQ_MAX_ELEMS		2048
 #define	ICE_RESET_EMPR			3
 #define	DDI_FM_OK			0
+#define	DDI_FM_NONFATAL			1
+#define	DDI_SERVICE_LOST		-1
+#define	ICE_STATE_ERROR			4
 #define	MICROSEC			1000000
 #define	MILLISEC			1000
 #define	BIT(n)				(1u << (n))
@@ -88,8 +91,11 @@ typedef struct ice {
 	struct {
 		int ios_reg_handle;
 	} ice_osdep;
+	void *ice_dip;
+	uint32_t ice_state;
 	int ice_rebuild_lock;
 	boolean_t ice_phy_fw_pending;
+	boolean_t ice_phy_fw_fault;
 } ice_t;
 
 #define	ASSERT(x)	assert(x)
@@ -107,7 +113,7 @@ ice_phy_setup(ice_t *ice)
 /* Register and control-queue boundary. */
 static u32 rstat;
 static unsigned sbq_cleans, other_cleans;
-static unsigned fw_loading, fw_reads, delays, errors;
+static unsigned fw_loading, fw_reads, delays, errors, fw_faults, impacts;
 static long delayed_us;
 
 static u32
@@ -130,7 +136,24 @@ ice_check_acc_handle(ice_t *ice, int handle)
 {
 	(void) ice;
 	(void) handle;
-	return (DDI_FM_OK);
+	if (fw_faults == 0)
+		return (DDI_FM_OK);
+	fw_faults--;
+	return (DDI_FM_NONFATAL);
+}
+
+static void
+ddi_fm_service_impact(void *dip, int impact)
+{
+	(void) dip;
+	assert(impact == DDI_SERVICE_LOST);
+	impacts++;
+}
+
+static void
+atomic_or_32(uint32_t *target, uint32_t bits)
+{
+	*target |= bits;
 }
 
 static long
@@ -223,20 +246,29 @@ family_checks(struct ice_hw *hw, const char *want)
 	fw_loading = 3;
 	fw_reads = delays = errors = 0;
 	delayed_us = 0;
-	assert(ice_phy_fw_wait(&ice));
+	assert(ice_phy_fw_wait(&ice) == ICE_PHY_FW_READY);
 	assert(delays == (e830 ? 3u : 0u) && errors == 0);
 	assert(fw_reads == (e830 ? 4u : 0u));
 	fw_loading = 1000000;
 	delays = errors = 0;
 	delayed_us = 0;
 	if (e830) {
-		assert(!ice_phy_fw_wait(&ice));
+		assert(ice_phy_fw_wait(&ice) == ICE_PHY_FW_LOADING);
 		assert(errors == 1);
 		assert(delayed_us == (long)ICE_PHY_FW_WAIT_MS * 1000);
 	} else {
-		assert(ice_phy_fw_wait(&ice));
+		assert(ice_phy_fw_wait(&ice) == ICE_PHY_FW_READY);
 		assert(delays == 0 && errors == 0);
 	}
+
+	/* A faulted read ends the wait and is not a finished load. */
+	fw_loading = 2;
+	fw_faults = 1;
+	delays = errors = 0;
+	assert(ice_phy_fw_wait(&ice) ==
+	    (e830 ? ICE_PHY_FW_UNREADABLE : ICE_PHY_FW_READY));
+	assert(delays == 0 && errors == 0);
+	fw_faults = 0;
 
 	/* The admin worker finishes a deferred setup once the load ends. */
 	ice.ice_rebuild_lock = 1;
@@ -250,6 +282,24 @@ family_checks(struct ice_hw *hw, const char *want)
 	ice_phy_fw_poll(&ice);
 	assert(phy_setups == (e830 ? 1u : 0u));
 	fw_loading = 0;
+
+	/*
+	 * A register fault keeps the setup pending, fails the datapath closed
+	 * and is reported once; the setup runs after a clean read.
+	 */
+	ice.ice_phy_fw_pending = e830;
+	ice.ice_state = 0;
+	phy_setups = errors = impacts = 0;
+	fw_faults = 2;
+	ice_phy_fw_poll(&ice);
+	ice_phy_fw_poll(&ice);
+	assert(phy_setups == 0 && ice.ice_phy_fw_pending == e830);
+	assert(impacts == (e830 ? 1u : 0u) && errors == (e830 ? 1u : 0u));
+	assert(ice.ice_state == (e830 ? (uint32_t)ICE_STATE_ERROR : 0u));
+	ice_phy_fw_poll(&ice);
+	assert(phy_setups == (e830 ? 1u : 0u) && !ice.ice_phy_fw_pending);
+	assert(!ice.ice_phy_fw_fault && impacts == (e830 ? 1u : 0u));
+	fw_faults = 0;
 }
 
 static void

@@ -92,7 +92,7 @@ def main():
     for name in ("ice_family_name", "ice_reset_empr_slow"):
         fragments.append(extract(source,
             rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}", args.source))
-    for name in ("ice_phy_fw_loading", "ice_phy_fw_wait"):
+    for name in ("ice_phy_fw_state", "ice_phy_fw_wait"):
         fragments.append(extract(source,
             rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}", args.source))
     fragments.insert(0, "\n".join(re.findall(
@@ -105,6 +105,9 @@ def main():
         fragments.append(extract(ddp,
             rf"^static u32 {name}\([\s\S]*?^\}}", CORE / "ice_ddp_common.c"))
     header = (DRIVER / "ice.h").read_text()
+    fragments.insert(0, extract(header,
+        r"^typedef enum ice_phy_fw_state \{[\s\S]*?^\} ice_phy_fw_state_t;",
+        DRIVER / "ice.h"))
     fragments.insert(0, extract(header,
         r"^#define\tICE_E830_GL_MDET_TX_TCLAN[\s\S]*?PF_MDET_TX_TCLAN\)$",
         DRIVER / "ice.h"))
@@ -125,6 +128,11 @@ def main():
            "ice_devids.h": (CORE / "ice_devids.h").read_text()},
           cflags=("-Wno-unused-function",), cases=(tuple(cases),))
     check_package()
+    attach = (DRIVER / "ice.c").read_text()
+    attach = attach[attach.index("switch (ice_phy_fw_wait(ice)) {"):]
+    attach = attach[:attach.index("ice_phy_setup(ice);")]
+    assert re.search(r"default:\n\t\tddi_fm_service_impact\(dip, "
+                     r"DDI_SERVICE_LOST\);[\s\S]*goto fail;", attach)
     print(f"PASS: {len(bound)} aliases match the core MAC type mapping")
 
 

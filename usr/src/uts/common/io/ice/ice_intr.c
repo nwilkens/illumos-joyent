@@ -563,15 +563,35 @@ ice_phy_setup(ice_t *ice)
 
 /*
  * The E830 PHY firmware load has no completion interrupt, so the admin
- * worker polls for it and does the deferred PHY setup.
+ * worker polls for it and does the deferred PHY setup.  A faulted read keeps
+ * the setup pending and is reported once until a read succeeds.
  */
 static void
 ice_phy_fw_poll(ice_t *ice)
 {
 	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
 
-	if (!ice->ice_phy_fw_pending || ice_phy_fw_loading(ice))
+	if (!ice->ice_phy_fw_pending)
 		return;
+
+	switch (ice_phy_fw_state(ice)) {
+	case ICE_PHY_FW_READY:
+		break;
+	case ICE_PHY_FW_LOADING:
+		ice->ice_phy_fw_fault = B_FALSE;
+		return;
+	default:
+		if (!ice->ice_phy_fw_fault) {
+			ice->ice_phy_fw_fault = B_TRUE;
+			ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
+			atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
+			ice_error(ice, "cannot read the PHY firmware state; "
+			    "link setup withheld");
+		}
+		return;
+	}
+
+	ice->ice_phy_fw_fault = B_FALSE;
 	ice->ice_phy_fw_pending = B_FALSE;
 	ice_phy_setup(ice);
 }

@@ -51,6 +51,7 @@ typedef struct ice {
 	boolean_t ice_detaching;
 	boolean_t ice_safe_mode;
 	boolean_t ice_phy_fw_pending;
+	boolean_t ice_phy_fw_fault;
 	boolean_t ice_stat_port_loaded;
 	boolean_t ice_stat_vsi_loaded;
 	enum ice_ddp_state ice_ddp_state;
@@ -60,6 +61,23 @@ typedef struct ice {
 } ice_t;
 
 #include "ice_reset_types.h"
+
+static ice_phy_fw_state_t phy_fw_state;
+static unsigned phy_setups;
+
+static ice_phy_fw_state_t
+ice_phy_fw_state(ice_t *ice)
+{
+	(void) ice;
+	return (phy_fw_state);
+}
+
+static void
+ice_phy_setup(ice_t *ice)
+{
+	if (!ice->ice_phy_fw_pending)
+		phy_setups++;
+}
 
 void ice_reset_task(void *);
 void ice_reset_dispatch(ice_t *);
@@ -251,8 +269,6 @@ ICE_NOOP(ice_loopback_replay)
 ICE_NOOP(ice_led_replay)
 ICE_NOOP(ice_queues_intr_map)
 ICE_NOOP(ice_link_status_update)
-ICE_NOOP(ice_phy_setup)
-static int ice_phy_fw_loading(ice_t *ice) { (void) ice; return (0); }
 ICE_NOOP(ice_link_state_publish)
 ICE_NOOP(ice_intr_oicr_disable)
 
@@ -355,6 +371,8 @@ reset(void)
 	slow_empr = 0;
 	slow_waits = 0;
 	fw_state = ICE_FW_USABLE;
+	phy_fw_state = ICE_PHY_FW_READY;
+	phy_setups = 0;
 	recovery_reports = ctrlq_inits = 0;
 	fail_dispatch = fail_reset = start_result = 0;
 	resume_ok = 1;
@@ -488,6 +506,35 @@ check_fw_recovery(void)
 }
 
 static void
+check_phy_fw(void)
+{
+	/* A PHY firmware load still running leaves the setup to the worker. */
+	reset();
+	device.ice_state = ICE_STATE_STARTED;
+	phy_fw_state = ICE_PHY_FW_LOADING;
+	request(ICE_STATE_RESET_PENDING);
+	run_one();
+	assert(device.ice_phy_fw_pending && phy_setups == 0 && starts == 1);
+	assert((device.ice_state & ICE_STATE_RESET_FAILED) == 0);
+
+	reset();
+	device.ice_phy_fw_pending = B_TRUE;
+	request(ICE_STATE_PFR_REQ);
+	run_one();
+	assert(!device.ice_phy_fw_pending && phy_setups == 1);
+
+	/* A faulted read is not a finished load; the rebuild fails closed. */
+	reset();
+	device.ice_state = ICE_STATE_STARTED;
+	phy_fw_state = ICE_PHY_FW_UNREADABLE;
+	request(ICE_STATE_RESET_PENDING);
+	run_one();
+	assert(phy_setups == 0 && starts == 0 && queued == 0);
+	assert((device.ice_state & ICE_STATE_RESET_FAILED) != 0);
+	assert((device.ice_state & ICE_STATE_ERROR) != 0);
+}
+
+static void
 check_gates(void)
 {
 	unsigned gate;
@@ -557,6 +604,7 @@ main(void)
 	check_gates();
 	check_slow_empr();
 	check_fw_recovery();
+	check_phy_fw();
 	check_restart_failure();
 	(void) puts("PASS: ICE reset ownership and rebuild interleavings");
 	return (0);
