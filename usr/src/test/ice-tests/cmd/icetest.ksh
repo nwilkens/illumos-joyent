@@ -24,6 +24,8 @@
 # default tests need only the device and do not change its configuration
 # for long.  With a peer address (-p or $ICE_TEST_PEER) the datapath tests
 # also run; they plumb the link, and the peer must already serve "iperf -s".
+# They refuse a link with IP configuration unless ICE_TEST_ALLOW_IP=1, and
+# then restore that configuration when they finish.
 #
 
 export LC_ALL=C.UTF-8
@@ -63,6 +65,12 @@ fi
 
 it_device=$(dladm show-phys -p -o device "$it_link" 2>/dev/null)
 [[ "$it_device" == ice+([0-9]) ]] || fatal "$it_link is not an ice link"
+
+if [[ -n "$it_peer" && "${ICE_TEST_ALLOW_IP:-0}" != 1 ]] &&
+    ipadm show-if "$it_link" >/dev/null 2>&1; then
+	fatal "$it_link has IP configuration, which the datapath tests" \
+	    "replace; set ICE_TEST_ALLOW_IP=1 to allow it"
+fi
 
 export ICE_TEST_LINK="$it_link"
 export ICE_TEST_DEVICE="$it_device"

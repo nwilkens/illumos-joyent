@@ -16,7 +16,9 @@
 #
 # Traffic tests against a peer that serves "iperf -s" at $ICE_TEST_PEER.
 # They plumb $ICE_TEST_LINK with $ICE_TEST_ADDR (default 192.0.2.1/30) at
-# $ICE_TEST_MTU and report SKIP without a peer.
+# $ICE_TEST_MTU and report SKIP without a peer.  A link with IP
+# configuration is refused unless ICE_TEST_ALLOW_IP=1; the MTU and IP
+# configuration are restored when the test exits.
 #
 
 [DEFAULT]

@@ -693,9 +693,25 @@ The kstat instance comes from the ice device behind `$ICE_TEST_LINK`
 (`dladm show-phys -p -o device`), so a renamed link such as `net0` over
 `ice3` reads `ice:3`. A link that is not an ice device, or an
 `$ICE_TEST_DEVICE` that names another device, stops the run before it
-changes anything. `accept_script.py` runs the script on the build host
-against stub `dladm`, `ipadm`, `kstat` and traffic commands and checks these
-rules.
+changes anything.
+
+The script replumbs the link and changes its MTU, so it refuses a link with
+IP configuration. `ICE_TEST_ALLOW_IP=1` lets it take a link whose addresses
+are all temporary static, DHCP or addrconf addresses; persistent `ipadm`
+configuration and other address types are still refused. It records the MTU,
+those addresses and the default routes over the link, makes only temporary
+changes, and restores the record from an `EXIT`, `INT`, `TERM` and `HUP`
+trap. A restore that fails prints `RESTORE FAILED` and fails the run. The
+`icetest` wrapper applies the same refusal before it starts the datapath
+runfile, and the `led` test returns the LED to firmware control from its own
+exit trap.
+
+`accept_script.py` runs the script on the build host against stub `dladm`,
+`ipadm`, `netstat`, `route`, `kstat` and traffic commands and checks these
+rules: the instance comes from the device, a configured link is left
+untouched without the override, and a run that finishes or takes `SIGTERM`
+leaves the MTU, addresses and default route as they were. It also runs the
+`icetest` refusal under `ksh`.
 
 Historical validation recorded in commit `60beba06389` (2026-07-18) reported
 boston<->hunter at MTU 1500 (9.36 Gbps) and 9000 (9.59 Gbps), with all checks

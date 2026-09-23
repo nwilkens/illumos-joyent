@@ -18,6 +18,12 @@
 # instance comes from the ice device behind the link, so a renamed link
 # works; ICE_TEST_DEVICE, if set, must name that device.
 #
+# The test replumbs the link and changes its MTU, so it refuses a link that
+# has IP configuration.  With ICE_TEST_ALLOW_IP=1 it accepts one whose
+# addresses are all temporary static, DHCP or addrconf addresses; it records
+# them with the MTU and the default routes over the link, and restores them
+# when it exits or is interrupted.  All test changes are temporary.
+#
 # Exit status is 0 only if every check passes.
 #
 # Copyright 2026 MNX Cloud, Inc.
@@ -32,8 +38,8 @@ IPERF="${ICE_TEST_IPERF:-/opt/tools/bin/iperf}"
 FAILED=0
 
 msg() { printf '%s %s\n' "$1" "$2"; }
-pass() { msg "PASS" "$1"; }
-fail() { msg "FAIL" "$1"; FAILED=1; }
+pass() { msg "PASS" "$*"; }
+fail() { msg "FAIL" "$*"; FAILED=1; }
 
 DEVICE=$(dladm show-phys -p -o device "$LINK" 2>/dev/null)
 if [[ ! "$DEVICE" =~ ^ice[0-9]+$ ]]; then
@@ -66,6 +72,120 @@ require_zero() {
 	fi
 }
 
+ORIG_MTU=$(dladm show-linkprop -c -p mtu -o value "$LINK" 2>/dev/null)
+if [[ ! "$ORIG_MTU" =~ ^[0-9]+$ ]]; then
+	fail "cannot read the mtu of $LINK"
+	exit 1
+fi
+
+HAD_IF=0
+ORIG_ADDRS=()
+ORIG_ROUTES=()
+ORIG_ROUTES6=()
+if ipadm show-if "$LINK" >/dev/null 2>&1; then
+	HAD_IF=1
+	if [[ "${ICE_TEST_ALLOW_IP:-0}" != 1 ]]; then
+		fail "$LINK has IP configuration; set ICE_TEST_ALLOW_IP=1 to" \
+		    "let the test replace it and restore it on exit"
+		exit 1
+	fi
+	if [[ "$(ipadm show-if -p -o persistent "$LINK" 2>/dev/null)" == \
+	    *[46]* ]]; then
+		fail "$LINK has persistent IP configuration, which the test" \
+		    "cannot restore"
+		exit 1
+	fi
+	for obj in $(ipadm show-addr -p -o addrobj "$LINK/" 2>/dev/null); do
+		type=$(ipadm show-addr -p -o type "$obj" 2>/dev/null)
+		addr=$(ipadm show-addr -p -o addr "$obj" 2>/dev/null)
+		case "$type" in
+		static|dhcp|addrconf) ;;
+		*)
+			fail "$obj is a $type address, which the test cannot" \
+			    "restore"
+			exit 1
+			;;
+		esac
+		ORIG_ADDRS+=("$type|$addr")
+	done
+	ORIG_ROUTES=($(netstat -rn -f inet 2>/dev/null |
+	    awk -v l="$LINK" '$1 == "default" && $6 == l { print $2 }'))
+	ORIG_ROUTES6=($(netstat -rn -f inet6 2>/dev/null |
+	    awk -v l="$LINK" '$1 == "default" && $6 == l { print $2 }'))
+	echo "saved $LINK: mtu $ORIG_MTU;" \
+	    "addresses ${ORIG_ADDRS[*]+${ORIG_ADDRS[*]}};" \
+	    "default routes ${ORIG_ROUTES[*]+${ORIG_ROUTES[*]}}" \
+	    "${ORIG_ROUTES6[*]+${ORIG_ROUTES6[*]}}"
+fi
+
+has_default() {
+	# has_default <inet|inet6> <gateway>
+	netstat -rn -f "$1" 2>/dev/null |
+	    awk -v g="$2" '$1 == "default" && $2 == g { f = 1 } END { exit !f }'
+}
+
+MODIFIED=0
+restore() {
+	local rc=0 i=0 entry type addr gw
+
+	(( MODIFIED )) || return 0
+	ipadm delete-addr "$LINK/v4accept" >/dev/null 2>&1
+	ipadm delete-if "$LINK" >/dev/null 2>&1
+	if [[ "$(dladm show-linkprop -c -p mtu -o value "$LINK" 2>/dev/null)" \
+	    != "$ORIG_MTU" ]] &&
+	    ! dladm set-linkprop -t -p mtu="$ORIG_MTU" "$LINK"; then
+		echo "RESTORE FAILED: mtu $ORIG_MTU on $LINK"
+		rc=1
+	fi
+	(( HAD_IF )) || return $rc
+
+	if ! ipadm create-if -t "$LINK"; then
+		echo "RESTORE FAILED: IP interface $LINK"
+		return 1
+	fi
+	for entry in ${ORIG_ADDRS[@]+"${ORIG_ADDRS[@]}"}; do
+		type=${entry%%|*}
+		addr=${entry#*|}
+		case "$type" in
+		static)
+			if [[ "$addr" == *"->"* ]]; then
+				addr="local=${addr%%->*},remote=${addr#*->}"
+			fi
+			ipadm create-addr -t -T static -a "$addr" "$LINK/rs$i"
+			;;
+		*)
+			ipadm create-addr -t -T "$type" "$LINK/rs$i"
+			;;
+		esac || { echo "RESTORE FAILED: $type $addr on $LINK"; rc=1; }
+		i=$((i + 1))
+	done
+	for gw in ${ORIG_ROUTES[@]+"${ORIG_ROUTES[@]}"}; do
+		has_default inet "$gw" || route -n add default "$gw" ||
+		    { echo "RESTORE FAILED: default route $gw"; rc=1; }
+	done
+	for gw in ${ORIG_ROUTES6[@]+"${ORIG_ROUTES6[@]}"}; do
+		has_default inet6 "$gw" ||
+		    route -n add -inet6 default "$gw" ||
+		    { echo "RESTORE FAILED: default route $gw"; rc=1; }
+	done
+	return $rc
+}
+
+on_exit() {
+	local status=$?
+
+	trap '' INT TERM HUP
+	if ! restore; then
+		echo "=== $LINK was not fully restored ==="
+		status=1
+	fi
+	exit $status
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
 echo "=== ice datapath acceptance: peer=$PEER_IP mtu=$MTU ==="
 
 # 1. Driver loaded and bound.
@@ -76,13 +196,14 @@ fi
 pass "ice module loaded"
 
 # 2. Configure MTU (requires the link unplumbed) and plumb the test address.
-ipadm delete-addr "$LINK/v4accept" 2>/dev/null
+MODIFIED=1
 ipadm delete-if "$LINK" 2>/dev/null
-if ! dladm set-linkprop -p mtu="$MTU" "$LINK" 2>/dev/null; then
+if ! dladm set-linkprop -t -p mtu="$MTU" "$LINK" 2>/dev/null; then
 	fail "could not set mtu=$MTU on $LINK"
 fi
-ipadm create-if "$LINK" 2>/dev/null
-if ipadm create-addr -T static -a "$ADDR_LOCAL" "$LINK/v4accept" 2>/dev/null; then
+ipadm create-if -t "$LINK" 2>/dev/null
+if ipadm create-addr -t -T static -a "$ADDR_LOCAL" "$LINK/v4accept" \
+    2>/dev/null; then
 	pass "plumbed $ADDR_LOCAL mtu=$MTU"
 else
 	fail "could not plumb $ADDR_LOCAL"
@@ -163,8 +284,9 @@ echo "--- plumb/unplumb x3 ---"
 for i in 1 2 3; do
 	ipadm delete-addr "$LINK/v4accept" 2>/dev/null
 	ipadm delete-if "$LINK" 2>/dev/null
-	ipadm create-if "$LINK" 2>/dev/null
-	ipadm create-addr -T static -a "$ADDR_LOCAL" "$LINK/v4accept" 2>/dev/null
+	ipadm create-if -t "$LINK" 2>/dev/null
+	ipadm create-addr -t -T static -a "$ADDR_LOCAL" "$LINK/v4accept" \
+	    2>/dev/null
 	sleep 2
 	ST=$(dladm show-phys "$LINK" 2>/dev/null | awk 'NR==2{print $3}')
 	if [[ "$ST" == "up" ]]; then pass "cycle $i: link up"; else fail "cycle $i: link $ST"; fi

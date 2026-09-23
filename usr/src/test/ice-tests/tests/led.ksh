@@ -41,6 +41,10 @@ function fail
 	fails+=1
 }
 
+trap '$dlled -s default "$link" >/dev/null 2>&1' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # dlled prints a header, then: LINK ACTIVE SUPPORTED.
 function field
 {
