@@ -25,6 +25,10 @@ GLUE = (
     "ice_ddp.c",
     "ice_osdep.c",
     "ice_osdep.h",
+    "ice_filter.c",
+    "ice_hw.c",
+    "ice_ioctl.c",
+    "ice_ioctl.h",
 )
 
 # "M5", "M6a" and friends: development milestone labels that outlived the

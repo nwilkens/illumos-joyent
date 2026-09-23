@@ -10,7 +10,7 @@ from c_test import DRIVER, TESTDIR, extract, run_c
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", type=Path, default=DRIVER / "ice.c")
+    parser.add_argument("--source", type=Path, default=DRIVER / "ice_hw.c")
     args = parser.parse_args()
     source = args.source.read_text()
     header = (DRIVER / "ice.h").read_text()

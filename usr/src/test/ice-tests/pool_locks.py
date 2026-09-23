@@ -21,7 +21,10 @@ def function(source: str, signature: str, following: str) -> str:
 
 def main() -> None:
     header = HEADER.read_text(encoding="utf-8")
-    source = SOURCE.read_text(encoding="utf-8")
+    # The locks are created with the vectors (ice_hw.c) and destroyed at
+    # teardown (ice.c); read in that order.
+    source = (SOURCE.parent / "ice_hw.c").read_text(encoding="utf-8") + \
+        SOURCE.read_text(encoding="utf-8")
 
     inits = {}
     for lock in LOCKS:

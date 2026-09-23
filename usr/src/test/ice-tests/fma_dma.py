@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[4]
-ATTACH_SOURCE = REPO / "usr/src/uts/common/io/ice/ice.c"
+ATTACH_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_hw.c"
 DMA_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_dma.c"
 OSDEP_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_osdep.c"
 RX_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_rx.c"
@@ -24,7 +24,7 @@ def main() -> None:
     fm_init = function(
         attach_source,
         "ice_fm_init(ice_t *ice)\n{",
-        "\nstatic void\nice_fm_fini",
+        "\nvoid\nice_fm_fini",
     )
     assert fm_init.count("DDI_FM_DMACHK_CAPABLE") == 2
 

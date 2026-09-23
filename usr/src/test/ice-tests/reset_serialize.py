@@ -203,7 +203,7 @@ def main() -> None:
     unconf_hw = function(
         attach,
         "ice_unconfigure(ice_t *ice)\n{",
-        "\nstatic uint32_t\nice_prop_get_num_queues",
+        "\n/*\n * Hand an owed rebuild",
     )
     assert "ice->ice_attach_progress & ICE_ATTACH_HW_INIT" in unconf_hw
     assert unconf_hw.count("ice_deinit_hw(&ice->ice_hw)") == 1
@@ -235,7 +235,7 @@ def main() -> None:
     unconf = function(
         attach,
         "ice_unconfigure(ice_t *ice)\n{",
-        "\nstatic uint32_t\nice_prop_get_num_queues",
+        "\n/*\n * Hand an owed rebuild",
     )
     rem = unconf.index("ice_rem_intr_handlers(ice)")
     destroy = unconf.index("ddi_taskq_destroy(ice->ice_reset_taskq)")

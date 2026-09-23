@@ -12,7 +12,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[4]
 PORT_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_port.c"
-ICE_SOURCE = REPO / "usr/src/uts/common/io/ice/ice.c"
+ICE_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_hw.c"
 
 
 def function(source: str, signature: str, following: str) -> str:

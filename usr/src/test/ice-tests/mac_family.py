@@ -63,7 +63,7 @@ def family(name):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", type=Path, default=DRIVER / "ice.c")
+    parser.add_argument("--source", type=Path, default=DRIVER / "ice_hw.c")
     parser.add_argument("--intr-source", type=Path,
                         default=DRIVER / "ice_intr.c")
     args = parser.parse_args()
@@ -91,10 +91,10 @@ def main():
     source = args.source.read_text()
     for name in ("ice_family_name", "ice_reset_empr_slow"):
         fragments.append(extract(source,
-            rf"^static [\w *]+\n{name}\([\s\S]*?^}}", args.source))
+            rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}", args.source))
     for name in ("ice_phy_fw_wait",):
         fragments.append(extract(source,
-            rf"^static [\w *]+\n{name}\([\s\S]*?^}}", args.source))
+            rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}", args.source))
     fragments.insert(0, "\n".join(re.findall(
         r"^#define\tICE_PHY_FW_\w+\t+\d+$", source, re.MULTILINE)))
     fragments.insert(0, extract(common,

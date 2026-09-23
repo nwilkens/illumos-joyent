@@ -10,7 +10,9 @@ from c_test import DRIVER, TESTDIR, extract, run_c
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", type=Path, default=DRIVER / "ice.c")
+    parser.add_argument("--source", type=Path, default=DRIVER / "ice_hw.c")
+    parser.add_argument("--lifecycle-source", type=Path,
+                        default=DRIVER / "ice.c")
     args = parser.parse_args()
     source = args.source.read_text()
     core = DRIVER / "core"
@@ -26,7 +28,7 @@ def main():
         extract(source, r"^#define\tICE_FWSM_MODE_RECOVERY\t.*$", args.source)]
     for name in ("ice_fw_recovery_mode", "ice_fw_recovery_report"):
         body.append(extract(source,
-            rf"^static [\w *]+\n{name}\([\s\S]*?^}}", args.source))
+            rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}", args.source))
     run_c(TESTDIR / "fw_recovery.c",
           {"fw_recovery_regs.h": "\n".join(regs) + "\n",
            "fw_recovery_body.h": "\n".join(body)})
@@ -39,7 +41,8 @@ def main():
     assert init.index("ice_set_mac_type(hw)") < \
         init.index("ice_fw_recovery_mode(ice, &fwsm)") < \
         init.index("ice_init_hw(hw)")
-    rebuild = source[source.index("\nice_rebuild(ice_t *ice"):]
+    lifecycle = args.lifecycle_source.read_text()
+    rebuild = lifecycle[lifecycle.index("\nice_rebuild(ice_t *ice"):]
     rebuild = rebuild[:rebuild.index("\nreset_failed:")]
     check = rebuild.index("ice_fw_recovery_mode(ice, &fwsm)")
     assert rebuild.index("ice_check_reset(hw)") < check < \

@@ -9,7 +9,7 @@ import re
 REPO = Path(__file__).resolve().parents[4]
 HEADER = REPO / "usr/src/uts/common/io/ice/ice.h"
 SOURCE = REPO / "usr/src/uts/common/io/ice/ice_rx.c"
-ICE_SOURCE = REPO / "usr/src/uts/common/io/ice/ice.c"
+ICE_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_hw.c"
 GLD_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_gld.c"
 
 
@@ -55,7 +55,7 @@ def main() -> None:
     validate_caps = function(
         ice_source,
         "ice_validate_caps(ice_t *ice)\n{",
-        "\nvoid\nice_update_mtu",
+        "\n}\n",
     )
     setprop = function(
         gld_source,

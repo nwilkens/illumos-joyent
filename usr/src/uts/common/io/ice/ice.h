@@ -679,6 +679,24 @@ extern void ice_test_request_reset(ice_t *);
 #endif
 
 /*
+ * ice_hw.c: device bring-up shared by attach and the reset rebuild.
+ */
+extern void ice_fm_init(ice_t *);
+extern void ice_fm_fini(ice_t *);
+extern void ice_identify_hardware(ice_t *);
+extern boolean_t ice_regs_map(ice_t *);
+extern boolean_t ice_validate_caps(ice_t *);
+extern boolean_t ice_hw_init(ice_t *);
+extern boolean_t ice_fw_recovery_mode(ice_t *, uint32_t *);
+extern void ice_fw_recovery_report(ice_t *, uint32_t);
+extern boolean_t ice_reset_empr_slow(struct ice_hw *);
+extern void ice_phy_fw_wait(ice_t *);
+extern boolean_t ice_alloc_intrs(ice_t *);
+extern void ice_free_intrs(ice_t *);
+extern boolean_t ice_add_intr_handlers(ice_t *);
+extern void ice_rem_intr_handlers(ice_t *);
+
+/*
  * ice_intr.c
  */
 extern uint_t ice_intr_msix(caddr_t, caddr_t);

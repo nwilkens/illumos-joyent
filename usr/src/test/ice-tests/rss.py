@@ -53,17 +53,18 @@ def main() -> None:
     unconfigure = function(
         attach,
         "ice_unconfigure(ice_t *ice)\n{",
-        "\nstatic uint32_t\nice_prop_get_num_queues",
+        "\n/*\n * Hand an owed rebuild",
     )
     intr_teardown = unconfigure.index("ICE_ATTACH_ALLOC_INTR")
     hw_teardown = unconfigure.index("ICE_ATTACH_HW_INIT")
     assert intr_teardown < hw_teardown
+    hw = (ATTACH_SOURCE.parent / "ice_hw.c").read_text(encoding="utf-8")
     allocator = function(
-        attach,
+        hw,
         "ice_alloc_intrs(ice_t *ice)\n{",
-        "\nstatic void\nice_rem_intr_handlers",
+        "\nvoid\nice_rem_intr_handlers",
     )
-    assert '"num_queues"' in attach
+    assert '"num_queues"' in hw
     limited = allocator.index("nreq = ice_queue_limit(ice);")
     requested = allocator.index("request = (int)MIN(1 + nreq,")
     assert limited < requested
