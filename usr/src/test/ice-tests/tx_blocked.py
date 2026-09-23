@@ -23,9 +23,10 @@ def main() -> None:
         "ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)\n{",
         "\nmblk_t *\nice_ring_tx",
     )
-    nores = one[
-        one.index("if (res == ICE_TX_BUILD_NORES)"):
-        one.index("if (res == ICE_TX_BUILD_DROP)")
+    build = one[one.index("ice_tx_lso_chain(itr, mp"):]
+    nores = build[
+        build.index("if (res == ICE_TX_BUILD_NORES)"):
+        build.index("if (res == ICE_TX_BUILD_DROP)")
     ]
 
     # blocked is armed under the ring lock ...
@@ -40,6 +41,34 @@ def main() -> None:
 
     # the caller still keeps the chain for MAC to retry
     assert "return (B_FALSE);" in nores
+
+    # a drop that returns resources rewakes a ring another sender blocked
+    drop = build[build.index("if (res == ICE_TX_BUILD_DROP)"):]
+    drop = drop[:drop.index("return (B_TRUE);")]
+    assert drop.index("mutex_enter(&itr->itxr_lock)") < \
+        drop.index("if (itr->itxr_blocked)") < \
+        drop.index("ice_tx_recycle(itr)") < \
+        drop.index("mutex_exit(&itr->itxr_lock)")
+
+    # an LSO packet waits, blocked, for the ring's LSO pool
+    lso = one[one.index("if (ctx.itc_use_ctx) {"):
+              one.index("ice_tx_lso_chain(itr, mp")]
+    assert "res = ice_tx_lso_resources(itr);" in lso
+    assert lso.index("ICE_TX_BUILD_NORES") < lso.index("return (B_FALSE);")
+    res = function(tx, "ice_tx_lso_resources(ice_tx_ring_t *itr)\n{",
+                   "\nstatic boolean_t\nice_tx_one")
+    locked = res[res.index("mutex_enter(&itr->itxr_lock)"):
+                 res.index("mutex_exit(&itr->itxr_lock)")]
+    assert "itr->itxr_blocked = B_TRUE;" in locked
+    assert "itr->itxr_lso_state = ICE_TX_LSO_PENDING;" in locked
+    assert "taskq_dispatch_ent(" not in locked
+    assert res.index("mutex_exit(&itr->itxr_lock)") < \
+        res.index("taskq_dispatch_ent(")
+
+    # after a reset every ring is woken by its own handle
+    wake = function(tx, "ice_tx_wake(ice_t *ice)\n{", "\n}\n")
+    assert "ice->ice_txr[i].itxr_mactxring" in wake
+    assert "mac_tx_update(" not in tx
 
     # the sibling arm path still recycles before arming
     sibling = one[one.index("if (itr->itxr_avail <= ndesc)"):]

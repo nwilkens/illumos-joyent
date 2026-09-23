@@ -604,16 +604,6 @@ ice_alloc_intrs(ice_t *ice)
 	    DDI_INTR_PRI(ice->ice_intr_pri));
 	cv_init(&ice->ice_lse_cv, NULL, CV_DRIVER, NULL);
 
-	/*
-	 * The copy-buffer pool locks are taken from the tx completion path via
-	 * ice_tcb_free(), which runs under the MSI-X priority itxr_lock, so
-	 * they need the same interrupt cookie.
-	 */
-	mutex_init(&ice->ice_buf_lock, NULL, MUTEX_DRIVER,
-	    DDI_INTR_PRI(ice->ice_intr_pri));
-	mutex_init(&ice->ice_small_buf_lock, NULL, MUTEX_DRIVER,
-	    DDI_INTR_PRI(ice->ice_intr_pri));
-
 	return (B_TRUE);
 }
 

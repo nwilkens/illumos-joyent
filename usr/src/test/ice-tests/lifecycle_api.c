@@ -30,8 +30,14 @@
 
 typedef bool boolean_t;
 typedef int kmutex_t;
+typedef unsigned int uint_t;
 
 #include "ice_lifecycle_types.h"
+
+typedef int taskq_t;
+typedef struct ice_tx_ring {
+	unsigned int lso_finis;
+} ice_tx_ring_t;
 
 typedef struct ice {
 	uint32_t ice_state;
@@ -39,7 +45,13 @@ typedef struct ice {
 	kmutex_t ice_rebuild_lock, ice_lse_lock;
 	link_state_t ice_link_state;
 	void *ice_mac_hdl, *ice_dip;
+	taskq_t *ice_tx_taskq;
+	unsigned int ice_num_txr;
+	ice_tx_ring_t *ice_txr;
 } ice_t;
+
+static taskq_t tx_taskq;
+static ice_tx_ring_t tx_rings[2];
 
 static ice_t device;
 static struct {
@@ -49,7 +61,7 @@ static struct {
 	unsigned int tx_buffers, rx_buffers;
 	unsigned int maps, programs, rx_starts, tx_starts, disables;
 	unsigned int tx_quiesces, rx_quiesces, tx_reclaims, rx_reclaims;
-	unsigned int publications, impacts, resets;
+	unsigned int publications, impacts, resets, lso_waits;
 	uint32_t inject_during_start;
 	link_state_t published;
 } fixture;
@@ -183,6 +195,25 @@ ice_tx_reclaim(ice_t *ice)
 	fixture.tx_reclaims++;
 }
 
+/* The LSO allocation task is drained before the LSO pools are freed. */
+static void
+taskq_wait(taskq_t *tq)
+{
+	check_owner(&device);
+	assert(tq == &tx_taskq && fixture.tx_closed);
+	assert(fixture.tx_reclaims == 0);
+	fixture.lso_waits++;
+}
+
+static void
+ice_tx_lso_fini(ice_tx_ring_t *itr)
+{
+	check_owner(&device);
+	assert(fixture.lso_waits == 1 && fixture.tx_reclaims == 1);
+	assert(!fixture.dma_live && fixture.tx_buffers == 0);
+	itr->lso_finis++;
+}
+
 static void
 ice_rx_reclaim(ice_t *ice)
 {
@@ -237,6 +268,10 @@ reset(void)
 	check_unlocked();
 	memset(&device, 0, sizeof (device));
 	memset(&fixture, 0, sizeof (fixture));
+	memset(tx_rings, 0, sizeof (tx_rings));
+	device.ice_tx_taskq = &tx_taskq;
+	device.ice_num_txr = ARRAY_SIZE(tx_rings);
+	device.ice_txr = tx_rings;
 	device.ice_state = ICE_STATE_ATTACHED;
 	device.ice_link_state = LINK_STATE_UP;
 	device.ice_mac_hdl = &device;
@@ -346,6 +381,8 @@ stop_case(boolean_t disabled, boolean_t drained)
 		assert(fixture.rx_buffers == (drained ? 0U : 4U));
 		assert(fixture.tx_reclaims == 1);
 		assert(fixture.rx_reclaims == 1);
+		assert(tx_rings[0].lso_finis == 1);
+		assert(tx_rings[1].lso_finis == 1);
 		assert(fixture.resets == 0 && fixture.impacts == 0);
 		assert(device.ice_state == ICE_STATE_ATTACHED);
 	} else {
@@ -353,6 +390,8 @@ stop_case(boolean_t disabled, boolean_t drained)
 		assert(fixture.rx_buffers == 4);
 		assert(fixture.tx_reclaims == 0);
 		assert(fixture.rx_reclaims == 0);
+		/* A queue that may still be live keeps its LSO pool too. */
+		assert(fixture.lso_waits == 0 && tx_rings[0].lso_finis == 0);
 		assert(fixture.resets == 1 && fixture.impacts == 1);
 		assert(device.ice_state == (ICE_STATE_ATTACHED |
 		    ICE_STATE_ERROR | ICE_STATE_PFR_REQ));

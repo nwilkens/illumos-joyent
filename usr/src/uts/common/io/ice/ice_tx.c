@@ -123,8 +123,7 @@ ice_tx_kstat_init(ice_t *ice, ice_tx_ring_t *itr)
  * costs a kmem_cache_alloc, a mutex pair and an insert into the single
  * per-devinfo FM handle cache on every transmit.  A handle is fixed to its
  * attributes at allocation, so the two sgllens need two handles.  The LSO
- * handle is unreachable when LSO is off: ice_tx_one() drops such a packet
- * before the bind path.
+ * handles come with the ring's LSO pool (ice_tx_lso_task()).
  */
 static boolean_t
 ice_tcb_handles_alloc(ice_t *ice, ice_tx_ctrl_block_t *itcb)
@@ -138,17 +137,48 @@ ice_tcb_handles_alloc(ice_t *ice, ice_tx_ctrl_block_t *itcb)
 		return (B_FALSE);
 	}
 
-	if (!ice->ice_tx_lso_enable)
-		return (B_TRUE);
+	return (B_TRUE);
+}
+
+/*
+ * The TX path reads an LSO handle only once the ring's LSO state is READY,
+ * and a stop frees the handles only after every TCB is reclaimed.
+ */
+boolean_t
+ice_tcb_lso_handles_alloc(ice_t *ice, ice_tx_ring_t *itr)
+{
+	ddi_dma_attr_t attr;
+	uint16_t i;
 
 	ice_pkt_txbind_lso_attr(ice, &attr);
-	if (ddi_dma_alloc_handle(ice->ice_dip, &attr, DDI_DMA_DONTWAIT, NULL,
-	    &itcb->itcb_lso_dmah) != DDI_SUCCESS) {
-		itcb->itcb_lso_dmah = NULL;
-		return (B_FALSE);
+	for (i = 0; i < itr->itxr_size; i++) {
+		ice_tx_ctrl_block_t *itcb = &itr->itxr_tcb_area[i];
+
+		ASSERT3P(itcb->itcb_lso_dmah, ==, NULL);
+		if (ddi_dma_alloc_handle(ice->ice_dip, &attr, DDI_DMA_SLEEP,
+		    NULL, &itcb->itcb_lso_dmah) != DDI_SUCCESS) {
+			itcb->itcb_lso_dmah = NULL;
+			return (B_FALSE);
+		}
 	}
 
 	return (B_TRUE);
+}
+
+void
+ice_tcb_lso_handles_free(ice_tx_ring_t *itr)
+{
+	uint16_t i;
+
+	if (itr->itxr_tcb_area == NULL)
+		return;
+	for (i = 0; i < itr->itxr_size; i++) {
+		ice_tx_ctrl_block_t *itcb = &itr->itxr_tcb_area[i];
+
+		if (itcb->itcb_lso_dmah != NULL)
+			ddi_dma_free_handle(&itcb->itcb_lso_dmah);
+		itcb->itcb_lso_dmah = NULL;
+	}
 }
 
 static void
@@ -603,8 +633,8 @@ ice_tx_bind_fragment(ice_tx_ring_t *itr, mblk_t *mp, uint_t *ncookiesp)
 
 /*
  * LSO binds may span more cookies than ordinary frames, so they use the
- * handle carrying the wider sgllen.  That handle exists only when LSO was
- * enabled at ring allocation, which is also the only way this path runs.
+ * handle carrying the wider sgllen.  ice_tx_one() reaches this path only
+ * after ice_tx_lso_resources() found the ring's LSO handles ready.
  */
 static ice_tx_ctrl_block_t *
 ice_tx_bind_lso_fragment(ice_tx_ring_t *itr, caddr_t addr, size_t len,
@@ -663,7 +693,6 @@ static ice_tx_ctrl_block_t *
 ice_tx_copy_packet(ice_tx_ring_t *itr, mblk_t *mp, size_t msglen,
     ice_tx_build_t *resp)
 {
-	ice_t *ice = itr->itxr_ice;
 	ice_tx_ctrl_block_t *tcb;
 	mblk_t *cmp;
 	caddr_t dst;
@@ -675,9 +704,9 @@ ice_tx_copy_packet(ice_tx_ring_t *itr, mblk_t *mp, size_t msglen,
 	}
 
 	if (msglen <= ICE_TX_SMALL_PKT &&
-	    (tcb->itcb_buf = ice_small_buf_alloc(ice)) != NULL) {
+	    (tcb->itcb_buf = ice_small_buf_alloc(itr)) != NULL) {
 		tcb->itcb_type = ITCB_SMALL_COPY;
-	} else if ((tcb->itcb_buf = ice_buf_alloc(ice)) != NULL) {
+	} else if ((tcb->itcb_buf = ice_buf_alloc(itr)) != NULL) {
 		tcb->itcb_type = ITCB_COPY;
 	} else {
 		ice_tcb_free(itr, tcb);
@@ -802,11 +831,11 @@ ice_tx_mblk_advance(mblk_t **mpp, size_t *offp, size_t len)
 	return (B_TRUE);
 }
 
+/* A header fits a small buffer; only payload copies need LSO buffers. */
 static ice_tx_ctrl_block_t *
 ice_tx_lso_copy(ice_tx_ring_t *itr, mblk_t **mpp, size_t *offp, size_t len,
-    ice_tx_build_t *resp)
+    boolean_t header, ice_tx_build_t *resp)
 {
-	ice_t *ice = itr->itxr_ice;
 	ice_tx_ctrl_block_t *tcb;
 
 	tcb = ice_tcb_alloc(itr);
@@ -815,13 +844,14 @@ ice_tx_lso_copy(ice_tx_ring_t *itr, mblk_t **mpp, size_t *offp, size_t len,
 		return (NULL);
 	}
 
-	tcb->itcb_buf = ice_lso_buf_alloc(ice);
+	tcb->itcb_buf = header ? ice_small_buf_alloc(itr) :
+	    ice_lso_buf_alloc(itr);
 	if (tcb->itcb_buf == NULL) {
 		ice_tcb_free(itr, tcb);
 		*resp = ICE_TX_BUILD_NORES;
 		return (NULL);
 	}
-	tcb->itcb_type = ITCB_LSO_COPY;
+	tcb->itcb_type = header ? ITCB_SMALL_COPY : ITCB_LSO_COPY;
 
 	if (len == 0 || len > tcb->itcb_buf->idb_len ||
 	    !ice_tx_mblk_copy(mpp, offp, tcb->itcb_buf->idb_va, len)) {
@@ -1221,7 +1251,7 @@ ice_tx_lso_build(ice_tx_ring_t *itr, mblk_t *mp,
 	 * descriptor once for the header and again for the first payload
 	 * segment.
 	 */
-	tcb = ice_tx_lso_copy(itr, &cmp, &coff, hdrlen, &res);
+	tcb = ice_tx_lso_copy(itr, &cmp, &coff, hdrlen, B_TRUE, &res);
 	if (tcb == NULL)
 		return (res);
 	tcbs[ntcb++] = tcb;
@@ -1317,7 +1347,8 @@ force_copy:
 			goto drop;
 		}
 		fraglen = MIN(remaining, (size_t)ICE_TX_LSO_BUFSZ);
-		tcb = ice_tx_lso_copy(itr, &cmp, &coff, fraglen, &res);
+		tcb = ice_tx_lso_copy(itr, &cmp, &coff, fraglen, B_FALSE,
+		    &res);
 		if (tcb == NULL)
 			goto fail;
 
@@ -1717,6 +1748,51 @@ ice_tx_count_drop(ice_tx_ring_t *itr, const ice_tx_ctx_t *ctx)
 	}
 }
 
+/*
+ * The ring's LSO pool is allocated for its first LSO packet.  Until it is
+ * ready the ring stays blocked, and ice_tx_lso_task() wakes MAC.
+ */
+static ice_tx_build_t
+ice_tx_lso_resources(ice_tx_ring_t *itr)
+{
+	ice_t *ice = itr->itxr_ice;
+	ice_tx_build_t res = ICE_TX_BUILD_NORES;
+	boolean_t dispatch = B_FALSE;
+
+	if (itr->itxr_lso_state == ICE_TX_LSO_READY) {
+		membar_consumer();
+		return (ICE_TX_BUILD_OK);
+	}
+
+	mutex_enter(&itr->itxr_lock);
+	switch (itr->itxr_lso_state) {
+	case ICE_TX_LSO_READY:
+		res = ICE_TX_BUILD_OK;
+		break;
+	case ICE_TX_LSO_FAILED:
+		res = ICE_TX_BUILD_DROP;
+		break;
+	case ICE_TX_LSO_NONE:
+		itr->itxr_lso_state = ICE_TX_LSO_PENDING;
+		dispatch = B_TRUE;
+		/* FALLTHROUGH */
+	case ICE_TX_LSO_PENDING:
+		itr->itxr_blocked = B_TRUE;
+		itr->itxr_stats.ictxs_blocked.value.ui64++;
+		itr->itxr_stats.ictxs_lso_nores.value.ui64++;
+		break;
+	}
+	mutex_exit(&itr->itxr_lock);
+
+	/* The entry is idle: only the NONE to PENDING step queues it. */
+	if (dispatch) {
+		taskq_dispatch_ent(ice->ice_tx_taskq, ice_tx_lso_task, itr, 0,
+		    &itr->itxr_lso_ent);
+	}
+
+	return (res);
+}
+
 static boolean_t
 ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 {
@@ -1746,6 +1822,15 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 	}
 
 	if (ctx.itc_use_ctx) {
+		res = ice_tx_lso_resources(itr);
+		if (res == ICE_TX_BUILD_NORES)
+			return (B_FALSE);
+		if (res == ICE_TX_BUILD_DROP) {
+			freemsg(mp);
+			itr->itxr_stats.ictxs_drops.value.ui64++;
+			itr->itxr_stats.ictxs_lso_drops.value.ui64++;
+			return (B_TRUE);
+		}
 		res = ice_tx_lso_chain(itr, mp, &ctx, tcbs, &ntcb, &ndesc,
 		    &txmp);
 		if (res == ICE_TX_BUILD_OK) {
@@ -1781,9 +1866,18 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 	if (res == ICE_TX_BUILD_DROP) {
 		/* Undeliverable (too large to copy, unbindable); drop it. */
 		freemsg(mp);
+		mutex_enter(&itr->itxr_lock);
 		itr->itxr_stats.ictxs_drops.value.ui64++;
 		if (ctx.itc_use_ctx)
 			itr->itxr_stats.ictxs_lso_drops.value.ui64++;
+		/*
+		 * The build returned TCBs and buffers that another sender may
+		 * have blocked the ring on.  With nothing in flight, no
+		 * completion would wake MAC for it.
+		 */
+		if (itr->itxr_blocked)
+			(void) ice_tx_recycle(itr);
+		mutex_exit(&itr->itxr_lock);
 		return (B_TRUE);
 	}
 	ASSERT3U(res, ==, ICE_TX_BUILD_OK);
@@ -1904,6 +1998,8 @@ ice_tx_start(ice_t *ice)
 		itr->itxr_rs_cidx = 0;
 		itr->itxr_quiesce = B_FALSE;
 		itr->itxr_blocked = B_FALSE;
+		if (itr->itxr_lso_state == ICE_TX_LSO_FAILED)
+			itr->itxr_lso_state = ICE_TX_LSO_NONE;
 		mutex_exit(&itr->itxr_lock);
 	}
 }
@@ -1971,16 +2067,36 @@ ice_tx_reclaim(ice_t *ice)
 }
 
 /*
- * Quiesce the rings on mac_stop and release everything they hold.  Reached only
- * once ice_queues_disable() has confirmed every tx queue is disabled; a disable
- * that did not complete quiesces without reclaiming and lets the reset barrier
- * release the mappings instead.
+ * Quiesce the rings on mac_stop and release everything they hold, including
+ * the LSO pools.  Reached only once ice_queues_disable() has confirmed every
+ * tx queue is disabled; a disable that did not complete quiesces without
+ * reclaiming and lets the reset barrier release the mappings instead.
  */
 void
 ice_tx_stop(ice_t *ice)
 {
+	uint_t i;
+
 	ice_tx_quiesce(ice);
+	taskq_wait(ice->ice_tx_taskq);
 	ice_tx_reclaim(ice);
+	for (i = 0; i < ice->ice_num_txr; i++)
+		ice_tx_lso_fini(&ice->ice_txr[i]);
+}
+
+/*
+ * Tell MAC every ring can send.  MAC unblocks a ring only for its own handle,
+ * so a NULL handle would wake none of them.
+ */
+void
+ice_tx_wake(ice_t *ice)
+{
+	uint_t i;
+
+	for (i = 0; i < ice->ice_num_txr; i++) {
+		mac_tx_ring_update(ice->ice_mac_hdl,
+		    ice->ice_txr[i].itxr_mactxring);
+	}
 }
 
 /*

@@ -88,15 +88,20 @@ ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
 	nfrees++;
 }
 
+/* The pools belong to the ring that sends the packet. */
 static ice_dma_buffer_t *
-ice_small_buf_alloc(ice_t *ice)
+ice_small_buf_alloc(ice_tx_ring_t *itr)
 {
+	ice_t *ice = itr->itxr_ice;
+
 	return (ice->small_available ? &ice->small : NULL);
 }
 
 static ice_dma_buffer_t *
-ice_buf_alloc(ice_t *ice)
+ice_buf_alloc(ice_tx_ring_t *itr)
 {
+	ice_t *ice = itr->itxr_ice;
+
 	return (ice->general_available ? &ice->general : NULL);
 }
 

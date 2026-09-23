@@ -89,6 +89,14 @@ def main() -> None:
     # length field even after the count_max fix.
     assert "dmac_size > ICE_TX_MAX_BUFSZ" in lso_build
     assert "msgpullup(mp, -1)" in tx
+    # Headers take small buffers; only payload copies use the LSO pool.
+    assert "ice_tx_lso_copy(itr, &cmp, &coff, hdrlen, B_TRUE, &res)" in \
+        lso_build
+    assert "fraglen, B_FALSE," in lso_build
+    copy = function(tx, "ice_tx_lso_copy(ice_tx_ring_t *itr, mblk_t **mpp,",
+                    "\n/*\n * Push only the descriptors")
+    assert "header ? ice_small_buf_alloc(itr) :" in copy
+    assert "CTASSERT(ICE_TX_LSO_MAX_HDRLEN <= ICE_TX_SMALL_PKT);" in header
 
     print("PASS: ice LSO source invariants")
 

@@ -18,8 +18,11 @@
 /*
  * DMA support for the ice(4D) driver: descriptor-ring and packet-buffer DMA
  * attributes, the allocate/free primitives that wrap the DDI DMA bind dance,
- * and the shared TX/RX buffer pools that the data path draws from.
+ * and the per-ring TX copy-buffer pools that the data path draws from.
  */
+
+#include <sys/atomic.h>
+#include <sys/disp.h>
 
 #include "ice.h"
 
@@ -246,10 +249,10 @@ ice_check_dma_handle(ddi_dma_handle_t handle)
 }
 
 /*
- * Pool storage is constructed before MAC registration and destroyed only
- * after TX is quiesced and reclaimed.  Those lifecycle fences exclude users
- * while allocation/free can sleep; the interrupt-priority lock protects only
- * the live free stack.  Normal and LSO copies share a lock, as before.
+ * Pool storage is built and destroyed only while TX is closed to the ring's
+ * users: at attach, at detach, and at a stop or in ice_tx_lso_task() for the
+ * LSO pool.  Allocation can sleep there; the interrupt-priority lock guards
+ * only the live free stack.
  */
 static void
 ice_buf_pool_fini(ice_buf_pool_t *pool)
@@ -290,7 +293,7 @@ ice_buf_pool_init(ice_t *ice, ice_buf_pool_t *pool, uint_t n, size_t size)
 		ice_dma_buffer_t *buf = &pool->ibp_bufs[i];
 
 		if (!ice_dma_alloc(ice, buf, &attr, &acc, B_TRUE, size,
-		    B_FALSE)) {
+		    B_TRUE)) {
 			ice_buf_pool_fini(pool);
 			return (B_FALSE);
 		}
@@ -318,21 +321,21 @@ ice_buf_pool_alloc(ice_buf_pool_t *pool)
 }
 
 ice_dma_buffer_t *
-ice_buf_alloc(ice_t *ice)
+ice_buf_alloc(ice_tx_ring_t *itr)
 {
-	return (ice_buf_pool_alloc(&ice->ice_copy_pool));
+	return (ice_buf_pool_alloc(&itr->itxr_copy_pool));
 }
 
 ice_dma_buffer_t *
-ice_lso_buf_alloc(ice_t *ice)
+ice_lso_buf_alloc(ice_tx_ring_t *itr)
 {
-	return (ice_buf_pool_alloc(&ice->ice_lso_pool));
+	return (ice_buf_pool_alloc(&itr->itxr_lso_pool));
 }
 
 ice_dma_buffer_t *
-ice_small_buf_alloc(ice_t *ice)
+ice_small_buf_alloc(ice_tx_ring_t *itr)
 {
-	return (ice_buf_pool_alloc(&ice->ice_small_pool));
+	return (ice_buf_pool_alloc(&itr->itxr_small_pool));
 }
 
 /* The allocation records its owner; callers never choose a return pool. */
@@ -352,53 +355,119 @@ ice_buf_free(ice_dma_buffer_t *buf)
 	mutex_exit(pool->ibp_lock);
 }
 
+/* Buffers per ring in one pool: the per-ring count, within the cap. */
+uint_t
+ice_tx_pool_bufs(uint_t per_ring, uint_t cap, uint_t nrings)
+{
+	ASSERT3U(nrings, >, 0);
+	return (MIN(per_ring, cap / nrings));
+}
+
 boolean_t
 ice_buf_init(ice_t *ice)
 {
-	uint_t i, n = 0;
+	uint_t ncopy, nsmall, i;
 
-	ice->ice_copy_pool.ibp_lock = &ice->ice_buf_lock;
-	ice->ice_lso_pool.ibp_lock = &ice->ice_buf_lock;
-	ice->ice_small_pool.ibp_lock = &ice->ice_small_buf_lock;
+	ncopy = ice_tx_pool_bufs(ICE_TX_COPY_BUFS_RING, ICE_TX_COPY_BUFS_MAX,
+	    ice->ice_num_txr);
+	nsmall = ice_tx_pool_bufs(ICE_TX_SMALL_BUFS_RING,
+	    ICE_TX_SMALL_BUFS_MAX, ice->ice_num_txr);
 
-	/* One copy buffer per TX descriptor, across all rings. */
-	for (i = 0; i < ice->ice_num_txr; i++)
-		n += ice->ice_txr[i].itxr_size;
+	ice->ice_tx_taskq = taskq_create_instance("ice_tx", ice->ice_instance,
+	    1, minclsyspri, 1, 1, TASKQ_PREPOPULATE);
 
-	if (!ice_buf_pool_init(ice, &ice->ice_copy_pool, n,
-	    ICE_TX_COPY_BUFSZ)) {
-		ice_error(ice, "failed to allocate tx copy buffers");
-		goto fail;
-	}
+	for (i = 0; i < ice->ice_num_txr; i++) {
+		ice_tx_ring_t *itr = &ice->ice_txr[i];
 
-	if (ice->ice_tx_lso_enable) {
-		VERIFY3U(ICE_TX_LSO_BUFSZ, >=, ICE_MAX_FRAME_SIZE);
-		VERIFY3U(ICE_TX_LSO_BUFSZ, <=, ICE_TX_MAX_BUFSZ);
-		/* Close any supported MSS window with one descriptor. */
-		if (!ice_buf_pool_init(ice, &ice->ice_lso_pool, n,
-		    ICE_TX_LSO_BUFSZ)) {
-			ice_error(ice,
-			    "failed to allocate tx LSO copy buffers");
-			goto fail;
+		itr->itxr_copy_pool.ibp_lock = &itr->itxr_tcb_lock;
+		itr->itxr_small_pool.ibp_lock = &itr->itxr_tcb_lock;
+		itr->itxr_lso_pool.ibp_lock = &itr->itxr_tcb_lock;
+		itr->itxr_lso_state = ICE_TX_LSO_NONE;
+
+		if (!ice_buf_pool_init(ice, &itr->itxr_copy_pool, ncopy,
+		    ICE_TX_COPY_BUFSZ) ||
+		    !ice_buf_pool_init(ice, &itr->itxr_small_pool, nsmall,
+		    ICE_TX_SMALL_PKT)) {
+			ice_error(ice, "failed to allocate tx ring %u copy "
+			    "buffers", i);
+			ice_buf_fini(ice);
+			return (B_FALSE);
 		}
 	}
 
-	if (!ice_buf_pool_init(ice, &ice->ice_small_pool, n,
-	    ICE_TX_SMALL_PKT)) {
-		ice_error(ice, "failed to allocate tx small buffers");
-		goto fail;
-	}
 	return (B_TRUE);
-
-fail:
-	ice_buf_fini(ice);
-	return (B_FALSE);
 }
 
+/*
+ * Release a ring's LSO pool and bind handles.  The caller has closed the
+ * ring, waited out ice_tx_lso_task() and reclaimed every TCB.
+ */
+void
+ice_tx_lso_fini(ice_tx_ring_t *itr)
+{
+	ice_buf_pool_fini(&itr->itxr_lso_pool);
+	ice_tcb_lso_handles_free(itr);
+	itr->itxr_lso_state = ICE_TX_LSO_NONE;
+}
+
+/*
+ * Allocate a ring's LSO pool and bind handles for its first LSO packet.
+ * ice_tx_one() blocked the ring and queued this task, which may sleep; the
+ * task then wakes MAC unless the ring was closed meanwhile.  A failure makes
+ * the ring drop LSO packets until the next start.
+ */
+void
+ice_tx_lso_task(void *arg)
+{
+	ice_tx_ring_t *itr = arg;
+	ice_t *ice = itr->itxr_ice;
+	uint_t n;
+	boolean_t ok;
+
+	n = ice_tx_pool_bufs(ICE_TX_LSO_BUFS_RING, ICE_TX_LSO_BUFS_MAX,
+	    ice->ice_num_txr);
+	VERIFY3U(ICE_TX_LSO_BUFSZ, >=, ICE_MAX_FRAME_SIZE);
+	VERIFY3U(ICE_TX_LSO_BUFSZ, <=, ICE_TX_MAX_BUFSZ);
+	ok = ice_buf_pool_init(ice, &itr->itxr_lso_pool, n,
+	    ICE_TX_LSO_BUFSZ) && ice_tcb_lso_handles_alloc(ice, itr);
+	if (!ok) {
+		ice_buf_pool_fini(&itr->itxr_lso_pool);
+		ice_tcb_lso_handles_free(itr);
+		ice_error(ice, "failed to allocate tx ring %u LSO buffers; "
+		    "its LSO packets are dropped until the next start",
+		    itr->itxr_index);
+	}
+
+	mutex_enter(&itr->itxr_lock);
+	ASSERT3U(itr->itxr_lso_state, ==, ICE_TX_LSO_PENDING);
+	membar_producer();
+	itr->itxr_lso_state = ok ? ICE_TX_LSO_READY : ICE_TX_LSO_FAILED;
+	if (itr->itxr_blocked && !itr->itxr_quiesce) {
+		itr->itxr_blocked = B_FALSE;
+		mac_tx_ring_update(ice->ice_mac_hdl, itr->itxr_mactxring);
+	}
+	mutex_exit(&itr->itxr_lock);
+}
+
+/*
+ * Destroying the taskq waits out any LSO allocation.  Every ring is closed
+ * and reclaimed, so each buffer is back in its pool.
+ */
 void
 ice_buf_fini(ice_t *ice)
 {
-	ice_buf_pool_fini(&ice->ice_small_pool);
-	ice_buf_pool_fini(&ice->ice_lso_pool);
-	ice_buf_pool_fini(&ice->ice_copy_pool);
+	uint_t i;
+
+	if (ice->ice_tx_taskq != NULL) {
+		taskq_destroy(ice->ice_tx_taskq);
+		ice->ice_tx_taskq = NULL;
+	}
+
+	for (i = 0; i < ice->ice_num_txr; i++) {
+		ice_tx_ring_t *itr = &ice->ice_txr[i];
+
+		ice_tx_lso_fini(itr);
+		ice_buf_pool_fini(&itr->itxr_small_pool);
+		ice_buf_pool_fini(&itr->itxr_copy_pool);
+	}
 }

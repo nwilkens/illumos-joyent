@@ -46,7 +46,9 @@ symmetric hashing each compile and fail at runtime.
 link publication, and TX/RX stop composition. Sixteen scenarios cover detach,
 terminal and owed-reset admission, queue/RX startup failures, new errors during
 startup, successful publication, loan retention, failed-disable recovery, and
-restart with the lock already held. Four source mutations compile and fail
+restart with the lock already held. A stop that confirmed the queue disable
+waits for the LSO task and then frees each ring's LSO pool after the reclaim;
+a stop that did not keeps them. Four source mutations compile and fail
 runtime checks for admission, barrier handling, programming errors, and lost
 asynchronous errors. Paired `--source` and `--gld-source` paths also exercise
 pre-refactor revisions. `lifecycle_boundary.py` rejects external calls to
@@ -272,7 +274,9 @@ worker waits, after the reset barrier, at interrupt rearm, and during atomic
 completion. Assertions check reset counts and type, deferred work, request
 retention, datapath restart suppression, and terminal handling. A slow EMPR
 (E825-C and E830) must wait once before the reset-complete poll; a PF reset
-issued by the driver must not wait. A PHY firmware load still running after
+issued by the driver must not wait. A rebuild that restarts the datapath
+calls `ice_tx_wake()` once, since the reset closed the rings without telling
+MAC; `tx_blocked.py` requires that it wake each ring by its own MAC handle. A PHY firmware load still running after
 the reset leaves the PHY setup pending, and an unreadable PHY firmware state
 fails the rebuild closed.
 
@@ -520,7 +524,9 @@ and read-only property callbacks.
 mode or by the property), context descriptor
 encoding, hostile-metadata checks, per-segment and per-packet descriptor
 limits, LSO bind emission, frame-sized copy fallback, DMA cookie-size guard,
-and compile-time descriptor-layout checks. Setting the `tx_lso_enable`
+and compile-time descriptor-layout checks. The LSO header is copied into a
+small-pool buffer, so only payload copies take LSO-pool buffers. Setting the
+`tx_lso_enable`
 driver property to 0 in `/kernel/drv/ice.conf` withholds LSO.
 
 `rss.py` verifies that interrupt allocation takes its data-queue count from
@@ -571,7 +577,11 @@ Controls omitting the DROP guard, runt guard, or pad zeroing each fail.
 is armed under the ring lock and reclaim is re-driven after arming and before
 the lock is dropped, so a fully drained ring that will raise no further
 completion interrupt cannot stay blocked at MAC; the chain is returned for MAC
-to retry; and both exits of the recycle path own the wakeup.
+to retry; and both exits of the recycle path own the wakeup. A packet dropped
+after its build returned TCBs or buffers re-drives reclaim when the ring is
+blocked, since the pools are per ring and another sender may have blocked on
+them. An LSO packet on a ring without its LSO pool blocks the ring under the
+lock and queues the allocation task after dropping it.
 
 `tx_emit.py` compiles the actual descriptor writers, emission, DMA sync,
 TCB cleanup, and completion walk. Twenty cases cover ordinary/LSO bindings,
@@ -603,16 +613,27 @@ peeks and repost, plus data-buffer and register faults. Copy/loan cases
 verify delivery suppression, counter/tail behavior, and cleanup outside
 the ring lock; healthy controls retain ordinary delivery.
 
-`buf_pool.py` compiles the actual shared TX pool functions. Its 27 lifecycle
-cases cover LSO enabled/disabled, failure at every DMA allocation, repeated
-cleanup, full-stack exhaustion, and returns to the correct pool when ordinary
-and LSO buffers have equal sizes. Allocation and release boundaries assert
-that no pool lock is held. The original implementation fails the sleeping
-allocation check. These controlled boundaries do not exercise real DMA.
+`buf_pool.py` compiles the actual TX pool functions, the pool sizing, the
+LSO allocation task and the TX path's `ice_tx_lso_resources()`. For 1 to 127
+rings and 64 to 4096 descriptors per ring, each ring's copy and small pools
+take `MIN(per-ring count, cap / rings)` buffers whatever the descriptor count,
+the instance totals stay within the caps, and every ring at 127 queues still
+has LSO buffers for its largest packet. No LSO buffer or LSO bind handle
+exists after `ice_buf_init()`. The first LSO packet blocks its ring and
+queues the task once; later packets wait on it. The task allocates only that
+ring's LSO pool, publishes READY, and wakes MAC unless the ring was closed;
+an allocation that fails publishes FAILED, wakes MAC, and the LSO packets then
+drop until a stop. `ice_tx_lso_fini()` releases the pool and resets the state.
+The test also covers failure at every DMA allocation, repeated cleanup, and
+per-ring exhaustion and returns. Allocation and release boundaries assert that
+no pool or ring lock is held. These controlled boundaries do not exercise
+real DMA.
 
-`pool_locks.py` checks the two pool locks are initialized once at the negotiated
-interrupt priority and destroyed after pool teardown. Construction and
-unwind rely on exclusive lifecycle ownership rather than holding those locks.
+`pool_locks.py` checks that each ring's pools use the ring's TCB lock, which
+is created at the negotiated interrupt priority before the pools and destroyed
+after them, and that the old per-instance pools and locks are gone.
+Construction and unwind rely on exclusive lifecycle ownership rather than
+holding the lock, and the LSO task allocates before it takes the ring lock.
 
 `jumbo_copy.py` verifies that the transmit copy pool can hold any MTU-legal
 frame: the general pool buffer is page-rounded from `ICE_MAX_FRAME_SIZE`, a

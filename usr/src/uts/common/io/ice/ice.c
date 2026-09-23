@@ -169,6 +169,12 @@
  * power of two: the VSI TC map rounds up, while the rings and the RSS table
  * use the exact count.
  *
+ * Each tx ring has its own copy-buffer pools, sized for the copied packets
+ * it can have in flight rather than for its descriptors, within a cap per
+ * instance.  A ring's LSO pool and LSO bind handles are allocated on a taskq
+ * for its first LSO packet, which waits with the ring blocked, and are freed
+ * at MAC stop.
+ *
  * Checksum offload and LSO are advertised unless the DDP package is missing
  * (safe mode), which also leaves one queue pair.  For LSO the MSS comes from
  * mac_lso_get() and must be at least 88 bytes; the header is copied into one
@@ -733,8 +739,6 @@ ice_unconfigure(ice_t *ice)
 		ice_free_intrs(ice);
 		cv_destroy(&ice->ice_lse_cv);
 		mutex_destroy(&ice->ice_lse_lock);
-		mutex_destroy(&ice->ice_small_buf_lock);
-		mutex_destroy(&ice->ice_buf_lock);
 	}
 
 	if (ice->ice_attach_progress & ICE_ATTACH_HW_INIT) {
@@ -1533,6 +1537,12 @@ ice_rebuild(ice_t *ice, uint32_t requests)
 		return;
 	}
 
+	/*
+	 * The reset closed the rings without telling MAC, so a ring that was
+	 * blocked, or waiting on its LSO pool, needs a wakeup.
+	 */
+	if ((ice->ice_state & ICE_STATE_STARTED) != 0)
+		ice_tx_wake(ice);
 	ice_link_state_publish(ice);
 	dev_err(ice->ice_dip, CE_NOTE, "!reset recovery complete");
 	return;

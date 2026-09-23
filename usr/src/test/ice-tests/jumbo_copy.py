@@ -61,10 +61,10 @@ def main() -> None:
     buf_init = function(
         dma_source,
         "ice_buf_init(ice_t *ice)\n{",
-        "\nvoid\nice_buf_fini",
+        "\n/*\n * Release a ring's LSO pool",
     )
     assert re.search(
-        r"ice_buf_pool_init\(ice,\s*&ice->ice_copy_pool,\s*n,\s*"
+        r"ice_buf_pool_init\(ice,\s*&itr->itxr_copy_pool,\s*ncopy,\s*"
         r"ICE_TX_COPY_BUFSZ\)", buf_init)
     # rx data buffers are allocated in ice_rx.c, not from these pools.
     assert "ICE_RX_BUF_SIZE" not in dma_source
@@ -75,8 +75,8 @@ def main() -> None:
             "ice_tx_copy_packet(ice_tx_ring_t *itr, mblk_t *mp, size_t msglen,"
         ),
     )
-    small = copy_packet.index("ice_small_buf_alloc(ice)")
-    assert copy_packet.index("ice_buf_alloc(ice)", small) > small
+    small = copy_packet.index("ice_small_buf_alloc(itr)")
+    assert copy_packet.index("ice_buf_alloc(itr)", small) > small
     # The general pool must be usable with ice_tx_lso_enable off.
     assert "ice_lso_buf_alloc(" not in copy_packet
 

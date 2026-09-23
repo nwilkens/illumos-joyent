@@ -27,6 +27,7 @@
 #include <sys/modctl.h>
 #include <sys/pci.h>
 #include <sys/list.h>
+#include <sys/taskq_impl.h>
 #include <sys/ethernet.h>
 #include <sys/mac_provider.h>
 #include <sys/mac_ether.h>
@@ -148,6 +149,18 @@ CTASSERT(ICE_MAX_FRAME_SIZE <= UINT16_MAX);
  */
 #define	ICE_TX_COPY_BUFSZ	P2ROUNDUP(ICE_MAX_FRAME_SIZE, PAGESIZE)
 #define	ICE_TX_SMALL_PKT	512		/* small-copy threshold */
+
+/*
+ * TX copy-buffer pools, per ring.  A ring takes the per-ring count unless that
+ * would put the instance above the cap.  The LSO cap must leave every ring at
+ * ICE_MAX_QUEUES enough buffers for its largest packet.
+ */
+#define	ICE_TX_COPY_BUFS_RING	64
+#define	ICE_TX_COPY_BUFS_MAX	2048
+#define	ICE_TX_SMALL_BUFS_RING	256
+#define	ICE_TX_SMALL_BUFS_MAX	8192
+#define	ICE_TX_LSO_BUFS_RING	64
+#define	ICE_TX_LSO_BUFS_MAX	2048
 /* GLCOMM_MIN_MAX_PKT.MIHDL reset value; a shorter frame is a TCLAN MDD. */
 #define	ICE_TX_MIN_LEN		17
 
@@ -165,6 +178,12 @@ CTASSERT(ICE_LSO_MAXLEN <= (ICE_TXD_CTX_QW1_TSO_LEN_M >>
     ICE_TXD_CTX_QW1_TSO_LEN_S));
 CTASSERT(ICE_TXD_CTX_MAX_MSS <= (ICE_TXD_CTX_QW1_MSS_M >>
     ICE_TXD_CTX_QW1_MSS_S));
+/* An LSO header takes a small buffer, its payload this many LSO buffers. */
+CTASSERT(ICE_TX_LSO_MAX_HDRLEN <= ICE_TX_SMALL_PKT);
+CTASSERT(ICE_TX_LSO_BUFS_MAX / ICE_MAX_QUEUES >=
+    howmany(ICE_LSO_MAXLEN, ICE_MAX_FRAME_SIZE));
+CTASSERT(ICE_TX_COPY_BUFS_MAX / ICE_MAX_QUEUES >= 1);
+CTASSERT(ICE_TX_SMALL_BUFS_MAX / ICE_MAX_QUEUES >= 1);
 
 #define	ICE_DEF_TX_RING_SIZE	1024
 #define	ICE_DEF_RX_RING_SIZE	1024
@@ -231,7 +250,7 @@ typedef enum ice_attach_state {
 	ICE_ATTACH_VSI		= 1 << 10,
 	ICE_ATTACH_RINGS	= 1 << 11,	/* ring DMA allocated */
 	ICE_ATTACH_QUEUE_INTR	= 1 << 12,	/* queue->vector wired */
-	ICE_ATTACH_BUFS		= 1 << 13,	/* tx copy-buffer pools */
+	ICE_ATTACH_BUFS		= 1 << 13,	/* tx pools and taskq */
 	ICE_ATTACH_STATS	= 1 << 14,	/* hardware stat kstats */
 	ICE_ATTACH_MAC		= 1 << 15	/* mac_register done */
 } ice_attach_state_t;
@@ -349,6 +368,13 @@ typedef struct ice_txq_stat {
 	kstat_named_t		ictxs_lso_badmss;
 } ice_txq_stat_t;
 
+typedef enum ice_tx_lso_state {
+	ICE_TX_LSO_NONE,	/* no LSO pool or bind handles */
+	ICE_TX_LSO_PENDING,	/* ice_tx_lso_task() is queued */
+	ICE_TX_LSO_READY,
+	ICE_TX_LSO_FAILED	/* allocation failed; LSO packets drop */
+} ice_tx_lso_state_t;
+
 typedef struct ice_tx_ring {
 	struct ice		*itxr_ice;	/* RO */
 	uint32_t		itxr_index;	/* absolute HW tx queue index */
@@ -385,6 +411,17 @@ typedef struct ice_tx_ring {
 	kmutex_t		itxr_tcb_lock;
 	ice_tx_ctrl_block_t	**itxr_tcb_free_list;
 	uint16_t		itxr_tcb_nfree;
+
+	/*
+	 * Copy-buffer pools; itxr_tcb_lock guards their free stacks.  The
+	 * LSO pool and the TCBs' LSO bind handles exist only from the first
+	 * LSO packet after a start until the next stop.
+	 */
+	ice_buf_pool_t		itxr_copy_pool;
+	ice_buf_pool_t		itxr_small_pool;
+	ice_buf_pool_t		itxr_lso_pool;
+	ice_tx_lso_state_t	itxr_lso_state;	/* itxr_lock */
+	taskq_ent_t		itxr_lso_ent;
 
 	kstat_t			*itxr_kstat;
 	ice_txq_stat_t		itxr_stats;
@@ -625,12 +662,8 @@ typedef struct ice {
 	uint32_t		ice_rx_ring_size;
 	uint32_t		ice_rx_limit_per_intr;
 
-	/* Shared TX copy-buffer pools. */
-	kmutex_t		ice_buf_lock;
-	kmutex_t		ice_small_buf_lock;
-	ice_buf_pool_t		ice_copy_pool;
-	ice_buf_pool_t		ice_lso_pool;
-	ice_buf_pool_t		ice_small_pool;
+	/* Allocates each ring's LSO resources; see ice_tx_lso_task(). */
+	taskq_t			*ice_tx_taskq;
 
 	/* DDP firmware. */
 	/* Attach-only: MAC caches mi_capab at mac_register(). */
@@ -769,12 +802,15 @@ extern boolean_t ice_dma_alloc(ice_t *, ice_dma_buffer_t *, ddi_dma_attr_t *,
     ddi_device_acc_attr_t *, boolean_t, size_t, boolean_t);
 extern void ice_dma_free(ice_dma_buffer_t *);
 extern int ice_check_dma_handle(ddi_dma_handle_t);
-extern ice_dma_buffer_t *ice_buf_alloc(ice_t *);
+extern uint_t ice_tx_pool_bufs(uint_t, uint_t, uint_t);
+extern ice_dma_buffer_t *ice_buf_alloc(ice_tx_ring_t *);
 extern void ice_buf_free(ice_dma_buffer_t *);
-extern ice_dma_buffer_t *ice_lso_buf_alloc(ice_t *);
-extern ice_dma_buffer_t *ice_small_buf_alloc(ice_t *);
+extern ice_dma_buffer_t *ice_lso_buf_alloc(ice_tx_ring_t *);
+extern ice_dma_buffer_t *ice_small_buf_alloc(ice_tx_ring_t *);
 extern boolean_t ice_buf_init(ice_t *);
 extern void ice_buf_fini(ice_t *);
+extern void ice_tx_lso_task(void *);
+extern void ice_tx_lso_fini(ice_tx_ring_t *);
 
 /*
  * ice_tx.c
@@ -784,6 +820,8 @@ extern void ice_tx_rings_free(ice_t *);
 extern int ice_tx_ring_program(ice_t *, ice_tx_ring_t *);
 extern int ice_tx_ring_unprogram(ice_t *, ice_tx_ring_t *);
 extern void ice_map_txq_vector(ice_t *, ice_tx_ring_t *);
+extern boolean_t ice_tcb_lso_handles_alloc(ice_t *, ice_tx_ring_t *);
+extern void ice_tcb_lso_handles_free(ice_tx_ring_t *);
 
 /*
  * ice_rx.c
@@ -812,6 +850,7 @@ extern void ice_tx_start(ice_t *);
 extern void ice_tx_quiesce(ice_t *);
 extern void ice_tx_reclaim(ice_t *);
 extern void ice_tx_stop(ice_t *);
+extern void ice_tx_wake(ice_t *);
 extern void ice_tx_ring_intr(ice_tx_ring_t *);
 extern int ice_ring_tx_stat(mac_ring_driver_t, uint_t, uint64_t *);
 

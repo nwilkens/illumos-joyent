@@ -63,7 +63,7 @@ typedef struct ice {
 #include "ice_reset_types.h"
 
 static ice_phy_fw_state_t phy_fw_state;
-static unsigned phy_setups;
+static unsigned phy_setups, tx_wakes;
 
 static ice_phy_fw_state_t
 ice_phy_fw_state(ice_t *ice)
@@ -360,6 +360,14 @@ static int ice_start_datapath(ice_t *ice)
 }
 static int ice_rx_rings_resume(ice_t *ice) { (void) ice; return (resume_ok); }
 
+static void
+ice_tx_wake(ice_t *ice)
+{
+	assert(ice == &device && device.ice_rebuild_lock);
+	assert((device.ice_state & ICE_STATE_ERROR) == 0);
+	tx_wakes++;
+}
+
 #include "ice_reset_body.h"
 
 static void
@@ -367,6 +375,7 @@ reset(void)
 {
 	(void) memset(&device, 0, sizeof (device));
 	device.ice_safe_mode = B_TRUE;
+	tx_wakes = 0;
 	queued = prepared = pfrs = global_waits = starts = errors = 0;
 	slow_empr = 0;
 	slow_waits = 0;
@@ -397,7 +406,7 @@ check_coalescing(void)
 	/* Redispatch the same still-owed request while the worker waits. */
 	at_lock = ICE_STATE_PFR_REQ;
 	run_one();
-	assert(queued == 0 && prepared == 1 && pfrs == 1);
+	assert(queued == 0 && prepared == 1 && pfrs == 1 && tx_wakes == 0);
 	assert(!device.ice_reset_pending && (device.ice_state & OWED) == 0);
 
 	/* A stale callback must not prepare or reset the hardware. */
@@ -419,6 +428,8 @@ check_new_requests(void)
 	    (ICE_STATE_PFR_REQ | ICE_STATE_ERROR));
 	run_one();
 	assert(pfrs == 2 && queued == 0 && starts == 1);
+	/* The restarted rings wake MAC; the deferred pass did not. */
+	assert(tx_wakes == 1);
 
 	reset();
 	device.ice_state = ICE_STATE_STARTED;
@@ -591,6 +602,7 @@ check_restart_failure(void)
 		request(ICE_STATE_PFR_REQ);
 		run_one();
 		assert(starts == 1 && down_reports == 1 && queued == 0);
+		assert(tx_wakes == 0);
 		assert((device.ice_state & ICE_STATE_ERROR) != 0);
 		assert((device.ice_state & ICE_STATE_RESET_FAILED) == 0);
 	}

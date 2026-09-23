@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 
-"""Check the tx copy-buffer pool locks are created, destroyed, and ordered."""
+"""Check the tx copy-buffer pools use each ring's TCB lock, and its lifetime."""
 
 from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[4]
-HEADER = REPO / "usr/src/uts/common/io/ice/ice.h"
-SOURCE = REPO / "usr/src/uts/common/io/ice/ice.c"
-DMA_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_dma.c"
-
-LOCKS = ("ice_buf_lock", "ice_small_buf_lock")
+DRIVER = REPO / "usr/src/uts/common/io/ice"
 
 
 def function(source: str, signature: str, following: str) -> str:
@@ -20,43 +16,50 @@ def function(source: str, signature: str, following: str) -> str:
 
 
 def main() -> None:
-    header = HEADER.read_text(encoding="utf-8")
-    # The locks are created with the vectors (ice_hw.c) and destroyed at
-    # teardown (ice.c); read in that order.
-    source = (SOURCE.parent / "ice_hw.c").read_text(encoding="utf-8") + \
-        SOURCE.read_text(encoding="utf-8")
+    header = (DRIVER / "ice.h").read_text(encoding="utf-8")
+    lifecycle = (DRIVER / "ice.c").read_text(encoding="utf-8")
+    tx = (DRIVER / "ice_tx.c").read_text(encoding="utf-8")
+    dma = (DRIVER / "ice_dma.c").read_text(encoding="utf-8")
+    everything = header + lifecycle + tx + dma + \
+        (DRIVER / "ice_hw.c").read_text(encoding="utf-8")
 
-    inits = {}
-    for lock in LOCKS:
-        assert "kmutex_t\t\t%s;" % lock in header
+    # The shared per-instance pools and their locks are gone.
+    for name in ("ice_buf_lock", "ice_small_buf_lock", "ice_copy_pool",
+                 "ice_lso_pool", "ice_small_pool"):
+        assert name not in everything, name
 
-        init = "mutex_init(&ice->%s," % lock
-        destroy = "mutex_destroy(&ice->%s" % lock
-        assert source.count(init) == 1, lock
-        assert source.count(destroy) == 1, lock
-
-        idx = source.index(init)
-        inits[lock] = idx
-        call = source[idx:source.index(";", idx)]
-        assert "DDI_INTR_PRI(ice->ice_intr_pri)" in call, lock
-
-    pri = source.index("ddi_intr_get_pri(")
-    first_use = source.index("ice_buf_init(ice)")
-    for lock in LOCKS:
-        assert pri < inits[lock] < first_use, lock
-
-    assert source.index("ice_buf_fini(ice)") < \
-        source.index("mutex_destroy(&ice->ice_buf_lock")
-
-    dma = DMA_SOURCE.read_text(encoding="utf-8")
-    buf_init = function(
-        dma, "ice_buf_init(ice_t *ice)\n{", "\nvoid\nice_buf_fini")
-    # Pool construction/destruction have exclusive lifecycle ownership.
-    # The actual-C buf_pool test checks every allocator/free boundary.
+    # Each ring's pools use its TCB lock, created at MSI-X priority when
+    # the ring is allocated.
+    ring = function(tx, "ice_tx_ring_alloc(ice_t *ice, ice_tx_ring_t *itr,",
+                    "\nboolean_t\nice_tx_rings_alloc")
+    init = ring[ring.index("mutex_init(&itr->itxr_tcb_lock,"):]
+    assert "DDI_INTR_PRI(ice->ice_intr_pri)" in init[:init.index(";")]
+    buf_init = function(dma, "ice_buf_init(ice_t *ice)\n{",
+                        "\n/*\n * Release a ring's LSO pool")
+    for pool in ("itxr_copy_pool", "itxr_small_pool", "itxr_lso_pool"):
+        assert f"itr->{pool}.ibp_lock = &itr->itxr_tcb_lock;" in buf_init
+    # Pool construction has exclusive lifecycle ownership.
     assert "mutex_enter(" not in buf_init
     assert "ice_buf_fini(ice)" in buf_init
 
-    print("PASS: ice copy-buffer pool lock lifetime invariants")
+    # Rings (and their locks) exist before the pools and outlive them.
+    attach = lifecycle[lifecycle.index("\nice_attach(dev_info_t *dip"):]
+    assert attach.index("ice_tx_rings_alloc(ice)") < \
+        attach.index("ice_buf_init(ice)")
+    teardown = function(lifecycle, "\nice_unconfigure(ice_t *ice)\n{",
+                        "\nvoid\nice_reset_redispatch")
+    assert teardown.index("ice_buf_fini(ice)") < \
+        teardown.index("ice_tx_rings_free(ice)")
+
+    # The LSO task runs without the ring lock while it allocates.
+    task = function(dma, "ice_tx_lso_task(void *arg)\n{",
+                    "\n/*\n * Destroying the taskq")
+    assert task.index("ice_buf_pool_init(") < \
+        task.index("mutex_enter(&itr->itxr_lock)")
+    assert task.index("ice_tcb_lso_handles_alloc(") < \
+        task.index("mutex_enter(&itr->itxr_lock)")
+
+    print("PASS: ice tx pool lock and lifetime invariants")
 
 
 if __name__ == "__main__":
