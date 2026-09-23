@@ -27,6 +27,7 @@ TESTS = (
     "jumbo_rx.py",
     "lifecycle_api.py",
     "lifecycle_boundary.py",
+    "led.py",
     "link_operational.py",
     "link_speed_caps.py",
     "link_state.py",

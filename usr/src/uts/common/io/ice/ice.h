@@ -570,6 +570,7 @@ typedef struct ice {
 
 	uint32_t		ice_mtu;
 	boolean_t		ice_tx_lso_enable;
+	boolean_t		ice_led_ident;		/* ice_rebuild_lock */
 	boolean_t		ice_promisc_on;		/* replay on reset */
 	ice_vsi_t		ice_pf_vsi;		/* the PF's data VSI */
 
@@ -760,6 +761,17 @@ extern boolean_t ice_mac_register(ice_t *);
 extern int ice_mac_unregister(ice_t *);
 extern void ice_link_state_publish(ice_t *);
 extern link_state_t ice_link_state_effective(ice_t *, link_state_t);
+
+/*
+ * ice_port.c: transceiver and LED capabilities.  The replay requires
+ * ice_rebuild_lock; the other entry points acquire it.
+ */
+extern int ice_transceiver_info(void *, uint_t, mac_transceiver_info_t *);
+extern int ice_transceiver_read(void *, uint_t, uint_t, void *, size_t, off_t,
+    size_t *);
+extern int ice_led_set(void *, mac_led_mode_t, uint_t);
+extern void ice_led_replay(ice_t *);
+extern void ice_led_fini(ice_t *);
 
 /*
  * Hardware statistics (ice_stats.c).

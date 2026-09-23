@@ -260,6 +260,12 @@ ice_loopback_fini(ice_t *p)
 }
 
 static void
+ice_led_fini(ice_t *p)
+{
+	assert(p->ice_detaching);
+}
+
+static void
 list_remove(int *list, ice_t *p)
 {
 	(void) list;

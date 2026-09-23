@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[4]
-GLD_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_gld.c"
+PORT_SOURCE = REPO / "usr/src/uts/common/io/ice/ice_port.c"
 ICE_SOURCE = REPO / "usr/src/uts/common/io/ice/ice.c"
 
 
@@ -26,11 +26,11 @@ def main() -> None:
     assert ("mutex_init(&ice->ice_lock, NULL, MUTEX_DRIVER,\n"
             "\t    DDI_INTR_PRI(ice->ice_intr_pri));") in ice_c
 
-    gld = GLD_SOURCE.read_text(encoding="utf-8")
+    port = PORT_SOURCE.read_text(encoding="utf-8")
     read = function(
-        gld,
+        port,
         "ice_transceiver_read(void *arg, uint_t id, uint_t page, void *buf,",
-        "\nstatic boolean_t\nice_m_getcapab",
+        "\n}\n",
     )
     assert "ice_aq_sff_eeprom(" in read
     assert "mutex_enter(&ice->ice_rebuild_lock);" in read

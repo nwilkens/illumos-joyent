@@ -100,6 +100,16 @@ rounding and stays at or below `MAX_RINGS_PER_GROUP - 1`, because MAC keeps
 one SRS per rx ring plus one for software classification in an array of that
 size. The check also requires that the vector grant only lowers the count.
 
+## LED regression
+
+`led.py` compiles `ice_led_set()`, `ice_led_replay()` and `ice_led_fini()`
+from `ice_port.c` with a stub admin queue. It checks that only DEFAULT and
+IDENT are accepted, that each command runs under `ice_rebuild_lock`, that a
+failed command returns EIO without changing the recorded mode, that a
+rebuild blinks the LED again only when IDENT was set, and that detach gives
+the LED back to firmware once. It also checks the `MAC_CAPAB_LED` fields and
+the replay and restore call sites.
+
 ## Shared MAC filter request regression
 
 ```

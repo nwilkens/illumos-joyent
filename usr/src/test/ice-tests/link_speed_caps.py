@@ -61,7 +61,7 @@ def main() -> None:
     mstat = function(
         gld,
         "ice_m_stat(void *arg, uint_t stat, uint64_t *val)\n{",
-        "\n/*\n * SFF module",
+        "\nstatic boolean_t\nice_m_getcapab",
     )
     # E822 and E823 SGMII ports link at 100 Mb/s; E830 reaches 200 Gb/s.
     for rate in ("100", "25G", "40G", "100G", "200G"):

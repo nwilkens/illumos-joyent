@@ -532,89 +532,6 @@ ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 	return (ice_stats_read(ice, stat, val));
 }
 
-/*
- * SFF module (transceiver) access.  Pages 0xa0/0xa2 are the I2C device
- * addresses of the SFF-8472 diagnostic memory; the admin-queue command reads at
- * most 16 bytes per request.
- */
-#define	ICE_SFF_8472_BASE	0xa0
-#define	ICE_SFF_8472_DIAG	0xa2
-#define	ICE_SFF_PAGE_LEN	256
-#define	ICE_SFF_READ_CHUNK	16
-
-static int
-ice_transceiver_info(void *arg, uint_t id, mac_transceiver_info_t *infop)
-{
-	ice_t *ice = arg;
-	struct ice_link_status *li;
-	boolean_t present, usable;
-
-	if (id != 0 || infop == NULL)
-		return (EINVAL);
-
-	/*
-	 * ice_rebuild_lock is the outermost lock: hold it so a reset
-	 * rebuild cannot reinitialize port_info underneath this
-	 * read.  Read link_info under the lock rather than snapshotting the
-	 * pointer earlier.
-	 */
-	mutex_enter(&ice->ice_rebuild_lock);
-	mutex_enter(&ice->ice_lock);
-	li = &ice->ice_hw.port_info->phy.link_info;
-	present = (li->link_info & ICE_AQ_MEDIA_AVAILABLE) != 0;
-	usable = present && (li->an_info & ICE_AQ_QUALIFIED_MODULE) != 0;
-	mutex_exit(&ice->ice_lock);
-	mutex_exit(&ice->ice_rebuild_lock);
-
-	mac_transceiver_info_set_present(infop, present);
-	mac_transceiver_info_set_usable(infop, usable);
-
-	return (0);
-}
-
-static int
-ice_transceiver_read(void *arg, uint_t id, uint_t page, void *buf,
-    size_t nbytes, off_t offset, size_t *nread)
-{
-	ice_t *ice = arg;
-	struct ice_hw *hw = &ice->ice_hw;
-	uint8_t *out = buf;
-	size_t i;
-
-	if (id != 0 || buf == NULL || nbytes == 0 || nread == NULL ||
-	    (page != ICE_SFF_8472_BASE && page != ICE_SFF_8472_DIAG) ||
-	    offset < 0)
-		return (EINVAL);
-	if (nbytes > ICE_SFF_PAGE_LEN || offset >= ICE_SFF_PAGE_LEN ||
-	    offset + nbytes > ICE_SFF_PAGE_LEN)
-		return (EINVAL);
-
-	/*
-	 * ice_rebuild_lock is the outermost lock: hold it across the
-	 * admin-queue SFF reads so a reset rebuild cannot tear the control
-	 * queue down underneath ice_aq_sff_eeprom().  ice_lock is not taken:
-	 * it is an interrupt-priority mutex, each command can poll firmware
-	 * for up to a second, and any /dev/dld user in the link's zone can
-	 * issue this read.  The core's sq_lock serializes the commands.
-	 */
-	mutex_enter(&ice->ice_rebuild_lock);
-	for (i = 0; i < nbytes; ) {
-		uint8_t len = (uint8_t)MIN(nbytes - i, ICE_SFF_READ_CHUNK);
-
-		if (ice_aq_sff_eeprom(hw, 0, (uint8_t)page,
-		    (uint16_t)(offset + i), 0, 0, &out[i], len, false,
-		    NULL) != ICE_SUCCESS) {
-			mutex_exit(&ice->ice_rebuild_lock);
-			return (EIO);
-		}
-		i += len;
-	}
-	mutex_exit(&ice->ice_rebuild_lock);
-
-	*nread = nbytes;
-	return (0);
-}
-
 static boolean_t
 ice_m_getcapab(void *arg, mac_capab_t capab, void *cap_data)
 {
@@ -668,6 +585,16 @@ ice_m_getcapab(void *arg, mac_capab_t capab, void *cap_data)
 		mct->mct_ntransceivers = 1;
 		mct->mct_info = ice_transceiver_info;
 		mct->mct_read = ice_transceiver_read;
+		break;
+	}
+
+	case MAC_CAPAB_LED: {
+		mac_capab_led_t *mcl = cap_data;
+
+		/* The port ID LED command can only blink or restore. */
+		mcl->mcl_flags = 0;
+		mcl->mcl_modes = MAC_LED_DEFAULT | MAC_LED_IDENT;
+		mcl->mcl_set = ice_led_set;
 		break;
 	}
 

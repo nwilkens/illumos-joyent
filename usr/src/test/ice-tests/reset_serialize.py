@@ -99,18 +99,19 @@ def main() -> None:
     assert "mutex_exit(&ice->ice_rebuild_lock)" in lbset
     assert "ice_loopback_mode_set_locked(ice, mode)" in lbset
 
+    port = (GLD_SOURCE.parent / "ice_port.c").read_text(encoding="utf-8")
     tinfo = function(
-        gld,
+        port,
         "ice_transceiver_info(void *arg, uint_t id, mac_transceiver_info_t *infop)\n{",
-        "\nstatic int\nice_transceiver_read",
+        "\nint\nice_transceiver_read",
     )
     assert "mutex_enter(&ice->ice_rebuild_lock)" in tinfo
     assert "mutex_exit(&ice->ice_rebuild_lock)" in tinfo
 
     tread = function(
-        gld,
+        port,
         "ice_transceiver_read(void *arg, uint_t id, uint_t page, void *buf,",
-        "\nstatic boolean_t\nice_m_getcapab",
+        "\n}\n",
     )
     assert "mutex_enter(&ice->ice_rebuild_lock)" in tread
     assert "mutex_exit(&ice->ice_rebuild_lock)" in tread

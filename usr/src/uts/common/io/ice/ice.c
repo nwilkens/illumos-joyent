@@ -1510,6 +1510,7 @@ ice_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	}
 
 	ice_loopback_fini(ice);
+	ice_led_fini(ice);
 
 	mutex_enter(&ice_glock);
 	list_remove(&ice_glist, ice);
@@ -1817,6 +1818,7 @@ ice_rebuild(ice_t *ice, uint32_t requests)
 		goto reset_failed;
 
 	ice_loopback_replay(ice);
+	ice_led_replay(ice);
 
 	/*
 	 * Re-route and re-arm the interrupts a reset clears.  Discard the

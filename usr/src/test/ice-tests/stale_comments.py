@@ -15,6 +15,7 @@ GLUE = (
     "ice.c",
     "ice.h",
     "ice_gld.c",
+    "ice_port.c",
     "ice_intr.c",
     "ice_rx.c",
     "ice_tx.c",
