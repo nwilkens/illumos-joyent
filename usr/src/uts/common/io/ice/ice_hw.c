@@ -430,15 +430,20 @@ ice_phy_fw_wait(ice_t *ice)
 	return (B_TRUE);
 }
 
-/* The optional ice.conf ceiling on the queue pair count. */
+/* The ice.conf ceiling on the queue pair count. */
 static uint32_t
 ice_prop_get_num_queues(ice_t *ice)
 {
-	int value;
+	int value, clamped;
 
 	value = ddi_prop_get_int(DDI_DEV_T_ANY, ice->ice_dip, 0, "num_queues",
-	    ICE_MAX_QUEUES);
-	return ((uint32_t)MIN(MAX(value, 1), ICE_MAX_QUEUES));
+	    ICE_DEF_QUEUES);
+	clamped = MIN(MAX(value, 1), ICE_MAX_QUEUES);
+	if (clamped != value) {
+		ice_error(ice, "num_queues %d is outside 1 to %d; using %d",
+		    value, ICE_MAX_QUEUES, clamped);
+	}
+	return ((uint32_t)clamped);
 }
 
 /*
@@ -451,7 +456,7 @@ static uint32_t
 ice_queue_limit(ice_t *ice)
 {
 	struct ice_hw_common_caps *c = &ice->ice_hw.func_caps.common_cap;
-	uint32_t n, cpus;
+	uint32_t n, cpus, conf;
 
 	/*
 	 * Attach can observe one CPU before the rest of the boot CPUs are
@@ -469,7 +474,8 @@ ice_queue_limit(ice_t *ice)
 	if (c->rss_table_entry_width > 0 && c->rss_table_entry_width < 8)
 		n = MIN(n, 1u << c->rss_table_entry_width);
 	n = MIN(n, ICE_MAX_QUEUES);
-	n = MIN(n, ice_prop_get_num_queues(ice));
+	conf = ice_prop_get_num_queues(ice);
+	n = MIN(n, conf);
 
 	return (MAX(n, 1));
 }

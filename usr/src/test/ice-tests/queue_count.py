@@ -14,8 +14,8 @@ def main():
     args = parser.parse_args()
     source = args.source.read_text()
     header = (DRIVER / "ice.h").read_text()
-    fragments = [extract(header, r"^#define\tICE_MAX_QUEUES\t.*$",
-                         DRIVER / "ice.h")]
+    fragments = [extract(header, rf"^#define\t{name}\t.*$", DRIVER / "ice.h")
+                 for name in ("ICE_MAX_QUEUES", "ICE_DEF_QUEUES")]
     for name in ("ice_queue_limit", "ice_prop_get_num_queues"):
         fragments.append(extract(source,
             rf"^static uint32_t\n{name}\([\s\S]*?^}}", args.source))

@@ -164,9 +164,10 @@
  *
  * The queue pair count is the lowest of the CPU count, the queues and vectors
  * firmware gives this PF, the vectors the platform grants less the OICR
- * vector, MAX_RINGS_PER_GROUP - 1, and the num_queues property.  It need not
- * be a power of two: the VSI TC map rounds up, while the rings and the RSS
- * table use the exact count.
+ * vector, and the num_queues property.  That property defaults to 16 and is
+ * clamped to 1 through MAX_RINGS_PER_GROUP - 1.  The count need not be a
+ * power of two: the VSI TC map rounds up, while the rings and the RSS table
+ * use the exact count.
  *
  * Checksum offload and LSO are advertised unless the DDP package is missing
  * (safe mode), which also leaves one queue pair.  For LSO the MSS comes from

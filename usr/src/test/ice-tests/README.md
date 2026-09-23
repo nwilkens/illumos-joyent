@@ -96,10 +96,12 @@ passes traffic.
 
 `queue_count.py` compiles `ice_queue_limit()` and `ice_prop_get_num_queues()`
 and runs them against CPU, firmware queue, MSI-X, RSS entry width and
-`num_queues` combinations. The count follows the CPUs without power-of-two
-rounding and stays at or below `MAX_RINGS_PER_GROUP - 1`, because MAC keeps
-one SRS per rx ring plus one for software classification in an array of that
-size. The check also requires that the vector grant only lowers the count.
+`num_queues` combinations. Without the property the count is at most 16. The
+count follows the CPUs without power-of-two rounding and stays at or below
+`MAX_RINGS_PER_GROUP - 1`, because MAC keeps one SRS per rx ring plus one for
+software classification in an array of that size. A property outside 1 to
+127 is clamped and logged once. The check also requires that the vector grant
+only lowers the count.
 
 ## LED regression
 

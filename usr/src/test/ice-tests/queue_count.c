@@ -41,6 +41,15 @@ typedef struct ice {
 static int ncpus, boot_max_ncpus, max_ncpus;
 static int prop;
 static int have_prop;
+static int logged;
+
+static void
+ice_error(ice_t *ice, const char *fmt, ...)
+{
+	(void) ice;
+	(void) fmt;
+	logged++;
+}
 
 static int
 ddi_prop_get_int(int dev, void *dip, int flags, const char *name, int dflt)
@@ -69,35 +78,45 @@ limit(int cpus, u32 rxq, u32 txq, u32 msix, u32 width, int conf)
 	ice.ice_hw.func_caps.common_cap.rss_table_entry_width = width;
 	have_prop = conf >= -1000;
 	prop = conf;
+	logged = 0;
 	return (ice_queue_limit(&ice));
 }
 
 int
 main(void)
 {
-	/* The count follows the CPUs and is not rounded to a power of two. */
+	/* Sixteen queue pairs by default, fewer when the CPUs are fewer. */
 	assert(limit(6, 256, 256, 1025, 8, -2000) == 6);
-	assert(limit(24, 256, 256, 1025, 8, -2000) == 24);
-	assert(limit(64, 256, 256, 1025, 8, -2000) == 64);
+	assert(limit(16, 256, 256, 1025, 8, -2000) == 16);
+	assert(limit(24, 256, 256, 1025, 8, -2000) == 16);
+	assert(limit(512, 1024, 1024, 2048, 11, -2000) == 16);
+	assert(logged == 0);
+	/* The property raises the ceiling, following the CPUs. */
+	assert(limit(24, 256, 256, 1025, 8, 64) == 24);
+	assert(limit(64, 256, 256, 1025, 8, 64) == 64);
 	/* MAC rx groups hold at most MAX_RINGS_PER_GROUP - 1 rings. */
-	assert(limit(512, 1024, 1024, 2048, 11, -2000) == 127);
+	assert(limit(512, 1024, 1024, 2048, 11, 127) == 127);
+	assert(logged == 0);
 	/* Firmware queue and vector limits; vector 0 is not a queue. */
-	assert(limit(64, 3, 256, 1025, 8, -2000) == 3);
-	assert(limit(64, 256, 5, 1025, 8, -2000) == 5);
+	assert(limit(64, 3, 256, 1025, 8, 127) == 3);
+	assert(limit(64, 256, 5, 1025, 8, 127) == 5);
+	assert(limit(64, 256, 256, 9, 8, 127) == 8);
 	assert(limit(64, 256, 256, 9, 8, -2000) == 8);
 	/* A narrow RSS entry bounds the queues it can name. */
-	assert(limit(64, 256, 256, 1025, 2, -2000) == 4);
+	assert(limit(64, 256, 256, 1025, 2, 127) == 4);
 	/* Safe mode leaves one queue pair. */
 	assert(limit(64, 1, 1, 2, 0, -2000) == 1);
-	/* The ice.conf ceiling, clamped to [1, ICE_MAX_QUEUES]. */
 	assert(limit(64, 256, 256, 1025, 8, 5) == 5);
-	assert(limit(64, 256, 256, 1025, 8, 0) == 1);
-	assert(limit(64, 256, 256, 1025, 8, -7) == 1);
-	assert(limit(64, 256, 256, 1025, 8, 100000) == 64);
-	assert(limit(512, 1024, 1024, 2048, 8, 100000) == 127);
+	assert(logged == 0);
+	/* An out-of-range property is clamped to [1, 127] and logged. */
+	assert(limit(64, 256, 256, 1025, 8, 0) == 1 && logged == 1);
+	assert(limit(64, 256, 256, 1025, 8, -7) == 1 && logged == 1);
+	assert(limit(64, 256, 256, 1025, 8, 128) == 64 && logged == 1);
+	assert(limit(512, 1024, 1024, 2048, 8, 100000) == 127 && logged == 1);
 	/* One CPU seen early in boot uses the boot CPU count instead. */
-	assert(limit(1, 256, 256, 1025, 8, -2000) == 32);
-	(void) puts("PASS: queue pair count follows CPUs, firmware and MAC "
-	    "limits");
+	assert(limit(1, 256, 256, 1025, 8, -2000) == 16);
+	assert(limit(1, 256, 256, 1025, 8, 127) == 32);
+	(void) puts("PASS: queue pair count defaults to 16 and follows CPUs, "
+	    "firmware and MAC limits");
 	return (0);
 }

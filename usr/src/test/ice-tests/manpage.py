@@ -57,8 +57,6 @@ def main():
     for name in re.findall(r"^# (\w+): ", conf, re.MULTILINE):
         assert f".It Sy {name}\n" in props, name
     for name, value in re.findall(r"^# (\w+)=(\d+);", conf, re.MULTILINE):
-        if name == "num_queues":
-            continue
         block = props[props.index(f".It Sy {name}\n"):]
         block = block[:block.find("\n.It ", 1)]
         assert f".Sy {value} ." in block, (name, value)

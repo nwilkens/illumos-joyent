@@ -50,7 +50,7 @@ IPv4 and IPv6 TCP segmentation offload
 .It
 Receive side scaling
 .Pq RSS
-across one receive and transmit queue pair per CPU.
+across one receive and transmit queue pair per CPU, up to 16 by default.
 .It
 Transceiver presence and module data.
 .It
@@ -183,14 +183,17 @@ The following properties may be set in
 .Pa /kernel/drv/ice.conf .
 .Bl -tag -width Ds
 .It Sy num_queues
-A ceiling on the number of receive and transmit queue pairs.
-The driver uses one queue pair per CPU, limited by the queues and MSI-X
-vectors that the firmware gives the function, by the vectors that the system
-grants, and by 127, the largest ring count that MAC allows in a group.
+A ceiling on the number of receive and transmit queue pairs, from 1 to 127,
+the largest ring count that MAC allows in a group.
+The driver uses one queue pair per CPU up to this ceiling, limited also by
+the queues and MSI-X vectors that the firmware gives the function and by the
+vectors that the system grants.
 The count need not be a power of two.
-The default is no ceiling beyond those limits.
-Each queue pair has its own receive buffers, so a large count uses more
-memory.
+A value outside the range is clamped to it and the driver logs a message.
+The default is
+.Sy 16 .
+Each queue pair has its own receive and transmit buffers, so a large count
+uses more memory.
 .It Sy tx_lso_enable
 Set to
 .Sy 0
