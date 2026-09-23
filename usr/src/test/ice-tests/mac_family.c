@@ -88,7 +88,21 @@ typedef struct ice {
 	struct {
 		int ios_reg_handle;
 	} ice_osdep;
+	int ice_rebuild_lock;
+	boolean_t ice_phy_fw_pending;
 } ice_t;
+
+#define	ASSERT(x)	assert(x)
+#define	MUTEX_HELD(m)	(*(m) != 0)
+
+static unsigned phy_setups;
+
+static void
+ice_phy_setup(ice_t *ice)
+{
+	assert(!ice->ice_phy_fw_pending);
+	phy_setups++;
+}
 
 /* Register and control-queue boundary. */
 static u32 rstat;
@@ -209,19 +223,33 @@ family_checks(struct ice_hw *hw, const char *want)
 	fw_loading = 3;
 	fw_reads = delays = errors = 0;
 	delayed_us = 0;
-	ice_phy_fw_wait(&ice);
+	assert(ice_phy_fw_wait(&ice));
 	assert(delays == (e830 ? 3u : 0u) && errors == 0);
 	assert(fw_reads == (e830 ? 4u : 0u));
 	fw_loading = 1000000;
 	delays = errors = 0;
 	delayed_us = 0;
-	ice_phy_fw_wait(&ice);
 	if (e830) {
+		assert(!ice_phy_fw_wait(&ice));
 		assert(errors == 1);
 		assert(delayed_us == (long)ICE_PHY_FW_WAIT_MS * 1000);
 	} else {
+		assert(ice_phy_fw_wait(&ice));
 		assert(delays == 0 && errors == 0);
 	}
+
+	/* The admin worker finishes a deferred setup once the load ends. */
+	ice.ice_rebuild_lock = 1;
+	ice.ice_phy_fw_pending = e830;
+	phy_setups = 0;
+	fw_loading = 1;
+	ice_phy_fw_poll(&ice);
+	assert(phy_setups == 0 && ice.ice_phy_fw_pending == e830);
+	ice_phy_fw_poll(&ice);
+	assert(phy_setups == (e830 ? 1u : 0u) && !ice.ice_phy_fw_pending);
+	ice_phy_fw_poll(&ice);
+	assert(phy_setups == (e830 ? 1u : 0u));
+	fw_loading = 0;
 }
 
 static void

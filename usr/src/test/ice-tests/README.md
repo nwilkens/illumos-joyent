@@ -86,7 +86,7 @@ set exactly. Subsystem IDs and the unmapped `0x1888` stay out. It then
 compiles the core mapping with the driver's `ice_family_name()` and the
 per-family helpers, and runs them for every device ID: the slow EMPR wait,
 the sideband receive drain, the E830 TCLAN detection registers, the E830 PHY
-firmware wait and its bound, the Get Link Status data length, and the DDP
+firmware wait, its bound and the deferred setup the admin worker completes, the Get Link Status data length, and the DDP
 segment and signature type. It also parses `firmware/ice.pkg` and requires a
 signed configuration segment for each family. The check covers the
 decisions that differ by family; it cannot show that an untested family

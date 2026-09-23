@@ -549,6 +549,34 @@ ice_oicr_fatal(ice_t *ice, uint32_t cause, boolean_t mdd)
 }
 
 /*
+ * Enable the PHY and refresh the capabilities, unless the E830 PHY firmware
+ * is still loading.  In that case ice_phy_fw_poll() does it later.
+ */
+void
+ice_phy_setup(ice_t *ice)
+{
+	if (ice->ice_phy_fw_pending)
+		return;
+	ice_setup_link(ice);
+	ice_phy_caps_update(ice);
+}
+
+/*
+ * The E830 PHY firmware load has no completion interrupt, so the admin
+ * worker polls for it and does the deferred PHY setup.
+ */
+static void
+ice_phy_fw_poll(ice_t *ice)
+{
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+
+	if (!ice->ice_phy_fw_pending || ice_phy_fw_loading(ice))
+		return;
+	ice->ice_phy_fw_pending = B_FALSE;
+	ice_phy_setup(ice);
+}
+
+/*
  * The E82X and E825-C parts have a sideband queue.  The driver sends it only
  * polled commands, but firmware can also post messages to its receive ring.
  * Discard them so that the ring cannot fill, as the FreeBSD admin task does.
@@ -666,6 +694,8 @@ ice_oicr_task(void *arg)
 		return;
 	}
 
+	ice_phy_fw_poll(ice);
+
 	bzero(&evt, sizeof (evt));
 	evt.buf_len = ICE_AQ_MAX_BUF_LEN;
 	evt.msg_buf = ice->ice_aqbuf;
@@ -683,7 +713,7 @@ ice_oicr_task(void *arg)
 		switch (LE_16(evt.desc.opcode)) {
 		case ice_aqc_opc_get_link_status:
 			ice_link_status_update_impl(ice, &media_inserted);
-			if (media_inserted)
+			if (media_inserted && !ice->ice_phy_fw_pending)
 				ice_setup_link(ice);
 			ice_phy_caps_update(ice);
 			break;

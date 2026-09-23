@@ -92,7 +92,7 @@ def main():
     for name in ("ice_family_name", "ice_reset_empr_slow"):
         fragments.append(extract(source,
             rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}", args.source))
-    for name in ("ice_phy_fw_wait",):
+    for name in ("ice_phy_fw_loading", "ice_phy_fw_wait"):
         fragments.append(extract(source,
             rf"^(?:static )?[\w *]+\n{name}\([\s\S]*?^}}", args.source))
     fragments.insert(0, "\n".join(re.findall(
@@ -109,8 +109,9 @@ def main():
         r"^#define\tICE_E830_GL_MDET_TX_TCLAN[\s\S]*?PF_MDET_TX_TCLAN\)$",
         DRIVER / "ice.h"))
     intr = args.intr_source.read_text()
-    fragments.append(extract(intr,
-        r"^static void\nice_sbq_drain\([\s\S]*?^}", args.intr_source))
+    for name in ("ice_sbq_drain", "ice_phy_fw_poll"):
+        fragments.append(extract(intr,
+            rf"^static void\n{name}\([\s\S]*?^}}", args.intr_source))
     autogen = (CORE / "ice_hw_autogen.h").read_text()
     regs = "\n".join(re.findall(
         r"^#define (?:GLGEN_RSTAT(?:_RESET_TYPE_[SM])?|GL_MNG_FWSM|"

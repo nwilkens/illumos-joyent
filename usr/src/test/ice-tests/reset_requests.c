@@ -50,6 +50,7 @@ typedef struct ice {
 	boolean_t ice_attaching;
 	boolean_t ice_detaching;
 	boolean_t ice_safe_mode;
+	boolean_t ice_phy_fw_pending;
 	boolean_t ice_stat_port_loaded;
 	boolean_t ice_stat_vsi_loaded;
 	enum ice_ddp_state ice_ddp_state;
@@ -250,8 +251,8 @@ ICE_NOOP(ice_loopback_replay)
 ICE_NOOP(ice_led_replay)
 ICE_NOOP(ice_queues_intr_map)
 ICE_NOOP(ice_link_status_update)
-ICE_NOOP(ice_setup_link)
-ICE_NOOP(ice_phy_caps_update)
+ICE_NOOP(ice_phy_setup)
+static int ice_phy_fw_loading(ice_t *ice) { (void) ice; return (0); }
 ICE_NOOP(ice_link_state_publish)
 ICE_NOOP(ice_intr_oicr_disable)
 

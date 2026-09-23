@@ -387,32 +387,46 @@ ice_reset_empr_slow(struct ice_hw *hw)
 /*
  * E830 firmware loads the PHY firmware after the PF comes up, and PHY
  * configuration fails until the load completes.  No interrupt reports the
- * completion, so poll for a bounded time as Linux does (ice_wait_fw_load()).
- * A timeout is logged and attach continues; ice_setup_link() then reports
- * its own failure.
+ * completion.  A faulted read (all ones) is not a load in progress; the
+ * caller's own access checks report the fault.
  */
-void
-ice_phy_fw_wait(ice_t *ice)
+boolean_t
+ice_phy_fw_loading(ice_t *ice)
 {
 	struct ice_hw *hw = &ice->ice_hw;
-	uint_t waited = 0;
+	uint32_t fwsm;
 
 	if (!ice_is_e830(hw))
-		return;
+		return (B_FALSE);
 
-	while ((rd32(hw, GL_MNG_FWSM) & GL_MNG_FWSM_FW_LOADING_M) != 0) {
-		/* A failed bus reads all ones; do not wait on it. */
-		if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
-		    DDI_FM_OK)
-			return;
+	fwsm = rd32(hw, GL_MNG_FWSM);
+	if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
+	    DDI_FM_OK)
+		return (B_FALSE);
+	return ((fwsm & GL_MNG_FWSM_FW_LOADING_M) != 0);
+}
+
+/*
+ * Wait a bounded time for the E830 PHY firmware, as Linux does
+ * (ice_wait_fw_load()).  Returns B_FALSE if it is still loading; the caller
+ * then leaves the PHY setup to the admin worker (ice_phy_fw_poll()).
+ */
+boolean_t
+ice_phy_fw_wait(ice_t *ice)
+{
+	uint_t waited = 0;
+
+	while (ice_phy_fw_loading(ice)) {
 		if (waited >= ICE_PHY_FW_WAIT_MS) {
-			ice_error(ice, "PHY firmware still loading after %u ms",
-			    waited);
-			return;
+			ice_error(ice, "PHY firmware still loading after "
+			    "%u ms; link setup deferred", waited);
+			return (B_FALSE);
 		}
 		delay(drv_usectohz(ICE_PHY_FW_POLL_MS * (MICROSEC / MILLISEC)));
 		waited += ICE_PHY_FW_POLL_MS;
 	}
+
+	return (B_TRUE);
 }
 
 /* The optional ice.conf ceiling on the queue pair count. */

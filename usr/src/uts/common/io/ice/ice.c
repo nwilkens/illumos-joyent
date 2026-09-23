@@ -63,7 +63,10 @@
  *		slow EMPR (below).
  * E830, E835	ICE_MAC_E830.  The TCLAN malicious-driver registers moved
  *		(ICE_GL_MDET_TX_TCLAN()); PHY firmware loads after the PF is
- *		up, so attach waits for it (ice_phy_fw_wait()); links reach
+ *		up, so attach waits for it for a bounded time
+ *		(ice_phy_fw_wait()), and the admin worker does a deferred PHY
+ *		setup when a load outlasts that wait or follows a reset
+ *		(ice_phy_fw_poll()); links reach
  *		200 Gb/s; the common code uses the longer Get Link Status
  *		response and the E830 DDP segment.  After an EMPR, E825-C and
  *		E830 firmware needs more time than ice_check_reset() allows,
@@ -932,10 +935,13 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 
 	ice_link_status_update(ice);
 
-	/* Enable the PHY; firmware will not bring the link up on its own. */
-	ice_phy_fw_wait(ice);
-	ice_setup_link(ice);
-	ice_phy_caps_update(ice);
+	/*
+	 * Enable the PHY; firmware will not bring the link up on its own.  The
+	 * worker gate is still closed, so no lock is needed for the pending
+	 * flag yet.
+	 */
+	ice->ice_phy_fw_pending = !ice_phy_fw_wait(ice);
+	ice_phy_setup(ice);
 
 	if (!ice_vsi_init(ice))
 		goto fail;
@@ -1472,10 +1478,14 @@ ice_rebuild(ice_t *ice, uint32_t requests)
 		goto reset_failed;
 	ice_queues_intr_map(ice);
 
-	/* Refresh the cached link and re-enable the PHY. */
+	/*
+	 * Refresh the cached link and re-enable the PHY.  An EMPR reloads the
+	 * E830 PHY firmware; do not hold the lifecycle lock while it loads,
+	 * but leave the setup to the admin worker.
+	 */
 	ice_link_status_update(ice);
-	ice_setup_link(ice);
-	ice_phy_caps_update(ice);
+	ice->ice_phy_fw_pending = ice_phy_fw_loading(ice);
+	ice_phy_setup(ice);
 
 	/* A later request keeps the datapath closed until its own rebuild. */
 	if (!ice_reset_complete(ice))

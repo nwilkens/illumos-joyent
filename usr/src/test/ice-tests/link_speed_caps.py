@@ -23,7 +23,7 @@ def main() -> None:
     setup = function(
         intr,
         "ice_setup_link(ice_t *ice)\n{",
-        "\n/*\n * Ask firmware to deliver link and media events",
+        "\n}\n",
     )
     assert "ice_fw_supports_report_dflt_cfg" in setup
     assert (
@@ -53,9 +53,11 @@ def main() -> None:
         "ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)\n{",
         "\nstatic int\nice_detach",
     )
-    setup_at = attach.index("ice_setup_link(ice)")
-    refresh_at = attach.index("ice_phy_caps_update(ice)", setup_at)
-    assert setup_at < refresh_at
+    # ice_phy_setup() enables the PHY, then reads its capabilities.
+    assert "ice_phy_setup(ice)" in attach
+    phy = function(intr, "ice_phy_setup(ice_t *ice)\n{", "\n}\n")
+    assert phy.index("ice_setup_link(ice)") < \
+        phy.index("ice_phy_caps_update(ice)")
 
     gld = GLD_SOURCE.read_text(encoding="utf-8")
     mstat = function(

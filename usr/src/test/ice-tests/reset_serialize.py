@@ -327,7 +327,7 @@ def main() -> None:
     assert enable < attach_fn.index("ice_mac_register(ice)")
     assert attach_fn.index("ice_intr_oicr_setup(ice, B_TRUE)") < enable
     assert attach_fn.index("ice_set_link_events(ice)") < attach_fn.index(
-        "ice_setup_link(ice)"
+        "ice_phy_setup(ice)"
     )
     # Final carrier resync follows registration and interrupt setup, under
     # the lifecycle lock and before lifting the attach gate.  This prevents
