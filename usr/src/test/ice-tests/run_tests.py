@@ -41,6 +41,7 @@ TESTS = (
     "mac_filter.py",
     "mac_ipv6_eh.py",
     "mdb_module.py",
+    "onsystem_suite.py",
     "pool_locks.py",
     "queue_count.py",
     "reset_loan_escalation.py",

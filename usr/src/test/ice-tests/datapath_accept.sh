@@ -12,6 +12,10 @@
 #
 #   datapath_accept.sh <peer_ip> [mtu]
 #
+# ICE_TEST_LINK (default ice0), ICE_TEST_ADDR (default 192.0.2.1/30) and
+# ICE_TEST_IPERF (default /opt/tools/bin/iperf) select the link, the local
+# address and the iperf binary.  The icetest wrapper sets them.
+#
 # Exit status is 0 only if every check passes.
 #
 # Copyright 2026 MNX Cloud, Inc.
@@ -20,19 +24,20 @@ set -u
 
 PEER_IP="${1:?usage: datapath_accept.sh <peer_ip> [mtu]}"
 MTU="${2:-1500}"
-LINK=ice0
-ADDR_LOCAL=192.0.2.1/30
-IPERF=/opt/tools/bin/iperf
+LINK="${ICE_TEST_LINK:-ice0}"
+INST="${LINK#ice}"
+ADDR_LOCAL="${ICE_TEST_ADDR:-192.0.2.1/30}"
+IPERF="${ICE_TEST_IPERF:-/opt/tools/bin/iperf}"
 FAILED=0
 
 msg() { printf '%s %s\n' "$1" "$2"; }
 pass() { msg "PASS" "$1"; }
 fail() { msg "FAIL" "$1"; FAILED=1; }
 
-kv() { kstat -p "ice:0:$1" 2>/dev/null | awk '{print $2}'; }
+kv() { kstat -p "ice:$INST:$1" 2>/dev/null | awk '{print $2}'; }
 # Sum one statistic over every tx ring.
 ringsum() {
-	kstat -p "ice:0:tx_ring_*:$1" 2>/dev/null |
+	kstat -p "ice:$INST:tx_ring_*:$1" 2>/dev/null |
 	    awk '{ s += $2 } END { print s + 0 }'
 }
 
@@ -41,9 +46,9 @@ require_zero() {
 	local v
 	v=$(kv "$1")
 	if [[ -z "$v" ]]; then
-		fail "$2: kstat ice:0:$1 missing"
+		fail "$2: kstat ice:$INST:$1 missing"
 	elif [[ "$v" != "0" ]]; then
-		fail "$2: ice:0:$1 = $v (expected 0)"
+		fail "$2: ice:$INST:$1 = $v (expected 0)"
 	else
 		pass "$2 ($1 = 0)"
 	fi

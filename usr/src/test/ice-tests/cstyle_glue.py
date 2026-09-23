@@ -21,6 +21,7 @@ def main():
     # core/ is vendored Intel code and follows its own style.
     files = sorted(GLUE_DIR.glob("*.[ch]"))
     files += sorted(MDB.glob("*.[ch]"))
+    files += sorted((REPO / "usr/src/test/ice-tests/tests").glob("*.c"))
     assert files, "no glue sources found"
     result = subprocess.run([perl, str(CSTYLE), "-pP", *map(str, files)],
                             capture_output=True, text=True, timeout=120)

@@ -634,6 +634,25 @@ queues' ITR slot (never No-ITR, which would refire unthrottled), the SWINT
 bits fold into the single `GLINT_DYN_CTL` re-arm write, and the base word is
 the shared `ICE_GLINT_DYN_CTL_REARM` definition.
 
+## On-system test suite
+
+The `cmd`, `runfiles` and `tests` directories are an illumos test-runner
+suite, installed to `/opt/ice-tests` by the `system/test/icetest` package.
+Run it on a host with an ice link:
+
+```
+/opt/ice-tests/bin/icetest [-p peer] [-m mtu] [link]
+```
+
+The link defaults to `$ICE_TEST_LINK`, then to the first ice link. The
+default runfile checks the published kstats and FMA counters (`attach`), the
+LED identify modes through `dlled` (`led`), and the diagnostic ioctls
+(`diag_ioctl.64`: privilege drops, size and cluster checks, a firmware log
+configuration read). With a peer (`-p` or `$ICE_TEST_PEER`) the datapath
+runfile also runs `datapath_accept.sh`. A test without its device or peer
+reports SKIP. `onsystem_suite.py` checks the runfiles, scripts and package
+manifest on the build host.
+
 ## On-hardware datapath acceptance
 
 `datapath_accept.sh` is not a source check: it runs on a host with a live

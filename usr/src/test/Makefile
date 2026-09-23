@@ -15,6 +15,7 @@
 # Copyright 2019 Joyent, Inc.
 # Copyright 2021 Tintri by DDN, Inc. All rights reserved.
 # Copyright 2025 Oxide Computer Company
+# Copyright 2026 Edgecast Cloud LLC.
 #
 
 .PARALLEL: $(SUBDIRS)
@@ -25,6 +26,7 @@ SUBDIRS = \
 	elf-tests \
 	header-tests \
 	i2c-tests \
+	ice-tests \
 	libc-tests \
 	libmlrpc-tests \
 	libproc-tests \
