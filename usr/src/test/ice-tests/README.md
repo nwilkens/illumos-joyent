@@ -689,6 +689,14 @@ counters stay zero; and three plumb/unplumb cycles each bring the link back
 with FMA still clean. Exit status is zero only if every check passes. Run it
 from both hosts to cover both traffic directions.
 
+The kstat instance comes from the ice device behind `$ICE_TEST_LINK`
+(`dladm show-phys -p -o device`), so a renamed link such as `net0` over
+`ice3` reads `ice:3`. A link that is not an ice device, or an
+`$ICE_TEST_DEVICE` that names another device, stops the run before it
+changes anything. `accept_script.py` runs the script on the build host
+against stub `dladm`, `ipadm`, `kstat` and traffic commands and checks these
+rules.
+
 Historical validation recorded in commit `60beba06389` (2026-07-18) reported
 boston<->hunter at MTU 1500 (9.36 Gbps) and 9000 (9.59 Gbps), with all checks
 green. Those earlier branch results do not validate the reviewed fixes.

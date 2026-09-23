@@ -10,6 +10,7 @@ import sys
 # Support modules and hardware acceptance programs are deliberately absent.
 TESTS = (
     "runner_checks.py",
+    "accept_script.py",
     "admin_interrupt.py",
     "buf_pool.py",
     "control_setup.py",

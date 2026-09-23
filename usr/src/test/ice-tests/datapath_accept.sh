@@ -14,7 +14,9 @@
 #
 # ICE_TEST_LINK (default ice0), ICE_TEST_ADDR (default 192.0.2.1/30) and
 # ICE_TEST_IPERF (default /opt/tools/bin/iperf) select the link, the local
-# address and the iperf binary.  The icetest wrapper sets them.
+# address and the iperf binary.  The icetest wrapper sets them.  The kstat
+# instance comes from the ice device behind the link, so a renamed link
+# works; ICE_TEST_DEVICE, if set, must name that device.
 #
 # Exit status is 0 only if every check passes.
 #
@@ -25,7 +27,6 @@ set -u
 PEER_IP="${1:?usage: datapath_accept.sh <peer_ip> [mtu]}"
 MTU="${2:-1500}"
 LINK="${ICE_TEST_LINK:-ice0}"
-INST="${LINK#ice}"
 ADDR_LOCAL="${ICE_TEST_ADDR:-192.0.2.1/30}"
 IPERF="${ICE_TEST_IPERF:-/opt/tools/bin/iperf}"
 FAILED=0
@@ -33,6 +34,17 @@ FAILED=0
 msg() { printf '%s %s\n' "$1" "$2"; }
 pass() { msg "PASS" "$1"; }
 fail() { msg "FAIL" "$1"; FAILED=1; }
+
+DEVICE=$(dladm show-phys -p -o device "$LINK" 2>/dev/null)
+if [[ ! "$DEVICE" =~ ^ice[0-9]+$ ]]; then
+	fail "$LINK is not an ice link (device '$DEVICE')"
+	exit 1
+fi
+if [[ -n "${ICE_TEST_DEVICE:-}" && "$ICE_TEST_DEVICE" != "$DEVICE" ]]; then
+	fail "ICE_TEST_DEVICE is $ICE_TEST_DEVICE but $LINK is $DEVICE"
+	exit 1
+fi
+INST="${DEVICE#ice}"
 
 kv() { kstat -p "ice:$INST:$1" 2>/dev/null | awk '{print $2}'; }
 # Sum one statistic over every tx ring.
