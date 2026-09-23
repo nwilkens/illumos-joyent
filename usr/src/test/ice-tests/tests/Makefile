@@ -56,7 +56,7 @@ $(ROOTOPTTESTS)/%: %
 $(ROOTOPTTESTS)/%: %.ksh
 	$(INS.rename)
 
-$(ROOTOPTTESTS)/datapath_accept: ../datapath_accept.sh
+$(ROOTOPTTESTS)/%: ../%.sh
 	$(INS.rename)
 
 %.o.64: %.c
