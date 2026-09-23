@@ -16,6 +16,8 @@ def main() -> None:
     desc = DRIVER / "core/ice_lan_tx_rx.h"
     mac = REPO / "usr/src/uts/common/sys/mac_provider.h"
     fragments = [
+        extract_file(header,
+                r"^typedef enum ice_tx_hck_drop \{[\s\S]*?^} ice_tx_hck_drop_t;"),
         extract_file(header, r"^typedef struct ice_tx_ctx_t \{[\s\S]*?^} ice_tx_ctx_t;"),
         extract_file(args.source,
                 r"^typedef enum ice_tx_build \{[\s\S]*?^} ice_tx_build_t;"),
@@ -36,6 +38,8 @@ def main() -> None:
             fragments.append(extract_file(path, rf"^#define\s+{name}\s+[^\n]*"))
 
     body = extract_file(args.source,
+                   r"^static ice_tx_build_t\nice_tx_context_drop\([\s\S]*?^}")
+    body += extract_file(args.source,
                    r"^static ice_tx_build_t\nice_tx_context\([\s\S]*?^}")
     # Permit testing the reviewed baseline, which also passed the MTU owner.
     legacy = "ice_tx_context(ice_t *ice," in body

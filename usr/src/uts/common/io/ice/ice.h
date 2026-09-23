@@ -287,6 +287,18 @@ typedef enum ice_tcb_type {
 	ITCB_LSO_BIND
 } ice_tcb_type_t;
 
+/* Why ice_tx_context() refused an offload request; see the tx kstats. */
+typedef enum ice_tx_hck_drop {
+	ICE_TX_HCK_NONE = 0,
+	ICE_TX_HCK_HDRLEN,	/* a header length overflows its field */
+	ICE_TX_HCK_NOL3,	/* no usable L2/L3 metadata */
+	ICE_TX_HCK_NOL4,	/* no usable L4 metadata */
+	ICE_TX_HCK_BADL4,	/* L4 protocol the hardware cannot sum */
+	ICE_TX_LSO_NOHCK,	/* LSO without the checksum offload it needs */
+	ICE_TX_LSO_BADHDR,	/* LSO headers unusable for segmentation */
+	ICE_TX_LSO_BADMSS	/* MSS outside the hardware range */
+} ice_tx_hck_drop_t;
+
 typedef struct ice_tx_ctx_t {
 	uint64_t		itc_data_cmd;
 	uint64_t		itc_data_off;
@@ -294,6 +306,7 @@ typedef struct ice_tx_ctx_t {
 	uint32_t		itc_mss;
 	uint32_t		itc_tsolen;
 	uint32_t		itc_hdrlen;	/* L2+L3+L4, LSO only */
+	ice_tx_hck_drop_t	itc_drop;	/* reason for a DROP result */
 } ice_tx_ctx_t;
 
 typedef struct ice_tx_ctrl_block {
@@ -321,6 +334,13 @@ typedef struct ice_txq_stat {
 	kstat_named_t		ictxs_lso_drops;
 	kstat_named_t		ictxs_lso_pullups;
 	kstat_named_t		ictxs_lso_nores;
+	kstat_named_t		ictxs_hck_hdrlen;
+	kstat_named_t		ictxs_hck_nol3;
+	kstat_named_t		ictxs_hck_nol4;
+	kstat_named_t		ictxs_hck_badl4;
+	kstat_named_t		ictxs_lso_nohck;
+	kstat_named_t		ictxs_lso_badhdr;
+	kstat_named_t		ictxs_lso_badmss;
 } ice_txq_stat_t;
 
 typedef struct ice_tx_ring {
@@ -390,6 +410,16 @@ typedef struct ice_rxq_stat {
 	kstat_named_t		icrxs_copy_nomem;
 	kstat_named_t		icrxs_no_rcb;
 	kstat_named_t		icrxs_intr_limit;
+	/* Receive checksum verdicts, one per delivered frame and layer. */
+	kstat_named_t		icrxs_hck_v4hdr_ok;
+	kstat_named_t		icrxs_hck_v4hdr_err;
+	kstat_named_t		icrxs_hck_outer_err;
+	kstat_named_t		icrxs_hck_l4_ok;
+	kstat_named_t		icrxs_hck_l4_err;
+	kstat_named_t		icrxs_hck_v6exthdr;
+	kstat_named_t		icrxs_hck_nol4;
+	kstat_named_t		icrxs_hck_unprocessed;
+	kstat_named_t		icrxs_hck_unknown;
 } ice_rxq_stat_t;
 
 typedef struct ice_rx_ring {

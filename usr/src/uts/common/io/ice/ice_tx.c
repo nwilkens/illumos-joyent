@@ -99,6 +99,20 @@ ice_tx_kstat_init(ice_t *ice, ice_tx_ring_t *itr)
 	    KSTAT_DATA_UINT64);
 	kstat_named_init(&txs->ictxs_lso_nores, "tx_lso_nores",
 	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_hck_hdrlen, "tx_hck_hdrlen",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_hck_nol3, "tx_hck_nol3",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_hck_nol4, "tx_hck_nol4",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_hck_badl4, "tx_hck_badl4",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_lso_nohck, "tx_lso_nohck",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_lso_badhdr, "tx_lso_badhdr",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&txs->ictxs_lso_badmss, "tx_lso_badmss",
+	    KSTAT_DATA_UINT64);
 	kstat_install(itr->itxr_kstat);
 
 	return (B_TRUE);
@@ -891,6 +905,14 @@ ice_tx_write_ctx_desc(ice_tx_ring_t *itr, uint16_t slot, uint32_t mss,
 	desc->qw1 = CPU_TO_LE64(qw1);
 }
 
+/* Record why an offload request was refused and refuse it. */
+static ice_tx_build_t
+ice_tx_context_drop(ice_tx_ctx_t *ctx, ice_tx_hck_drop_t why)
+{
+	ctx->itc_drop = why;
+	return (ICE_TX_BUILD_DROP);
+}
+
 /*
  * Translate requested offloads into data-descriptor fields and, when needed,
  * the TSO context.  Invalid metadata is dropped because trusting it can make
@@ -923,12 +945,12 @@ ice_tx_context(mblk_t *mp, ice_tx_ctx_t *ctx)
 	if (meo.meoi_l2hlen > ICE_TXD_MACLEN_MAX ||
 	    meo.meoi_l3hlen > ICE_TXD_IPLEN_MAX ||
 	    meo.meoi_l4hlen > ICE_TXD_L4LEN_MAX)
-		return (ICE_TX_BUILD_DROP);
+		return (ice_tx_context_drop(ctx, ICE_TX_HCK_HDRLEN));
 
 	if ((chkflags & HCK_IPV4_HDRCKSUM) != 0) {
 		if ((meo.meoi_flags & l23) != l23 ||
 		    meo.meoi_l3proto != ETHERTYPE_IP)
-			return (ICE_TX_BUILD_DROP);
+			return (ice_tx_context_drop(ctx, ICE_TX_HCK_NOL3));
 		ctx->itc_data_cmd |= ICE_TX_DESC_CMD_IIPT_IPV4_CSUM;
 		ctx->itc_data_off |= (uint64_t)(meo.meoi_l2hlen >> 1) <<
 		    ICE_TX_DESC_LEN_MACLEN_S;
@@ -938,17 +960,20 @@ ice_tx_context(mblk_t *mp, ice_tx_ctx_t *ctx)
 
 	if ((chkflags & HCK_PARTIALCKSUM) != 0) {
 		if ((meo.meoi_flags & MEOI_L4INFO_SET) == 0)
-			return (ICE_TX_BUILD_DROP);
+			return (ice_tx_context_drop(ctx, ICE_TX_HCK_NOL4));
 
 		if ((chkflags & HCK_IPV4_HDRCKSUM) == 0) {
-			if ((meo.meoi_flags & l23) != l23)
-				return (ICE_TX_BUILD_DROP);
+			if ((meo.meoi_flags & l23) != l23) {
+				return (ice_tx_context_drop(ctx,
+				    ICE_TX_HCK_NOL3));
+			}
 			if (meo.meoi_l3proto == ETHERTYPE_IP)
 				ctx->itc_data_cmd |= ICE_TX_DESC_CMD_IIPT_IPV4;
 			else if (meo.meoi_l3proto == ETHERTYPE_IPV6)
 				ctx->itc_data_cmd |= ICE_TX_DESC_CMD_IIPT_IPV6;
 			else
-				return (ICE_TX_BUILD_DROP);
+				return (ice_tx_context_drop(ctx,
+				    ICE_TX_HCK_NOL3));
 			ctx->itc_data_off |=
 			    (uint64_t)(meo.meoi_l2hlen >> 1) <<
 			    ICE_TX_DESC_LEN_MACLEN_S;
@@ -968,7 +993,7 @@ ice_tx_context(mblk_t *mp, ice_tx_ctx_t *ctx)
 			ctx->itc_data_cmd |= ICE_TX_DESC_CMD_L4T_EOFT_SCTP;
 			break;
 		default:
-			return (ICE_TX_BUILD_DROP);
+			return (ice_tx_context_drop(ctx, ICE_TX_HCK_BADL4));
 		}
 		ctx->itc_data_off |= (uint64_t)(meo.meoi_l4hlen >> 2) <<
 		    ICE_TX_DESC_LEN_L4_LEN_S;
@@ -980,7 +1005,7 @@ ice_tx_context(mblk_t *mp, ice_tx_ctx_t *ctx)
 	if ((chkflags & HCK_PARTIALCKSUM) == 0 ||
 	    (meo.meoi_l3proto == ETHERTYPE_IP &&
 	    (chkflags & HCK_IPV4_HDRCKSUM) == 0))
-		return (ICE_TX_BUILD_DROP);
+		return (ice_tx_context_drop(ctx, ICE_TX_LSO_NOHCK));
 
 	if ((meo.meoi_flags & (l23 | MEOI_L4INFO_SET)) !=
 	    (l23 | MEOI_L4INFO_SET) ||
@@ -990,15 +1015,15 @@ ice_tx_context(mblk_t *mp, ice_tx_ctx_t *ctx)
 	    (meo.meoi_l2hlen & 1) != 0 ||
 	    (meo.meoi_l3hlen & 3) != 0 ||
 	    (meo.meoi_l4hlen & 3) != 0)
-		return (ICE_TX_BUILD_DROP);
+		return (ice_tx_context_drop(ctx, ICE_TX_LSO_BADHDR));
 
 	hdrlen = meo.meoi_l2hlen + meo.meoi_l3hlen + meo.meoi_l4hlen;
 	if (hdrlen == 0 || hdrlen > ICE_TX_LSO_MAX_HDRLEN ||
 	    hdrlen >= meo.meoi_len || meo.meoi_len != msgdsize(mp))
-		return (ICE_TX_BUILD_DROP);
+		return (ice_tx_context_drop(ctx, ICE_TX_LSO_BADHDR));
 	tsolen = meo.meoi_len - hdrlen;
 	if (tsolen > ICE_LSO_MAXLEN)
-		return (ICE_TX_BUILD_DROP);
+		return (ice_tx_context_drop(ctx, ICE_TX_LSO_BADHDR));
 
 	/*
 	 * LSO's partial TCP checksum seed excludes the TCP length.  Even
@@ -1007,7 +1032,7 @@ ice_tx_context(mblk_t *mp, ice_tx_ctx_t *ctx)
 	 * and leave the LSO marker set for the caller's drop accounting.
 	 */
 	if (mss < ICE_TX_LSO_MIN_MSS || mss > ICE_TXD_CTX_MAX_MSS)
-		return (ICE_TX_BUILD_DROP);
+		return (ice_tx_context_drop(ctx, ICE_TX_LSO_BADMSS));
 
 	ctx->itc_mss = mss;
 	ctx->itc_tsolen = (uint32_t)tsolen;
@@ -1652,6 +1677,46 @@ ice_tx_recycle(ice_tx_ring_t *itr)
  * ring (mp consumed/retained), B_FALSE if the ring is full and the caller must
  * back off (mp left intact for the caller to return to MAC).
  */
+/*
+ * Count a refused packet, with the reason ice_tx_context() recorded.  Only
+ * the drop path pays for the reason lookup.
+ */
+static void
+ice_tx_count_drop(ice_tx_ring_t *itr, const ice_tx_ctx_t *ctx)
+{
+	ice_txq_stat_t *st = &itr->itxr_stats;
+
+	st->ictxs_drops.value.ui64++;
+	if (ctx->itc_use_ctx)
+		st->ictxs_lso_drops.value.ui64++;
+
+	switch (ctx->itc_drop) {
+	case ICE_TX_HCK_HDRLEN:
+		st->ictxs_hck_hdrlen.value.ui64++;
+		break;
+	case ICE_TX_HCK_NOL3:
+		st->ictxs_hck_nol3.value.ui64++;
+		break;
+	case ICE_TX_HCK_NOL4:
+		st->ictxs_hck_nol4.value.ui64++;
+		break;
+	case ICE_TX_HCK_BADL4:
+		st->ictxs_hck_badl4.value.ui64++;
+		break;
+	case ICE_TX_LSO_NOHCK:
+		st->ictxs_lso_nohck.value.ui64++;
+		break;
+	case ICE_TX_LSO_BADHDR:
+		st->ictxs_lso_badhdr.value.ui64++;
+		break;
+	case ICE_TX_LSO_BADMSS:
+		st->ictxs_lso_badmss.value.ui64++;
+		break;
+	case ICE_TX_HCK_NONE:
+		break;
+	}
+}
+
 static boolean_t
 ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 {
@@ -1676,9 +1741,7 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 	}
 	if (res != ICE_TX_BUILD_OK) {
 		freemsg(mp);
-		itr->itxr_stats.ictxs_drops.value.ui64++;
-		if (ctx.itc_use_ctx)
-			itr->itxr_stats.ictxs_lso_drops.value.ui64++;
+		ice_tx_count_drop(itr, &ctx);
 		return (B_TRUE);
 	}
 

@@ -110,6 +110,17 @@ rebuild blinks the LED again only when IDENT was set, and that detach gives
 the LED back to firmware once. It also checks the `MAC_CAPAB_LED` fields and
 the replay and restore call sites.
 
+## Checksum counter regression
+
+`rx_hcksum.py` compiles `ice_rx_hcksum()` with the imported ptype and status
+definitions and runs each verdict: clean IPv4 and IPv6 frames, IP header and
+outer IP errors, L4 errors, IPv6 extension headers, IP without a summed L4
+protocol, unprocessed and unknown frames, and safe mode. It checks the
+reported flags and the per-ring `rx_hck_*` counter for each case, and that
+every rx and tx checksum counter has a kstat name. `lso_context.py` checks
+the reason `ice_tx_context()` records for each refused request, which feeds
+the `tx_hck_*` and `tx_lso_*` counters.
+
 ## Shared MAC filter request regression
 
 ```

@@ -19,6 +19,8 @@ def main():
         r"^typedef enum ice_tcb_type \{[\s\S]*?^} ice_tcb_type_t;"),
         extract_file(header,
         r"^typedef enum ice_state \{[\s\S]*?^} ice_state_t;"),
+        extract_file(header,
+        r"^typedef enum ice_tx_hck_drop \{[\s\S]*?^} ice_tx_hck_drop_t;"),
         extract_file(desc, r"^struct ice_tx_desc \{[\s\S]*?"
         r"^enum ice_tx_ctx_desc_cmd_bits \{[\s\S]*?^};")]
     for name in ("ice_dma_buffer", "ice_tx_ctrl_block", "ice_tx_ctx_t"):

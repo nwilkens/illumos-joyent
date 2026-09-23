@@ -48,6 +48,7 @@ TESTS = (
     "rss.py",
     "rx_checksum.py",
     "rx_dma_faults.py",
+    "rx_hcksum.py",
     "rx_double_start.py",
     "rx_intr_limit.py",
     "rx_intr_rearm.py",

@@ -121,11 +121,13 @@ check_protocol(boolean_t ipv6)
 			assert(context(&mp, &ctx) == ICE_TX_BUILD_DROP);
 			/* Preserve the caller's LSO drop accounting. */
 			assert(ctx.itc_use_ctx);
+			assert(ctx.itc_drop == ICE_TX_LSO_BADMSS);
 		}
 		for (j = 0; j < sizeof (accepted) / sizeof (accepted[0]); j++) {
 			mp = packet(ipv6, lengths[i], accepted[j]);
 			assert(context(&mp, &ctx) == ICE_TX_BUILD_OK);
 			assert(ctx.itc_use_ctx);
+			assert(ctx.itc_drop == ICE_TX_HCK_NONE);
 			assert(ctx.itc_mss == accepted[j]);
 			assert(ctx.itc_tsolen == lengths[i] - (ipv6 ? 74 : 54));
 			assert(ctx.itc_data_cmd == (ipv6 ? 0x120 : 0x160));
@@ -145,11 +147,37 @@ check_protocol(boolean_t ipv6)
 	mp = packet(ipv6, 128, 63);
 	mp.checksum_flags = 0;
 	assert(context(&mp, &ctx) == ICE_TX_BUILD_DROP);
+	assert(ctx.itc_drop == ICE_TX_LSO_NOHCK);
 	mp = packet(ipv6, ipv6 ? 74 : 54, 63);
 	assert(context(&mp, &ctx) == ICE_TX_BUILD_DROP);
+	assert(ctx.itc_drop == ICE_TX_LSO_BADHDR);
 	mp = packet(ipv6, 128, 63);
 	mp.len++;
 	assert(context(&mp, &ctx) == ICE_TX_BUILD_DROP);
+	assert(ctx.itc_drop == ICE_TX_LSO_BADHDR);
+
+	/* Each refused checksum request records its reason for the kstats. */
+	mp = packet(ipv6, 128, 0);
+	mp.lso_flags = 0;
+	mp.info.meoi_l4proto = IPPROTO_ICMP;
+	assert(context(&mp, &ctx) == ICE_TX_BUILD_DROP);
+	assert(ctx.itc_drop == ICE_TX_HCK_BADL4);
+	mp = packet(ipv6, 128, 0);
+	mp.lso_flags = 0;
+	mp.info.meoi_flags &= ~MEOI_L4INFO_SET;
+	assert(context(&mp, &ctx) == ICE_TX_BUILD_DROP);
+	assert(ctx.itc_drop == ICE_TX_HCK_NOL4);
+	mp = packet(ipv6, 128, 0);
+	mp.lso_flags = 0;
+	mp.info.meoi_l3hlen = 1024;
+	assert(context(&mp, &ctx) == ICE_TX_BUILD_DROP);
+	assert(ctx.itc_drop == ICE_TX_HCK_HDRLEN);
+	mp = packet(ipv6, 128, 0);
+	mp.lso_flags = 0;
+	mp.checksum_flags |= HCK_IPV4_HDRCKSUM;
+	mp.info.meoi_l3proto = ETHERTYPE_IPV6;
+	assert(context(&mp, &ctx) == ICE_TX_BUILD_DROP);
+	assert(ctx.itc_drop == ICE_TX_HCK_NOL3);
 }
 
 int

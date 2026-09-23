@@ -110,6 +110,24 @@ ice_rx_kstat_init(ice_t *ice, ice_rx_ring_t *irr)
 	kstat_named_init(&rxs->icrxs_no_rcb, "rx_no_rcb", KSTAT_DATA_UINT64);
 	kstat_named_init(&rxs->icrxs_intr_limit, "rx_intr_limit",
 	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_hck_v4hdr_ok, "rx_hck_v4hdr_ok",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_hck_v4hdr_err, "rx_hck_v4hdr_err",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_hck_outer_err, "rx_hck_outer_err",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_hck_l4_ok, "rx_hck_l4_ok",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_hck_l4_err, "rx_hck_l4_err",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_hck_v6exthdr, "rx_hck_v6exthdr",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_hck_nol4, "rx_hck_nol4",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_hck_unprocessed, "rx_hck_unprocessed",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&rxs->icrxs_hck_unknown, "rx_hck_unknown",
+	    KSTAT_DATA_UINT64);
 	kstat_install(irr->irxr_kstat);
 
 	return (B_TRUE);
@@ -817,12 +835,21 @@ ice_rx_bind(ice_rx_ring_t *irr, uint16_t idx, ice_rx_ctrl_block_t *rcb,
  * integrity-processed bit and per-layer error bits; the ptype identifies which
  * layers are present.  A clear error bit on a present, processed layer is a
  * verified-good checksum.  Tunneled and unknown packets are left unverified.
+ * The per-ring counters record each verdict.  The caller holds irxr_lock, so
+ * they cost no atomics.
  */
 static void
 ice_rx_hcksum(ice_rx_ring_t *irr, mblk_t *mp, uint16_t status0, uint16_t ptype)
 {
 	struct ice_rx_ptype_decoded pinfo = ice_decode_rx_desc_ptype(ptype);
+	ice_rxq_stat_t *st = &irr->irxr_stats;
+	const uint16_t l3err = BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_IPE_S) |
+	    BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_EIPE_S);
+	const uint16_t l4err = BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_L4E_S) |
+	    BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_EUDPE_S);
 	uint32_t cksum = 0;
+
+	ASSERT(MUTEX_HELD(&irr->irxr_lock));
 
 	/*
 	 * Without the DDP package the pipeline does not classify or checksum,
@@ -833,32 +860,50 @@ ice_rx_hcksum(ice_rx_ring_t *irr, mblk_t *mp, uint16_t status0, uint16_t ptype)
 	if (irr->irxr_ice->ice_safe_mode)
 		return;
 
-	if (pinfo.known == 0)
+	if (pinfo.known == 0 || pinfo.outer_ip != ICE_RX_PTYPE_OUTER_IP ||
+	    pinfo.tunnel_type != ICE_RX_PTYPE_TUNNEL_NONE) {
+		st->icrxs_hck_unknown.value.ui64++;
 		return;
-	if ((status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_L3L4P_S)) == 0)
+	}
+	if ((status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_L3L4P_S)) == 0) {
+		st->icrxs_hck_unprocessed.value.ui64++;
 		return;
+	}
 
-	if (pinfo.outer_ip == ICE_RX_PTYPE_OUTER_IP &&
-	    pinfo.outer_ip_ver == ICE_RX_PTYPE_OUTER_IPV4 &&
-	    pinfo.tunnel_type == ICE_RX_PTYPE_TUNNEL_NONE &&
-	    (status0 & (BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_IPE_S) |
-	    BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_EIPE_S))) == 0)
-		cksum |= HCK_IPV4_HDRCKSUM_OK;
+	/*
+	 * Any IP error bit withholds the IPv4 header verdict.  EIPE (outer IP)
+	 * has its own counter because Linux treats it as a checksum failure
+	 * only on E830.
+	 */
+	if (pinfo.outer_ip_ver == ICE_RX_PTYPE_OUTER_IPV4) {
+		if ((status0 & l3err) == 0) {
+			cksum |= HCK_IPV4_HDRCKSUM_OK;
+			st->icrxs_hck_v4hdr_ok.value.ui64++;
+		}
+		if ((status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_IPE_S)) != 0)
+			st->icrxs_hck_v4hdr_err.value.ui64++;
+		if ((status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_EIPE_S)) != 0)
+			st->icrxs_hck_outer_err.value.ui64++;
+	}
 
 	/*
 	 * IPV6EXADD marks IPv6 extension headers that make the L4 checksum
 	 * coverage unreliable even when the L4-error bit is clear, so it must
 	 * also suppress the verified-good result (no-op for IPv4 frames).
 	 */
-	if (pinfo.outer_ip == ICE_RX_PTYPE_OUTER_IP &&
-	    pinfo.tunnel_type == ICE_RX_PTYPE_TUNNEL_NONE &&
-	    (pinfo.inner_prot == ICE_RX_PTYPE_INNER_PROT_TCP ||
-	    pinfo.inner_prot == ICE_RX_PTYPE_INNER_PROT_UDP ||
-	    pinfo.inner_prot == ICE_RX_PTYPE_INNER_PROT_SCTP) &&
-	    (status0 & (BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_L4E_S) |
-	    BIT(ICE_RX_FLEX_DESC_STATUS0_XSUM_EUDPE_S))) == 0 &&
-	    (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_IPV6EXADD_S)) == 0)
+	if (pinfo.inner_prot != ICE_RX_PTYPE_INNER_PROT_TCP &&
+	    pinfo.inner_prot != ICE_RX_PTYPE_INNER_PROT_UDP &&
+	    pinfo.inner_prot != ICE_RX_PTYPE_INNER_PROT_SCTP) {
+		st->icrxs_hck_nol4.value.ui64++;
+	} else if ((status0 & l4err) != 0) {
+		st->icrxs_hck_l4_err.value.ui64++;
+	} else if ((status0 &
+	    BIT(ICE_RX_FLEX_DESC_STATUS0_IPV6EXADD_S)) != 0) {
+		st->icrxs_hck_v6exthdr.value.ui64++;
+	} else {
 		cksum |= HCK_FULLCKSUM_OK;
+		st->icrxs_hck_l4_ok.value.ui64++;
+	}
 
 	if (cksum != 0)
 		mac_hcksum_set(mp, 0, 0, 0, 0, cksum);

@@ -14,6 +14,9 @@ def main():
     args = parser.parse_args()
     fragments = [
         extract(args.header.read_text(),
+                r"^typedef enum ice_tx_hck_drop \{[\s\S]*?^} ice_tx_hck_drop_t;",
+                args.header),
+        extract(args.header.read_text(),
                 r"^typedef struct ice_tx_ctx_t \{[\s\S]*?^} ice_tx_ctx_t;",
                 args.header),
         extract(args.source.read_text(),
