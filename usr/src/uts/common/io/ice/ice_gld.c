@@ -28,8 +28,8 @@
  * reported from the cache ice_intr.c maintains.  Filter and control callbacks
  * can block on firmware; cached link property getters do not issue commands.
  *
- * Hardware checksum offload is advertised.  LSO remains dark unless the
- * operator enables the validation property before attach.
+ * Checksum offload and LSO are advertised unless the DDP package is missing
+ * (safe mode).  The tx_lso_enable property can withhold LSO.
  */
 
 #include <sys/mac_provider.h>

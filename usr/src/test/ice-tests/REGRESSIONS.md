@@ -38,7 +38,7 @@ separate gate; its results belong with the exact source revision built.
 | 5 | `reset_requests.py` | Real dispatch, worker and rebuild; duplicate work and preservation of later requests | Reset timing, coalescing and device recovery |
 | 6 | `link_operational.py`, `reset_requests.py` | Cached carrier versus operational state, startup and rebuild failures | Physical carrier UP through failed restart and successful recovery |
 | 7 | `rx_dma_faults.py` | Descriptor/data sync and handle errors, delivery suppression and loan cleanup | DMA fault injection, FMA reports and recovery |
-| 8 | `lso_context.py` | IPv4/IPv6 MSS limits, context fields and rejection marker | Wire checksums and segmentation; LSO remains disabled by default |
+| 8 | `lso_context.py` | IPv4/IPv6 MSS limits, context fields and rejection marker | Wire checksums and segmentation (LSO is on by default) |
 | 9 | `filter_requests.py` | Captured request fields for GLD, attach, replay and teardown | Imported-core encoding and actual device programming |
 | 13 | `tx_bind_threshold.py` | Copy/bind decisions, runt padding and fallback ownership | Ordinary datapath acceptance; driver behavior was unchanged by this test repair |
 | 10 follow-up | `vsi_stats.py` | Actual refresh, statistics structure and register definitions; 0/767 accepted; 768/UINT16_MAX and missing context preserve counters with no reads/clear writes, before and after initial loading | Device MMIO and firmware behavior |

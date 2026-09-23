@@ -30,6 +30,11 @@ pass() { msg "PASS" "$1"; }
 fail() { msg "FAIL" "$1"; FAILED=1; }
 
 kv() { kstat -p "ice:0:$1" 2>/dev/null | awk '{print $2}'; }
+# Sum one statistic over every tx ring.
+ringsum() {
+	kstat -p "ice:0:tx_ring_*:$1" 2>/dev/null |
+	    awk '{ s += $2 } END { print s + 0 }'
+}
 
 require_zero() {
 	# require_zero <kstat-suffix> <label>
@@ -97,6 +102,7 @@ fi
 
 # 6. Counters before traffic.
 RXB0=$(kv "pfstats:rx_bytes"); TXB0=$(kv "pfstats:tx_bytes")
+LSO0=$(ringsum tx_lso_packets)
 
 # 7. TX throughput (peer must run iperf -s).  Run this script on both hosts to
 # cover both directions; iperf dual/reverse mode is unreliable here.
@@ -113,6 +119,20 @@ fi
 RXB1=$(kv "pfstats:rx_bytes"); TXB1=$(kv "pfstats:tx_bytes")
 if (( RXB1 > RXB0 )); then pass "rx_bytes advanced ($RXB0 -> $RXB1)"; else fail "rx_bytes did not advance"; fi
 if (( TXB1 > TXB0 )); then pass "tx_bytes advanced ($TXB0 -> $TXB1)"; else fail "tx_bytes did not advance"; fi
+
+# 8b. LSO is on by default: TCP bulk transmit must use it, and no request
+# may be refused for its checksum or segmentation metadata.
+LSO1=$(ringsum tx_lso_packets)
+if (( LSO1 > LSO0 )); then
+	pass "tx_lso_packets advanced ($LSO0 -> $LSO1)"
+else
+	fail "tx_lso_packets did not advance (LSO not in use?)"
+fi
+for k in tx_lso_badmss tx_lso_badhdr tx_lso_nohck tx_hck_hdrlen \
+    tx_hck_nol3 tx_hck_nol4 tx_hck_badl4; do
+	v=$(ringsum "$k")
+	if [[ "$v" == "0" ]]; then pass "$k = 0"; else fail "$k = $v"; fi
+done
 
 # 9. Error and FMA counters still clean after traffic.
 for k in mac:ierrors mac:oerrors mac:fcs_errors mac:align_errors \

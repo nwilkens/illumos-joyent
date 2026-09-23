@@ -207,8 +207,8 @@ those requests reach the queue.
 
 Use `--source /path/to/ice_tx.c` to run the same regression against an earlier
 implementation. The reviewed baseline fails the small-MSS case. The test does
-not emulate the NIC or establish wire checksum correctness; LSO remains off
-by default until hardware validation is complete.
+not emulate the NIC or establish wire checksum correctness. LSO is on by
+default; `datapath_accept.sh` exercises it on hardware.
 
 ## Reset request ownership regression
 
@@ -457,12 +457,12 @@ set with automatic FEC, media insertion reapplies that configuration, and the
 cached supported and advertised speed/FEC values reach the GLDv3 statistics
 and read-only property callbacks.
 
-`lso.py` verifies the dark-by-default LSO capability gate, context descriptor
+`lso.py` verifies the LSO capability gate (on by default, withheld in safe
+mode or by the property), context descriptor
 encoding, hostile-metadata checks, per-segment and per-packet descriptor
 limits, LSO bind emission, frame-sized copy fallback, DMA cookie-size guard,
-and compile-time descriptor-layout checks. The `tx_lso_enable` integer driver
-property remains zero by default and should be set in `/kernel/drv/ice.conf`
-only for hardware validation.
+and compile-time descriptor-layout checks. Setting the `tx_lso_enable`
+driver property to 0 in `/kernel/drv/ice.conf` withholds LSO.
 
 `rss.py` verifies that interrupt allocation takes its data-queue count from
 `ice_queue_limit()` (executed by `queue_count.py`); that the granted vector
@@ -612,7 +612,8 @@ datapath_accept.sh 192.0.2.2 9000
 It asserts the module is bound; the test address plumbs at the requested MTU
 and the link comes up; FMA access/DMA/dropped-ereport counters are zero before
 and after traffic; small and near-MTU ICMP reach the peer; a four-stream
-`iperf` run moves traffic and advances the PF byte counters; MAC and CRC error
+`iperf` run moves traffic and advances the PF byte counters and the per-ring
+`tx_lso_packets`, with no `tx_lso_*` or `tx_hck_*` refusals; MAC and CRC error
 counters stay zero; and three plumb/unplumb cycles each bring the link back
 with FMA still clean. Exit status is zero only if every check passes. Run it
 from both hosts to cover both traffic directions.

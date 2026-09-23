@@ -1309,7 +1309,7 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		mtu = ICE_MAX_MTU;
 	ice->ice_mtu = mtu;
 	ice->ice_tx_lso_enable = ddi_prop_get_int(DDI_DEV_T_ANY,
-	    ice->ice_dip, DDI_PROP_DONTPASS, "tx_lso_enable", 0) != 0;
+	    ice->ice_dip, DDI_PROP_DONTPASS, "tx_lso_enable", 1) != 0;
 	limit = ddi_prop_get_int(DDI_DEV_T_ANY, ice->ice_dip,
 	    DDI_PROP_DONTPASS, "rx_limit_per_intr", ICE_DEF_RX_LIMIT_PER_INTR);
 	if (limit < ICE_MIN_RX_LIMIT_PER_INTR)

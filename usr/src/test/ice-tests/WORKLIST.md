@@ -21,7 +21,7 @@ fixes land, and record both the implemented behavior and remaining validation.
 | 5 | P2 | One reset request can cause two complete resets | Implemented; hardware validation pending |
 | 6 | P2 | Link refresh reports UP while the datapath remains failed | Implemented; hardware validation pending |
 | 7 | P2 | RX descriptor DMA faults are checked late or missed | Implemented; hardware fault injection pending |
-| 8 | P2 | Small-MSS LSO fallback retains the wrong checksum seed | Implemented; LSO disabled by default, hardware validation pending |
+| 8 | P2 | Small-MSS LSO fallback retains the wrong checksum seed | Implemented; LSO on by default with an 88-byte MSS minimum, hardware validation pending |
 | 9 | Maintenance | Duplicate MAC filter constructors | Implemented; request equivalence tested |
 | 10 | Architecture | Filter ownership and replay contract is incomplete | Implemented; hardware fault injection pending |
 | 11 | Architecture | Lifecycle callers conflate several kinds of quiescence | Completed; explicit lifecycle contracts documented |
@@ -264,8 +264,9 @@ portable test checks driver decisions, not checksums produced by hardware.
 
 Hardware acceptance still needed: verify that below-minimum MSS requests
 increment LSO drops without emitting a frame, and capture IPv4/IPv6 traffic at
-supported MSS boundaries to validate wire checksums. LSO remains disabled by
-default pending its existing hardware acceptance work.
+supported MSS boundaries to validate wire checksums. LSO is now on by
+default; the MSS minimum is 88 bytes (datasheet 10.5.8.4.4), and requests from
+64 through 87 bytes, which the earlier minimum passed, are dropped.
 
 ## 9. Shared filter construction
 
