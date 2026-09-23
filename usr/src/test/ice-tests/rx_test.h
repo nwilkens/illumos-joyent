@@ -37,6 +37,7 @@ typedef char *caddr_t;
 #define	ETHERTYPE_VLAN	0x8100
 #define	VLAN_TAGSZ	4
 #define	BIT(n)	(1U << (n))
+#define	MIN(a, b)	((a) < (b) ? (a) : (b))
 #define	ICE_RX_FLEX_DESC_STATUS0_DD_S	0
 #define	ICE_RX_FLEX_DESC_STATUS0_EOF_S	1
 #define	ICE_RX_FLEX_DESC_STATUS0_L2TAG1P_S	5
@@ -126,6 +127,7 @@ typedef struct {
 		int ios_reg_handle;
 	} ice_osdep;
 	uint32_t ice_state, ice_rx_limit_per_intr;
+	uint_t ice_num_rxr;
 	int ice_dip, ice_mac_hdl;
 } ice_t;
 typedef enum {
@@ -452,6 +454,7 @@ setup(ice_rx_ring_t *r, ice_t *ice)
 	active_ring = r;
 	ice->ice_pf_vsi.vi_max_frame = 9728;
 	ice->ice_rx_limit_per_intr = 256;
+	ice->ice_num_rxr = 1;
 	r->irxr_ice = ice;
 	r->irxr_size = 16;
 	r->irxr_dbuf = ICE_RX_BUF_SIZE;

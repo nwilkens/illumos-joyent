@@ -20,6 +20,8 @@ def main():
     fragments += [extract(types, rf"^#define\t{name}\t.*$", header)
                   for name in re.findall(r"^#define\t(ICE_TX_\w+_BUFS_\w+)\t",
                                          types, re.MULTILINE)]
+    fragments.append(extract(types, r"^#define\tICE_TX_SMALL_ALIGN\t.*$",
+                             header))
     names = ("ice_buf_pool_fini", "ice_buf_pool_init", "ice_buf_pool_alloc",
              "ice_buf_alloc", "ice_lso_buf_alloc", "ice_small_buf_alloc",
              "ice_buf_free", "ice_tx_pool_bufs", "ice_buf_init",

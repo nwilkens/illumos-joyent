@@ -635,7 +635,9 @@ VLAN reinsertion, and frame assembly functions. Sixteen cases verify aligned
 and contiguous IP headers, packet bytes, the full DMA allocation and sync
 extent, jumbo chains, and loan accounting. Shared `rx_test.py`/`rx_test.h`
 supply controlled DDI/STREAMS boundaries. These are host regressions;
-hardware performance measurements remain separate.
+hardware performance measurements remain separate. It also checks that the loan reserve is
+`MIN(1024, 16384 / rings)` per ring, so the instance total stays within the
+cap and a ring at 127 queues keeps a share.
 
 `rx_dma_faults.py` executes the production descriptor walk, frame assembly,
 drain, and interrupt/poll entry points. Its 108 cases inject DMA sync and
@@ -649,8 +651,9 @@ the LSO pool allocation and release that MAC start and stop run. For 1 to 127
 rings and 64 to 4096 descriptors per ring, each ring's copy and small pools
 take `MIN(per-ring count, cap / rings)` buffers whatever the descriptor count,
 the instance totals stay within the caps, and every ring at 127 queues still
-has LSO buffers for its largest packet. No LSO buffer or LSO bind handle
-exists after `ice_buf_init()`. `ice_tx_lso_alloc()` gives every ring its LSO
+has LSO buffers for its largest packet. Small-pool buffers are allocated
+with 128-byte alignment so that each does not take a page; the others are
+page aligned. No LSO buffer or LSO bind handle exists after `ice_buf_init()`. `ice_tx_lso_alloc()` gives every ring its LSO
 pool and handles under the lifecycle lock, does nothing with LSO off, and
 allocates nothing on a rebuild that kept them. A buffer or handle failure on
 any ring returns failure with no ring holding part of a pool.

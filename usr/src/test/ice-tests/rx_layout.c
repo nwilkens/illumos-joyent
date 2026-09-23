@@ -98,11 +98,47 @@ layout(size_t length, boolean_t tagged, boolean_t force_copy)
 	teardown(&ring);
 }
 
+/*
+ * The loan reserve is per ring within a cap per instance, so a ring at 127
+ * queues keeps a share of it.
+ */
+static void
+reserve(void)
+{
+	const unsigned rings[] = { 1, 16, 127 };
+	ice_rx_ring_t ring;
+	ice_t ice;
+	unsigned i, want;
+
+	for (i = 0; i < sizeof (rings) / sizeof (*rings); i++) {
+		setup(&ring, &ice);
+		teardown(&ring);
+		ice.ice_num_rxr = rings[i];
+		mutex_enter(&ring.irxr_lock);
+		ring.irxr_rcbs = calloc(ring.irxr_size,
+		    sizeof (*ring.irxr_rcbs));
+		assert(ice_rx_alloc_rcbs(&ring));
+		want = MIN(ICE_RX_LOAN_RESERVE,
+		    ICE_RX_LOAN_RESERVE_MAX / rings[i]);
+		assert(ring.irxr_nreserve == want && want >= 1);
+		assert(want * rings[i] <= ICE_RX_LOAN_RESERVE_MAX);
+		assert(ring.irxr_nrcb == ring.irxr_size + want);
+		assert(ring.irxr_nfree == ring.irxr_nrcb);
+		ice_rx_free_rcbs(&ring);
+		mutex_exit(&ring.irxr_lock);
+		free(ring.irxr_rcbs);
+	}
+	assert(MIN(ICE_RX_LOAN_RESERVE, ICE_RX_LOAN_RESERVE_MAX / 16) == 1024);
+	assert(live_mblks == 0 && live_dma == 0);
+}
+
 int
 main(void)
 {
 	const size_t sizes[] = { 128, 1500, 2048, 9216 };
 	unsigned i, vlan, copy;
+
+	reserve();
 
 	for (i = 0; i < sizeof (sizes) / sizeof (*sizes); i++) {
 		for (vlan = 0; vlan < 2; vlan++) {
@@ -110,6 +146,7 @@ main(void)
 				layout(sizes[i], vlan, copy);
 		}
 	}
-	puts("RX layout: 16 copy/loan, VLAN and jumbo cases passed");
+	puts("RX layout: 16 copy/loan, VLAN and jumbo cases and the "
+	    "loan reserve passed");
 	return (0);
 }

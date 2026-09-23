@@ -156,10 +156,12 @@ CTASSERT(ICE_MAX_FRAME_SIZE <= UINT16_MAX);
  */
 #define	ICE_TX_COPY_BUFS_RING	64
 #define	ICE_TX_COPY_BUFS_MAX	2048
-#define	ICE_TX_SMALL_BUFS_RING	256
-#define	ICE_TX_SMALL_BUFS_MAX	8192
-#define	ICE_TX_LSO_BUFS_RING	64
-#define	ICE_TX_LSO_BUFS_MAX	2048
+#define	ICE_TX_SMALL_BUFS_RING	1024
+#define	ICE_TX_SMALL_BUFS_MAX	16384
+#define	ICE_TX_LSO_BUFS_RING	128
+#define	ICE_TX_LSO_BUFS_MAX	4096
+/* Page alignment would give each small buffer a page of its own. */
+#define	ICE_TX_SMALL_ALIGN	128
 /* GLCOMM_MIN_MAX_PKT.MIHDL reset value; a shorter frame is a TCLAN MDD. */
 #define	ICE_TX_MIN_LEN		17
 
@@ -183,12 +185,20 @@ CTASSERT(ICE_TX_LSO_BUFS_MAX / ICE_MAX_QUEUES >=
     howmany(ICE_LSO_MAXLEN, ICE_MAX_FRAME_SIZE));
 CTASSERT(ICE_TX_COPY_BUFS_MAX / ICE_MAX_QUEUES >= 1);
 CTASSERT(ICE_TX_SMALL_BUFS_MAX / ICE_MAX_QUEUES >= 1);
+CTASSERT(ISP2(ICE_TX_SMALL_ALIGN) && ICE_TX_SMALL_ALIGN < ICE_TX_SMALL_PKT);
 
 #define	ICE_DEF_TX_RING_SIZE	1024
 #define	ICE_DEF_RX_RING_SIZE	1024
 #define	ICE_MIN_RING_SIZE	64
 #define	ICE_MAX_RING_SIZE	4096
 #define	ICE_RX_BUF_SIZE		2048		/* posted rx data buffer */
+/*
+ * Spare rx buffers per ring beyond the posted ones, which bounds the frames
+ * loaned up the stack at once; within a cap per instance.
+ */
+#define	ICE_RX_LOAN_RESERVE	1024
+#define	ICE_RX_LOAN_RESERVE_MAX	16384
+CTASSERT(ICE_RX_LOAN_RESERVE_MAX / ICE_MAX_QUEUES >= 1);
 /* ceil(ICE_AQ_SET_MAC_FRAME_SIZE_MAX / ICE_RX_BUF_SIZE) */
 #define	ICE_RX_MAX_DESC		5
 

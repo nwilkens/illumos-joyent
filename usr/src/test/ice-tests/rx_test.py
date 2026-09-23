@@ -24,8 +24,12 @@ def run(test, functions=FUNCTIONS, optional=("ice_rx_desc_sync",)):
     header = args.header.read_text()
     parts = [extract(header, r"^typedef enum ice_state \{[\s\S]*?^} ice_state_t;",
                      args.header)]
-    for name in ("ICE_RX_BUF_SIZE", "ICE_RX_MAX_DESC"):
-        parts.append(extract(header, rf"^#define\s+{name}\s+.*", args.header))
+    for name in ("ICE_RX_BUF_SIZE", "ICE_RX_MAX_DESC", "ICE_RX_LOAN_RESERVE",
+                 "ICE_RX_LOAN_RESERVE_MAX"):
+        # Older revisions kept the reserve in the source; see below.
+        if re.search(rf"^#define\s+{name}\s+", header, re.MULTILINE):
+            parts.append(extract(header, rf"^#define\s+{name}\s+.*",
+                                 args.header))
     for name in ("ICE_RX_LOAN_RESERVE", "ICE_RX_COPY_THRESHOLD", "ICE_RX_HEADROOM"):
         # Optional headroom permits the original source to be a failing control.
         if re.search(rf"^#define\s+{name}\s+", source, re.MULTILINE):

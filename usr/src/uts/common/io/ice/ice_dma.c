@@ -283,6 +283,8 @@ ice_buf_pool_init(ice_t *ice, ice_buf_pool_t *pool, uint_t n, size_t size)
 
 	ASSERT3P(pool->ibp_bufs, ==, NULL);
 	ice_pkt_dma_attr(ice, &attr);
+	if (size <= ICE_TX_SMALL_PKT)
+		attr.dma_attr_align = ICE_TX_SMALL_ALIGN;
 	ice_dma_acc_attr(ice, &acc);
 
 	pool->ibp_size = n;

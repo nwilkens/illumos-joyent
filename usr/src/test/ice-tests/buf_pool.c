@@ -30,7 +30,10 @@ typedef int kmutex_t;
 typedef void *ddi_acc_handle_t;
 typedef void *ddi_dma_handle_t;
 typedef struct { uint64_t dmac_laddress; } ddi_dma_cookie_t;
-typedef int ddi_dma_attr_t;
+typedef struct {
+	int marker;
+	uint64_t dma_attr_align;
+} ddi_dma_attr_t;
 typedef int ddi_device_acc_attr_t;
 #define	B_TRUE 1
 #define	B_FALSE 0
@@ -116,7 +119,8 @@ static void
 ice_pkt_dma_attr(ice_t *ice, ddi_dma_attr_t *attr)
 {
 	(void) ice;
-	*attr = 1;
+	attr->marker = 1;
+	attr->dma_attr_align = 0x1000;
 }
 
 static void
@@ -142,7 +146,10 @@ ice_dma_alloc(ice_t *ice, ice_dma_buffer_t *buf, ddi_dma_attr_t *attr,
     ddi_device_acc_attr_t *acc, boolean_t zero, size_t size, boolean_t sleep)
 {
 	(void) ice;
-	assert(*attr == 1 && *acc == 1 && zero && sleep && locks == 0);
+	assert(attr->marker == 1 && *acc == 1 && zero && sleep && locks == 0);
+	/* A sub-page buffer must not be page aligned; the others are. */
+	assert(attr->dma_attr_align ==
+	    (size <= ICE_TX_SMALL_PKT ? ICE_TX_SMALL_ALIGN : 0x1000));
 	if (++attempts == fail_at)
 		return (B_FALSE);
 	buf->idb_va = &token;

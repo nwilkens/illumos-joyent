@@ -454,14 +454,6 @@ ice_rx_ring_unprogram(ice_t *ice, ice_rx_ring_t *irr)
  * posted buffer size before it is ever used to advance b_wptr or size a copy.
  */
 
-/*
- * Loan high-water mark: spare control blocks allocated per ring beyond the
- * irxr_size that are posted.  A loan that would exceed the buffers actually
- * available falls back to copy, so this only bounds how many frames can be
- * outstanding up the stack at once.
- */
-#define	ICE_RX_LOAN_RESERVE	256
-
 /* Bind (loan) a frame at least this large; smaller frames are copied. */
 #define	ICE_RX_COPY_THRESHOLD	256
 
@@ -636,7 +628,9 @@ ice_rx_alloc_rcbs(ice_rx_ring_t *irr)
 
 	ASSERT(MUTEX_HELD(&irr->irxr_lock));
 
-	irr->irxr_nreserve = ICE_RX_LOAN_RESERVE;
+	/* A loan past the reserve falls back to a copy. */
+	irr->irxr_nreserve = MIN(ICE_RX_LOAN_RESERVE,
+	    ICE_RX_LOAN_RESERVE_MAX / ice->ice_num_rxr);
 	irr->irxr_nrcb = irr->irxr_size + irr->irxr_nreserve;
 
 	irr->irxr_rcb_area = kmem_zalloc(
