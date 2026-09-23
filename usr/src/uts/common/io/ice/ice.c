@@ -189,8 +189,11 @@
  *
  * usr/src/test/ice-tests runs the lifecycle, filter, reset, offload and
  * ioctl code with controlled boundaries on any host.  Those checks cannot
- * show memory ordering, device timing or interrupt delivery; the on-system
- * tests in usr/src/test/ice-tests/runfiles cover those on hardware.
+ * show memory ordering, device timing or interrupt delivery.  The on-system
+ * tests in usr/src/test/ice-tests/runfiles check the kstats and FMA counters
+ * after attach, the LED modes and the diagnostic ioctls, and with a peer they
+ * pass traffic, change the MTU and replumb one link.  They do not reset the
+ * device, inject faults or test concurrency beyond what that traffic does.
  */
 
 #include <sys/atomic.h>

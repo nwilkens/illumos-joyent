@@ -665,8 +665,12 @@ LED identify modes through `dlled` (`led`), and the diagnostic ioctls
 (`diag_ioctl.64`: privilege drops, size and cluster checks, a firmware log
 configuration read). With a peer (`-p` or `$ICE_TEST_PEER`) the datapath
 runfile also runs `datapath_accept.sh`. A test without its device or peer
-reports SKIP. `onsystem_suite.py` checks the runfiles, scripts and package
-manifest on the build host.
+reports SKIP. `attach` fails if an FMA counter kstat is missing or nonzero.
+The suite does not reset the device, inject faults, or test memory ordering,
+device timing, interrupt delivery or concurrency beyond what its traffic
+produces. `onsystem_suite.py` checks the runfiles, scripts and package
+manifest on the build host, and runs `attach` under `ksh` against a stub
+`kstat` to check that a missing or nonzero FMA counter fails it.
 
 ## On-hardware datapath acceptance
 
@@ -726,4 +730,6 @@ four runs) and 9000 (9.88 Gbps); with `tx_lso_enable=0`, MTU 1500 reached
 5.3 to 5.9 Gbps. The on-system `attach`, `led` and `diag_ioctl.64` tests
 passed, detach and reattach with the LED in identify mode were clean, and
 the mdb module read the instance and its rings. The reverse direction, the
-other device families, reset and fault injection were not tested.
+other device families, reset and fault injection were not tested, and these
+runs do not show memory ordering or interrupt delivery under load beyond the
+traffic they passed.

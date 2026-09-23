@@ -62,7 +62,11 @@ done
 
 for k in fm:acc_err fm:dma_err fm:erpt_dropped; do
 	v=$(stat $k)
-	[[ -z "$v" || "$v" == "0" ]] || fail "ice:$inst:$k is $v"
+	if [[ -z "$v" ]]; then
+		fail "kstat ice:$inst:$k is missing"
+	elif [[ "$v" != "0" ]]; then
+		fail "ice:$inst:$k is $v"
+	fi
 done
 
 (( fails == 0 )) && echo "PASS: $link kstats and FMA counters"
