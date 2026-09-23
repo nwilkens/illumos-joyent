@@ -193,6 +193,13 @@ static boolean_t ice_rx_quiesce(ice_t *p)
 	return (fixture.drained);
 }
 static boolean_t
+ice_rx_orphans_drain(ice_t *p)
+{
+	assert(MUTEX_HELD(&p->ice_rebuild_lock));
+	assert(fixture.rx_closed);
+	return (fixture.drained);
+}
+static boolean_t
 ice_rx_drain(ice_t *p)
 {
 	(void) p;

@@ -200,6 +200,8 @@ CTASSERT(ISP2(ICE_TX_SMALL_ALIGN) && ICE_TX_SMALL_ALIGN < ICE_TX_SMALL_PKT);
  */
 #define	ICE_RX_LOAN_RESERVE	1024
 #define	ICE_RX_LOAN_RESERVE_MAX	16384
+/* Replaced pools a ring keeps for loans still up the stack. */
+#define	ICE_RX_ORPHANS_MAX	8
 CTASSERT(ICE_RX_LOAN_RESERVE_MAX / ICE_MAX_QUEUES >= 1);
 /* ceil(ICE_AQ_SET_MAC_FRAME_SIZE_MAX / ICE_RX_BUF_SIZE) */
 #define	ICE_RX_MAX_DESC		5
@@ -438,13 +440,27 @@ typedef enum ice_rcb_state {
 } ice_rcb_state_t;
 
 struct ice_rx_ring;
-typedef struct ice_rx_ctrl_block {
+typedef struct ice_rx_ctrl_block ice_rx_ctrl_block_t;
+
+/*
+ * A control-block pool that a start replaced while the stack still held some
+ * of its buffers.  It is freed once iro_nloaned reaches zero.
+ */
+typedef struct ice_rx_orphan {
+	struct ice_rx_orphan	*iro_next;
+	ice_rx_ctrl_block_t	*iro_area;	/* [iro_nrcb] */
+	ice_rx_ctrl_block_t	**iro_free;	/* [iro_nrcb] */
+	uint_t			iro_nrcb;
+	uint_t			iro_nloaned;
+} ice_rx_orphan_t;
+
+struct ice_rx_ctrl_block {
 	mblk_t			*ircb_mp;
 	struct ice_rx_ring	*ircb_ring;
 	ice_dma_buffer_t	ircb_dma;
 	frtn_t			ircb_free_rtn;
 	ice_rcb_state_t		ircb_state;
-} ice_rx_ctrl_block_t;
+};
 
 typedef struct ice_rxq_stat {
 	kstat_named_t		icrxs_bytes;
@@ -503,6 +519,7 @@ typedef struct ice_rx_ring {
 	uint_t			irxr_nfree;
 	uint_t			irxr_nreserve;	/* loan high-water */
 	uint_t			irxr_nloaned;	/* outstanding loans */
+	ice_rx_orphan_t		*irxr_orphans;	/* irxr_lock */
 
 	kstat_t			*irxr_kstat;
 	ice_rxq_stat_t		irxr_stats;
@@ -860,6 +877,7 @@ extern int ice_ring_tx_stat(mac_ring_driver_t, uint_t, uint64_t *);
 extern void ice_rx_recycle(caddr_t);
 extern boolean_t ice_rx_start(ice_t *);
 extern boolean_t ice_rx_quiesce(ice_t *);
+extern boolean_t ice_rx_orphans_drain(ice_t *);
 extern void ice_rx_reclaim(ice_t *);
 extern boolean_t ice_rx_stop(ice_t *);
 extern boolean_t ice_rx_rings_resume(ice_t *);

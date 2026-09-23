@@ -30,7 +30,7 @@ def main() -> None:
     quiesce = function(
         rx,
         "ice_rx_quiesce(ice_t *ice)\n{",
-        "\nvoid\nice_rx_reclaim",
+        "\n/*\n * Wait, within the loan deadline",
     )
 
     # Every ring is closed before any ring is waited on, which is what makes a
@@ -105,6 +105,17 @@ def main() -> None:
     )
     assert "irxr_rcb_area != NULL" in start
     assert start.index("irxr_nloaned > 0") < start.index("ice_rx_alloc_rcbs")
+    # A pool with loans outstanding is set aside, not a reason to fail.
+    assert start.index("irxr_nloaned > 0") < start.index("ice_rx_orphan(irr)") \
+        < start.index("ice_rx_alloc_rcbs")
+
+    # Detach waits for the set-aside pools too, within the same bound.
+    drain = function(rx, "ice_rx_orphans_drain(ice_t *ice)\n{", "\n}\n")
+    assert "cv_timedwait(&irr->irxr_cv" in drain
+    assert "ICE_RX_LOAN_WAIT_US" in drain
+    lifecycle = (Path(__file__).resolve().parents[2] /
+                 "uts/common/io/ice/ice.c").read_text()
+    assert "!ice_rx_quiesce(ice) || !ice_rx_orphans_drain(ice)" in lifecycle
 
     # Detach now uses the same close/upcall/loan fence as mac stop.  It
     # releases no buffer pool until hardware isolation has been confirmed.

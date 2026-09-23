@@ -124,7 +124,10 @@
  * MAC stop cannot fail.  If a queue does not confirm its disable, the queue
  * can still write to memory, so stop releases nothing, closes the software
  * paths, and requests a PF reset.  Packet memory is reclaimed only after a
- * queue disable is confirmed or a reset completes.
+ * queue disable is confirmed or a reset completes.  An rx buffer loaned up the
+ * stack can stay there for as long as a peer keeps its connection, so a start
+ * sets aside a pool with loans outstanding and uses a new one; detach waits
+ * for those loans.
  *
  * A reset request is an atomic cause bit: RESET_PENDING for a reset firmware
  * or another PF started, PFR_REQ for one the driver owes.  The reset worker
@@ -633,7 +636,7 @@ ice_stop(ice_t *ice)
 		 * stack never returns leaves ice_rx_stop() short of a full
 		 * drain; it deliberately leaves that ring's pool intact rather
 		 * than freeing buffers still held upstream, and ice_rx_start()
-		 * re-checks before reusing it.
+		 * sets it aside instead of reusing it.
 		 */
 		(void) ice_rx_stop(ice);
 	} else {
@@ -1102,7 +1105,7 @@ ice_detach_quiesce(ice_t *ice)
 
 	if ((ice->ice_attach_progress & ICE_ATTACH_RINGS) != 0) {
 		ice_tx_quiesce(ice);
-		if (!ice_rx_quiesce(ice)) {
+		if (!ice_rx_quiesce(ice) || !ice_rx_orphans_drain(ice)) {
 			ice_error(ice, "timed out draining rx loans; "
 			    "detach deferred");
 			return (B_FALSE);
@@ -1234,11 +1237,10 @@ ice_reset_set_failed(ice_t *ice)
  * ice_rebuild_lock.
  *
  * A loan the stack does not return within the bounded wait is deliberately not
- * an error here.  ice_rx_quiesce() leaves such a ring fully intact and
- * ice_rx_start() refuses to reuse a pool with loans outstanding, so the rebuild
- * fails soft at ice_start_datapath() and recovers on the next mac start.
- * Escalating instead would take the NIC terminally offline over buffers that
- * were about to come back.
+ * an error here.  ice_rx_quiesce() leaves such a ring fully intact, and
+ * ice_rx_start() sets that pool aside until its loans return and restarts the
+ * ring with a new one.  Escalating instead would take the NIC terminally
+ * offline over buffers that were about to come back.
  */
 static void
 ice_prepare_for_reset(ice_t *ice)

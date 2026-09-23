@@ -62,6 +62,7 @@ TESTS = (
     "rx_intr_rearm.py",
     "rx_intr_route.py",
     "rx_layout.py",
+    "rx_orphan.py",
     "safe_mode.py",
     "sched_resources.py",
     "stale_comments.py",

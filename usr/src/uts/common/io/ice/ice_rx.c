@@ -38,6 +38,7 @@
 #include "ice_lan_tx_rx.h"
 
 static void ice_rx_free_rcbs(ice_rx_ring_t *);
+static void ice_rx_orphans_reap(ice_rx_ring_t *);
 
 /*
  * Free a single rx ring's DMA and per-slot state.  Safe to call on a ring that
@@ -56,6 +57,8 @@ ice_rx_ring_free(ice_rx_ring_t *irr)
 	ASSERT0(irr->irxr_nloaned);
 	ASSERT(!irr->irxr_intr_busy);
 	ice_rx_free_rcbs(irr);
+	ice_rx_orphans_reap(irr);
+	VERIFY3P(irr->irxr_orphans, ==, NULL);
 
 	if (irr->irxr_kstat != NULL) {
 		kstat_delete(irr->irxr_kstat);
@@ -541,6 +544,35 @@ ice_rcb_free(ice_rx_ring_t *irr, ice_rx_ctrl_block_t *rcb)
 	irr->irxr_free_rcbs[irr->irxr_nfree++] = rcb;
 }
 
+static boolean_t
+ice_rx_rcb_current(const ice_rx_ring_t *irr, const ice_rx_ctrl_block_t *rcb)
+{
+	ASSERT(MUTEX_HELD(&irr->irxr_lock));
+	return (irr->irxr_rcb_area != NULL && rcb >= irr->irxr_rcb_area &&
+	    rcb < irr->irxr_rcb_area + irr->irxr_nrcb);
+}
+
+/*
+ * A loan from a replaced pool came back.  Its memory is freed later, in
+ * thread context, by ice_rx_orphans_reap().
+ */
+static void
+ice_rx_orphan_return(ice_rx_ring_t *irr, ice_rx_ctrl_block_t *rcb)
+{
+	ice_rx_orphan_t *o;
+
+	ASSERT(MUTEX_HELD(&irr->irxr_lock));
+	for (o = irr->irxr_orphans; o != NULL; o = o->iro_next) {
+		if (rcb >= o->iro_area && rcb < o->iro_area + o->iro_nrcb)
+			break;
+	}
+	VERIFY3P(o, !=, NULL);
+	VERIFY3U(o->iro_nloaned, >, 0);
+	o->iro_nloaned--;
+	rcb->ircb_state = IRXB_FREE;
+	cv_broadcast(&irr->irxr_cv);
+}
+
 /*
  * freemsg(9F) callback for a loaned buffer.  A loaned buffer's mblk is gone
  * once we are here, so drop the reference and either re-arm a fresh loaner and
@@ -565,6 +597,12 @@ ice_rx_recycle(caddr_t arg)
 		return;
 
 	mutex_enter(&irr->irxr_lock);
+
+	if (!ice_rx_rcb_current(irr, rcb)) {
+		ice_rx_orphan_return(irr, rcb);
+		mutex_exit(&irr->irxr_lock);
+		return;
+	}
 
 	if (irr->irxr_shutdown) {
 		/*
@@ -698,6 +736,82 @@ ice_rx_free_rcbs(ice_rx_ring_t *irr)
 	irr->irxr_nfree = irr->irxr_nrcb = irr->irxr_nreserve = 0;
 	/* No pool implies not started, ice_rx_start()'s realloc included. */
 	irr->irxr_started = B_FALSE;
+}
+
+/*
+ * Set aside a pool whose loans have not all come back, so that a start need
+ * not wait for them: a peer can hold a loaned frame in a TCP reassembly queue
+ * for as long as its connection lives.  Only the loaned buffers are kept.
+ * Hardware no longer reaches the pool.
+ */
+static boolean_t
+ice_rx_orphan(ice_rx_ring_t *irr)
+{
+	ice_rx_orphan_t *o;
+	uint_t i, n = 0;
+
+	ASSERT(MUTEX_HELD(&irr->irxr_lock));
+	ASSERT3U(irr->irxr_nloaned, >, 0);
+
+	for (o = irr->irxr_orphans; o != NULL; o = o->iro_next)
+		n++;
+	if (n >= ICE_RX_ORPHANS_MAX)
+		return (B_FALSE);
+
+	o = kmem_zalloc(sizeof (*o), KM_SLEEP);
+	o->iro_area = irr->irxr_rcb_area;
+	o->iro_free = irr->irxr_free_rcbs;
+	o->iro_nrcb = irr->irxr_nrcb;
+	o->iro_nloaned = irr->irxr_nloaned;
+	for (i = 0; i < o->iro_nrcb; i++) {
+		ice_rx_ctrl_block_t *rcb = &o->iro_area[i];
+
+		if (rcb->ircb_state == IRXB_ONLOAN)
+			continue;
+		if (rcb->ircb_mp != NULL) {
+			freemsg(rcb->ircb_mp);
+			rcb->ircb_mp = NULL;
+		}
+		ice_dma_free(&rcb->ircb_dma);
+	}
+	o->iro_next = irr->irxr_orphans;
+	irr->irxr_orphans = o;
+
+	irr->irxr_rcb_area = NULL;
+	irr->irxr_free_rcbs = NULL;
+	irr->irxr_nfree = irr->irxr_nrcb = irr->irxr_nreserve = 0;
+	irr->irxr_nloaned = 0;
+	irr->irxr_started = B_FALSE;
+	return (B_TRUE);
+}
+
+/* Free every set-aside pool whose loans have all come back. */
+static void
+ice_rx_orphans_reap(ice_rx_ring_t *irr)
+{
+	ice_rx_orphan_t *o, **op = &irr->irxr_orphans;
+	uint_t i;
+
+	while ((o = *op) != NULL) {
+		if (o->iro_nloaned != 0) {
+			op = &o->iro_next;
+			continue;
+		}
+		*op = o->iro_next;
+		for (i = 0; i < o->iro_nrcb; i++) {
+			ice_rx_ctrl_block_t *rcb = &o->iro_area[i];
+
+			ASSERT3S(rcb->ircb_state, !=, IRXB_ONLOAN);
+			if (rcb->ircb_mp != NULL) {
+				freemsg(rcb->ircb_mp);
+				rcb->ircb_mp = NULL;
+			}
+			ice_dma_free(&rcb->ircb_dma);
+		}
+		kmem_free(o->iro_free, o->iro_nrcb * sizeof (*o->iro_free));
+		kmem_free(o->iro_area, o->iro_nrcb * sizeof (*o->iro_area));
+		kmem_free(o, sizeof (*o));
+	}
 }
 
 /*
@@ -1566,7 +1680,8 @@ ice_ring_rx_stat(mac_ring_driver_t rh, uint_t stat, uint64_t *val)
  * A pool may have survived a teardown that timed out waiting for loans; it is
  * never reused, because ice_rx_recycle()'s shutdown path drops returning
  * control blocks without re-arming them or putting them back on the free list.
- * Reclaim it once drained, and refuse to start at all while loans remain.
+ * Free it if drained, or set it aside, and start with a new pool.  A ring
+ * that already holds ICE_RX_ORPHANS_MAX such pools does not start.
  */
 boolean_t
 ice_rx_start(ice_t *ice)
@@ -1577,12 +1692,16 @@ ice_rx_start(ice_t *ice)
 		ice_rx_ring_t *irr = &ice->ice_rxr[i];
 
 		mutex_enter(&irr->irxr_lock);
+		ice_rx_orphans_reap(irr);
 		if (irr->irxr_rcb_area != NULL) {
 			if (irr->irxr_nloaned > 0) {
-				mutex_exit(&irr->irxr_lock);
-				goto unwind;
+				if (!ice_rx_orphan(irr)) {
+					mutex_exit(&irr->irxr_lock);
+					goto unwind;
+				}
+			} else {
+				ice_rx_free_rcbs(irr);
 			}
-			ice_rx_free_rcbs(irr);
 		}
 
 		if (!ice_rx_alloc_rcbs(irr)) {
@@ -1600,6 +1719,7 @@ unwind:
 		ice_rx_ring_t *irr = &ice->ice_rxr[i];
 
 		mutex_enter(&irr->irxr_lock);
+		ASSERT0(irr->irxr_nloaned);
 		ice_rx_free_rcbs(irr);
 		mutex_exit(&irr->irxr_lock);
 	}
@@ -1669,6 +1789,37 @@ ice_rx_quiesce(ice_t *ice)
 }
 
 /*
+ * Wait, within the loan deadline, for the loans of every set-aside pool.
+ * Detach needs them back: each one ends in ice_rx_recycle().
+ */
+boolean_t
+ice_rx_orphans_drain(ice_t *ice)
+{
+	clock_t deadline = ddi_get_lbolt() + drv_usectohz(ICE_RX_LOAN_WAIT_US);
+	boolean_t drained = B_TRUE;
+	uint_t i;
+
+	for (i = 0; i < ice->ice_num_rxr; i++) {
+		ice_rx_ring_t *irr = &ice->ice_rxr[i];
+
+		mutex_enter(&irr->irxr_lock);
+		for (;;) {
+			ice_rx_orphans_reap(irr);
+			if (irr->irxr_orphans == NULL ||
+			    cv_timedwait(&irr->irxr_cv, &irr->irxr_lock,
+			    deadline) == -1)
+				break;
+		}
+		ice_rx_orphans_reap(irr);
+		if (irr->irxr_orphans != NULL)
+			drained = B_FALSE;
+		mutex_exit(&irr->irxr_lock);
+	}
+
+	return (drained);
+}
+
+/*
  * Free the control-block pool of every ring that fully drained.  A ring that
  * did not is left fully intact -- its control blocks are NOT freed and its
  * descriptors are NOT reposted -- so the loaned buffers return harmlessly
@@ -1687,6 +1838,7 @@ ice_rx_reclaim(ice_t *ice)
 		mutex_enter(&irr->irxr_lock);
 		if (irr->irxr_nloaned == 0)
 			ice_rx_free_rcbs(irr);
+		ice_rx_orphans_reap(irr);
 		mutex_exit(&irr->irxr_lock);
 	}
 }

@@ -8,14 +8,18 @@ import re
 from c_test import DRIVER, TESTDIR, extract, run_c
 
 FUNCTIONS = (
-    "ice_rx_alloc_mp", "ice_rcb_alloc", "ice_rcb_free", "ice_rx_recycle",
-    "ice_rx_reset_desc", "ice_rx_alloc_rcbs", "ice_rx_free_rcbs",
+    "ice_rx_alloc_mp", "ice_rcb_alloc", "ice_rcb_free", "ice_rx_rcb_current",
+    "ice_rx_orphan_return", "ice_rx_recycle", "ice_rx_reset_desc",
+    "ice_rx_orphan", "ice_rx_orphans_reap", "ice_rx_alloc_rcbs",
+    "ice_rx_free_rcbs",
     "ice_rx_next", "ice_rx_copy", "ice_rx_bind", "ice_rx_discard_frame",
     "ice_rx_vlan_insert", "ice_rx_desc_sync", "ice_ring_rx_frame",
 )
 
 
-def run(test, functions=FUNCTIONS, optional=("ice_rx_desc_sync",)):
+def run(test, functions=FUNCTIONS, optional=("ice_rx_desc_sync",
+        "ice_rx_rcb_current", "ice_rx_orphan_return", "ice_rx_orphan",
+        "ice_rx_orphans_reap")):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=DRIVER / "ice_rx.c")
     parser.add_argument("--header", type=Path, default=DRIVER / "ice.h")
@@ -25,7 +29,7 @@ def run(test, functions=FUNCTIONS, optional=("ice_rx_desc_sync",)):
     parts = [extract(header, r"^typedef enum ice_state \{[\s\S]*?^} ice_state_t;",
                      args.header)]
     for name in ("ICE_RX_BUF_SIZE", "ICE_RX_MAX_DESC", "ICE_RX_LOAN_RESERVE",
-                 "ICE_RX_LOAN_RESERVE_MAX"):
+                 "ICE_RX_LOAN_RESERVE_MAX", "ICE_RX_ORPHANS_MAX"):
         # Older revisions kept the reserve in the source; see below.
         if re.search(rf"^#define\s+{name}\s+", header, re.MULTILINE):
             parts.append(extract(header, rf"^#define\s+{name}\s+.*",

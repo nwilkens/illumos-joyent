@@ -55,6 +55,8 @@ typedef char *caddr_t;
 #define	ASSERT3S(a, op, b)	assert((a) op (b))
 /* CSTYLED */
 #define	ASSERT3P(a, op, b)	assert((a) op (b))
+#define	VERIFY3P(a, op, b)	assert((a) op(b))
+#define	VERIFY3U(a, op, b)	assert((a) op(b))
 #define	MUTEX_HELD(m)	(*(m) != 0)
 #undef bcopy
 #define	bcopy(s, d, n)	((void) memmove((d), (s), (n)))
@@ -143,6 +145,12 @@ typedef struct {
 	frtn_t ircb_free_rtn;
 	ice_rcb_state_t ircb_state;
 } ice_rx_ctrl_block_t;
+typedef struct ice_rx_orphan {
+	struct ice_rx_orphan *iro_next;
+	ice_rx_ctrl_block_t *iro_area;
+	ice_rx_ctrl_block_t **iro_free;
+	uint_t iro_nrcb, iro_nloaned;
+} ice_rx_orphan_t;
 union ice_32b_rx_flex_desc {
 	struct {
 		uint64_t pkt_addr, hdr_addr;
@@ -164,6 +172,7 @@ typedef struct ice_rx_ring {
 	ice_rx_ctrl_block_t **irxr_rcbs, *irxr_rcb_area, **irxr_free_rcbs;
 	uint16_t irxr_size, irxr_head, irxr_tail;
 	uint_t irxr_nrcb, irxr_nfree, irxr_nreserve, irxr_nloaned;
+	ice_rx_orphan_t *irxr_orphans;
 	ice_rxq_stat_t irxr_stats;
 } ice_rx_ring_t;
 
@@ -209,10 +218,13 @@ cv_signal(int *cv)
 	(void) cv;
 }
 
+static unsigned broadcasts;
+
 static void
 cv_broadcast(int *cv)
 {
 	(void) cv;
+	broadcasts++;
 }
 
 static void
