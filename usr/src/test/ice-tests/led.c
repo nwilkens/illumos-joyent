@@ -40,7 +40,10 @@ struct ice_port_info {
 	int unused;
 };
 
+#define	CE_WARN		2
+
 typedef struct ice {
+	void *ice_dip;
 	kmutex_t ice_rebuild_lock;
 	boolean_t ice_led_ident;
 	struct {
@@ -74,6 +77,16 @@ ice_error(ice_t *ice, const char *fmt, ...)
 	errors++;
 }
 
+static unsigned warnings;
+
+static void
+dev_err(void *dip, int level, const char *fmt, ...)
+{
+	(void) dip;
+	assert(level == CE_WARN && fmt[0] == '!');
+	warnings++;
+}
+
 static ice_t *current;
 
 static int
@@ -98,7 +111,7 @@ fresh(void)
 
 	(void) memset(&ice, 0, sizeof (ice));
 	ice.ice_hw.port_info = &port;
-	commands = blinks = errors = 0;
+	commands = blinks = errors = warnings = 0;
 	fail = 0;
 	return (ice);
 }
@@ -148,7 +161,15 @@ main(void)
 	ice_led_fini(&ice);
 	assert(commands == 1 && blinks == 0 && !ice.ice_led_ident);
 	ice_led_fini(&ice);
-	assert(commands == 1 && ice.ice_rebuild_lock == 0);
+	assert(commands == 1 && ice.ice_rebuild_lock == 0 && warnings == 0);
+
+	/* A failed restore is logged and the LED is still recorded as IDENT. */
+	ice = fresh();
+	ice.ice_led_ident = B_TRUE;
+	fail = -1;
+	ice_led_fini(&ice);
+	assert(commands == 1 && warnings == 1 && ice.ice_led_ident);
+	assert(ice.ice_rebuild_lock == 0);
 
 	(void) puts("PASS: LED identify, replay and detach restore");
 	return (0);

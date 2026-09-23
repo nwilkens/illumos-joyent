@@ -239,6 +239,8 @@ state under firmware control
 The driver does not support holding the LED on or off.
 The mode is restored after a device reset, and the LED returns to firmware
 control when the driver detaches.
+If the device refuses that command at detach, the driver logs a message and
+detaches anyway; the LED can then blink until the device is reset.
 .Sh STATISTICS
 The driver provides the standard MAC and Ethernet statistics, and the
 following

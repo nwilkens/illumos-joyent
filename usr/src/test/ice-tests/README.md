@@ -114,8 +114,11 @@ from `ice_port.c` with a stub admin queue. It checks that only DEFAULT and
 IDENT are accepted, that each command runs under `ice_rebuild_lock`, that a
 failed command returns EIO without changing the recorded mode, that a
 rebuild blinks the LED again only when IDENT was set, and that detach gives
-the LED back to firmware once. It also checks the `MAC_CAPAB_LED` fields and
-the replay and restore call sites.
+the LED back to firmware once. A restore the device refuses at detach is
+logged with `dev_err` and leaves IDENT recorded, and detach continues. It
+also checks the `MAC_CAPAB_LED` fields and the replay and restore call sites;
+the restore must come after MAC unregister and before the admin queue
+teardown in `ice_unconfigure()`.
 
 ## Checksum counter regression
 

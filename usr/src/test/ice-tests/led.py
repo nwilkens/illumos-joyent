@@ -28,6 +28,7 @@ def main():
     rebuild = lifecycle[lifecycle.index("\nice_rebuild(ice_t *ice"):]
     assert rebuild.index("ice_vsi_rebuild(ice)") < \
         rebuild.index("ice_led_replay(ice);")
+    # The restore rides the admin queue, so it must precede the teardown.
     detach = lifecycle[lifecycle.index("\nice_detach(dev_info_t *dip"):]
     assert detach.index("ice_mac_unregister(ice)") < \
         detach.index("ice_led_fini(ice);") < detach.index("ice_unconfigure(ice)")

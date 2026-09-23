@@ -165,17 +165,26 @@ ice_led_replay(ice_t *ice)
 }
 
 /*
- * Give the LED back to firmware at detach.  MAC is unregistered, so no
- * callback can race this.
+ * Give the LED back to firmware at detach, before the admin queue is torn
+ * down.  MAC is unregistered, so no callback can race this.  A failure is
+ * logged and does not stop the detach: a dead device must still detach.
  */
 void
 ice_led_fini(ice_t *ice)
 {
+	int status;
+
 	mutex_enter(&ice->ice_rebuild_lock);
 	if (ice->ice_led_ident) {
-		(void) ice_aq_set_port_id_led(ice->ice_hw.port_info, true,
+		status = ice_aq_set_port_id_led(ice->ice_hw.port_info, true,
 		    NULL);
-		ice->ice_led_ident = B_FALSE;
+		if (status == ICE_SUCCESS) {
+			ice->ice_led_ident = B_FALSE;
+		} else {
+			dev_err(ice->ice_dip, CE_WARN, "!port LED not returned "
+			    "to firmware control: %d; it can blink until the "
+			    "device is reset", status);
+		}
 	}
 	mutex_exit(&ice->ice_rebuild_lock);
 }
