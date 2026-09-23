@@ -1347,8 +1347,14 @@ ice_rebuild(ice_t *ice, uint32_t requests)
 	 * An EMPR can leave the firmware in recovery mode.  The rebuild then
 	 * stops here, fail-closed, before any queue or filter programming.
 	 */
-	if (ice_fw_recovery_mode(ice, &fwsm)) {
+	switch (ice_fw_state(ice, &fwsm)) {
+	case ICE_FW_USABLE:
+		break;
+	case ICE_FW_RECOVERY:
 		ice_fw_recovery_report(ice, fwsm);
+		goto reset_failed;
+	default:
+		ice_error(ice, "cannot read the firmware state after reset");
 		goto reset_failed;
 	}
 

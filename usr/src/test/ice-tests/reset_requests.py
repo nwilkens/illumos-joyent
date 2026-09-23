@@ -17,6 +17,8 @@ def main():
     header = DRIVER / "ice.h"
     types = extract(header.read_text(),
         r"^typedef enum ice_state \{[\s\S]*?^} ice_state_t;", header)
+    types += extract(header.read_text(),
+        r"^typedef enum ice_fw_state \{[\s\S]*?^} ice_fw_state_t;", header)
     fragments = [extract(args.intr_source.read_text(),
         r"^void\nice_reset_dispatch\([\s\S]*?^}", args.intr_source)]
     names = ["ice_reset_redispatch", "ice_reset_take_requests",

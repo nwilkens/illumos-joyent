@@ -145,19 +145,28 @@ dev_err(void *dip, int level, const char *fmt, ...)
 
 #include "fw_recovery_body.h"
 
-static boolean_t
-detect(enum ice_mac_type mac, u32 fwsm)
+static ice_fw_state_t
+state(enum ice_mac_type mac, u32 fwsm)
 {
 	ice_t ice;
 	u32 seen = 0;
-	boolean_t r;
+	ice_fw_state_t r;
 
 	(void) memset(&ice, 0, sizeof (ice));
 	ice.ice_hw.mac_type = mac;
 	fwsm_value = fwsm;
-	r = ice_fw_recovery_mode(&ice, &seen);
+	r = ice_fw_state(&ice, &seen);
 	assert(seen == fwsm);
 	return (r);
+}
+
+static boolean_t
+detect(enum ice_mac_type mac, u32 fwsm)
+{
+	ice_fw_state_t r = state(mac, fwsm);
+
+	assert(r != ICE_FW_UNREADABLE);
+	return (r == ICE_FW_RECOVERY);
 }
 
 int
@@ -177,9 +186,10 @@ main(void)
 	assert(!detect(ICE_MAC_E830, 4));
 	/* Upper bits (for example FW_LOADING) do not select a mode. */
 	assert(!detect(ICE_MAC_E810, 0x40000000));
-	/* A faulted read (all ones) is not taken as recovery. */
+	/* A faulted read (all ones) is neither recovery nor usable. */
 	access_fault = 1;
-	assert(!detect(ICE_MAC_E810, 0xffffffff));
+	assert(state(ICE_MAC_E810, 0xffffffff) == ICE_FW_UNREADABLE);
+	assert(state(ICE_MAC_E810, 0) == ICE_FW_UNREADABLE);
 	access_fault = 0;
 
 	(void) memset(&ice, 0, sizeof (ice));

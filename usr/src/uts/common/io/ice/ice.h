@@ -687,7 +687,12 @@ extern void ice_identify_hardware(ice_t *);
 extern boolean_t ice_regs_map(ice_t *);
 extern boolean_t ice_validate_caps(ice_t *);
 extern boolean_t ice_hw_init(ice_t *);
-extern boolean_t ice_fw_recovery_mode(ice_t *, uint32_t *);
+typedef enum ice_fw_state {
+	ICE_FW_USABLE,
+	ICE_FW_RECOVERY,	/* firmware needs an NVM update */
+	ICE_FW_UNREADABLE	/* register access faulted */
+} ice_fw_state_t;
+extern ice_fw_state_t ice_fw_state(ice_t *, uint32_t *);
 extern void ice_fw_recovery_report(ice_t *, uint32_t);
 extern boolean_t ice_reset_empr_slow(struct ice_hw *);
 extern void ice_phy_fw_wait(ice_t *);

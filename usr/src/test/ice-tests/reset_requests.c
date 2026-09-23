@@ -209,15 +209,15 @@ ice_check_reset(struct ice_hw *hw)
 	return (fail_reset);
 }
 
-static int fw_recovery;
+static ice_fw_state_t fw_state;
 static unsigned recovery_reports, ctrlq_inits;
 
-static int
-ice_fw_recovery_mode(ice_t *ice, uint32_t *fwsmp)
+static ice_fw_state_t
+ice_fw_state(ice_t *ice, uint32_t *fwsmp)
 {
 	(void) ice;
-	*fwsmp = fw_recovery ? 2 : 0;
-	return (fw_recovery);
+	*fwsmp = fw_state == ICE_FW_RECOVERY ? 2 : 0;
+	return (fw_state);
 }
 
 static void
@@ -353,7 +353,7 @@ reset(void)
 	queued = prepared = pfrs = global_waits = starts = errors = 0;
 	slow_empr = 0;
 	slow_waits = 0;
-	fw_recovery = 0;
+	fw_state = ICE_FW_USABLE;
 	recovery_reports = ctrlq_inits = 0;
 	fail_dispatch = fail_reset = start_result = 0;
 	resume_ok = 1;
@@ -462,13 +462,22 @@ check_fw_recovery(void)
 	 */
 	reset();
 	device.ice_state = ICE_STATE_STARTED;
-	fw_recovery = 1;
+	fw_state = ICE_FW_RECOVERY;
 	request(ICE_STATE_RESET_PENDING);
 	run_one();
 	assert(recovery_reports == 1 && ctrlq_inits == 0 && starts == 0);
 	assert((device.ice_state & ICE_STATE_RESET_FAILED) != 0);
 	assert((device.ice_state & ICE_STATE_ERROR) != 0);
 	assert(queued == 0);
+
+	/* A faulted read cannot prove usable firmware either. */
+	reset();
+	device.ice_state = ICE_STATE_STARTED;
+	fw_state = ICE_FW_UNREADABLE;
+	request(ICE_STATE_PFR_REQ);
+	run_one();
+	assert(recovery_reports == 0 && ctrlq_inits == 0 && starts == 0);
+	assert((device.ice_state & ICE_STATE_RESET_FAILED) != 0);
 
 	/* Normal firmware rebuilds as before. */
 	reset();

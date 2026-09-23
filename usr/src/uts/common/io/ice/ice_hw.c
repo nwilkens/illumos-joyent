@@ -221,13 +221,14 @@ ice_set_ctrlq_len(struct ice_hw *hw)
 }
 
 /*
- * Report whether firmware runs in recovery mode.  ice_get_fw_mode() tests the
+ * Report whether firmware can run the device.  ice_get_fw_mode() tests the
  * debug bit first, so a device in both debug and recovery mode reads as DBG;
  * the recovery bit is tested as well, within the per-MAC width of the field.
- * A failed read proves nothing, and the caller's access check fails it.
+ * A faulted read proves nothing either way, and the check consumes the fault,
+ * so the caller must fail on ICE_FW_UNREADABLE itself.
  */
-boolean_t
-ice_fw_recovery_mode(ice_t *ice, uint32_t *fwsmp)
+ice_fw_state_t
+ice_fw_state(ice_t *ice, uint32_t *fwsmp)
 {
 	struct ice_hw *hw = &ice->ice_hw;
 	uint32_t fwsm;
@@ -236,11 +237,14 @@ ice_fw_recovery_mode(ice_t *ice, uint32_t *fwsmp)
 	*fwsmp = fwsm;
 	if (ice_check_acc_handle(ice, ice->ice_osdep.ios_reg_handle) !=
 	    DDI_FM_OK)
-		return (B_FALSE);
+		return (ICE_FW_UNREADABLE);
 
-	return (ice_get_fw_mode(hw) == ICE_FW_MODE_REC ||
+	if (ice_get_fw_mode(hw) == ICE_FW_MODE_REC ||
 	    (fwsm & GL_MNG_FWSM_FW_MODES_M_BY_MAC(hw) &
-	    ICE_FWSM_MODE_RECOVERY) != 0);
+	    ICE_FWSM_MODE_RECOVERY) != 0)
+		return (ICE_FW_RECOVERY);
+
+	return (ICE_FW_USABLE);
 }
 
 /*
@@ -318,8 +322,15 @@ ice_hw_init(ice_t *ice)
 	 * nothing the driver builds on it is usable.  Detect it before any
 	 * admin queue work.
 	 */
-	if (ice_fw_recovery_mode(ice, &fwsm)) {
+	switch (ice_fw_state(ice, &fwsm)) {
+	case ICE_FW_USABLE:
+		break;
+	case ICE_FW_RECOVERY:
 		ice_fw_recovery_report(ice, fwsm);
+		return (B_FALSE);
+	default:
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
+		ice_error(ice, "cannot read the firmware state");
 		return (B_FALSE);
 	}
 
