@@ -2,8 +2,9 @@
 
 The [review working list](WORKLIST.md) tracks the open correctness,
 architecture, performance, and test issues, their priorities, and acceptance
-criteria. The driver [lifecycle contract](../../uts/common/io/ice/LIFECYCLE.md)
-records the lock, callback, DMA, and recovery boundaries exercised here.
+criteria. The theory statement at the top of
+[ice.c](../../uts/common/io/ice/ice.c) records the lock, lifecycle, DMA,
+filter, and recovery rules exercised here.
 
 ## Scheduler resource admission regression
 
@@ -74,8 +75,8 @@ Use `--source /path/to/ice_gld.c`, `--vsi-source /path/to/ice_vsi.c`, and
 `--filter-source /path/to/ice_filter.c` for matching source revisions. The pre-recovery source at `79bd14d475` compiles with this
 fixture and fails at runtime because a failed add does not request recovery.
 This test does not load the driver or establish hardware isolation. The
-[filter contract](../../uts/common/io/ice/FILTERS.md) records these ownership
-and recovery rules.
+"Filters and replay" section of the ice.c theory statement records these
+ownership and recovery rules.
 
 ## Device family regression
 

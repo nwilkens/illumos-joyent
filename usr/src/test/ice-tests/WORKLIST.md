@@ -286,7 +286,8 @@ This refactor does not establish hardware programming or rollback success.
 
 ## 10. Filter ownership contract
 
-[FILTERS.md](../../uts/common/io/ice/FILTERS.md) defines MAC references, the
+The "Filters and replay" section of the theory statement in
+[ice.c](../../uts/common/io/ice/ice.c) defines MAC references, the
 accepted driver replay set, imported bookkeeping, and hardware state as
 separate ownership domains. Duplicate/missing behavior, attach failure,
 partial commands, recovery, terminal retirement, replay, and final teardown
@@ -347,7 +348,7 @@ comments now reflect that ownership.
 
 ## 11. Lifecycle contract
 
-[LIFECYCLE.md](../../uts/common/io/ice/LIFECYCLE.md) records lock order,
+The theory statement in [ice.c](../../uts/common/io/ice/ice.c) records lock order,
 submission and callback fences, RX loan ownership, hardware isolation,
 reclamation prerequisites, reset request ownership, operational readiness,
 and detach rollback. The helper table states what each operation establishes

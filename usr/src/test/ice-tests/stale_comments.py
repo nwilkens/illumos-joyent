@@ -86,6 +86,20 @@ def main() -> None:
     for name, text in sources.items():
         assert "ice_glist" not in text and "ice_glock" not in text, name
 
+    # 4. The theory statement in ice.c replaces the old design notes, and its
+    # file list names exactly the driver's source files.
+    for gone in ("LIFECYCLE.md", "FILTERS.md"):
+        assert not (GLUE_DIR / gone).exists(), gone
+    theory = sources["ice.c"][:sources["ice.c"].index("#include")]
+    for section in ("Organization", "Device families", "State shared by PFs",
+                    "Locks", "Start, stop and reset", "Filters and replay",
+                    "Queues and offloads", "Diagnostic ioctls", "Validation"):
+        assert f" * {section}\n" in theory, section
+    org = theory[theory.index("Organization"):theory.index("Device families")]
+    listed = set(re.findall(r"\b(ice\w*\.c)\b", org))
+    actual = {p.name for p in GLUE_DIR.glob("*.c") if p.name != "ice_osdep.c"}
+    assert actual <= listed, sorted(actual - listed)
+
     print("PASS: ice glue comments match the implemented driver")
 
 

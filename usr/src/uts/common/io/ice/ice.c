@@ -14,13 +14,179 @@
  */
 
 /*
- * Intel Ethernet 800 series "ice" driver.
+ * ice - Intel Ethernet 800 series driver
  *
- * This file is the illumos device-driver glue: DDI attach/detach, FMA, PCI
- * configuration and register mapping, interrupt allocation, and bring-up of
- * the hardware through the Intel common code under core/.  The common code
- * reaches illumos services through the osdep shim (ice_osdep.[ch]) by way of
- * hw->back; that wiring is established at the top of attach.
+ * Each PCI physical function (PF) of an E800 series device is one instance
+ * of this driver and one MAC.  Firmware runs on the device and the driver
+ * programs it through an admin queue.  The Intel common code under core/
+ * encodes those commands and keeps the switch, scheduler and VSI bookkeeping.
+ * It reaches illumos through ice_osdep.[ch] by way of hw->back; attach wires
+ * that first.  core/README.illumos lists the few local changes to it.
+ *
+ * ------------
+ * Organization
+ * ------------
+ *
+ * ice.c		DDI entry points; the lifecycle: attach, detach, MAC
+ *			start and stop, reset and rebuild.
+ * ice_hw.c		Bring-up steps that attach and rebuild share: FMA,
+ *			registers, firmware checks, per-family decisions,
+ *			interrupt vectors.
+ * ice_intr.c		Interrupt handlers, the admin queue worker, link state.
+ * ice_gld.c		MAC callbacks and properties.
+ * ice_port.c		Transceiver access and the identification LED.
+ * ice_vsi.c		The PF's VSI and RSS.
+ * ice_filter.c		Accepted MAC addresses and promiscuous policy.
+ * ice_tx.c, ice_rx.c	The data path.
+ * ice_dma.c		DMA attributes and the TX copy-buffer pools.
+ * ice_stats.c		Hardware counters and kstats.
+ * ice_ddp.c		The DDP package load and safe mode.
+ * ice_ioctl.c		Firmware logging and debug dump ioctls.
+ *
+ * ---------------
+ * Device families
+ * ---------------
+ *
+ * The common code maps each device ID to a MAC type and keys every family
+ * difference on it, so the driver binds every ID that ice_set_mac_type()
+ * maps and rejects any other at attach.  Only the E810-C (0x1592) has been
+ * tested on hardware.  The differences the driver itself must handle:
+ *
+ * E810		The base case.
+ * E822, E823	ICE_MAC_GENERIC.  These have a sideband queue.  The common
+ *		code sizes, starts and stops it with the other control
+ *		queues; the admin worker discards the messages firmware posts
+ *		to it (ice_sbq_drain()) so that its ring cannot fill.  SGMII
+ *		ports link at 100 Mb/s.
+ * E825-C	ICE_MAC_GENERIC_3K_E825: the sideband queue as above, a
+ *		separate DDP signature that the common code selects, and a
+ *		slow EMPR (below).
+ * E830, E835	ICE_MAC_E830.  The TCLAN malicious-driver registers moved
+ *		(ICE_GL_MDET_TX_TCLAN()); PHY firmware loads after the PF is
+ *		up, so attach waits for it (ice_phy_fw_wait()); links reach
+ *		200 Gb/s; the common code uses the longer Get Link Status
+ *		response and the E830 DDP segment.  After an EMPR, E825-C and
+ *		E830 firmware needs more time than ice_check_reset() allows,
+ *		so the rebuild waits first (ice_reset_empr_slow()).
+ *
+ * The data path, queue contexts and descriptors are the same for all of
+ * them.  Features that differ by family but that the driver does not use
+ * (PTP, Tx time, DCB, SR-IOV) are not handled.
+ *
+ * -------------------
+ * State shared by PFs
+ * -------------------
+ *
+ * The PFs of one card share no driver state.  A card-wide reset (CORER,
+ * GLOBR, EMPR) reaches every PF as its own OICR cause, and each PF rebuilds
+ * itself; the driver issues only PF resets.  Firmware serializes the DDP
+ * download with its global configuration lock, and a later PF finds the
+ * package loaded.  Nothing else needs one owner per card, so there is no
+ * per-card structure.
+ *
+ * -----
+ * Locks
+ * -----
+ *
+ * ice_rebuild_lock is the outermost lock.  It is adaptive and is taken only in
+ * thread context: MAC start and stop, the reset worker, detach, and every
+ * management operation that sends a firmware command.  No interrupt handler
+ * takes it; handlers record causes and defer the work.  Then, in order:
+ *
+ *	ice_lock	interrupt priority; OICR causes and worker dispatch.
+ *			Never hold it across a firmware command, which can poll
+ *			for a second.
+ *	ring locks	each ring's descriptors, pool and interrupt routing.
+ *	vi_mac_lock	the accepted address list (ice_filter.c); it is
+ *			dropped around switch commands.
+ *	ice_loopback_lock, then ice_lse_lock	the link state cache.
+ *	ice_stat_lock	the counter baselines (ice_stats.c).
+ *	ice_fwlog_lock	the firmware log ring (ice_ioctl.c).
+ *
+ * Never wait for a worker while holding a lock that the worker takes.
+ *
+ * ---------------------
+ * Start, stop and reset
+ * ---------------------
+ *
+ * ICE_STATE_STARTED records a successful MAC start and whether a rebuild must
+ * start the data path again.  It does not mean that carrier is up or that DMA
+ * has stopped.  ICE_STATE_ERROR closes the data path.  MAC start refuses to
+ * run while a reset is owed or after a failed one, and clears an ordinary
+ * ERROR because it programs every queue again.
+ *
+ * MAC stop cannot fail.  If a queue does not confirm its disable, the queue
+ * can still write to memory, so stop releases nothing, closes the software
+ * paths, and requests a PF reset.  Packet memory is reclaimed only after a
+ * queue disable is confirmed or a reset completes.
+ *
+ * A reset request is an atomic cause bit: RESET_PENDING for a reset firmware
+ * or another PF started, PFR_REQ for one the driver owes.  The reset worker
+ * claims the bits under ice_rebuild_lock, prepares (quiesce, never release),
+ * waits for or issues the reset, and rebuilds.  A request that arrives after
+ * the claim stays owed and the worker dispatches again.  If a hardware or
+ * firmware step of the rebuild fails, ICE_STATE_RESET_FAILED is set; it is
+ * terminal and the device stays down until the driver is reloaded.  If only
+ * the data path restart fails, ERROR stays set and a later MAC start can
+ * recover.
+ *
+ * Firmware in recovery mode cannot run the device.  Attach checks for it
+ * before its first admin queue command, and the rebuild checks right after
+ * the reset.  Either posts an ereport.io.device.fw_corrupt, marks the service
+ * lost, tells the operator to update the NVM, and fails closed.
+ *
+ * Detach refuses a started interface.  Before MAC unregister it must prove
+ * that packet DMA has stopped: every queue confirmed its disable, or a PF
+ * reset completed, and no register access fault occurred meanwhile.  If that
+ * proof fails, or MAC refuses to unregister, detach keeps every resource and
+ * can be tried again.  Attach and detach record each completed step in
+ * ice_attach_progress, and ice_unconfigure() undoes only those steps.
+ *
+ * ------------------
+ * Filters and replay
+ * ------------------
+ *
+ * MAC owns the reference counts of addresses and promiscuous mode.  The
+ * driver records only what it accepted (vi_macs, ice_promisc_on) so that a
+ * rebuild can program it again.  The common code keeps its own rule records,
+ * and the hardware is a third copy; a failed command can leave the three out
+ * of step.  So a failed add returns its errno and requests a reset; a failed
+ * remove retires the address, requests a reset and succeeds, because MAC
+ * drops its reference anyway.  While a reset is owed or after one failed,
+ * adds fail with EIO and removals retire the record without a command.
+ *
+ * -------------------
+ * Queues and offloads
+ * -------------------
+ *
+ * The queue pair count is the lowest of the CPU count, the queues and vectors
+ * firmware gives this PF, the vectors the platform grants less the OICR
+ * vector, MAX_RINGS_PER_GROUP - 1, and the num_queues property.  It need not
+ * be a power of two: the VSI TC map rounds up, while the rings and the RSS
+ * table use the exact count.
+ *
+ * Checksum offload and LSO are advertised unless the DDP package is missing
+ * (safe mode), which also leaves one queue pair.  For LSO the MSS comes from
+ * mac_lso_get() and must be at least 88 bytes; the header is copied into one
+ * descriptor so that each segment uses at most eight.
+ *
+ * -----------------
+ * Diagnostic ioctls
+ * -----------------
+ *
+ * ice_ioctl.h describes the firmware logging and debug dump ioctls.  They
+ * reach card-wide firmware state, so only the global zone with
+ * {PRIV_SYS_DEVICES} and {PRIV_SYS_CONFIG} can use them, even when a zone
+ * owns the link.  No ioctl can start a card-wide reset.
+ *
+ * ----------
+ * Validation
+ * ----------
+ *
+ * usr/src/test/ice-tests runs the lifecycle, filter, reset, offload and
+ * ioctl code with controlled boundaries on any host.  Those checks cannot
+ * show memory ordering, device timing or interrupt delivery; the on-system
+ * tests in usr/src/test/ice-tests/runfiles cover those on hardware.
  */
 
 #include <sys/atomic.h>
