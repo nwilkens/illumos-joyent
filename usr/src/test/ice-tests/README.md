@@ -424,6 +424,24 @@ planted violation and the TX queue disable put back under `ice_lock` must
 both be reported. The walk ignores control flow beyond that, so it is a
 guard, not a proof.
 
+## Interrupt-priority lock check
+
+```
+python3 usr/src/test/ice-tests/intr_locks.py
+```
+
+`intr_locks.py` walks the glue as `aq_locks.py` does and fails on any call,
+made while `ice_lock`, `ice_lse_lock`, a ring lock or a TCB lock is held, that
+allocates with `KM_SLEEP` or `DDI_DMA_SLEEP`, allocates or frees DMA memory or
+handles (`ddi_dma_*`, `ice_dma_alloc()`, `ice_dma_free()`), frees kernel
+memory, frees a message (`freemsg()`, `freemsgchain()`, `freeb()`), or
+changes interrupt vectors or MAC interrupt handles. A call also fails if the
+glue or core function it reaches does any of these. A function that asserts
+it holds one of the locks is walked as holding it. Planted violations, direct
+and through a helper, must be reported. RX pools are built and freed outside
+`irxr_lock` and exchanged under it; completed TX packets and RX frames that
+cannot be delivered are freed after the ring lock is dropped.
+
 ## DDP section bounds regression
 
 ```
@@ -711,13 +729,15 @@ receive-sized pool constant is too small for a jumbo frame.
 `loan_wait.py` verifies that receive teardown never waits unbounded on loaned
 buffers: one absolute deadline is computed before the ring loop, the wait is a
 `cv_timedwait`, a ring that times out is left fully intact and is neither freed
-nor reposted, every control-block free is guarded by the loan count or pool
-ownership, a surviving pool is not clobbered on restart, and a single bounded
+nor reposted, a pool leaves a ring only under the ring lock and only when its
+loan count is zero or to be set aside, pools are freed after the lock is
+dropped, a surviving pool is not clobbered on restart, and a single bounded
 stop serves both the unplumb and reset callers. A start sets a pool with
 loans outstanding aside instead of failing, and detach waits, within the same
 bound, for the loans of the pools set aside.
 
-`rx_orphan.py` runs the actual pool functions through the RX harness. A peer
+`rx_orphan.py` runs the actual pool functions and `ice_rx_start()` through
+the RX harness. A peer
 can keep a loaned frame in a TCP reassembly queue for as long as its
 connection lives, and a start used to refuse to run until every loan was
 back, which left the link down across a replumb or reset. Setting a pool aside

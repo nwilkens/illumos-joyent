@@ -48,7 +48,7 @@ def main() -> None:
     assert "irxr_shutdown = B_TRUE" in close
     assert "irxr_started = B_FALSE" in close
     assert "cv_timedwait" not in close
-    assert "ice_rx_free_rcbs" not in close
+    assert "ice_rx_pool_" not in close
     # ...and the waiting pass may not reopen the question of which rings are
     # closed.
     assert "irxr_shutdown = " not in wait
@@ -60,7 +60,7 @@ def main() -> None:
     # (i40e can use a relative wait only because it broadcasts once, at zero.)
     assert "cv_reltimedwait" not in quiesce
     # The waiting half releases nothing at all.
-    assert "ice_rx_free_rcbs" not in quiesce
+    assert "ice_rx_pool_" not in quiesce
     assert "ice_rx_reset_desc" not in quiesce
     assert "ice_rx_setup_bufs" not in quiesce
     assert "return (drained)" in quiesce
@@ -73,29 +73,23 @@ def main() -> None:
         "ice_rx_reclaim(ice_t *ice)\n{",
         "\nboolean_t\nice_rx_stop",
     )
-    guard = reclaim.index("irxr_nloaned == 0")
-    assert guard < reclaim.index("ice_rx_free_rcbs(irr)")
+    assert "ice_rx_pool_release(" in reclaim
     assert "ice_rx_reset_desc" not in reclaim
     assert "ice_rx_setup_bufs" not in reclaim
 
-    # Every call site is guarded by the loan count or by pool ownership: a
-    # loaned control block still holds the stack's mblk in ircb_mp.
-    offset = 0
-    sites = 0
-    while True:
-        try:
-            offset = rx.index("ice_rx_free_rcbs(irr)", offset)
-        except ValueError:
-            break
-        preceding = rx[max(0, offset - 400):offset]
-        assert ("irxr_nloaned > 0" in preceding or
-            "irxr_nloaned == 0" in preceding or
-            "ASSERT0(irr->irxr_nloaned)" in preceding or
-            "irxr_rcb_area == NULL" in preceding or
-            "irxr_rcb_area != NULL" in preceding)
-        sites += 1
-        offset += 1
-    assert sites > 0
+    # A pool leaves a ring only under the lock, and a pool with loans
+    # outstanding only to be set aside: a loaned control block still holds
+    # the stack's mblk in ircb_mp.  Pools are freed with the lock dropped.
+    release = function(rx, "ice_rx_pool_release(ice_rx_ring_t *irr)\n{",
+                       "\n}\n")
+    assert release.index("mutex_enter(&irr->irxr_lock)") < \
+        release.index("irxr_nloaned == 0") < \
+        release.index("ice_rx_pool_swap(irr, &p)") < \
+        release.index("mutex_exit(&irr->irxr_lock)") < \
+        release.index("ice_rx_pool_free(&p)")
+    assert rx.count("ice_rx_pool_swap(irr, &p)") == 2
+    free = function(rx, "ice_rx_pool_free(ice_rx_pool_t *p)\n{", "\n}\n")
+    assert "ASSERT0(p->irp_nloaned)" in free
 
     # A pool that survived a timed-out stop is never clobbered or reused.
     start = function(
@@ -103,11 +97,14 @@ def main() -> None:
         "ice_rx_start(ice_t *ice)\n{",
         "\n/*\n * Tear down every rx ring",
     )
-    assert "irxr_rcb_area != NULL" in start
-    assert start.index("irxr_nloaned > 0") < start.index("ice_rx_alloc_rcbs")
+    assert start.index("ice_rx_pool_alloc(irr, &p)") < \
+        start.index("mutex_enter(&irr->irxr_lock)") < \
+        start.index("ice_rx_pool_swap(irr, &p)") < \
+        start.index("mutex_exit(&irr->irxr_lock)")
     # A pool with loans outstanding is set aside, not a reason to fail.
-    assert start.index("irxr_nloaned > 0") < start.index("ice_rx_orphan(irr)") \
-        < start.index("ice_rx_alloc_rcbs")
+    assert start.index("ice_rx_pool_swap(irr, &p)") < \
+        start.index("p.irp_nloaned > 0") < \
+        start.index("ice_rx_orphan_adopt(irr, o, &p)")
 
     # Detach waits for the set-aside pools too, within the same bound.
     drain = function(rx, "ice_rx_orphans_drain(ice_t *ice)\n{", "\n}\n")
@@ -124,15 +121,14 @@ def main() -> None:
         "ice_rx_ring_free(ice_rx_ring_t *irr)\n{",
         "\nstatic boolean_t\nice_rx_kstat_init",
     )
-    assert "ice_rx_free_rcbs(irr)" in ring_free
+    assert "ice_rx_pool_release(irr)" in ring_free
     assert "ASSERT0(irr->irxr_nloaned)" in ring_free
     assert ring_free.index("ASSERT0(irr->irxr_nloaned)") < \
-        ring_free.index("ice_rx_free_rcbs(irr)")
-    # It must precede the DMA/slot teardown: ice_rx_free_rcbs walks
-    # irxr_rcb_area and would otherwise run after the ring is gutted.
-    assert ring_free.index("ice_rx_free_rcbs(irr)") < \
+        ring_free.index("ice_rx_pool_release(irr)")
+    # It must precede the ring teardown: the release takes irxr_lock.
+    assert ring_free.index("ice_rx_pool_release(irr)") < \
         ring_free.index("ice_dma_free(&irr->irxr_desc_dma)")
-    assert ring_free.index("ice_rx_free_rcbs(irr)") < \
+    assert ring_free.index("ice_rx_pool_release(irr)") < \
         ring_free.index("mutex_destroy(&irr->irxr_lock)")
 
     rings_free = function(

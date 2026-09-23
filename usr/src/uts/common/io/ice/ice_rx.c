@@ -37,8 +37,9 @@
 #include "ice_common.h"
 #include "ice_lan_tx_rx.h"
 
-static void ice_rx_free_rcbs(ice_rx_ring_t *);
-static void ice_rx_orphans_reap(ice_rx_ring_t *);
+static void ice_rx_pool_free(ice_rx_pool_t *);
+static void ice_rx_pool_release(ice_rx_ring_t *);
+static boolean_t ice_rx_orphans_reap(ice_rx_ring_t *);
 
 /*
  * Free a single rx ring's DMA and per-slot state.  Safe to call on a ring that
@@ -56,19 +57,13 @@ ice_rx_ring_free(ice_rx_ring_t *irr)
 {
 	ASSERT0(irr->irxr_nloaned);
 	ASSERT(!irr->irxr_intr_busy);
-	ice_rx_free_rcbs(irr);
-	ice_rx_orphans_reap(irr);
-	VERIFY3P(irr->irxr_orphans, ==, NULL);
+	ice_rx_pool_release(irr);
+	VERIFY(ice_rx_orphans_reap(irr));
+	VERIFY3P(irr->irxr_rcb_area, ==, NULL);
 
 	if (irr->irxr_kstat != NULL) {
 		kstat_delete(irr->irxr_kstat);
 		irr->irxr_kstat = NULL;
-	}
-
-	if (irr->irxr_rcbs != NULL) {
-		kmem_free(irr->irxr_rcbs,
-		    irr->irxr_size * sizeof (ice_rx_ctrl_block_t *));
-		irr->irxr_rcbs = NULL;
 	}
 
 	if (irr->irxr_descs != NULL) {
@@ -184,18 +179,8 @@ ice_rx_ring_alloc(ice_t *ice, ice_rx_ring_t *irr, uint_t index)
 	irr->irxr_descs =
 	    (union ice_32b_rx_flex_desc *)irr->irxr_desc_dma.idb_va;
 
-	/*
-	 * The control blocks themselves (data buffers, desballoc loaners) are
-	 * posted by the data path; only the by-slot array is allocated now.
-	 */
-	irr->irxr_rcbs = kmem_zalloc(
-	    irr->irxr_size * sizeof (ice_rx_ctrl_block_t *), KM_SLEEP);
-
 	if (!ice_rx_kstat_init(ice, irr)) {
 		ice_error(ice, "failed to create rx ring %u kstat", index);
-		kmem_free(irr->irxr_rcbs,
-		    irr->irxr_size * sizeof (ice_rx_ctrl_block_t *));
-		irr->irxr_rcbs = NULL;
 		ice_dma_free(&irr->irxr_desc_dma);
 		irr->irxr_descs = NULL;
 		cv_destroy(&irr->irxr_intr_cv);
@@ -451,6 +436,11 @@ ice_rx_ring_unprogram(ice_t *ice, ice_rx_ring_t *irr)
  * fresh mblk and the buffer is left on the ring.  Loaned buffers return through
  * ice_rx_recycle(); teardown blocks until every loan is back.
  *
+ * irxr_lock is taken at interrupt priority, so no allocation, DMA release or
+ * freemsg(9F) happens under it.  A pool is built and freed outside the lock
+ * and only exchanged under it (ice_rx_pool_swap()), and a frame the drain
+ * cannot deliver is handed back to be freed after the lock is dropped.
+ *
  * Everything the hardware writes into the descriptor writeback is untrusted.
  * The decode reads each Descriptor Done bit first, issues a read barrier before
  * touching any other writeback field, and clamps every segment length to the
@@ -472,7 +462,7 @@ ice_rx_ring_unprogram(ice_t *ice, ice_rx_ring_t *irr)
  */
 #define	ICE_RX_LOAN_WAIT_US	5000000
 
-static mblk_t *ice_ring_rx(ice_rx_ring_t *, int, boolean_t *);
+static mblk_t *ice_ring_rx(ice_rx_ring_t *, int, boolean_t *, mblk_t **);
 
 /*
  * Attach a desballoc(9F) loaner mblk to a control block if it lacks one.  The
@@ -606,13 +596,11 @@ ice_rx_recycle(caddr_t arg)
 
 	if (irr->irxr_shutdown) {
 		/*
-		 * Teardown is waiting on outstanding loans.  Account this
-		 * one as returned and wake the waiter; the buffer is freed
-		 * by the teardown path, not re-armed.
+		 * Teardown is waiting on outstanding loans.  Return this one
+		 * without a loaner and wake the waiter; a closed pool is
+		 * never posted again.
 		 */
-		ASSERT3U(irr->irxr_nloaned, >, 0);
-		irr->irxr_nloaned--;
-		rcb->ircb_state = IRXB_FREE;
+		ice_rcb_free(irr, rcb);
 		cv_signal(&irr->irxr_cv);
 		mutex_exit(&irr->irxr_lock);
 		return;
@@ -650,37 +638,38 @@ ice_rx_reset_desc(ice_rx_ring_t *irr, uint16_t idx, ice_rx_ctrl_block_t *rcb)
 }
 
 /*
- * Allocate the per-ring control-block backing: one control block per
- * descriptor slot plus a loan reserve, each owning a DMA buffer with room
- * for ICE_RX_BUF_SIZE bytes after ICE_RX_HEADROOM, and a desballoc loaner.
- * Builds the spare free list; the descriptor
- * ring is populated by ice_rx_setup_bufs().
+ * Build a control-block pool for a ring: one control block per descriptor
+ * slot plus a loan reserve, each owning a DMA buffer with room for
+ * ICE_RX_BUF_SIZE bytes after ICE_RX_HEADROOM, and a desballoc loaner.  Every
+ * block starts on the free stack; ice_rx_setup_bufs() posts them.  Runs
+ * without irxr_lock.
  */
 static boolean_t
-ice_rx_alloc_rcbs(ice_rx_ring_t *irr)
+ice_rx_pool_alloc(ice_rx_ring_t *irr, ice_rx_pool_t *p)
 {
 	ice_t *ice = irr->irxr_ice;
 	ddi_dma_attr_t attr;
 	ddi_device_acc_attr_t acc;
 	uint_t i;
 
-	ASSERT(MUTEX_HELD(&irr->irxr_lock));
-
+	bzero(p, sizeof (*p));
 	/* A loan past the reserve falls back to a copy. */
-	irr->irxr_nreserve = MIN(ICE_RX_LOAN_RESERVE,
+	p->irp_nreserve = MIN(ICE_RX_LOAN_RESERVE,
 	    ICE_RX_LOAN_RESERVE_MAX / ice->ice_num_rxr);
-	irr->irxr_nrcb = irr->irxr_size + irr->irxr_nreserve;
-
-	irr->irxr_rcb_area = kmem_zalloc(
-	    irr->irxr_nrcb * sizeof (ice_rx_ctrl_block_t), KM_SLEEP);
-	irr->irxr_free_rcbs = kmem_zalloc(
-	    irr->irxr_nrcb * sizeof (ice_rx_ctrl_block_t *), KM_SLEEP);
+	p->irp_size = irr->irxr_size;
+	p->irp_nrcb = p->irp_size + p->irp_nreserve;
+	p->irp_area = kmem_zalloc(p->irp_nrcb * sizeof (ice_rx_ctrl_block_t),
+	    KM_SLEEP);
+	p->irp_free = kmem_zalloc(p->irp_nrcb * sizeof (ice_rx_ctrl_block_t *),
+	    KM_SLEEP);
+	p->irp_slots = kmem_zalloc(p->irp_size *
+	    sizeof (ice_rx_ctrl_block_t *), KM_SLEEP);
 
 	ice_pkt_dma_attr(ice, &attr);
 	ice_dma_acc_attr(ice, &acc);
 
-	for (i = 0; i < irr->irxr_nrcb; i++) {
-		ice_rx_ctrl_block_t *rcb = &irr->irxr_rcb_area[i];
+	for (i = 0; i < p->irp_nrcb; i++) {
+		ice_rx_ctrl_block_t *rcb = &p->irp_area[i];
 
 		rcb->ircb_ring = irr;
 		rcb->ircb_state = IRXB_FREE;
@@ -691,127 +680,210 @@ ice_rx_alloc_rcbs(ice_rx_ring_t *irr)
 		    ICE_RX_BUF_SIZE + ICE_RX_HEADROOM, B_TRUE)) {
 			ice_error(ice, "failed to allocate rx buffer for queue "
 			    "%u", irr->irxr_index);
+			ice_rx_pool_free(p);
 			return (B_FALSE);
 		}
 
 		(void) ice_rx_alloc_mp(rcb);
 
-		irr->irxr_free_rcbs[irr->irxr_nfree++] = rcb;
+		p->irp_free[p->irp_nfree++] = rcb;
 	}
 
 	return (B_TRUE);
 }
 
+static void
+ice_rx_rcb_release(ice_rx_ctrl_block_t *rcb)
+{
+	ASSERT3S(rcb->ircb_state, !=, IRXB_ONLOAN);
+	if (rcb->ircb_mp != NULL) {
+		freemsg(rcb->ircb_mp);
+		rcb->ircb_mp = NULL;
+	}
+	ice_dma_free(&rcb->ircb_dma);
+}
+
 /*
- * Free the per-ring control-block backing.  May only be called with
- * irxr_nloaned == 0: a loaned control block still holds the stack's mblk in
- * ircb_mp, so freeing here while a loan is outstanding is a double free of
- * that mblk and a use-after-free of live DMA.
+ * Free a pool that no ring holds.  May only be called with irp_nloaned == 0: a
+ * loaned control block still holds the stack's mblk in ircb_mp, so freeing
+ * here while a loan is outstanding is a double free of that mblk and a
+ * use-after-free of live DMA.
  */
 static void
-ice_rx_free_rcbs(ice_rx_ring_t *irr)
+ice_rx_pool_free(ice_rx_pool_t *p)
 {
 	uint_t i;
 
-	if (irr->irxr_rcb_area == NULL)
+	ASSERT0(p->irp_nloaned);
+	if (p->irp_area == NULL)
 		return;
 
-	for (i = 0; i < irr->irxr_nrcb; i++) {
-		ice_rx_ctrl_block_t *rcb = &irr->irxr_rcb_area[i];
+	for (i = 0; i < p->irp_nrcb; i++)
+		ice_rx_rcb_release(&p->irp_area[i]);
 
-		if (rcb->ircb_mp != NULL) {
-			freemsg(rcb->ircb_mp);
-			rcb->ircb_mp = NULL;
-		}
-		ice_dma_free(&rcb->ircb_dma);
+	kmem_free(p->irp_slots, p->irp_size * sizeof (ice_rx_ctrl_block_t *));
+	kmem_free(p->irp_free, p->irp_nrcb * sizeof (ice_rx_ctrl_block_t *));
+	kmem_free(p->irp_area, p->irp_nrcb * sizeof (ice_rx_ctrl_block_t));
+	bzero(p, sizeof (*p));
+}
+
+/*
+ * Exchange the ring's pool with *p.  A ring changes pools only while closed,
+ * and hardware no longer reaches the pool it gives up.
+ */
+static void
+ice_rx_pool_swap(ice_rx_ring_t *irr, ice_rx_pool_t *p)
+{
+	ice_rx_pool_t cur;
+
+	ASSERT(MUTEX_HELD(&irr->irxr_lock));
+	ASSERT(!irr->irxr_started);
+
+	cur.irp_area = irr->irxr_rcb_area;
+	cur.irp_free = irr->irxr_free_rcbs;
+	cur.irp_slots = irr->irxr_rcbs;
+	cur.irp_nrcb = irr->irxr_nrcb;
+	cur.irp_nfree = irr->irxr_nfree;
+	cur.irp_nreserve = irr->irxr_nreserve;
+	cur.irp_nloaned = irr->irxr_nloaned;
+	cur.irp_size = irr->irxr_size;
+
+	irr->irxr_rcb_area = p->irp_area;
+	irr->irxr_free_rcbs = p->irp_free;
+	irr->irxr_rcbs = p->irp_slots;
+	irr->irxr_nrcb = p->irp_nrcb;
+	irr->irxr_nfree = p->irp_nfree;
+	irr->irxr_nreserve = p->irp_nreserve;
+	irr->irxr_nloaned = p->irp_nloaned;
+
+	*p = cur;
+}
+
+/*
+ * Take a drained pool out of the ring and free it.  A pool with loans
+ * outstanding stays; ice_rx_start() sets it aside.
+ */
+static void
+ice_rx_pool_release(ice_rx_ring_t *irr)
+{
+	ice_rx_pool_t p;
+
+	bzero(&p, sizeof (p));
+	mutex_enter(&irr->irxr_lock);
+	if (irr->irxr_nloaned == 0)
+		ice_rx_pool_swap(irr, &p);
+	mutex_exit(&irr->irxr_lock);
+
+	ice_rx_pool_free(&p);
+}
+
+/*
+ * Free the blocks of a set-aside pool that are not on loan: those on its free
+ * stack and in its slots.  No returning loan touches either, so this needs no
+ * lock.  The block array and free stack stay with the ice_rx_orphan_t.
+ */
+static void
+ice_rx_pool_sweep(ice_rx_pool_t *p)
+{
+	uint_t i;
+
+	for (i = 0; i < p->irp_nfree; i++)
+		ice_rx_rcb_release(p->irp_free[i]);
+	for (i = 0; i < p->irp_size; i++) {
+		if (p->irp_slots[i] != NULL)
+			ice_rx_rcb_release(p->irp_slots[i]);
 	}
-
-	kmem_free(irr->irxr_free_rcbs,
-	    irr->irxr_nrcb * sizeof (ice_rx_ctrl_block_t *));
-	irr->irxr_free_rcbs = NULL;
-	kmem_free(irr->irxr_rcb_area,
-	    irr->irxr_nrcb * sizeof (ice_rx_ctrl_block_t));
-	irr->irxr_rcb_area = NULL;
-
-	irr->irxr_nfree = irr->irxr_nrcb = irr->irxr_nreserve = 0;
-	/* No pool implies not started, ice_rx_start()'s realloc included. */
-	irr->irxr_started = B_FALSE;
+	kmem_free(p->irp_slots, p->irp_size * sizeof (ice_rx_ctrl_block_t *));
+	p->irp_slots = NULL;
 }
 
 /*
  * Set aside a pool whose loans have not all come back, so that a start need
  * not wait for them: a peer can hold a loaned frame in a TCP reassembly queue
- * for as long as its connection lives.  Only the loaned buffers are kept.
- * Hardware no longer reaches the pool.
+ * for as long as its connection lives.
  */
-static boolean_t
-ice_rx_orphan(ice_rx_ring_t *irr)
+static void
+ice_rx_orphan_adopt(ice_rx_ring_t *irr, ice_rx_orphan_t *o,
+    const ice_rx_pool_t *p)
 {
-	ice_rx_orphan_t *o;
-	uint_t i, n = 0;
-
 	ASSERT(MUTEX_HELD(&irr->irxr_lock));
-	ASSERT3U(irr->irxr_nloaned, >, 0);
+	ASSERT3U(p->irp_nloaned, >, 0);
 
-	for (o = irr->irxr_orphans; o != NULL; o = o->iro_next)
-		n++;
-	if (n >= ICE_RX_ORPHANS_MAX)
-		return (B_FALSE);
-
-	o = kmem_zalloc(sizeof (*o), KM_SLEEP);
-	o->iro_area = irr->irxr_rcb_area;
-	o->iro_free = irr->irxr_free_rcbs;
-	o->iro_nrcb = irr->irxr_nrcb;
-	o->iro_nloaned = irr->irxr_nloaned;
-	for (i = 0; i < o->iro_nrcb; i++) {
-		ice_rx_ctrl_block_t *rcb = &o->iro_area[i];
-
-		if (rcb->ircb_state == IRXB_ONLOAN)
-			continue;
-		if (rcb->ircb_mp != NULL) {
-			freemsg(rcb->ircb_mp);
-			rcb->ircb_mp = NULL;
-		}
-		ice_dma_free(&rcb->ircb_dma);
-	}
+	o->iro_area = p->irp_area;
+	o->iro_free = p->irp_free;
+	o->iro_nrcb = p->irp_nrcb;
+	o->iro_nloaned = p->irp_nloaned;
 	o->iro_next = irr->irxr_orphans;
 	irr->irxr_orphans = o;
-
-	irr->irxr_rcb_area = NULL;
-	irr->irxr_free_rcbs = NULL;
-	irr->irxr_nfree = irr->irxr_nrcb = irr->irxr_nreserve = 0;
-	irr->irxr_nloaned = 0;
-	irr->irxr_started = B_FALSE;
-	return (B_TRUE);
 }
 
-/* Free every set-aside pool whose loans have all come back. */
-static void
-ice_rx_orphans_reap(ice_rx_ring_t *irr)
+static uint_t
+ice_rx_orphans_count(const ice_rx_ring_t *irr)
 {
-	ice_rx_orphan_t *o, **op = &irr->irxr_orphans;
+	const ice_rx_orphan_t *o;
+	uint_t n = 0;
+
+	ASSERT(MUTEX_HELD(&irr->irxr_lock));
+	for (o = irr->irxr_orphans; o != NULL; o = o->iro_next)
+		n++;
+	return (n);
+}
+
+static boolean_t
+ice_rx_orphans_loaned(const ice_rx_ring_t *irr)
+{
+	const ice_rx_orphan_t *o;
+
+	ASSERT(MUTEX_HELD(&irr->irxr_lock));
+	for (o = irr->irxr_orphans; o != NULL; o = o->iro_next) {
+		if (o->iro_nloaned != 0)
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+static void
+ice_rx_orphan_free(ice_rx_orphan_t *o)
+{
 	uint_t i;
 
+	for (i = 0; i < o->iro_nrcb; i++)
+		ice_rx_rcb_release(&o->iro_area[i]);
+	kmem_free(o->iro_free, o->iro_nrcb * sizeof (*o->iro_free));
+	kmem_free(o->iro_area, o->iro_nrcb * sizeof (*o->iro_area));
+	kmem_free(o, sizeof (*o));
+}
+
+/*
+ * Free every set-aside pool whose loans have all come back.  Returns B_TRUE
+ * if none is left.
+ */
+static boolean_t
+ice_rx_orphans_reap(ice_rx_ring_t *irr)
+{
+	ice_rx_orphan_t *o, **op, *dead = NULL;
+	boolean_t empty;
+
+	mutex_enter(&irr->irxr_lock);
+	op = &irr->irxr_orphans;
 	while ((o = *op) != NULL) {
 		if (o->iro_nloaned != 0) {
 			op = &o->iro_next;
 			continue;
 		}
 		*op = o->iro_next;
-		for (i = 0; i < o->iro_nrcb; i++) {
-			ice_rx_ctrl_block_t *rcb = &o->iro_area[i];
-
-			ASSERT3S(rcb->ircb_state, !=, IRXB_ONLOAN);
-			if (rcb->ircb_mp != NULL) {
-				freemsg(rcb->ircb_mp);
-				rcb->ircb_mp = NULL;
-			}
-			ice_dma_free(&rcb->ircb_dma);
-		}
-		kmem_free(o->iro_free, o->iro_nrcb * sizeof (*o->iro_free));
-		kmem_free(o->iro_area, o->iro_nrcb * sizeof (*o->iro_area));
-		kmem_free(o, sizeof (*o));
+		o->iro_next = dead;
+		dead = o;
 	}
+	empty = (irr->irxr_orphans == NULL);
+	mutex_exit(&irr->irxr_lock);
+
+	while ((o = dead) != NULL) {
+		dead = o->iro_next;
+		ice_rx_orphan_free(o);
+	}
+
+	return (empty);
 }
 
 /*
@@ -1096,20 +1168,21 @@ ice_rx_desc_sync(ice_rx_ring_t *irr, union ice_32b_rx_flex_desc *desc)
  * descriptor buffers into a b_cont chain.  On entry, a non-zero *total_lenp
  * is the remaining budget for a non-empty poll result; zero means unlimited.
  * A frame that exceeds that budget is deferred without consuming any slots.
+ * A frame that cannot be assembled is chained on *discardp for the caller to
+ * free once irxr_lock is dropped.
  */
 static mblk_t *
 ice_ring_rx_frame(ice_rx_ring_t *irr, uint32_t *total_lenp,
-    boolean_t *deferp)
+    boolean_t *deferp, mblk_t **discardp)
 {
 	ice_t *ice = irr->irxr_ice;
 	mblk_t *mp_head = NULL, *mp_tail = NULL;
-	ice_rx_ctrl_block_t *loaned[ICE_RX_MAX_DESC];
 	uint16_t seglens[ICE_RX_MAX_DESC];
 	uint32_t frame_limit = *total_lenp;
 	uint32_t total = 0;
 	uint16_t h = irr->irxr_head;
 	uint16_t eop_status0 = 0, eop_ptype = 0, eop_l2tag1 = 0;
-	uint16_t nsegs = 0, nloans = 0, i;
+	uint16_t nsegs = 0, i;
 	boolean_t bad = B_FALSE, eop = B_FALSE, vlan = B_FALSE;
 	boolean_t dma_fault = B_FALSE;
 
@@ -1211,10 +1284,7 @@ ice_ring_rx_frame(ice_rx_ring_t *irr, uint32_t *total_lenp,
 
 		if (seglen >= ICE_RX_COPY_THRESHOLD) {
 			mp = ice_rx_bind(irr, h, rcb, seglen);
-			if (mp != NULL) {
-				bound = B_TRUE;
-				loaned[nloans++] = rcb;
-			}
+			bound = (mp != NULL);
 		}
 		if (mp == NULL)
 			mp = ice_rx_copy(irr, rcb, seglen);
@@ -1246,22 +1316,12 @@ ice_ring_rx_frame(ice_rx_ring_t *irr, uint32_t *total_lenp,
 
 assemble_fail:
 	/*
-	 * desballoc(9F) invokes ice_rx_recycle() synchronously from
-	 * freemsg(9F).  Mark partial loans returned while holding the ring
-	 * lock so the callback takes its non-loaned path and cannot recursively
-	 * enter this mutex; re-arm and stack the control blocks afterwards.
+	 * A partial loan comes back through ice_rx_recycle(), which takes this
+	 * lock, so the caller frees the chain once it has dropped it.
 	 */
-	for (i = 0; i < nloans; i++) {
-		ASSERT3S(loaned[i]->ircb_state, ==, IRXB_ONLOAN);
-		ASSERT3U(irr->irxr_nloaned, >, 0);
-		irr->irxr_nloaned--;
-		loaned[i]->ircb_state = IRXB_FREE;
-	}
-	if (mp_head != NULL)
-		freemsg(mp_head);
-	for (i = 0; i < nloans; i++) {
-		(void) ice_rx_alloc_mp(loaned[i]);
-		ice_rcb_free(irr, loaned[i]);
+	if (mp_head != NULL) {
+		mp_head->b_next = *discardp;
+		*discardp = mp_head;
 	}
 
 	ice_rx_discard_frame(irr, nsegs);
@@ -1285,11 +1345,13 @@ assemble_fail:
  * through *limitp so the ISR can schedule a software interrupt for them; see
  * ice_intr_queue() for why a plain re-arm cannot service that residue.
  * Refilled slots advance the tail doorbell so hardware can reuse them.
- * On error the caller must discard the returned chain after dropping the
- * ring lock: freeing loaned segments synchronously re-enters that lock.
+ * On error the caller must discard the returned chain, and in every case the
+ * *discardp chain, after dropping the ring lock: freeing loaned segments
+ * synchronously re-enters that lock.
  */
 static mblk_t *
-ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp)
+ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp,
+    mblk_t **discardp)
 {
 	ice_t *ice = irr->irxr_ice;
 	struct ice_hw *hw = &ice->ice_hw;
@@ -1336,7 +1398,7 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp)
 		if (poll_bytes > 0 && bytes > 0)
 			total_len = (uint32_t)poll_bytes - bytes;
 
-		mp = ice_ring_rx_frame(irr, &total_len, &defer);
+		mp = ice_ring_rx_frame(irr, &total_len, &defer, discardp);
 		if (defer)
 			break;
 
@@ -1424,7 +1486,7 @@ ice_ring_rx_poll(void *arg, int poll_bytes)
 {
 	ice_rx_ring_t *irr = arg;
 	boolean_t limit, failed;
-	mblk_t *mp;
+	mblk_t *mp, *discard = NULL;
 
 	/*
 	 * A bandwidth-capped SRS at its drop threshold polls with a zero
@@ -1440,11 +1502,12 @@ ice_ring_rx_poll(void *arg, int poll_bytes)
 		mutex_exit(&irr->irxr_lock);
 		return (NULL);
 	}
-	mp = ice_ring_rx(irr, poll_bytes, &limit);
+	mp = ice_ring_rx(irr, poll_bytes, &limit, &discard);
 	failed = (irr->irxr_ice->ice_state & ICE_STATE_ERROR) != 0;
 	mutex_exit(&irr->irxr_lock);
 
 	/* Loan recycling re-enters irxr_lock, so discard outside it. */
+	freemsgchain(discard);
 	if (failed) {
 		freemsgchain(mp);
 		return (NULL);
@@ -1470,7 +1533,7 @@ boolean_t
 ice_rx_ring_intr(ice_rx_ring_t *irr)
 {
 	ice_t *ice = irr->irxr_ice;
-	mblk_t *mp, *discard = NULL;
+	mblk_t *mp, *discard = NULL, *failed = NULL;
 	uint64_t gen;
 	boolean_t limit;
 
@@ -1479,9 +1542,9 @@ ice_rx_ring_intr(ice_rx_ring_t *irr)
 		mutex_exit(&irr->irxr_lock);
 		return (B_FALSE);
 	}
-	mp = ice_ring_rx(irr, 0, &limit);
+	mp = ice_ring_rx(irr, 0, &limit, &discard);
 	if ((ice->ice_state & ICE_STATE_ERROR) != 0) {
-		discard = mp;
+		failed = mp;
 		mp = NULL;
 	}
 	gen = irr->irxr_rxgen;
@@ -1491,6 +1554,7 @@ ice_rx_ring_intr(ice_rx_ring_t *irr)
 
 	/* A failed drain can contain loans; their callbacks need irxr_lock. */
 	freemsgchain(discard);
+	freemsgchain(failed);
 
 	if (mp != NULL) {
 		mac_rx_ring(ice->ice_mac_hdl, irr->irxr_macrxring, mp, gen);
@@ -1674,14 +1738,13 @@ ice_ring_rx_stat(mac_ring_driver_t rh, uint_t stat, uint64_t *val)
 }
 
 /*
- * Allocate the control blocks for every rx ring.  Called once the queue
+ * Give every rx ring a new control-block pool.  Called once the queue
  * contexts are programmed; the descriptors are posted by ice_ring_rx_start().
  *
- * A pool may have survived a teardown that timed out waiting for loans; it is
- * never reused, because ice_rx_recycle()'s shutdown path drops returning
- * control blocks without re-arming them or putting them back on the free list.
- * Free it if drained, or set it aside, and start with a new pool.  A ring
- * that already holds ICE_RX_ORPHANS_MAX such pools does not start.
+ * The old pool is never reused: ice_rx_recycle()'s shutdown path returns
+ * control blocks without re-arming them.  It is freed if drained, or set
+ * aside if a teardown timed out waiting for its loans.  A ring that already
+ * holds ICE_RX_ORPHANS_MAX such pools does not start.
  */
 boolean_t
 ice_rx_start(ice_t *ice)
@@ -1690,39 +1753,43 @@ ice_rx_start(ice_t *ice)
 
 	for (i = 0; i < ice->ice_num_rxr; i++) {
 		ice_rx_ring_t *irr = &ice->ice_rxr[i];
+		ice_rx_orphan_t *o;
+		ice_rx_pool_t p;
+		boolean_t ok;
+
+		(void) ice_rx_orphans_reap(irr);
+		if (!ice_rx_pool_alloc(irr, &p))
+			goto unwind;
+		o = kmem_zalloc(sizeof (*o), KM_SLEEP);
 
 		mutex_enter(&irr->irxr_lock);
-		ice_rx_orphans_reap(irr);
-		if (irr->irxr_rcb_area != NULL) {
-			if (irr->irxr_nloaned > 0) {
-				if (!ice_rx_orphan(irr)) {
-					mutex_exit(&irr->irxr_lock);
-					goto unwind;
-				}
-			} else {
-				ice_rx_free_rcbs(irr);
+		ok = !irr->irxr_started && (irr->irxr_nloaned == 0 ||
+		    ice_rx_orphans_count(irr) < ICE_RX_ORPHANS_MAX);
+		if (ok) {
+			ice_rx_pool_swap(irr, &p);
+			if (p.irp_nloaned > 0) {
+				ice_rx_orphan_adopt(irr, o, &p);
+				o = NULL;
 			}
 		}
-
-		if (!ice_rx_alloc_rcbs(irr)) {
-			ice_rx_free_rcbs(irr);
-			mutex_exit(&irr->irxr_lock);
-			goto unwind;
-		}
 		mutex_exit(&irr->irxr_lock);
+
+		/* p now holds the old pool, or the new one if not taken. */
+		if (o == NULL) {
+			ice_rx_pool_sweep(&p);
+		} else {
+			kmem_free(o, sizeof (*o));
+			ice_rx_pool_free(&p);
+		}
+		if (!ok)
+			goto unwind;
 	}
 
 	return (B_TRUE);
 
 unwind:
-	while (i-- > 0) {
-		ice_rx_ring_t *irr = &ice->ice_rxr[i];
-
-		mutex_enter(&irr->irxr_lock);
-		ASSERT0(irr->irxr_nloaned);
-		ice_rx_free_rcbs(irr);
-		mutex_exit(&irr->irxr_lock);
-	}
+	while (i-- > 0)
+		ice_rx_pool_release(&ice->ice_rxr[i]);
 
 	return (B_FALSE);
 }
@@ -1803,17 +1870,15 @@ ice_rx_orphans_drain(ice_t *ice)
 		ice_rx_ring_t *irr = &ice->ice_rxr[i];
 
 		mutex_enter(&irr->irxr_lock);
-		for (;;) {
-			ice_rx_orphans_reap(irr);
-			if (irr->irxr_orphans == NULL ||
-			    cv_timedwait(&irr->irxr_cv, &irr->irxr_lock,
+		while (ice_rx_orphans_loaned(irr)) {
+			if (cv_timedwait(&irr->irxr_cv, &irr->irxr_lock,
 			    deadline) == -1)
 				break;
 		}
-		ice_rx_orphans_reap(irr);
-		if (irr->irxr_orphans != NULL)
-			drained = B_FALSE;
 		mutex_exit(&irr->irxr_lock);
+
+		if (!ice_rx_orphans_reap(irr))
+			drained = B_FALSE;
 	}
 
 	return (drained);
@@ -1833,13 +1898,8 @@ ice_rx_reclaim(ice_t *ice)
 	uint_t i;
 
 	for (i = 0; i < ice->ice_num_rxr; i++) {
-		ice_rx_ring_t *irr = &ice->ice_rxr[i];
-
-		mutex_enter(&irr->irxr_lock);
-		if (irr->irxr_nloaned == 0)
-			ice_rx_free_rcbs(irr);
-		ice_rx_orphans_reap(irr);
-		mutex_exit(&irr->irxr_lock);
+		ice_rx_pool_release(&ice->ice_rxr[i]);
+		(void) ice_rx_orphans_reap(&ice->ice_rxr[i]);
 	}
 }
 

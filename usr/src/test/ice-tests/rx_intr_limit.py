@@ -37,7 +37,7 @@ def main() -> None:
     rx = RX_SOURCE.read_text(encoding="utf-8")
     ring_rx = function(
         rx,
-        "ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp)",
+        "ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp,",
         "\nmblk_t *\nice_ring_rx_poll",
     )
 
@@ -55,7 +55,7 @@ def main() -> None:
     assert peek < ring_rx.index("*limitp = B_TRUE")
     # the limit check runs before a frame is pulled, and every non-deferred
     # frame counts, so discards consume budget too
-    assert check < ring_rx.index("ice_ring_rx_frame(irr, &total_len, &defer)")
+    assert check < ring_rx.index("ice_ring_rx_frame(irr, &total_len, &defer, discardp)")
     assert ring_rx.index("frames++") > ring_rx.index("if (defer)")
     assert ring_rx.index("frames++") < ring_rx.index("if (mp == NULL)")
 
@@ -65,12 +65,12 @@ def main() -> None:
                     "\nboolean_t\nice_rx_ring_intr")
     assert "if (poll_bytes <= 0)" in poll
     assert "ASSERT3S(poll_bytes" not in poll
-    assert "ice_ring_rx(irr, poll_bytes, &limit)" in poll
+    assert "ice_ring_rx(irr, poll_bytes, &limit, &discard)" in poll
 
     # the interrupt path reports a limit hit to its caller
     intr = function(rx, "ice_rx_ring_intr(ice_rx_ring_t *irr)",
                     "\nint\nice_ring_rx_intr_enable")
-    assert "ice_ring_rx(irr, 0, &limit)" in intr
+    assert "ice_ring_rx(irr, 0, &limit, &discard)" in intr
     assert "return (limit);" in intr
 
     # the kstat is published under the i40e-compatible name

@@ -111,16 +111,19 @@ def main() -> None:
         "cv_timedwait"
     )
 
-    # The clear lives in the pool destructor rather than at each call site, so
-    # "no pool implies not started" holds for the realloc inside ice_rx_start()
-    # and its unwind path too.  Without this the rebuild would no-op on a ring
-    # whose pool it had just reallocated and leave hardware an empty ring.
-    freercb = function(
+    # A ring changes pools only while closed: ice_rx_start() refuses a
+    # started ring under the lock before the exchange, and the exchange
+    # asserts it.  A started ring keeping its flag over a new pool would make
+    # the rebuild no-op and leave hardware an empty ring.
+    swap = function(
         rx,
-        "ice_rx_free_rcbs(ice_rx_ring_t *irr)\n{",
-        "\n/*\n * Fill every",
+        "ice_rx_pool_swap(ice_rx_ring_t *irr, ice_rx_pool_t *p)\n{",
+        "\n}\n",
     )
-    assert "irxr_started = B_FALSE" in freercb
+    assert "ASSERT(!irr->irxr_started);" in swap
+    start = function(rx, "ice_rx_start(ice_t *ice)\n{", "\n}\n")
+    assert start.index("!irr->irxr_started") < \
+        start.index("ice_rx_pool_swap(irr, &p)")
 
     # Those four bodies are the only places the flag is touched.  A fifth site
     # is not necessarily wrong, but it has to be reviewed for lock coverage and
@@ -129,7 +132,8 @@ def main() -> None:
         opened.count("irxr_started")
         + stop.count("irxr_started")
         + quiesce.count("irxr_started")
-        + freercb.count("irxr_started")
+        + swap.count("irxr_started")
+        + start.count("irxr_started")
     )
 
     # Reachability of the contract: ice_rx_setup_bufs() has exactly one caller,

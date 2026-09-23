@@ -23,7 +23,7 @@ layout(size_t length, boolean_t tagged, boolean_t force_copy)
 	uint_t nfree;
 	uint32_t total = 0;
 	boolean_t defer;
-	mblk_t *mp, *m;
+	mblk_t *mp, *m, *discard = NULL;
 	size_t offset, l2len, copied = 0;
 
 	setup(&ring, &ice);
@@ -46,9 +46,9 @@ layout(size_t length, boolean_t tagged, boolean_t force_copy)
 	if (force_copy)
 		ring.irxr_nreserve = 0;
 	mutex_enter(&ring.irxr_lock);
-	mp = ice_ring_rx_frame(&ring, &total, &defer);
+	mp = ice_ring_rx_frame(&ring, &total, &defer, &discard);
 	mutex_exit(&ring.irxr_lock);
-	assert(mp != NULL && !defer && checksum_head == mp);
+	assert(mp != NULL && !defer && checksum_head == mp && discard == NULL);
 	for (i = 0; i < nsegs; i++) {
 		ddi_dma_handle_t d = posted[i]->ircb_dma.idb_dma_handle;
 
@@ -107,6 +107,7 @@ reserve(void)
 {
 	const unsigned rings[] = { 1, 16, 127 };
 	ice_rx_ring_t ring;
+	ice_rx_pool_t p;
 	ice_t ice;
 	unsigned i, want;
 
@@ -114,19 +115,14 @@ reserve(void)
 		setup(&ring, &ice);
 		teardown(&ring);
 		ice.ice_num_rxr = rings[i];
-		mutex_enter(&ring.irxr_lock);
-		ring.irxr_rcbs = calloc(ring.irxr_size,
-		    sizeof (*ring.irxr_rcbs));
-		assert(ice_rx_alloc_rcbs(&ring));
+		assert(ice_rx_pool_alloc(&ring, &p));
 		want = MIN(ICE_RX_LOAN_RESERVE,
 		    ICE_RX_LOAN_RESERVE_MAX / rings[i]);
-		assert(ring.irxr_nreserve == want && want >= 1);
+		assert(p.irp_nreserve == want && want >= 1);
 		assert(want * rings[i] <= ICE_RX_LOAN_RESERVE_MAX);
-		assert(ring.irxr_nrcb == ring.irxr_size + want);
-		assert(ring.irxr_nfree == ring.irxr_nrcb);
-		ice_rx_free_rcbs(&ring);
-		mutex_exit(&ring.irxr_lock);
-		free(ring.irxr_rcbs);
+		assert(p.irp_nrcb == ring.irxr_size + want);
+		assert(p.irp_nfree == p.irp_nrcb);
+		ice_rx_pool_free(&p);
 	}
 	assert(MIN(ICE_RX_LOAN_RESERVE, ICE_RX_LOAN_RESERVE_MAX / 16) == 1024);
 	assert(live_mblks == 0 && live_dma == 0);

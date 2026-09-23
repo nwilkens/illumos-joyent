@@ -10,16 +10,16 @@ from c_test import DRIVER, TESTDIR, extract, run_c
 FUNCTIONS = (
     "ice_rx_alloc_mp", "ice_rcb_alloc", "ice_rcb_free", "ice_rx_rcb_current",
     "ice_rx_orphan_return", "ice_rx_recycle", "ice_rx_reset_desc",
-    "ice_rx_orphan", "ice_rx_orphans_reap", "ice_rx_alloc_rcbs",
-    "ice_rx_free_rcbs",
+    "ice_rx_pool_alloc", "ice_rx_rcb_release", "ice_rx_pool_free",
+    "ice_rx_pool_swap", "ice_rx_pool_release", "ice_rx_pool_sweep",
+    "ice_rx_orphan_adopt", "ice_rx_orphans_count", "ice_rx_orphans_loaned",
+    "ice_rx_orphan_free", "ice_rx_orphans_reap",
     "ice_rx_next", "ice_rx_copy", "ice_rx_bind", "ice_rx_discard_frame",
     "ice_rx_vlan_insert", "ice_rx_desc_sync", "ice_ring_rx_frame",
 )
 
 
-def run(test, functions=FUNCTIONS, optional=("ice_rx_desc_sync",
-        "ice_rx_rcb_current", "ice_rx_orphan_return", "ice_rx_orphan",
-        "ice_rx_orphans_reap")):
+def run(test, functions=FUNCTIONS, optional=("ice_rx_desc_sync",)):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=DRIVER / "ice_rx.c")
     parser.add_argument("--header", type=Path, default=DRIVER / "ice.h")

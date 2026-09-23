@@ -38,7 +38,7 @@ def main() -> None:
     # quiesces only; the reclaim moved past the barrier.
     assert "ice_tx_stop(ice)" not in prepare
     assert "ice_rx_stop(ice)" not in prepare
-    assert "ice_rx_free_rcbs" not in prepare
+    assert "ice_rx_pool_" not in prepare and "ice_rx_reclaim" not in prepare
     assert "ice_tcb_free" not in prepare
     assert "ice_tx_quiesce(ice)" in prepare
     assert "ice_rx_quiesce(ice)" in prepare
@@ -247,7 +247,9 @@ def main() -> None:
     assert "ice_tcb_free" not in tx_quiesce
     tx_reclaim = function(
         tx, "ice_tx_reclaim(ice_t *ice)\n{", "\nvoid\nice_tx_stop")
-    assert "ice_tcb_free(itr, itr->itxr_tcbs[slot])" in tx_reclaim
+    assert "ice_tcb_release(itr, itr->itxr_tcbs[slot])" in tx_reclaim
+    assert tx_reclaim.index("mutex_exit(&itr->itxr_lock)") < \
+        tx_reclaim.index("freemsgchain(done)")
     tx_stop = function(tx, "ice_tx_stop(ice_t *ice)\n{", "\n/*\n")
     assert tx_stop.index("ice_tx_quiesce(ice)") < tx_stop.index(
         "ice_tx_reclaim(ice)"
@@ -258,15 +260,18 @@ def main() -> None:
         rx, "ice_rx_quiesce(ice_t *ice)\n{", "\nvoid\nice_rx_reclaim")
     assert "irxr_shutdown = B_TRUE" in rx_quiesce
     assert "cv_timedwait(&irr->irxr_cv" in rx_quiesce
-    assert "ice_rx_free_rcbs" not in rx_quiesce
+    assert "ice_rx_pool_" not in rx_quiesce
     assert "return (drained)" in rx_quiesce
     rx_reclaim = function(
         rx, "ice_rx_reclaim(ice_t *ice)\n{", "\nboolean_t\nice_rx_stop")
     # A ring that never drained keeps its pool: freeing it would double free
     # the mblk the stack still holds.  The count is re-tested under the ring
     # lock because a late return can land between the quiesce and here.
-    assert "irxr_nloaned == 0" in rx_reclaim
-    assert "ice_rx_free_rcbs(irr)" in rx_reclaim
+    assert "ice_rx_pool_release(" in rx_reclaim
+    release = function(
+        rx, "ice_rx_pool_release(ice_rx_ring_t *irr)\n{", "\n}\n")
+    assert release.index("irxr_nloaned == 0") < \
+        release.index("ice_rx_pool_swap(irr, &p)")
     rx_stop = function(rx, "ice_rx_stop(ice_t *ice)\n{", "\n/*\n")
     assert rx_stop.index("ice_rx_quiesce(ice)") < rx_stop.index(
         "ice_rx_reclaim(ice)"
@@ -276,8 +281,8 @@ def main() -> None:
     # path too: it is the only reclaim for a ring that timed out.
     rx_start = function(
         rx, "ice_rx_start(ice_t *ice)\n{", "\n/*\n * Tear down every rx ring")
-    assert "irxr_nloaned > 0" in rx_start
-    assert "ice_rx_free_rcbs(irr)" in rx_start
+    assert "irxr_nloaned == 0" in rx_start
+    assert "ice_rx_pool_free(&p)" in rx_start
 
     print("PASS: ice reset prepare/rebuild source invariants")
 

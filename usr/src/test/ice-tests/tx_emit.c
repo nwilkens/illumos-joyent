@@ -27,7 +27,7 @@ typedef void *ddi_acc_handle_t;
 typedef uint16_t __le16;
 typedef uint32_t __le32;
 typedef uint64_t __le64;
-typedef struct { uint_t frees; } mblk_t;
+typedef struct mblk { uint_t frees; struct mblk *b_next; } mblk_t;
 typedef struct {
 	uint64_t dmac_laddress;
 	uint32_t dmac_size;
@@ -50,6 +50,8 @@ typedef struct fake_dma {
 #define	ASSERT0(x)	assert((x) == 0)
 /* CSTYLED */
 #define	ASSERT3U(a, op, b)	assert((a) op (b))
+/* CSTYLED */
+#define	ASSERT3P(a, op, b)	assert((a) op (b))
 /* CSTYLED */
 #define	VERIFY3U(a, op, b)	assert((a) op (b))
 #define	MUTEX_HELD(lock)	(*(lock))
@@ -201,9 +203,26 @@ ice_buf_put(ice_dma_buffer_t *buf)
 static void
 freemsg(mblk_t *mp)
 {
+	if (mp == NULL)
+		return;
 	assert(mp == &f.mp);
 	assert(++mp->frees == 1);
 }
+
+/* Recycle runs under itxr_lock; the caller frees what it hands back. */
+static void
+freemsgchain(mblk_t *mp)
+{
+	assert(!f.ring.itxr_lock);
+	while (mp != NULL) {
+		mblk_t *next = mp->b_next;
+
+		mp->b_next = NULL;
+		freemsg(mp);
+		mp = next;
+	}
+}
+
 
 static void
 ddi_fm_service_impact(void *dip, int impact)
@@ -248,6 +267,22 @@ ice_check_acc_handle(ice_t *ice, ddi_acc_handle_t handle)
 }
 
 #include "ice_tx_emit_body.h"
+
+/* The fixture holds itxr_lock; recycled mblks are freed with it dropped. */
+static uint_t
+recycle(void)
+{
+	mblk_t *done = NULL;
+	uint_t n;
+
+	assert(f.ring.itxr_lock);
+	n = ice_tx_recycle(&f.ring, &done);
+	assert(f.mp.frees == 0 || done == NULL);
+	f.ring.itxr_lock = B_FALSE;
+	freemsgchain(done);
+	f.ring.itxr_lock = B_TRUE;
+	return (n);
+}
 
 static void
 setup(ice_tcb_type_t copy_type, boolean_t lso, uint16_t start,
@@ -445,14 +480,14 @@ complete_packet(void)
 	uint_t before;
 
 	/* Completion before the packet's RS descriptor must free nothing. */
-	assert(ice_tx_recycle(&f.ring) == 0);
+	assert(recycle() == 0);
 	assert(f.ring.itxr_tcb_nfree == 0 && f.mp.frees == 0);
 	bits = read_le64(&f.ring.itxr_descs[last].cmd_type_offset_bsz);
 	f.ring.itxr_descs[last].cmd_type_offset_bsz =
 	    little_endian((bits & ~UINT64_C(0xf)) | 0xf);
 	f.ring.itxr_blocked = B_TRUE;
 	before = f.nsyncs;
-	assert(ice_tx_recycle(&f.ring) == f.ndesc);
+	assert(recycle() == f.ndesc);
 	check_sync(before, &f.dma[0], last * sizeof (struct ice_tx_desc),
 	    sizeof (struct ice_tx_desc), DDI_DMA_SYNC_FORKERNEL);
 	assert(f.ring.itxr_head == f.end && f.ring.itxr_avail == RING_SIZE);
@@ -460,7 +495,7 @@ complete_packet(void)
 	assert(!f.ring.itxr_blocked && f.notices == 1);
 	check_released();
 	check_empty_slots();
-	assert(ice_tx_recycle(&f.ring) == 0);
+	assert(recycle() == 0);
 	check_released();
 }
 

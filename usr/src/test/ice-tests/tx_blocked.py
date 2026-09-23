@@ -35,19 +35,21 @@ def main() -> None:
     assert enter < arm
 
     # ... and reclaim is re-driven after arming, before dropping the lock
-    recycle = nores.index("ice_tx_recycle(itr)")
+    recycle = nores.index("ice_tx_recycle(itr, &done)")
     exit_ = nores.index("mutex_exit(&itr->itxr_lock)")
     assert arm < recycle < exit_
 
     # the caller still keeps the chain for MAC to retry
     assert "return (B_FALSE);" in nores
+    # completed packets are freed once the ring lock is dropped
+    assert exit_ < nores.index("freemsgchain(done)")
 
     # a drop that returns resources rewakes a ring another sender blocked
     drop = build[build.index("if (res == ICE_TX_BUILD_DROP)"):]
     drop = drop[:drop.index("return (B_TRUE);")]
     assert drop.index("mutex_enter(&itr->itxr_lock)") < \
         drop.index("if (itr->itxr_blocked)") < \
-        drop.index("ice_tx_recycle(itr)") < \
+        drop.index("ice_tx_recycle(itr, &done)") < \
         drop.index("mutex_exit(&itr->itxr_lock)")
 
     # the TX path never waits on an LSO allocation: MAC start made the pool
@@ -66,13 +68,13 @@ def main() -> None:
 
     # the sibling arm path still recycles before arming
     sibling = one[one.index("if (itr->itxr_avail <= ndesc)"):]
-    assert sibling.index("ice_tx_recycle(itr)") < sibling.index(
+    assert sibling.index("ice_tx_recycle(itr, &done)") < sibling.index(
         "itr->itxr_blocked = B_TRUE")
 
     # recycle still owns the wakeup in both of its exits
     rec = function(
         tx,
-        "ice_tx_recycle(ice_tx_ring_t *itr)\n{",
+        "ice_tx_recycle(ice_tx_ring_t *itr, mblk_t **donep)\n{",
         "\nstatic boolean_t\nice_tx_one",
     )
     assert rec.count("mac_tx_ring_update(") == 2

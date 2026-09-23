@@ -462,6 +462,22 @@ struct ice_rx_ctrl_block {
 	ice_rcb_state_t		ircb_state;
 };
 
+/*
+ * A ring's control-block pool as a unit, so that it is built and released
+ * without irxr_lock and only exchanged under it.  Each block is on the free
+ * stack, in a slot, or out on loan.
+ */
+typedef struct ice_rx_pool {
+	ice_rx_ctrl_block_t	*irp_area;	/* [irp_nrcb] */
+	ice_rx_ctrl_block_t	**irp_free;	/* [irp_nrcb] free stack */
+	ice_rx_ctrl_block_t	**irp_slots;	/* [irp_size] posted, by slot */
+	uint_t			irp_nrcb;
+	uint_t			irp_nfree;
+	uint_t			irp_nreserve;
+	uint_t			irp_nloaned;
+	uint16_t		irp_size;
+} ice_rx_pool_t;
+
 typedef struct ice_rxq_stat {
 	kstat_named_t		icrxs_bytes;
 	kstat_named_t		icrxs_packets;
@@ -506,7 +522,7 @@ typedef struct ice_rx_ring {
 
 	ice_dma_buffer_t	irxr_desc_dma;	/* descriptor ring */
 	union ice_32b_rx_flex_desc *irxr_descs;
-	ice_rx_ctrl_block_t	**irxr_rcbs;	/* [irxr_size], by slot */
+	ice_rx_ctrl_block_t	**irxr_rcbs;	/* [irxr_size], pool's slots */
 	uint16_t		irxr_size;	/* descriptor count */
 	uint16_t		irxr_head;
 	uint16_t		irxr_tail;

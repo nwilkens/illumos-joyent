@@ -122,7 +122,7 @@ def main() -> None:
     assert re.search(r"seglen\s*>\s*irr->irxr_dbuf", frame)
 
     assert re.search(r"#define\s+ICE_RX_MAX_DESC\s+5\b", header)
-    assert frame.count("ICE_RX_MAX_DESC") >= 3
+    assert frame.count("ICE_RX_MAX_DESC") >= 2
     assert "total > ice->ice_pf_vsi.vi_max_frame" in frame
 
     eof = frame.index("ICE_RX_FLEX_DESC_STATUS0_EOF_S")
@@ -149,7 +149,8 @@ def main() -> None:
     bad_path = braced_block(frame, frame.index("if (bad)"))
     assert "ice_rx_discard_frame(irr, nsegs)" in bad_path
     failure_path = frame[frame.index("assemble_fail:") :]
-    assert "freemsg(mp_head)" in failure_path
+    assert "*discardp = mp_head;" in failure_path
+    assert "freemsg" not in failure_path
     assert "ice_rx_discard_frame(irr, nsegs)" in failure_path
     assert re.search(
         r"if \(mp == NULL\)\s*goto assemble_fail;", frame

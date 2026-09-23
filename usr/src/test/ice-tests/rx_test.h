@@ -60,6 +60,8 @@ typedef char *caddr_t;
 #define	MUTEX_HELD(m)	(*(m) != 0)
 #undef bcopy
 #define	bcopy(s, d, n)	((void) memmove((d), (s), (n)))
+#undef bzero
+#define	bzero(p, n)	((void) memset((p), 0, (n)))
 #define	ovbcopy(s, d, n)	((void) memmove((d), (s), (n)))
 #define	ICE_DMA_PA(d)	((d)->idb_cookie.dmac_laddress)
 #define	QRX_TAIL(n)	(n)
@@ -122,6 +124,7 @@ struct ice_hw {
 };
 typedef struct {
 	struct ice_hw ice_hw;
+	struct ice_rx_ring *ice_rxr;
 	struct {
 		uint16_t vi_max_frame;
 	} ice_pf_vsi;
@@ -145,6 +148,11 @@ typedef struct {
 	frtn_t ircb_free_rtn;
 	ice_rcb_state_t ircb_state;
 } ice_rx_ctrl_block_t;
+typedef struct {
+	ice_rx_ctrl_block_t *irp_area, **irp_free, **irp_slots;
+	uint_t irp_nrcb, irp_nfree, irp_nreserve, irp_nloaned;
+	uint16_t irp_size;
+} ice_rx_pool_t;
 typedef struct ice_rx_orphan {
 	struct ice_rx_orphan *iro_next;
 	ice_rx_ctrl_block_t *iro_area;
@@ -182,7 +190,8 @@ static unsigned wb_reads, bad_wb_reads;
 static ice_rx_ring_t *active_ring;
 static mblk_t *checksum_head;
 static void ice_rx_recycle(caddr_t);
-static void ice_rx_free_rcbs(ice_rx_ring_t *);
+static void ice_rx_pool_free(ice_rx_pool_t *);
+static void ice_rx_pool_release(ice_rx_ring_t *);
 
 static uint16_t
 checked_le16(const uint16_t *p)
@@ -450,12 +459,27 @@ mac_rx_ring(int handle, int ring, mblk_t *m, uint64_t generation)
 
 #include "rx_functions.h"
 
+/* Give the ring a new pool, as ice_rx_start() does, and post it. */
+static void
+post_pool(ice_rx_ring_t *r)
+{
+	ice_rx_pool_t p;
+	unsigned i;
+
+	assert(ice_rx_pool_alloc(r, &p));
+	mutex_enter(&r->irxr_lock);
+	ice_rx_pool_swap(r, &p);
+	assert(p.irp_area == NULL);
+	for (i = 0; i < r->irxr_size; i++)
+		ice_rx_reset_desc(r, i, ice_rcb_alloc(r, B_FALSE));
+	mutex_exit(&r->irxr_lock);
+}
+
 static void
 setup(ice_rx_ring_t *r, ice_t *ice)
 {
 	ddi_dma_attr_t attr = 0;
 	ddi_device_acc_attr_t acc = 0;
-	unsigned i;
 
 	memset(r, 0, sizeof (*r));
 	memset(ice, 0, sizeof (*ice));
@@ -467,29 +491,23 @@ setup(ice_rx_ring_t *r, ice_t *ice)
 	ice->ice_pf_vsi.vi_max_frame = 9728;
 	ice->ice_rx_limit_per_intr = 256;
 	ice->ice_num_rxr = 1;
+	ice->ice_rxr = r;
 	r->irxr_ice = ice;
 	r->irxr_size = 16;
 	r->irxr_dbuf = ICE_RX_BUF_SIZE;
-	r->irxr_rcbs = calloc(r->irxr_size, sizeof (*r->irxr_rcbs));
 	assert(ice_dma_alloc(ice, &r->irxr_desc_dma, &attr, &acc, B_TRUE,
 	    r->irxr_size * sizeof (*r->irxr_descs), B_TRUE));
 	r->irxr_descs = (void *)r->irxr_desc_dma.idb_va;
-	mutex_enter(&r->irxr_lock);
-	assert(ice_rx_alloc_rcbs(r));
-	for (i = 0; i < r->irxr_size; i++)
-		ice_rx_reset_desc(r, i, ice_rcb_alloc(r, B_FALSE));
-	mutex_exit(&r->irxr_lock);
+	post_pool(r);
 }
 
 static void
 teardown(ice_rx_ring_t *r)
 {
 	assert(r->irxr_nloaned == 0);
-	mutex_enter(&r->irxr_lock);
-	ice_rx_free_rcbs(r);
-	mutex_exit(&r->irxr_lock);
+	ice_rx_pool_release(r);
+	assert(r->irxr_rcb_area == NULL && r->irxr_rcbs == NULL);
 	ice_dma_free(&r->irxr_desc_dma);
-	free(r->irxr_rcbs);
 	assert(live_mblks == 0 && live_dma == 0);
 }
 

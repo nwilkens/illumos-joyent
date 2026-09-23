@@ -559,28 +559,26 @@ ice_tcb_bind_handle(const ice_tx_ctrl_block_t *tcb)
 }
 
 /*
- * Release whatever a TCB holds (copy buffer, DMA binding, retained mblk) and
- * return it to the ring's free list.  The bind handles are preallocated per
- * TCB and outlive it, so only the binding is dropped here.
+ * Release whatever a TCB holds (copy buffer, DMA binding) and return it to the
+ * ring's free list.  The bind handles are preallocated per TCB and outlive it,
+ * so only the binding is dropped here.  The retained mblk is returned rather
+ * than freed: a caller holding itxr_lock frees it after dropping the lock,
+ * because a free routine can enter another driver's locks.
  */
-static void
-ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
+static mblk_t *
+ice_tcb_release(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
 {
 	ice_dma_buffer_t *buf;
-
-	if (tcb == NULL)
-		return;
+	mblk_t *mp;
 
 	if (tcb->itcb_type == ITCB_BIND || tcb->itcb_type == ITCB_LSO_BIND)
 		(void) ddi_dma_unbind_handle(ice_tcb_bind_handle(tcb));
 	buf = tcb->itcb_buf;
+	mp = tcb->itcb_mp;
 	tcb->itcb_buf = NULL;
+	tcb->itcb_mp = NULL;
 	tcb->itcb_type = ITCB_NOT_USED;
 	tcb->itcb_len = 0;
-	if (tcb->itcb_mp != NULL) {
-		freemsg(tcb->itcb_mp);
-		tcb->itcb_mp = NULL;
-	}
 
 	mutex_enter(&itr->itxr_tcb_lock);
 	if (buf != NULL)
@@ -588,6 +586,26 @@ ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
 	ASSERT3U(itr->itxr_tcb_nfree, <, itr->itxr_size);
 	itr->itxr_tcb_free_list[itr->itxr_tcb_nfree++] = tcb;
 	mutex_exit(&itr->itxr_tcb_lock);
+
+	return (mp);
+}
+
+static void
+ice_tcb_free(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
+{
+	if (tcb != NULL)
+		freemsg(ice_tcb_release(itr, tcb));
+}
+
+/* Queue a released mblk for freemsgchain() once itxr_lock is dropped. */
+static void
+ice_tx_defer_free(mblk_t **chainp, mblk_t *mp)
+{
+	if (mp != NULL) {
+		ASSERT3P(mp->b_next, ==, NULL);
+		mp->b_next = *chainp;
+		*chainp = mp;
+	}
 }
 
 /*
@@ -1613,10 +1631,11 @@ ice_tx_desc_done(const ice_tx_ring_t *itr, uint16_t slot)
  * so probing one slot per outstanding packet finds the completed run at a cost
  * proportional to the packets freed rather than to the in-flight window.  We
  * free each completed packet's TCBs and slots, clear back-pressure, and notify
- * MAC when space frees up.  Returns descriptors reclaimed.
+ * MAC when space frees up.  The packets' mblks are chained on *donep for the
+ * caller to free after it drops itxr_lock.  Returns descriptors reclaimed.
  */
 static uint_t
-ice_tx_recycle(ice_tx_ring_t *itr)
+ice_tx_recycle(ice_tx_ring_t *itr, mblk_t **donep)
 {
 	ice_t *ice = itr->itxr_ice;
 	uint16_t head, rs_cidx;
@@ -1683,7 +1702,7 @@ ice_tx_recycle(ice_tx_ring_t *itr)
 
 		itr->itxr_tcbs[head] = NULL;
 		if (tcb != NULL)
-			ice_tcb_free(itr, tcb);
+			ice_tx_defer_free(donep, ice_tcb_release(itr, tcb));
 
 		itr->itxr_descs[head].buf_addr = 0;
 		itr->itxr_descs[head].cmd_type_offset_bsz = 0;
@@ -1755,7 +1774,7 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 	ice_tx_ctrl_block_t *tcbs[ICE_TX_MAX_LSO_DESC + 1];
 	ice_tx_ctx_t ctx;
 	ice_tx_build_t res;
-	mblk_t *txmp = mp;
+	mblk_t *txmp = mp, *done = NULL;
 	size_t msglen;
 	uint_t ntcb = 0, ndesc = 0;
 
@@ -1805,8 +1824,9 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 		 * flag set: a fully drained ring gets no further completion
 		 * interrupt and would otherwise stay blocked at MAC forever.
 		 */
-		(void) ice_tx_recycle(itr);
+		(void) ice_tx_recycle(itr, &done);
 		mutex_exit(&itr->itxr_lock);
+		freemsgchain(done);
 		return (B_FALSE);
 	}
 	if (res == ICE_TX_BUILD_DROP) {
@@ -1822,8 +1842,9 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 		 * completion would wake MAC for it.
 		 */
 		if (itr->itxr_blocked)
-			(void) ice_tx_recycle(itr);
+			(void) ice_tx_recycle(itr, &done);
 		mutex_exit(&itr->itxr_lock);
+		freemsgchain(done);
 		return (B_TRUE);
 	}
 	ASSERT3U(res, ==, ICE_TX_BUILD_OK);
@@ -1831,13 +1852,14 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 	mutex_enter(&itr->itxr_lock);
 
 	if (itr->itxr_avail <= ndesc) {
-		(void) ice_tx_recycle(itr);
+		(void) ice_tx_recycle(itr, &done);
 		if (itr->itxr_avail <= ndesc) {
 			itr->itxr_blocked = B_TRUE;
 			itr->itxr_stats.ictxs_blocked.value.ui64++;
 			if (ctx.itc_use_ctx)
 				itr->itxr_stats.ictxs_lso_nores.value.ui64++;
 			mutex_exit(&itr->itxr_lock);
+			freemsgchain(done);
 			ice_tx_free_tcbs(itr, tcbs, ntcb);
 			if (txmp != mp)
 				freemsg(txmp);
@@ -1846,7 +1868,11 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 	}
 
 	if (!ice_tx_emit(itr, tcbs, ntcb, ndesc, txmp, &ctx)) {
+		itr->itxr_stats.ictxs_drops.value.ui64++;
+		if (ctx.itc_use_ctx)
+			itr->itxr_stats.ictxs_lso_drops.value.ui64++;
 		mutex_exit(&itr->itxr_lock);
+		freemsgchain(done);
 		/*
 		 * Fatal DMA error: the device is wedged.  Drop the frame; the
 		 * emitted slots are torn back to a consistent state by emit.
@@ -1855,13 +1881,8 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 		freemsg(txmp);
 		if (txmp != mp)
 			freemsg(mp);
-		itr->itxr_stats.ictxs_drops.value.ui64++;
-		if (ctx.itc_use_ctx)
-			itr->itxr_stats.ictxs_lso_drops.value.ui64++;
 		return (B_TRUE);
 	}
-	if (txmp != mp)
-		freemsg(mp);
 
 	itr->itxr_stats.ictxs_bytes.value.ui64 += msglen;
 	itr->itxr_stats.ictxs_packets.value.ui64++;
@@ -1869,6 +1890,10 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 		itr->itxr_stats.ictxs_lso_packets.value.ui64++;
 
 	mutex_exit(&itr->itxr_lock);
+
+	freemsgchain(done);
+	if (txmp != mp)
+		freemsg(mp);
 
 	return (B_TRUE);
 }
@@ -1992,12 +2017,14 @@ ice_tx_reclaim(ice_t *ice)
 
 	for (i = 0; i < ice->ice_num_txr; i++) {
 		ice_tx_ring_t *itr = &ice->ice_txr[i];
+		mblk_t *done = NULL;
 
 		mutex_enter(&itr->itxr_lock);
 		for (slot = 0; slot < itr->itxr_size; slot++) {
 			if (itr->itxr_tcbs[slot] == NULL)
 				continue;
-			ice_tcb_free(itr, itr->itxr_tcbs[slot]);
+			ice_tx_defer_free(&done,
+			    ice_tcb_release(itr, itr->itxr_tcbs[slot]));
 			itr->itxr_tcbs[slot] = NULL;
 			itr->itxr_descs[slot].buf_addr = 0;
 			itr->itxr_descs[slot].cmd_type_offset_bsz = 0;
@@ -2011,6 +2038,7 @@ ice_tx_reclaim(ice_t *ice)
 		itr->itxr_rs_cidx = 0;
 		itr->itxr_blocked = B_FALSE;
 		mutex_exit(&itr->itxr_lock);
+		freemsgchain(done);
 	}
 }
 
@@ -2050,9 +2078,12 @@ ice_tx_wake(ice_t *ice)
 void
 ice_tx_ring_intr(ice_tx_ring_t *itr)
 {
+	mblk_t *done = NULL;
+
 	mutex_enter(&itr->itxr_lock);
-	(void) ice_tx_recycle(itr);
+	(void) ice_tx_recycle(itr, &done);
 	mutex_exit(&itr->itxr_lock);
+	freemsgchain(done);
 }
 
 int

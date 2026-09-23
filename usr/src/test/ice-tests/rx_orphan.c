@@ -41,35 +41,33 @@ loan(ice_rx_ring_t *r, uint16_t idx)
 	return (mp);
 }
 
-/* What a restart does: close the ring, then set the old pool aside. */
+/* What a restart does: close the ring, start it on a new pool, post it. */
 static boolean_t
 restart(ice_rx_ring_t *r)
 {
-	boolean_t ok;
+	ice_rx_ctrl_block_t *area = r->irxr_rcb_area;
 	uint_t i;
 
 	mutex_enter(&r->irxr_lock);
 	r->irxr_shutdown = B_TRUE;
-	ice_rx_orphans_reap(r);
-	ok = ice_rx_orphan(r);
-	if (ok) {
-		assert(r->irxr_rcb_area == NULL && r->irxr_nloaned == 0);
-		assert(r->irxr_nrcb == 0 && r->irxr_nfree == 0);
-		assert(ice_rx_alloc_rcbs(r));
-		for (i = 0; i < r->irxr_size; i++)
-			ice_rx_reset_desc(r, i, ice_rcb_alloc(r, B_FALSE));
-		r->irxr_shutdown = B_FALSE;
-	}
+	r->irxr_started = B_FALSE;
 	mutex_exit(&r->irxr_lock);
-	return (ok);
+	if (!ice_rx_start(r->irxr_ice))
+		return (B_FALSE);
+	mutex_enter(&r->irxr_lock);
+	assert(r->irxr_rcb_area != area && r->irxr_nloaned == 0);
+	assert(r->irxr_nfree == r->irxr_nrcb);
+	for (i = 0; i < r->irxr_size; i++)
+		ice_rx_reset_desc(r, i, ice_rcb_alloc(r, B_FALSE));
+	r->irxr_shutdown = B_FALSE;
+	mutex_exit(&r->irxr_lock);
+	return (B_TRUE);
 }
 
 static void
 reap(ice_rx_ring_t *r)
 {
-	mutex_enter(&r->irxr_lock);
-	ice_rx_orphans_reap(r);
-	mutex_exit(&r->irxr_lock);
+	(void) ice_rx_orphans_reap(r);
 }
 
 static void
