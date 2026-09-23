@@ -83,7 +83,8 @@ and recovery rules.
 `ice_set_mac_type()` and requires the package manifest aliases to match that
 set exactly. Subsystem IDs and the unmapped `0x1888` stay out. It then
 compiles the core mapping with the driver's `ice_family_name()` and the
-per-family helpers, and runs them for every device ID. The check covers the
+per-family helpers (slow EMPR wait, sideband receive drain), and runs them for
+every device ID. The check covers the
 decisions that differ by family; it cannot show that an untested family
 passes traffic.
 
@@ -180,7 +181,9 @@ worker, request claim/completion helpers, and full rebuild body. Hardware and
 taskq boundaries are controlled so the test can inject requests while the
 worker waits, after the reset barrier, at interrupt rearm, and during atomic
 completion. Assertions check reset counts and type, deferred work, request
-retention, datapath restart suppression, and terminal handling.
+retention, datapath restart suppression, and terminal handling. A slow EMPR
+(E825-C and E830) must wait once before the reset-complete poll; a PF reset
+issued by the driver must not wait.
 
 Use `--source /path/to/ice.c --intr-source /path/to/ice_intr.c` for an earlier
 revision. The reviewed implementation fails duplicate-dispatch coalescing.

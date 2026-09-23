@@ -42,6 +42,10 @@ def main() -> None:
     assert "ice_setup_link(ice)" in oicr
     assert "ice_phy_caps_update(ice)" in oicr
     assert "ice_update_phy_type" in intr
+    speeds = function(intr, "ice_phy_types_to_speeds(", "\n}\n")
+    for bit in ("100MB", "1000MB", "100GB"):
+        assert f"ICE_AQ_LINK_SPEED_{bit}," in speeds or \
+            f"ICE_AQ_LINK_SPEED_{bit}\n" in speeds
 
     attach_source = ATTACH_SOURCE.read_text(encoding="utf-8")
     attach = function(
@@ -59,7 +63,8 @@ def main() -> None:
         "ice_m_stat(void *arg, uint_t stat, uint64_t *val)\n{",
         "\n/*\n * SFF module",
     )
-    for rate in ("25G", "40G", "100G"):
+    # E822 and E823 SGMII ports link at 100 Mb/s.
+    for rate in ("100", "25G", "40G", "100G"):
         assert f"ETHER_STAT_CAP_{rate}FDX" in mstat
         assert f"ETHER_STAT_ADV_CAP_{rate}FDX" in mstat
     assert "ice->ice_phy_speeds_adv & speed" in mstat

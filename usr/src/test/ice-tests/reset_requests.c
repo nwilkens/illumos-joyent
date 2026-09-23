@@ -173,6 +173,34 @@ ice_reset(struct ice_hw *hw, int type)
 	return (fail_reset);
 }
 
+/* The per-family EMPR test is in mac_family.c; this fixes its verdict. */
+#define	ICE_EMPR_SLOW_WAIT_SEC	20
+#define	MICROSEC		1000000
+static int slow_empr;
+static unsigned slow_waits;
+
+static int
+ice_reset_empr_slow(struct ice_hw *hw)
+{
+	(void) hw;
+	return (slow_empr);
+}
+
+static long
+drv_usectohz(long usec)
+{
+	return (usec);
+}
+
+static void
+delay(long ticks)
+{
+	assert(ticks == (long)ICE_EMPR_SLOW_WAIT_SEC * MICROSEC);
+	/* The wait precedes the reset-complete poll. */
+	assert(global_waits == 0);
+	slow_waits++;
+}
+
 static int
 ice_check_reset(struct ice_hw *hw)
 {
@@ -296,6 +324,8 @@ reset(void)
 	(void) memset(&device, 0, sizeof (device));
 	device.ice_safe_mode = B_TRUE;
 	queued = prepared = pfrs = global_waits = starts = errors = 0;
+	slow_empr = 0;
+	slow_waits = 0;
 	fail_dispatch = fail_reset = start_result = 0;
 	resume_ok = 1;
 	down_reports = 0;
@@ -372,6 +402,29 @@ check_new_requests(void)
 }
 
 static void
+check_slow_empr(void)
+{
+	/* A slow EMPR waits once before the reset-complete poll. */
+	reset();
+	slow_empr = 1;
+	request(ICE_STATE_RESET_PENDING);
+	run_one();
+	assert(slow_waits == 1 && global_waits == 1 && pfrs == 0);
+
+	/* A PF reset issued by the driver has no EMPR to wait out. */
+	reset();
+	slow_empr = 1;
+	request(ICE_STATE_PFR_REQ);
+	run_one();
+	assert(slow_waits == 0 && pfrs == 1);
+
+	reset();
+	request(ICE_STATE_RESET_PENDING);
+	run_one();
+	assert(slow_waits == 0 && global_waits == 1);
+}
+
+static void
 check_gates(void)
 {
 	unsigned gate;
@@ -439,6 +492,7 @@ main(void)
 	check_coalescing();
 	check_new_requests();
 	check_gates();
+	check_slow_empr();
 	check_restart_failure();
 	(void) puts("PASS: ICE reset ownership and rebuild interleavings");
 	return (0);

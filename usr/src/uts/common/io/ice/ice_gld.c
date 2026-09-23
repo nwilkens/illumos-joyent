@@ -440,6 +440,9 @@ ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 		*val = ice->ice_link_duplex;
 		mutex_exit(&ice->ice_lse_lock);
 		return (0);
+	case ETHER_STAT_CAP_100FDX:
+		speed = ICE_AQ_LINK_SPEED_100MB;
+		break;
 	case ETHER_STAT_CAP_1000FDX:
 		speed = ICE_AQ_LINK_SPEED_1000MB;
 		break;
@@ -463,6 +466,10 @@ ice_m_stat(void *arg, uint_t stat, uint64_t *val)
 		break;
 	case ETHER_STAT_CAP_100GFDX:
 		speed = ICE_AQ_LINK_SPEED_100GB;
+		break;
+	case ETHER_STAT_ADV_CAP_100FDX:
+		speed = ICE_AQ_LINK_SPEED_100MB;
+		advertised = B_TRUE;
 		break;
 	case ETHER_STAT_ADV_CAP_1000FDX:
 		speed = ICE_AQ_LINK_SPEED_1000MB;

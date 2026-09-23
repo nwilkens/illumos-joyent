@@ -63,6 +63,8 @@ def family(name):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=DRIVER / "ice.c")
+    parser.add_argument("--intr-source", type=Path,
+                        default=DRIVER / "ice_intr.c")
     args = parser.parse_args()
     ids, subsystems = core_ids()
     common = (CORE / "ice_common.c").read_text()
@@ -80,18 +82,26 @@ def main():
     assert ids["ICE_DEV_ID_E822_SI_DFLT"] not in bound
 
     fragments = []
-    for name in ("ice_set_mac_type", "ice_is_e823"):
+    for name in ("ice_set_mac_type", "ice_is_generic_mac", "ice_is_e823",
+                 "ice_is_e825c", "ice_is_e830"):
         fragments.append(extract(common,
             rf"^(?:int|bool) {name}\(struct ice_hw \*hw\)\n\{{[\s\S]*?^\}}",
             CORE / "ice_common.c"))
     source = args.source.read_text()
-    fragments.append(extract(source,
-        r"^static const char \*\nice_family_name\([\s\S]*?^}", args.source))
-    fragments.append("#define FAMILY_CHECKS(hw, want) ((void)(hw), (void)(want))")
+    for name in ("ice_family_name", "ice_reset_empr_slow"):
+        fragments.append(extract(source,
+            rf"^static [\w *]+\n{name}\([\s\S]*?^}}", args.source))
+    intr = args.intr_source.read_text()
+    fragments.append(extract(intr,
+        r"^static void\nice_sbq_drain\([\s\S]*?^}", args.intr_source))
+    autogen = (CORE / "ice_hw_autogen.h").read_text()
+    regs = "\n".join(re.findall(r"^#define GLGEN_RSTAT(?:_RESET_TYPE_[SM])?\s.*$",
+                                autogen, re.MULTILINE))
     cases = [f"{ids[name]:x}:{family(name)}" for name in mapping]
     cases.append(f"{ids['ICE_DEV_ID_E822_SI_DFLT']:x}:none")
     run_c(TESTDIR / "mac_family.c",
           {"ice_family_body.h": "\n".join(fragments),
+           "ice_family_regs.h": regs + "\n",
            "ice_devids.h": (CORE / "ice_devids.h").read_text()},
           cflags=("-Wno-unused-function",), cases=(tuple(cases),))
     print(f"PASS: {len(bound)} aliases match the core MAC type mapping")

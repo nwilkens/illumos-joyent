@@ -222,6 +222,7 @@ static uint16_t
 ice_phy_types_to_speeds(const struct ice_aqc_get_phy_caps_data *pcaps)
 {
 	static const uint16_t speeds[] = {
+		ICE_AQ_LINK_SPEED_100MB,
 		ICE_AQ_LINK_SPEED_1000MB,
 		ICE_AQ_LINK_SPEED_2500MB,
 		ICE_AQ_LINK_SPEED_5GB,
@@ -546,6 +547,35 @@ ice_oicr_fatal(ice_t *ice, uint32_t cause, boolean_t mdd)
 }
 
 /*
+ * The E82X and E825-C parts have a sideband queue.  The driver sends it only
+ * polled commands, but firmware can also post messages to its receive ring.
+ * Discard them so that the ring cannot fill, as the FreeBSD admin task does.
+ * The event buffer is this worker's admin scratch buffer.
+ */
+static void
+ice_sbq_drain(ice_t *ice, struct ice_rq_event_info *evt)
+{
+	struct ice_hw *hw = &ice->ice_hw;
+	uint16_t pending = 0;
+	uint_t guard = 0;
+	int rc;
+
+	if (!ice_is_generic_mac(hw))
+		return;
+
+	do {
+		rc = ice_clean_rq_elem(hw, &hw->sbq, evt, &pending);
+		if (rc == ICE_ERR_AQ_NO_WORK)
+			return;
+		if (rc != 0) {
+			ice_error(ice, "sideband receive queue clean failed: "
+			    "%d", rc);
+			return;
+		}
+	} while (pending != 0 && ++guard < ICE_ARQ_MAX_ELEMS);
+}
+
+/*
  * Taskq worker: decode the causes latched as persistent state, drain the admin
  * receive queue, and refresh link.  Driven both by the OICR and by the admin
  * periodic, so every step must be safe to repeat.  The drain loop is bounded
@@ -664,6 +694,8 @@ ice_oicr_task(void *arg)
 		ice_error(ice, "admin receive queue drain cap hit; pending %u",
 		    pending);
 	}
+
+	ice_sbq_drain(ice, &evt);
 
 	/*
 	 * Refresh link unconditionally, not just when the drain saw a

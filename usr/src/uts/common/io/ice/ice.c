@@ -46,6 +46,9 @@
 
 #define	ICE_ERRBUF_LEN		512
 
+/* Extra settle time for an EMPR on E825-C and E830; see ice_rebuild(). */
+#define	ICE_EMPR_SLOW_WAIT_SEC	20
+
 static int ice_attach(dev_info_t *, ddi_attach_cmd_t);
 static int ice_detach(dev_info_t *, ddi_detach_cmd_t);
 static uint32_t ice_prop_get_num_queues(ice_t *);
@@ -1611,6 +1614,24 @@ ice_reset_complete(ice_t *ice)
 }
 
 /*
+ * After an EMPR, E825-C and E830 firmware can take longer to finish than
+ * ice_check_reset() waits.  FreeBSD pauses for 20 seconds before it polls on
+ * those parts (ICE_EMPR_ADDL_WAIT_MSEC_SLOW in if_ice_iflib.c).
+ */
+static boolean_t
+ice_reset_empr_slow(struct ice_hw *hw)
+{
+	uint32_t type;
+
+	if (!ice_is_e830(hw) && !ice_is_e825c(hw))
+		return (B_FALSE);
+
+	type = (rd32(hw, GLGEN_RSTAT) & GLGEN_RSTAT_RESET_TYPE_M) >>
+	    GLGEN_RSTAT_RESET_TYPE_S;
+	return (type == ICE_RESET_EMPR);
+}
+
+/*
  * Reinitialize the function after a reset and restore the datapath.  Modeled
  * on the FreeBSD ice driver's ice_rebuild().  Runs under ice_rebuild_lock.
  * Each failing step jumps to reset_failed, which fails closed until the driver
@@ -1631,10 +1652,13 @@ ice_rebuild(ice_t *ice, uint32_t requests)
 	 * and otherwise drives a real PF reset, which is what the fatal-cause
 	 * and test-hook PFR_REQ paths need.
 	 */
-	if ((requests & ICE_STATE_RESET_PENDING) != 0)
+	if ((requests & ICE_STATE_RESET_PENDING) != 0) {
+		if (ice_reset_empr_slow(hw))
+			delay(drv_usectohz(ICE_EMPR_SLOW_WAIT_SEC * MICROSEC));
 		rc = ice_check_reset(hw);
-	else
+	} else {
 		rc = ice_reset(hw, ICE_RESET_PFR);
+	}
 	if (rc != 0) {
 		ice_error(ice, "device never came out of reset: %d", rc);
 		goto reset_failed;
