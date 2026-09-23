@@ -182,8 +182,11 @@ ice_diag_fwlog_query(ice_t *ice, uint8_t *buf, ice_diag_fwlog_t *q)
 	q->idf_nmods = LE16_TO_CPU(cmd->ops.cfg.mdl_cnt);
 	q->idf_resolution = LE16_TO_CPU(cmd->ops.cfg.log_resolution);
 	q->idf_flags = cmd->cmd_flags;
-	if (q->idf_nmods > ICE_FWLOG_NMODULES) {
-		ice_error(ice, "firmware lists %u log modules", q->idf_nmods);
+	/* The common code copies only the returned length into buf. */
+	if (q->idf_nmods > ICE_FWLOG_NMODULES ||
+	    LE16_TO_CPU(desc.datalen) < q->idf_nmods * sizeof (*resp)) {
+		ice_error(ice, "firmware lists %u log modules in %u bytes",
+		    q->idf_nmods, LE16_TO_CPU(desc.datalen));
 		return (ICE_ERR_CFG);
 	}
 

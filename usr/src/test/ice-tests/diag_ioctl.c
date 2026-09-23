@@ -153,6 +153,7 @@ static struct {
 	u8 levels[FW_SLOTS];
 	u16 resolution;
 	u8 flags;
+	bool short_reply;
 } fw;
 
 /* Every module, in reverse order. */
@@ -366,6 +367,12 @@ ice_aq_send_cmd(struct ice_hw *hw, struct ice_aq_desc *desc, void *buf,
 			mods[i].log_level = i < n ? fw.levels[i] : 0xff;
 		}
 		cmd->ops.cfg.mdl_cnt = fw.count;
+		desc->datalen = (u16)(n * sizeof (*mods));
+		if (fw.short_reply && n > 0) {
+			/* The control queue copies only datalen bytes. */
+			desc->datalen -= sizeof (*mods);
+			memset(&mods[n - 1], 0, sizeof (*mods));
+		}
 		cmd->ops.cfg.log_resolution = fw.resolution;
 		cmd->cmd_flags = fw.flags;
 		return (ICE_SUCCESS);
@@ -625,14 +632,17 @@ check_fwlog_cfg(void)
 		};
 		static const u16 two[] = { 6, 8 };
 
-		for (i = 0; i <= sizeof (bad) / sizeof (bad[0]); i++) {
+		for (i = 0; i <= sizeof (bad) / sizeof (bad[0]) + 1; i++) {
 			firmware_modules();
 			if (i < sizeof (bad) / sizeof (bad[0])) {
 				fw.ids[bad[i].slot] = bad[i].id;
 				fw.levels[bad[i].slot] = bad[i].level;
-			} else {
+			} else if (i == sizeof (bad) / sizeof (bad[0])) {
 				fw.n = ICE_FWLOG_NMODULES;
 				fw.count = ICE_FWLOG_NMODULES + 1;
+			} else {
+				/* A count the returned length cannot hold. */
+				fw.short_reply = true;
 			}
 			errors = 0;
 			calls = configs;
