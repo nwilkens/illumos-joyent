@@ -36,6 +36,7 @@
 #include "ice_ioctl.h"
 
 CTASSERT(ICE_FWLOG_NMODULES == ICE_AQC_FW_LOG_ID_MAX);
+CTASSERT(ICE_FWLOG_NMODULES <= 32);
 CTASSERT(ICE_FWLOG_LEVEL_MAX + 1 == ICE_FWLOG_LEVEL_INVALID);
 CTASSERT(ICE_FWLOG_RES_MIN == ICE_AQC_FW_LOG_MIN_RESOLUTION);
 CTASSERT(ICE_FWLOG_RES_MAX == ICE_AQC_FW_LOG_MAX_RESOLUTION);
@@ -121,10 +122,40 @@ ice_diag_fwlog_read(ice_t *ice, ice_ioc_fwlog_read_t *rd)
 	return (0);
 }
 
+/*
+ * Index the module levels firmware returned by module ID; firmware need not
+ * list the modules in order.  The reply must name each module once, so an
+ * ID out of range or repeated, or a level out of range, rejects it.
+ */
+static boolean_t
+ice_diag_fwlog_levels(ice_t *ice, const struct ice_fwlog_cfg *fw,
+    uint8_t *levels)
+{
+	uint32_t seen = 0;
+	uint_t i;
+
+	for (i = 0; i < ICE_FWLOG_NMODULES; i++) {
+		uint16_t id = fw->module_entries[i].module_id;
+		uint8_t level = fw->module_entries[i].log_level;
+
+		if (id >= ICE_FWLOG_NMODULES || (seen & (1u << id)) != 0 ||
+		    level > ICE_FWLOG_LEVEL_MAX) {
+			ice_error(ice, "firmware log configuration has an "
+			    "invalid entry: module %u level %u", id, level);
+			return (B_FALSE);
+		}
+		seen |= 1u << id;
+		levels[id] = level;
+	}
+
+	return (B_TRUE);
+}
+
 static int
 ice_diag_fwlog_get(ice_t *ice, ice_ioc_fwlog_cfg_t *cfg)
 {
 	struct ice_fwlog_cfg fw;
+	uint8_t levels[ICE_FWLOG_NMODULES] = { 0 };
 	uint32_t module = cfg->ifc_module;
 	int status;
 
@@ -136,12 +167,12 @@ ice_diag_fwlog_get(ice_t *ice, ice_ioc_fwlog_cfg_t *cfg)
 	mutex_exit(&ice->ice_rebuild_lock);
 	if (status == ICE_ERR_NOT_SUPPORTED)
 		return (ENOTSUP);
-	if (status != ICE_SUCCESS)
+	if (status != ICE_SUCCESS || !ice_diag_fwlog_levels(ice, &fw, levels))
 		return (EIO);
 
 	bzero(cfg, sizeof (*cfg));
 	cfg->ifc_module = module;
-	cfg->ifc_level = fw.module_entries[module].log_level;
+	cfg->ifc_level = levels[module];
 	cfg->ifc_resolution = fw.log_resolution;
 	if ((fw.options & ICE_FWLOG_OPTION_ARQ_ENA) != 0)
 		cfg->ifc_flags |= ICE_FWLOG_F_ARQ;
@@ -156,6 +187,7 @@ ice_diag_fwlog_set(ice_t *ice, const ice_ioc_fwlog_cfg_t *cfg)
 {
 	struct ice_hw *hw = &ice->ice_hw;
 	struct ice_fwlog_cfg fw;
+	uint8_t levels[ICE_FWLOG_NMODULES] = { 0 };
 	boolean_t arq = (cfg->ifc_flags & ICE_FWLOG_F_ARQ) != 0;
 	uint8_t level = (uint8_t)cfg->ifc_level;
 	uint8_t *ring = NULL;
@@ -178,12 +210,18 @@ ice_diag_fwlog_set(ice_t *ice, const ice_ioc_fwlog_cfg_t *cfg)
 	status = ice_fwlog_get(hw, &fw);
 	if (status != ICE_SUCCESS)
 		goto out;
+	if (!ice_diag_fwlog_levels(ice, &fw, levels)) {
+		status = ICE_ERR_CFG;
+		goto out;
+	}
 
 	for (i = 0; i < ICE_FWLOG_NMODULES; i++) {
 		fw.module_entries[i].module_id = (uint16_t)i;
 		if (cfg->ifc_module == ICE_FWLOG_MODULE_ALL ||
 		    cfg->ifc_module == i)
 			fw.module_entries[i].log_level = level;
+		else
+			fw.module_entries[i].log_level = levels[i];
 	}
 	fw.log_resolution = (uint16_t)cfg->ifc_resolution;
 	fw.options &= ~ICE_FWLOG_OPTION_ARQ_ENA;

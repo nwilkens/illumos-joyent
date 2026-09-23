@@ -38,6 +38,7 @@ typedef int zoneid_t;
 #define	B_FALSE			0
 #define	ICE_SUCCESS		0
 #define	ICE_ERR_NOT_SUPPORTED	-4
+#define	ICE_ERR_CFG		-12
 #define	ICE_ERR_AQ_ERROR	-100
 #define	GLOBAL_ZONEID		0
 #define	KM_SLEEP		0
@@ -99,6 +100,41 @@ static int fw_status, dump_status;
 static unsigned fw_calls, registers, unregisters, acks, naks, allocs;
 static int nak_error;
 static u16 dump_len;
+static unsigned errors;
+
+static void
+ice_error(ice_t *ice, const char *fmt, ...)
+{
+	(void) ice;
+	(void) fmt;
+	errors++;
+}
+
+/* Firmware lists module IDs in its own order: here, reversed. */
+static void
+firmware_modules(void)
+{
+	unsigned i;
+
+	for (i = 0; i < ICE_FWLOG_NMODULES; i++) {
+		firmware.module_entries[i].module_id =
+		    (u16)(ICE_FWLOG_NMODULES - 1 - i);
+		firmware.module_entries[i].log_level = (u8)(i % 5);
+	}
+}
+
+static u8
+firmware_level(unsigned module)
+{
+	unsigned i;
+
+	for (i = 0; i < ICE_FWLOG_NMODULES; i++) {
+		if (firmware.module_entries[i].module_id == module)
+			return (firmware.module_entries[i].log_level);
+	}
+	assert(0);
+	return (0);
+}
 
 static void
 mutex_init(kmutex_t *m, void *n, int t, void *a)
@@ -378,6 +414,7 @@ check_fwlog_cfg(void)
 	assert(fw_calls == 0 && allocs == 0);
 
 	/* Firmware UART logging is preserved; ARQ follows the request. */
+	firmware_modules();
 	firmware.options = ICE_FWLOG_OPTION_UART_ENA;
 	assert(set(ICE_FWLOG_MODULE_ALL, 4, ICE_FWLOG_F_ARQ, 10) == 0);
 	assert(registers == 1 && dev.ice_fwlog_buf != NULL && allocs == 1);
@@ -390,6 +427,66 @@ check_fwlog_cfg(void)
 	assert(set(3, 1, 0, 1) == 0);
 	assert(unregisters == 1 && firmware.module_entries[3].log_level == 1);
 	assert(firmware.module_entries[4].log_level == 4);
+
+	/*
+	 * A reply in another order is read and rewritten by module ID: the
+	 * set changes module 3 alone and keeps every other module's level.
+	 */
+	firmware_modules();
+	memset(&req.u, 0xaa, sizeof (req.u));
+	req.u.cfg.ifc_module = 3;
+	assert(call(ICE_IOC_FWLOG_GET, &root, sizeof (req.u.cfg)) == 0);
+	assert(req.u.cfg.ifc_level == firmware_level(3) &&
+	    req.u.cfg.ifc_level == (28 % 5));
+	{
+		struct ice_fwlog_cfg before = firmware;
+		unsigned i;
+
+		assert(set(3, 4, 0, 1) == 0);
+		for (i = 0; i < ICE_FWLOG_NMODULES; i++) {
+			u8 want = (u8)((ICE_FWLOG_NMODULES - 1 - i) % 5);
+
+			assert(before.module_entries[ICE_FWLOG_NMODULES - 1 -
+			    i].log_level == want);
+			assert(firmware.module_entries[i].log_level ==
+			    (i == 3 ? 4 : want));
+		}
+	}
+
+	/* A duplicate or out-of-range ID or level fails before any set. */
+	{
+		static const struct {
+			unsigned slot;
+			u16 id;
+			u8 level;
+		} bad[] = {
+			{ 5, 7, 0 },			/* slot 24 has ID 7 */
+			{ 0, ICE_FWLOG_NMODULES, 0 },	/* out of range */
+			{ 9, 0xffff, 0 },
+			{ 2, 29, ICE_FWLOG_LEVEL_MAX + 1 },
+		};
+		unsigned i, calls;
+
+		for (i = 0; i < sizeof (bad) / sizeof (bad[0]); i++) {
+			struct ice_fwlog_cfg good;
+
+			firmware_modules();
+			firmware.module_entries[bad[i].slot].module_id =
+			    bad[i].id;
+			firmware.module_entries[bad[i].slot].log_level =
+			    bad[i].level;
+			good = firmware;
+			errors = 0;
+			calls = fw_calls;
+			assert(set(1, 1, 0, 1) == EIO);
+			assert(fw_calls == calls + 1 && errors == 1);
+			assert(memcmp(&good, &firmware, sizeof (good)) == 0);
+			req.u.cfg.ifc_module = 1;
+			assert(call(ICE_IOC_FWLOG_GET, &root,
+			    sizeof (req.u.cfg)) == EIO);
+		}
+	}
+	firmware_modules();
 	assert((firmware.options & ICE_FWLOG_OPTION_ARQ_ENA) == 0);
 	/* The ring stays until detach; a second enable does not leak. */
 	assert(set(3, 2, ICE_FWLOG_F_ARQ, 1) == 0 && allocs == 1);
