@@ -767,7 +767,11 @@ are all temporary static, DHCP or addrconf addresses; persistent `ipadm`
 configuration and other address types are still refused. It records the MTU,
 those addresses and the default routes over the link, makes only temporary
 changes, and restores the record from an `EXIT`, `INT`, `TERM` and `HUP`
-trap. A restore that fails prints `RESTORE FAILED` and fails the run. The
+trap. A delete of the test address or interface may fail only when the
+object is confirmed absent. After the restore the script compares the MTU,
+the interface, the static addresses and the types of the other addresses,
+and the default routes with the record. A restore that fails, or a final
+state that differs, prints `RESTORE FAILED` and fails the run. The
 `icetest` wrapper applies the same refusal before it starts the datapath
 runfile, and the `led` test returns the LED to firmware control from its own
 exit trap.
@@ -776,8 +780,11 @@ exit trap.
 `ipadm`, `netstat`, `route`, `kstat` and traffic commands and checks these
 rules: the instance comes from the device, a configured link is left
 untouched without the override, and a run that finishes or takes `SIGTERM`
-leaves the MTU, addresses and default route as they were. It also runs the
-`icetest` refusal under `ksh`.
+leaves the MTU, addresses and default route as they were. A delete that
+fails while the object remains, and a restored address that silently goes
+missing, must each fail the run with `RESTORE FAILED`; a delete of an
+address that was never created must not. It also runs the `icetest` refusal
+under `ksh`.
 
 Historical validation recorded in commit `60beba06389` (2026-07-18) reported
 boston<->hunter at MTU 1500 (9.36 Gbps) and 9000 (9.59 Gbps), with all checks

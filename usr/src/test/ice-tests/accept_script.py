@@ -41,22 +41,27 @@ show-addr)
 	*"-o addrobj"*) cut -d'|' -f1 "$S/addrs" 2>/dev/null ;;
 	*"-o type"*) grep "^$obj|" "$S/addrs" | cut -d'|' -f2 ;;
 	*"-o addr"*) grep "^$obj|" "$S/addrs" | cut -d'|' -f3 ;;
+	*) grep -q "^$obj|" "$S/addrs" 2>/dev/null || exit 1 ;;
 	esac ;;
 create-if)
 	[ -e "$S/if" ] && exit 1
 	touch "$S/if" ;;
 delete-if)
+	[ -e "$S/fail_delete" ] && exit 1
 	[ -e "$S/if" ] || exit 1
 	rm -f "$S/if" "$S/addrs" "$S/routes" "$S/routes6" ;;
 create-addr)
 	[ -e "$S/if" ] || exit 1
+	[ -e "$S/fail_create" ] && exit 1
 	type=""; addr=""
 	while [ $# -gt 1 ]; do
 		case "$1" in -T) type=$2; shift ;; -a) addr=$2; shift ;; esac
 		shift
 	done
+	case "$1" in */rs*) [ -e "$S/lose_restored" ] && exit 0 ;; esac
 	echo "$1|$type|$addr" >> "$S/addrs" ;;
 delete-addr)
+	[ -e "$S/fail_delete" ] && exit 1
 	grep -q "^$2|" "$S/addrs" 2>/dev/null || exit 1
 	grep -v "^$2|" "$S/addrs" > "$S/addrs.new"
 	mv "$S/addrs.new" "$S/addrs" ;;
@@ -231,6 +236,36 @@ def check_restore_failure(work):
     assert "RESTORE FAILED: mtu 1500" in result.stdout, result.stdout
 
 
+def check_delete_failure(work):
+    """A delete that fails while the object remains makes the run fail."""
+    host = fresh(work)
+    (host.state / "term_on_ping").touch()
+    (host.state / "fail_delete").touch()
+    result = host.run()
+    assert result.returncode == 1, result.stdout
+    assert "RESTORE FAILED: ipadm delete-addr ice0/v4accept" in \
+        result.stdout, result.stdout
+    assert "RESTORE FAILED: ice0 still has an IP interface" in \
+        result.stdout, result.stdout
+    assert "was not fully restored" in result.stdout
+
+    # An object that is confirmed absent is not a failure.
+    host = fresh(work)
+    (host.state / "fail_create").touch()
+    result = host.run()
+    assert "could not plumb" in result.stdout, result.stdout
+    assert "RESTORE FAILED" not in result.stdout, result.stdout
+    assert host.ip() == (False, set(), "1500", []), host.ip()
+
+    # The final state is checked, not only each command's status.
+    host = fresh(work, addrs=ADDRS, routes=("10.1.2.1",))
+    (host.state / "lose_restored").touch()
+    result = host.run(ICE_TEST_ALLOW_IP="1")
+    assert result.returncode == 1, result.stdout
+    assert "RESTORE FAILED: ice0 addresses are" in result.stdout, \
+        result.stdout
+
+
 def check_wrapper(work):
     """icetest refuses a configured link before it runs a datapath test."""
     host = fresh(work, addrs=ADDRS)
@@ -263,10 +298,12 @@ def main():
         check_refusal(work)
         check_restore(work)
         check_restore_failure(work)
+        check_delete_failure(work)
         if shutil.which("ksh") is not None:
             check_wrapper(work)
     print("PASS: datapath_accept.sh resolves the kstat instance from the "
-          "device, refuses configured links and restores the link")
+          "device, refuses configured links and restores and verifies the "
+          "link")
 
 
 if __name__ == "__main__":

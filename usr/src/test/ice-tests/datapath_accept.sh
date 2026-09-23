@@ -21,8 +21,9 @@
 # The test replumbs the link and changes its MTU, so it refuses a link that
 # has IP configuration.  With ICE_TEST_ALLOW_IP=1 it accepts one whose
 # addresses are all temporary static, DHCP or addrconf addresses; it records
-# them with the MTU and the default routes over the link, and restores them
-# when it exits or is interrupted.  All test changes are temporary.
+# them with the MTU and the default routes over the link, restores them when
+# it exits or is interrupted, and checks that the link matches the record.
+# All test changes are temporary.
 #
 # Exit status is 0 only if every check passes.
 #
@@ -124,20 +125,87 @@ has_default() {
 	    awk -v g="$2" '$1 == "default" && $2 == g { f = 1 } END { exit !f }'
 }
 
+# The link's addresses as sorted "type|address" lines.  A DHCP or addrconf
+# address can come back different, so only its type is compared.
+addr_state() {
+	local obj type addr
+
+	for obj in $(ipadm show-addr -p -o addrobj "$LINK/" 2>/dev/null); do
+		type=$(ipadm show-addr -p -o type "$obj" 2>/dev/null)
+		addr=$(ipadm show-addr -p -o addr "$obj" 2>/dev/null)
+		[[ "$type" == static ]] || addr=""
+		echo "$type|$addr"
+	done | sort
+}
+
+ORIG_STATE=$(addr_state)
+
+# Delete an IP object.  A failure counts only if the object is still there.
+remove_ip() {
+	# remove_ip <delete-addr|delete-if> <object>
+	local show=show-addr
+
+	[[ "$1" == delete-if ]] && show=show-if
+	ipadm "$1" "$2" >/dev/null 2>&1 && return 0
+	ipadm "$show" "$2" >/dev/null 2>&1 || return 0
+	echo "RESTORE FAILED: ipadm $1 $2"
+	return 1
+}
+
+# Compare the link with the snapshot taken before the test changed it.
+verify_restore() {
+	local rc=0 mtu state gw
+
+	mtu=$(dladm show-linkprop -c -p mtu -o value "$LINK" 2>/dev/null)
+	if [[ "$mtu" != "$ORIG_MTU" ]]; then
+		echo "RESTORE FAILED: $LINK mtu is '$mtu', was $ORIG_MTU"
+		rc=1
+	fi
+	if ! (( HAD_IF )); then
+		if ipadm show-if "$LINK" >/dev/null 2>&1; then
+			echo "RESTORE FAILED: $LINK still has an IP interface"
+			rc=1
+		fi
+		return $rc
+	fi
+	if ! ipadm show-if "$LINK" >/dev/null 2>&1; then
+		echo "RESTORE FAILED: $LINK has no IP interface"
+		return 1
+	fi
+	state=$(addr_state)
+	if [[ "$state" != "$ORIG_STATE" ]]; then
+		echo "RESTORE FAILED: $LINK addresses are" $state \
+		    "but were" $ORIG_STATE
+		rc=1
+	fi
+	for gw in ${ORIG_ROUTES[@]+"${ORIG_ROUTES[@]}"}; do
+		has_default inet "$gw" ||
+		    { echo "RESTORE FAILED: no default route $gw"; rc=1; }
+	done
+	for gw in ${ORIG_ROUTES6[@]+"${ORIG_ROUTES6[@]}"}; do
+		has_default inet6 "$gw" ||
+		    { echo "RESTORE FAILED: no default route $gw"; rc=1; }
+	done
+	return $rc
+}
+
 MODIFIED=0
 restore() {
 	local rc=0 i=0 entry type addr gw
 
 	(( MODIFIED )) || return 0
-	ipadm delete-addr "$LINK/v4accept" >/dev/null 2>&1
-	ipadm delete-if "$LINK" >/dev/null 2>&1
+	remove_ip delete-addr "$LINK/v4accept" || rc=1
+	remove_ip delete-if "$LINK" || rc=1
 	if [[ "$(dladm show-linkprop -c -p mtu -o value "$LINK" 2>/dev/null)" \
 	    != "$ORIG_MTU" ]] &&
 	    ! dladm set-linkprop -t -p mtu="$ORIG_MTU" "$LINK"; then
 		echo "RESTORE FAILED: mtu $ORIG_MTU on $LINK"
 		rc=1
 	fi
-	(( HAD_IF )) || return $rc
+	if ! (( HAD_IF )); then
+		verify_restore || rc=1
+		return $rc
+	fi
 
 	if ! ipadm create-if -t "$LINK"; then
 		echo "RESTORE FAILED: IP interface $LINK"
@@ -168,6 +236,7 @@ restore() {
 		    route -n add -inet6 default "$gw" ||
 		    { echo "RESTORE FAILED: default route $gw"; rc=1; }
 	done
+	verify_restore || rc=1
 	return $rc
 }
 
