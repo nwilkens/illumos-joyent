@@ -14,7 +14,7 @@
  */
 
 /*
- * Intel Ethernet 800 series (E810) "ice" driver.
+ * Intel Ethernet 800 series "ice" driver.
  *
  * This file is the illumos device-driver glue: DDI attach/detach, FMA, PCI
  * configuration and register mapping, interrupt allocation, and bring-up of
@@ -60,7 +60,7 @@ static void *ice_state_p;
 static kmutex_t ice_glock;
 static list_t ice_glist;
 
-static char ice_ident[] = "Intel E810 Ethernet";
+static char ice_ident[] = "Intel E800 Series Ethernet";
 
 static struct cb_ops ice_cb_ops = {
 	.cb_open = nulldev,
@@ -420,11 +420,48 @@ ice_set_ctrlq_len(struct ice_hw *hw)
 	hw->sbq.sq_buf_size = ICE_SBQ_MAX_BUF_LEN;
 }
 
+/*
+ * Name the family for messages.  The common code keys each family difference
+ * on hw->mac_type.  Only the E822 and E823 parts share a MAC type, and the
+ * device ID separates them.  NULL marks a MAC type that no supported device
+ * ID produces.
+ */
+static const char *
+ice_family_name(struct ice_hw *hw)
+{
+	switch (hw->mac_type) {
+	case ICE_MAC_E810:
+		return ("E810");
+	case ICE_MAC_GENERIC:
+		return (ice_is_e823(hw) ? "E823" : "E822");
+	case ICE_MAC_GENERIC_3K_E825:
+		return ("E825-C");
+	case ICE_MAC_E830:
+		return ("E830");
+	default:
+		return (NULL);
+	}
+}
+
 static boolean_t
 ice_hw_init(ice_t *ice)
 {
 	struct ice_hw *hw = &ice->ice_hw;
+	const char *family;
 	int rc;
+
+	/*
+	 * An alias added by hand can bind a device ID that the common code
+	 * does not map.  Reject it before any register access: the common
+	 * code selects registers, queue types and firmware formats from
+	 * the MAC type.
+	 */
+	if (ice_set_mac_type(hw) != 0 ||
+	    (family = ice_family_name(hw)) == NULL) {
+		ice_error(ice, "unsupported device %04x:%04x",
+		    hw->vendor_id, hw->device_id);
+		return (B_FALSE);
+	}
 
 	ice_set_ctrlq_len(hw);
 
@@ -443,6 +480,11 @@ ice_hw_init(ice_t *ice)
 		ice_deinit_hw(hw);
 		return (B_FALSE);
 	}
+
+	dev_err(ice->ice_dip, CE_NOTE, "!%s device %04x, PF %u, firmware "
+	    "%u.%u.%u, API %u.%u.%u", family, hw->device_id, hw->pf_id,
+	    hw->fw_maj_ver, hw->fw_min_ver, hw->fw_patch, hw->api_maj_ver,
+	    hw->api_min_ver, hw->api_patch);
 
 	return (B_TRUE);
 }

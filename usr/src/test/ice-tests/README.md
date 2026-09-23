@@ -77,6 +77,16 @@ This test does not load the driver or establish hardware isolation. The
 [filter contract](../../uts/common/io/ice/FILTERS.md) records these ownership
 and recovery rules.
 
+## Device family regression
+
+`mac_family.py` derives the supported device IDs from the imported
+`ice_set_mac_type()` and requires the package manifest aliases to match that
+set exactly. Subsystem IDs and the unmapped `0x1888` stay out. It then
+compiles the core mapping with the driver's `ice_family_name()` and the
+per-family helpers, and runs them for every device ID. The check covers the
+decisions that differ by family; it cannot show that an untested family
+passes traffic.
+
 ## Shared MAC filter request regression
 
 ```
