@@ -369,6 +369,7 @@ ice_tx_ring_program(ice_t *ice, ice_tx_ring_t *itr)
 	uint16_t qg_size;
 	int status;
 
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
 	bzero(&tlan, sizeof (tlan));
 
 	/* base is the ring DMA address in 128-byte units. */
@@ -412,15 +413,14 @@ ice_tx_ring_program(ice_t *ice, ice_tx_ring_t *itr)
 	/*
 	 * One queue group, one queue.  The queue handle is the per-VSI queue
 	 * index (ring i for the single PF VSI); it must be within the queue
-	 * count reserved by ice_cfg_vsi_lan().
+	 * count reserved by ice_cfg_vsi_lan().  The common code serializes
+	 * the scheduler tree with its own lock.
 	 */
-	mutex_enter(&ice->ice_lock);
 	itr->itxr_programmed = B_TRUE;
 	status = ice_ena_vsi_txq(hw->port_info, vsi->vi_handle, 0,
 	    (uint16_t)itr->itxr_index, 1, qg, qg_size, NULL);
 	if (status == ICE_SUCCESS)
 		itr->itxr_q_teid = LE32_TO_CPU(qg->txqs[0].q_teid);
-	mutex_exit(&ice->ice_lock);
 
 	kmem_free(qg, qg_size);
 
@@ -447,14 +447,13 @@ ice_tx_ring_unprogram(ice_t *ice, ice_tx_ring_t *itr)
 	uint32_t q_teid;
 	int status;
 
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
 	q_handle = (uint16_t)itr->itxr_index;
 	q_id = (uint16_t)itr->itxr_index;
 	q_teid = itr->itxr_q_teid;
 
-	mutex_enter(&ice->ice_lock);
 	status = ice_dis_vsi_txq(hw->port_info, ice->ice_pf_vsi.vi_handle, 0, 1,
 	    &q_handle, &q_id, &q_teid, ICE_NO_RESET, 0, NULL);
-	mutex_exit(&ice->ice_lock);
 
 	if (status == ICE_SUCCESS) {
 		itr->itxr_programmed = B_FALSE;

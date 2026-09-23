@@ -371,6 +371,7 @@ typedef struct ice_tx_ring {
 	struct ice		*itxr_ice;	/* RO */
 	uint32_t		itxr_index;	/* absolute HW tx queue index */
 	uint32_t		itxr_vec;	/* MSI-X vector index */
+	/* These two are guarded by ice_rebuild_lock. */
 	uint32_t		itxr_q_teid;	/* core: from ice_ena_vsi_txq */
 	/*
 	 * Set before the Add Tx Queues command and cleared only by a confirmed

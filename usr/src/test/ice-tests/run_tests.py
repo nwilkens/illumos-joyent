@@ -12,6 +12,7 @@ TESTS = (
     "runner_checks.py",
     "accept_script.py",
     "admin_interrupt.py",
+    "aq_locks.py",
     "buf_pool.py",
     "control_setup.py",
     "core_counts.py",

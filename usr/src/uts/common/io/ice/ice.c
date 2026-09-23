@@ -106,7 +106,10 @@
  *	ice_stat_lock	the counter baselines (ice_stats.c).
  *	ice_fwlog_lock	the firmware log ring (ice_ioctl.c).
  *
- * Never wait for a worker while holding a lock that the worker takes.
+ * The common code's control queue, scheduler and switch locks are adaptive
+ * and innermost.  No interrupt-priority lock (ice_lock, ice_lse_lock, a ring
+ * lock) is held across a firmware command or a reset poll.  Never wait for a
+ * worker while holding a lock that the worker takes.
  *
  * ---------------------
  * Start, stop and reset

@@ -377,6 +377,26 @@ read path, which any process in the link's zone can reach through
 `DLDIOC_READTRAN`, holds only the adaptive lifecycle lock across its
 admin-queue polling.
 
+## Firmware command lock check
+
+```
+python3 usr/src/test/ice-tests/aq_locks.py [--list]
+```
+
+`aq_locks.py` builds a call graph of the glue and the vendored core and finds
+every function that can reach `ice_sq_send_cmd()`, the one routine that
+submits an admin or sideband queue command, or a reset poll (`ice_reset()`,
+`ice_check_reset()`, `ice_pf_reset()`). It then walks each glue function,
+tracking `mutex_enter()` and `mutex_exit()` by block, and fails on any call
+into that set made while `ice_lock`, `ice_lse_lock` or a ring lock is held;
+these are interrupt-priority mutexes. A block that unlocks and returns keeps
+the lock state it was entered with. `--list` prints the core functions it
+classifies. The check fails if it loses sight of known command wrappers such
+as `ice_ena_vsi_txq()`, `ice_aq_sff_eeprom()` or `ice_fwlog_set()`, and a
+planted violation and the TX queue disable put back under `ice_lock` must
+both be reported. The walk ignores control flow beyond that, so it is a
+guard, not a proof.
+
 ## DDP section bounds regression
 
 ```
