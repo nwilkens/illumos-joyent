@@ -330,6 +330,11 @@ The following descriptions identify what each source check establishes.
 glue sources and the mdb module. It does not check the vendored `core/` code.
 It reports SKIP when perl is not installed.
 
+`exception_lists.py` checks that the `exception_lists/` files make the
+copyright, cstyle, hdrchk, wscheck, keywords, and utf8check passes skip the
+vendored `core/` code and the binary DDP package, and that no pattern skips
+the driver glue.
+
 `rx_checksum.py` verifies that receive checksum metadata is captured before
 the descriptor is reposted and that all hardware-reported L3/L4 checksum error
 bits suppress checksum validation.

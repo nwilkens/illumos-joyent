@@ -18,6 +18,7 @@ TESTS = (
     "detach_quiesce.py",
     "ddp_sections.py",
     "dma_lifetime.py",
+    "exception_lists.py",
     "filter_requests.py",
     "fma_dma.py",
     "hw_stats.py",
