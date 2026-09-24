@@ -352,6 +352,7 @@ typedef struct ice_tx_ctx_t {
 } ice_tx_ctx_t;
 
 typedef struct ice_tx_ctrl_block {
+	struct ice_tx_ctrl_block *itcb_next;	/* completed, to release */
 	ice_tcb_type_t		itcb_type;
 	uint32_t		itcb_len;
 	ice_dma_buffer_t	*itcb_buf;	/* copy buffer (pool) */

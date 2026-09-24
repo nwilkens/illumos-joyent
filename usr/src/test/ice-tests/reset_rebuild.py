@@ -247,9 +247,9 @@ def main() -> None:
     assert "ice_tcb_free" not in tx_quiesce
     tx_reclaim = function(
         tx, "ice_tx_reclaim(ice_t *ice)\n{", "\nvoid\nice_tx_stop")
-    assert "ice_tcb_release(itr, itr->itxr_tcbs[slot])" in tx_reclaim
+    assert "done = itr->itxr_tcbs[slot];" in tx_reclaim
     assert tx_reclaim.index("mutex_exit(&itr->itxr_lock)") < \
-        tx_reclaim.index("freemsgchain(done)")
+        tx_reclaim.index("ice_tx_done(itr, done)")
     tx_stop = function(tx, "ice_tx_stop(ice_t *ice)\n{", "\n/*\n")
     assert tx_stop.index("ice_tx_quiesce(ice)") < tx_stop.index(
         "ice_tx_reclaim(ice)"

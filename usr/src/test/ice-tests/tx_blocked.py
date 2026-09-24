@@ -42,7 +42,7 @@ def main() -> None:
     # the caller still keeps the chain for MAC to retry
     assert "return (B_FALSE);" in nores
     # completed packets are freed once the ring lock is dropped
-    assert exit_ < nores.index("freemsgchain(done)")
+    assert exit_ < nores.index("ice_tx_done(itr, done)")
 
     # a drop that returns resources rewakes a ring another sender blocked
     drop = build[build.index("if (res == ICE_TX_BUILD_DROP)"):]
@@ -74,7 +74,7 @@ def main() -> None:
     # recycle still owns the wakeup in both of its exits
     rec = function(
         tx,
-        "ice_tx_recycle(ice_tx_ring_t *itr, mblk_t **donep)\n{",
+        "ice_tx_recycle(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **donep)\n{",
         "\nstatic boolean_t\nice_tx_one",
     )
     assert rec.count("mac_tx_ring_update(") == 2

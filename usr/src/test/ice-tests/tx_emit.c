@@ -179,9 +179,11 @@ ice_check_dma_handle(ddi_dma_handle_t handle)
 	return (handle->fault ? -1 : DDI_FM_OK);
 }
 
+/* An unbind can run DMA callbacks, so it never runs under the ring lock. */
 static int
 ddi_dma_unbind_handle(ddi_dma_handle_t handle)
 {
+	assert(!f.ring.itxr_lock && !f.ring.itxr_tcb_lock);
 	assert(handle->bound);
 	handle->bound = B_FALSE;
 	assert(++handle->unbinds == 1);
@@ -268,18 +270,23 @@ ice_check_acc_handle(ice_t *ice, ddi_acc_handle_t handle)
 
 #include "ice_tx_emit_body.h"
 
-/* The fixture holds itxr_lock; recycled mblks are freed with it dropped. */
+/*
+ * The fixture holds itxr_lock; recycle only takes the completed TCBs off the
+ * ring, and they are released with the lock dropped.
+ */
 static uint_t
 recycle(void)
 {
-	mblk_t *done = NULL;
-	uint_t n;
+	ice_tx_ctrl_block_t *done = NULL;
+	uint_t n, nfree = f.ring.itxr_tcb_nfree, frees = f.mp.frees;
+	uint_t returns = f.returns[0] + f.returns[1];
 
 	assert(f.ring.itxr_lock);
 	n = ice_tx_recycle(&f.ring, &done);
-	assert(f.mp.frees == 0 || done == NULL);
+	assert(f.ring.itxr_tcb_nfree == nfree && f.mp.frees == frees);
+	assert(f.returns[0] + f.returns[1] == returns);
 	f.ring.itxr_lock = B_FALSE;
-	freemsgchain(done);
+	ice_tx_done(&f.ring, done);
 	f.ring.itxr_lock = B_TRUE;
 	return (n);
 }
@@ -571,7 +578,11 @@ failure_cases(void)
 			assert(f.nsyncs == (fault == 0 ? 1U : fault == 1 ?
 			    2U : 5U));
 			check_empty_slots();
-			/* The caller still owns every TCB and the message. */
+			/*
+			 * The caller still owns every TCB and the message, and
+			 * frees them once it drops the ring lock.
+			 */
+			f.ring.itxr_lock = B_FALSE;
 			for (i = 0; i < 3; i++) {
 				assert(f.chain[i]->itcb_mp == NULL);
 				ice_tcb_free(&f.ring, f.chain[i]);

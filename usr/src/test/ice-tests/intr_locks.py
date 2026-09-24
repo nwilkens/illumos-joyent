@@ -19,10 +19,13 @@ from aq_locks import KEYWORDS, WATCHED, functions, lock_name
 from c_test import DRIVER
 
 
-# Operations that can block, release DMA resources, or run a free routine.
+# Operations that can block, bind or release DMA resources (an unbind can run
+# other drivers' DMA callbacks), or run a free routine.
 FORBIDDEN = ("ddi_dma_alloc_handle", "ddi_dma_mem_alloc",
-             "ddi_dma_free_handle", "ddi_dma_mem_free", "ice_dma_alloc",
-             "ice_dma_free", "freemsg", "freemsgchain", "freeb", "kmem_free",
+             "ddi_dma_free_handle", "ddi_dma_mem_free",
+             "ddi_dma_addr_bind_handle", "ddi_dma_buf_bind_handle",
+             "ddi_dma_unbind_handle", "ice_dma_alloc", "ice_dma_free",
+             "freemsg", "freemsgchain", "freeb", "kmem_free",
              "ddi_intr_alloc", "ddi_intr_free", "ddi_intr_add_handler",
              "ddi_intr_remove_handler", "mac_ring_intr_set")
 SLEEP_ARGS = re.compile(r"\b(KM_SLEEP|DDI_DMA_SLEEP)\b")
@@ -157,7 +160,8 @@ def main():
                "static void\ng(ice_tx_ring_t *itr)\n{\n"
                "\tASSERT(MUTEX_HELD(&itr->itxr_lock));\n"
                "\t(void) ddi_dma_mem_alloc(h, n, a, f, DDI_DMA_DONTWAIT, "
-               "NULL, &v, &l, &ah);\n}\n")
+               "NULL, &v, &l, &ah);\n"
+               "\t(void) ddi_dma_unbind_handle(h);\n}\n")
     bodies = functions(planted)
     reach = blocking(bodies)
     found = [(lock, callee) for lock, callee, a in held_calls(bodies["f"])
@@ -166,7 +170,8 @@ def main():
                      ("irxr_lock", "freemsg")], found
     found = [(lock, callee) for lock, callee, a in held_calls(bodies["g"])
              if callee in reach]
-    assert found == [("itxr_lock", "ddi_dma_mem_alloc")], found
+    assert found == [("itxr_lock", "ddi_dma_mem_alloc"),
+                     ("itxr_lock", "ddi_dma_unbind_handle")], found
     assert set(WATCHED) >= {"ice_lock", "ice_lse_lock", "itxr_lock",
                             "itxr_tcb_lock", "irxr_lock"}
 

@@ -36,8 +36,9 @@ typedef struct {
 } kmutex_t;
 typedef pthread_cond_t kcondvar_t;
 typedef struct ice ice_t;
-typedef struct { unsigned int id; } ice_tx_ctrl_block_t;
-typedef struct { unsigned int id; } mblk_t;
+typedef struct ice_tx_ctrl_block {
+	struct ice_tx_ctrl_block *itcb_next;
+} ice_tx_ctrl_block_t;
 typedef struct ice_tx_ring {
 	ice_t *itxr_ice;
 	kmutex_t itxr_lock;
@@ -64,7 +65,6 @@ struct ice {
 static ice_t device;
 static ice_tx_ring_t ring;
 static ice_tx_ctrl_block_t block;
-static mblk_t message;
 static struct {
 	unsigned int notices, frees, probes;
 	boolean_t hold_notice, notice_entered, release_notice;
@@ -147,27 +147,14 @@ ddi_fm_service_impact(void *dip, int impact)
 	assert(!"unexpected DMA error");
 }
 
-static mblk_t *
-ice_tcb_release(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *tcb)
-{
-	assert(MUTEX_HELD(&itr->itxr_lock) && tcb == &block);
-	fixture.frees++;
-	return (&message);
-}
-
+/* Completed TCBs are released only once the ring lock is dropped. */
 static void
-ice_tx_defer_free(mblk_t **chainp, mblk_t *mp)
+ice_tx_done(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *list)
 {
-	assert(mp == &message && *chainp == NULL);
-	*chainp = mp;
-}
-
-/* Completed packets are freed only once the ring lock is dropped. */
-static void
-freemsgchain(mblk_t *mp)
-{
-	assert(!MUTEX_HELD(&ring.itxr_lock));
-	assert(mp == NULL || mp == &message);
+	assert(!MUTEX_HELD(&itr->itxr_lock));
+	assert(list == NULL || (list == &block && block.itcb_next == NULL));
+	if (list != NULL)
+		fixture.frees++;
 }
 
 static void

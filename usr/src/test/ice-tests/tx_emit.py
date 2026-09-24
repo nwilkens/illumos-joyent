@@ -33,8 +33,8 @@ def main():
     types.append(extract(source,
         r"^#define\s+ICE_TX_QW1_DTYPE_DONE_M\s+[^\n]*", args.source))
 
-    names = ["ice_tx_ring_next", "ice_tcb_release", "ice_tcb_free",
-             "ice_tx_defer_free", "ice_tx_sync_descs",
+    names = ["ice_tx_ring_next", "ice_tx_done", "ice_tcb_free",
+             "ice_tx_sync_descs",
              "ice_tx_write_desc", "ice_tx_write_ctx_desc", "ice_tx_sync_tcb",
              "ice_tx_doorbell", "ice_tx_emit", "ice_tx_desc_done",
              "ice_tx_recycle"]
