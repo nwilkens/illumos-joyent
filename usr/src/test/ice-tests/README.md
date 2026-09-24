@@ -174,7 +174,8 @@ carries exactly the listed modules, never one firmware did not report. A
 count above 32 or larger than the returned length holds, or a listed entry
 with a repeated or out-of-range module ID or a level above the maximum, fails
 GET and SET with EIO before any configuration is sent; entries past the count
-are not read.
+are not read. So does a reply whose resolution is outside 1 to 128 or whose
+flags include a bit the query does not define.
 
 ## mdb module check
 

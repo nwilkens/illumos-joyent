@@ -15,6 +15,10 @@ def main():
     source = args.source.read_text()
     body = re.findall(r"^#define\tICE_FWDUMP_MASK_\w+\t.*$", source,
                       re.MULTILINE)
+    if "ICE_DIAG_FWLOG_QUERY_FLAGS" in source:
+        body.append(extract(source,
+            r"^#define\tICE_DIAG_FWLOG_QUERY_FLAGS[^\n]*\\\n[^\n]*",
+            args.source))
     body.append(extract(source,
         r"^typedef struct ice_diag_fwlog \{[\s\S]*?^} ice_diag_fwlog_t;",
         args.source))

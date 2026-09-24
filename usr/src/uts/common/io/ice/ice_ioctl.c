@@ -43,6 +43,10 @@ CTASSERT(ICE_FWLOG_RES_MAX == ICE_AQC_FW_LOG_MAX_RESOLUTION);
 CTASSERT(ICE_IOC_BUFSZ <= ICE_AQ_MAX_BUF_LEN);
 CTASSERT(ICE_IOC_BUFSZ <= UINT16_MAX);
 
+/* The Query FW Logging reply flags (datasheet 0xFF32). */
+#define	ICE_DIAG_FWLOG_QUERY_FLAGS	(ICE_AQC_FW_LOG_CONF_UART_EN | \
+	ICE_AQC_FW_LOG_CONF_AQ_EN | ICE_AQC_FW_LOG_QUERY_REGISTERED)
+
 /*
  * Debug dump clusters FreeBSD permits (ICE_FW_DEBUG_DUMP_VALID_CLUSTER_MASK_*
  * in ice_lib.h), as bits above the family's first cluster ID.  The excluded
@@ -152,7 +156,8 @@ ice_diag_fwlog_find(const ice_diag_fwlog_t *q, uint32_t module)
 /*
  * Query the firmware logging configuration (0xFF32).  Firmware need not list
  * the modules in order or list all of them, but each one it lists must be a
- * known module, listed once, at a known level.
+ * known module, listed once, at a known level, and the resolution and flags
+ * must be ones the command defines.
  */
 static int
 ice_diag_fwlog_query(ice_t *ice, uint8_t *buf, ice_diag_fwlog_t *q)
@@ -163,6 +168,8 @@ ice_diag_fwlog_query(ice_t *ice, uint8_t *buf, ice_diag_fwlog_t *q)
 	struct ice_aqc_fw_log *cmd;
 	struct ice_aq_desc desc;
 	uint32_t seen = 0;
+	uint16_t nmods, resolution;
+	uint8_t flags;
 	uint_t i;
 	int status;
 
@@ -178,17 +185,27 @@ ice_diag_fwlog_query(ice_t *ice, uint8_t *buf, ice_diag_fwlog_t *q)
 	if (status != ICE_SUCCESS)
 		return (status);
 
-	bzero(q, sizeof (*q));
-	q->idf_nmods = LE16_TO_CPU(cmd->ops.cfg.mdl_cnt);
-	q->idf_resolution = LE16_TO_CPU(cmd->ops.cfg.log_resolution);
-	q->idf_flags = cmd->cmd_flags;
+	nmods = LE16_TO_CPU(cmd->ops.cfg.mdl_cnt);
+	resolution = LE16_TO_CPU(cmd->ops.cfg.log_resolution);
+	flags = cmd->cmd_flags;
 	/* The common code copies only the returned length into buf. */
-	if (q->idf_nmods > ICE_FWLOG_NMODULES ||
-	    LE16_TO_CPU(desc.datalen) < q->idf_nmods * sizeof (*resp)) {
+	if (nmods > ICE_FWLOG_NMODULES ||
+	    LE16_TO_CPU(desc.datalen) < nmods * sizeof (*resp)) {
 		ice_error(ice, "firmware lists %u log modules in %u bytes",
-		    q->idf_nmods, LE16_TO_CPU(desc.datalen));
+		    nmods, LE16_TO_CPU(desc.datalen));
 		return (ICE_ERR_CFG);
 	}
+	if (resolution < ICE_FWLOG_RES_MIN || resolution > ICE_FWLOG_RES_MAX ||
+	    (flags & ~ICE_DIAG_FWLOG_QUERY_FLAGS) != 0) {
+		ice_error(ice, "firmware log configuration has resolution %u "
+		    "and flags 0x%x", resolution, flags);
+		return (ICE_ERR_CFG);
+	}
+
+	bzero(q, sizeof (*q));
+	q->idf_nmods = nmods;
+	q->idf_resolution = resolution;
+	q->idf_flags = flags;
 
 	for (i = 0; i < q->idf_nmods; i++) {
 		uint16_t id = LE16_TO_CPU(resp[i].module_identifier);

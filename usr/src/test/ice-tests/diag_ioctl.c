@@ -656,6 +656,39 @@ check_fwlog_cfg(void)
 		assert(set(8, 2, 0, 1) == 0);
 	}
 
+	/*
+	 * A resolution outside 1 to 128 or a reply flag the query does not
+	 * define is neither returned nor sent back.
+	 */
+	{
+		static const struct {
+			u16 resolution;
+			u8 flags;
+		} bad[] = {
+			{ 0, 0 },
+			{ ICE_FWLOG_RES_MAX + 1, 0 },
+			{ 0xffff, 0 },
+			{ 1, ICE_AQC_FW_LOG_CONF_SET_VALID },
+			{ 1, 0x80 },
+		};
+
+		for (i = 0; i < sizeof (bad) / sizeof (bad[0]); i++) {
+			firmware_modules();
+			fw.resolution = bad[i].resolution;
+			fw.flags = bad[i].flags;
+			errors = 0;
+			calls = configs;
+			assert(get(1) == EIO && errors == 1);
+			assert(set(1, 1, 0, 1) == EIO && configs == calls);
+		}
+		firmware_modules();
+		fw.resolution = ICE_FWLOG_RES_MAX;
+		fw.flags = ICE_AQC_FW_LOG_CONF_UART_EN |
+		    ICE_AQC_FW_LOG_CONF_AQ_EN | ICE_AQC_FW_LOG_QUERY_REGISTERED;
+		assert(get(1) == 0);
+		assert(req.u.cfg.ifc_resolution == ICE_FWLOG_RES_MAX);
+	}
+
 	firmware_modules();
 	/* The ring stays until detach; a second enable does not leak. */
 	assert(set(3, 2, ICE_FWLOG_F_ARQ, 1) == 0 && allocs == 1);
