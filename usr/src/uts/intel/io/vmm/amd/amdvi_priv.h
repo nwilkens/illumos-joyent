@@ -28,381 +28,219 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+/*
+ * This file and its contents are supplied under the terms of the
+ * Common Development and Distribution License ("CDDL"), version 1.0.
+ * You may only use this file in accordance with the terms of version
+ * 1.0 of the CDDL.
+ *
+ * A full copy of the text of the CDDL should have accompanied this
+ * source.  A copy of the CDDL is also available via the Internet at
+ * http://www.illumos.org/license/CDDL.
+ */
+/* This file is dual-licensed; see usr/src/contrib/bhyve/LICENSE */
+
+/*
+ * Copyright 2026 Edgecast Cloud LLC.
+ */
 
 #ifndef _AMDVI_PRIV_H_
-#define _AMDVI_PRIV_H_
+#define	_AMDVI_PRIV_H_
 
-#include <contrib/dev/acpica/include/acpi.h>
+#include <sys/types.h>
+#include <sys/list.h>
 
-#define	BIT(n)			(1ULL << (n))
-/* Return value of bits[n:m] where n and (n >= ) m are bit positions. */
-#define REG_BITS(x, n, m)	(((x) >> (m)) &			\
-				((1 << (((n) - (m)) + 1)) - 1))
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /*
- * IOMMU PCI capability.
+ * Definitions from the "AMD I/O Virtualization Technology (IOMMU)
+ * Specification", publication 48882.
  */
-#define AMDVI_PCI_CAP_IOTLB	BIT(0)	/* IOTLB is supported. */
-#define AMDVI_PCI_CAP_HT	BIT(1)	/* HyperTransport tunnel support. */
-#define AMDVI_PCI_CAP_NPCACHE	BIT(2)	/* Not present page cached. */
-#define AMDVI_PCI_CAP_EFR	BIT(3)	/* Extended features. */
-#define AMDVI_PCI_CAP_EXT	BIT(4)	/* Miscellaneous information reg. */
+
+/* MMIO registers */
+#define	AMDVI_MMIO_SIZE		0x4000
+#define	AMDVI_REG_DEVTAB_BASE	0x0000
+#define	AMDVI_REG_CMDBUF_BASE	0x0008
+#define	AMDVI_REG_EVLOG_BASE	0x0010
+#define	AMDVI_REG_CTRL		0x0018
+#define	AMDVI_REG_EXCL_BASE	0x0020
+#define	AMDVI_REG_EXCL_LIMIT	0x0028
+#define	AMDVI_REG_EFR		0x0030
+#define	AMDVI_REG_CMDBUF_HEAD	0x2000
+#define	AMDVI_REG_CMDBUF_TAIL	0x2008
+#define	AMDVI_REG_EVLOG_HEAD	0x2010
+#define	AMDVI_REG_EVLOG_TAIL	0x2018
+#define	AMDVI_REG_STATUS	0x2020
+
+#define	AMDVI_CTRL_EN		(1ULL << 0)
+#define	AMDVI_CTRL_HTTUN_EN	(1ULL << 1)
+#define	AMDVI_CTRL_EVLOG_EN	(1ULL << 2)
+#define	AMDVI_CTRL_EVINT_EN	(1ULL << 3)
+#define	AMDVI_CTRL_COMWINT_EN	(1ULL << 4)
+#define	AMDVI_CTRL_INVTO_MASK	(7ULL << 5)
+#define	AMDVI_CTRL_INVTO_1S	(4ULL << 5)
+#define	AMDVI_CTRL_PASSPW	(1ULL << 8)
+#define	AMDVI_CTRL_RESPASSPW	(1ULL << 9)
+#define	AMDVI_CTRL_COHERENT	(1ULL << 10)
+#define	AMDVI_CTRL_ISOC		(1ULL << 11)
+#define	AMDVI_CTRL_CMDBUF_EN	(1ULL << 12)
+#define	AMDVI_CTRL_DEVTABSEG	(7ULL << 34)
+
+#define	AMDVI_EFR_IASUP		(1ULL << 6)
+#define	AMDVI_EFR_HATS(efr)	(((efr) >> 10) & 0x3)
+
+#define	AMDVI_STATUS_EVOVRFLW	(1ULL << 0)
+#define	AMDVI_STATUS_EVLOGRUN	(1ULL << 3)
+#define	AMDVI_STATUS_CMDBUFRUN	(1ULL << 4)
+
+/* The ring pointer registers hold byte offsets in bits 18:4. */
+#define	AMDVI_RING_PTR_MASK	0x7fff0ULL
+#define	AMDVI_RING_LEN_SHIFT	56
 
 /*
- * IOMMU extended features.
+ * The command buffer and the event log each use a single page, which holds
+ * 256 entries of 16 bytes.  Their base registers encode that as log2(256).
  */
-#define AMDVI_EX_FEA_PREFSUP	BIT(0)	/* Prefetch command support. */
-#define AMDVI_EX_FEA_PPRSUP	BIT(1)	/* PPR support */
-#define AMDVI_EX_FEA_XTSUP	BIT(2)	/* Reserved */
-#define AMDVI_EX_FEA_NXSUP	BIT(3)	/* No-execute. */
-#define AMDVI_EX_FEA_GTSUP	BIT(4)	/* Guest translation support. */
-#define AMDVI_EX_FEA_EFRW	BIT(5)	/* Reserved */
-#define AMDVI_EX_FEA_IASUP	BIT(6)	/* Invalidate all command supp. */
-#define AMDVI_EX_FEA_GASUP	BIT(7)	/* Guest APIC or AVIC support. */
-#define AMDVI_EX_FEA_HESUP	BIT(8)	/* Hardware Error. */
-#define AMDVI_EX_FEA_PCSUP	BIT(9)	/* Performance counters support. */
-/* XXX: add more EFER bits. */
+#define	AMDVI_PAGE_SIZE		4096
+#define	AMDVI_RING_SIZE		4096
+#define	AMDVI_RING_ENTRY_SIZE	16
+#define	AMDVI_RING_LEN_256	8ULL
+
+/* Device table */
+#define	AMDVI_NUM_DEVID		0x10000
+#define	AMDVI_DTE_SIZE		32
+#define	AMDVI_DEVTAB_SIZE	(AMDVI_NUM_DEVID * AMDVI_DTE_SIZE)
+
+#define	AMDVI_DTE0_V		(1ULL << 0)
+#define	AMDVI_DTE0_TV		(1ULL << 1)
+#define	AMDVI_DTE0_MODE_SHIFT	9
+#define	AMDVI_DTE0_IR		(1ULL << 61)
+#define	AMDVI_DTE0_IW		(1ULL << 62)
+#define	AMDVI_DTE1_SE		(1ULL << 33)
+#define	AMDVI_DTE1_SYSMGT_SHIFT	40
+#define	AMDVI_DTE2_INITPASS	(1ULL << 56)
+#define	AMDVI_DTE2_EINTPASS	(1ULL << 57)
+#define	AMDVI_DTE2_NMIPASS	(1ULL << 58)
+#define	AMDVI_DTE2_LINT0PASS	(1ULL << 62)
+#define	AMDVI_DTE2_LINT1PASS	(1ULL << 63)
+
+/* Page table entries */
+#define	AMDVI_PTE_PR		(1ULL << 0)
+#define	AMDVI_PTE_NL_SHIFT	9
+#define	AMDVI_PTE_NL_MASK	(7ULL << AMDVI_PTE_NL_SHIFT)
+#define	AMDVI_PTE_PA_MASK	0x000ffffffffff000ULL
+#define	AMDVI_PA_MAX		0x000fffffffffffffULL
+#define	AMDVI_PTE_FC		(1ULL << 60)
+#define	AMDVI_PTE_IR		(1ULL << 61)
+#define	AMDVI_PTE_IW		(1ULL << 62)
+
+#define	AMDVI_PT_SHIFT		9
+#define	AMDVI_PT_ENTRIES	(1 << AMDVI_PT_SHIFT)
+#define	AMDVI_MAX_LEVELS	6
+
+/* Commands */
+#define	AMDVI_CMD_OP_SHIFT		60
+#define	AMDVI_CMD_COMPLETION_WAIT	0x1ULL
+#define	AMDVI_CMD_INV_DEVTAB_ENTRY	0x2ULL
+#define	AMDVI_CMD_INV_IOMMU_PAGES	0x3ULL
+#define	AMDVI_CMD_INV_ALL		0x8ULL
+
+#define	AMDVI_CMD_CW_STORE		(1ULL << 0)
+#define	AMDVI_CMD_CW_ADDR_MASK		0x000ffffffffffff8ULL
+#define	AMDVI_CMD_INVP_S		(1ULL << 0)
+#define	AMDVI_CMD_INVP_PDE		(1ULL << 1)
+#define	AMDVI_CMD_INVP_ALL_ADDR		0x7ffffffffffff000ULL
+
+/* Event log entries */
+#define	AMDVI_EV_CODE(e)	((uint_t)((e) >> 60))
+#define	AMDVI_EV_DEVID(e)	((uint16_t)(e))
+#define	AMDVI_EV_DOMID(e)	((uint16_t)((e) >> 32))
+#define	AMDVI_EV_FLAGS(e)	((uint_t)(((e) >> 48) & 0xfff))
+
+#define	AMDVI_EV_ILL_DEV_TABLE_ENTRY	0x1
+#define	AMDVI_EV_IO_PAGE_FAULT		0x2
+#define	AMDVI_EV_DEV_TAB_HW_ERROR	0x3
+#define	AMDVI_EV_PAGE_TAB_HW_ERROR	0x4
+#define	AMDVI_EV_ILL_CMD_ERROR		0x5
+#define	AMDVI_EV_CMD_HW_ERROR		0x6
+#define	AMDVI_EV_IOTLB_INV_TIMEOUT	0x7
+#define	AMDVI_EV_INVALID_DEV_REQ	0x8
+
+/* IVRS */
+#define	AMDVI_IVHD_TYPE_10	0x10
+#define	AMDVI_IVHD_TYPE_11	0x11
+#define	AMDVI_IVHD_TYPE_40	0x40
+
+#define	AMDVI_IVHD_FLAG_HTTUN	(1U << 0)
+#define	AMDVI_IVHD_FLAG_PASSPW	(1U << 1)
+#define	AMDVI_IVHD_FLAG_RESPASSPW (1U << 2)
+#define	AMDVI_IVHD_FLAG_ISOC	(1U << 3)
+
+#define	AMDVI_MAX_UNITS		32
+#define	AMDVI_UNIT_NONE		0xff
 
 /*
- * Device table entry or DTE
- * NOTE: Must be 256-bits/32 bytes aligned.
+ * What the IVRS table says about a single requester ID: which unit
+ * translates it, the requester ID the unit will actually see (differs from
+ * the device's own for devices behind a PCIe-to-PCI bridge), and the IVHD
+ * DataSetting byte.
  */
-struct amdvi_dte {
-	uint32_t dt_valid:1;		/* Device Table valid. */
-	uint32_t pt_valid:1;		/* Page translation valid. */
-	uint16_t :7;			/* Reserved[8:2] */
-	uint8_t	 pt_level:3;		/* Paging level, 0 to disable. */
-	uint64_t pt_base:40;		/* Page table root pointer. */
-	uint8_t  :3;			/* Reserved[54:52] */
-	uint8_t	 gv_valid:1;		/* Revision 2, GVA to SPA. */
-	uint8_t	 gv_level:2;		/* Revision 2, GLX level. */
-	uint8_t	 gv_cr3_lsb:3;		/* Revision 2, GCR3[14:12] */
-	uint8_t	 read_allow:1;		/* I/O read enabled. */
-	uint8_t	 write_allow:1;		/* I/O write enabled. */
-	uint8_t  :1;			/* Reserved[63] */
-	uint16_t domain_id:16;		/* Domain ID */
-	uint16_t gv_cr3_lsb2:16;	/* Revision 2, GCR3[30:15] */
-	uint8_t	 iotlb_enable:1;	/* Device support IOTLB */
-	uint8_t	 sup_second_io_fault:1;	/* Suppress subsequent I/O faults. */
-	uint8_t	 sup_all_io_fault:1;	/* Suppress all I/O page faults. */
-	uint8_t	 IOctl:2;		/* Port I/O control. */
-	uint8_t	 iotlb_cache_disable:1;	/* IOTLB cache hints. */
-	uint8_t	 snoop_disable:1;	/* Snoop disable. */
-	uint8_t	 allow_ex:1;		/* Allow exclusion. */
-	uint8_t	 sysmgmt:2;		/* System management message.*/
-	uint8_t  :1;			/* Reserved[106] */
-	uint32_t gv_cr3_msb:21;		/* Revision 2, GCR3[51:31] */
-	uint8_t	 intmap_valid:1;	/* Interrupt map valid. */
-	uint8_t	 intmap_len:4;		/* Interrupt map table length. */
-	uint8_t	 intmap_ign:1;		/* Ignore unmapped interrupts. */
-	uint64_t intmap_base:46;	/* IntMap base. */
-	uint8_t  :4;			/* Reserved[183:180] */
-	uint8_t	 init_pass:1;		/* INIT pass through or PT */
-	uint8_t	 extintr_pass:1;	/* External Interrupt PT */
-	uint8_t	 nmi_pass:1;		/* NMI PT */
-	uint8_t  :1;			/* Reserved[187] */
-	uint8_t	 intr_ctrl:2;		/* Interrupt control */
-	uint8_t	 lint0_pass:1;		/* LINT0 PT */
-	uint8_t	 lint1_pass:1;		/* LINT1 PT */
-	uint64_t :64;			/* Reserved[255:192] */
-} __attribute__((__packed__));
-CTASSERT(sizeof(struct amdvi_dte) == 32);
+typedef struct amdvi_devcfg {
+	uint16_t	adc_alias;
+	uint8_t		adc_unit;
+	uint8_t		adc_data;
+} amdvi_devcfg_t;
 
-/*
- * IOMMU command entry.
- */
-struct amdvi_cmd {
-	uint32_t	word0;
-	uint32_t	word1:28;
-	uint8_t		opcode:4;
-	uint64_t	addr;
-} __attribute__((__packed__));
+typedef struct amdvi_unit {
+	uint16_t	au_devid;
+	uint16_t	au_seg;
+	uint8_t		au_ivhd_type;
+	uint8_t		au_ivhd_flags;
+	uint64_t	au_mmio_pa;
 
-/* Command opcodes. */
-#define AMDVI_CMP_WAIT_OPCODE	0x1	/* Completion wait. */
-#define AMDVI_INVD_DTE_OPCODE	0x2	/* Invalidate device table entry. */
-#define AMDVI_INVD_PAGE_OPCODE	0x3	/* Invalidate pages. */
-#define AMDVI_INVD_IOTLB_OPCODE	0x4	/* Invalidate IOTLB pages. */
-#define AMDVI_INVD_INTR_OPCODE	0x5	/* Invalidate Interrupt table. */
-#define AMDVI_PREFETCH_PAGES_OPCODE	0x6	/* Prefetch IOMMU pages. */
-#define AMDVI_COMP_PPR_OPCODE	0x7	/* Complete PPR request. */
-#define AMDVI_INV_ALL_OPCODE	0x8	/* Invalidate all. */
+	caddr_t		au_regs;
+	uint64_t	au_efr;
+	uint64_t	au_ctrl;
+	bool		au_enabled;
 
-/* Completion wait attributes. */
-#define AMDVI_CMP_WAIT_STORE	BIT(0)	/* Write back data. */
-#define AMDVI_CMP_WAIT_INTR	BIT(1)	/* Completion wait interrupt. */
-#define AMDVI_CMP_WAIT_FLUSH	BIT(2)	/* Flush queue. */
+	uint64_t	*au_cmdbuf;
+	uint64_t	au_cmdbuf_pa;
+	uint32_t	au_cmd_tail;
+	bool		au_cmd_err;
 
-/* Invalidate page. */
-#define AMDVI_INVD_PAGE_S	BIT(0)	/* Invalidation size. */
-#define AMDVI_INVD_PAGE_PDE	BIT(1)	/* Invalidate PDE. */
-#define AMDVI_INVD_PAGE_GN_GVA	BIT(2)	/* GPA or GVA. */
+	uint64_t	*au_evlog;
+	uint64_t	au_evlog_pa;
 
-#define AMDVI_INVD_PAGE_ALL_ADDR	(0x7FFFFFFFFFFFFULL << 12)
+	volatile uint64_t au_cw_store;
+	uint64_t	au_cw_seq;
+} amdvi_unit_t;
 
-/* Invalidate IOTLB. */
-#define AMDVI_INVD_IOTLB_S	BIT(0)	/* Invalidation size 4k or addr */
-#define AMDVI_INVD_IOTLB_GN_GVA	BIT(2)	/* GPA or GVA. */
+typedef struct amdvi_domain {
+	list_node_t	ad_node;
+	uint64_t	*ad_root;
+	uint64_t	ad_root_pa;
+	uint_t		ad_levels;
+	uint16_t	ad_id;
+	bool		ad_host;
+} amdvi_domain_t;
 
-#define AMDVI_INVD_IOTLB_ALL_ADDR	(0x7FFFFFFFFFFFFULL << 12)
-/* XXX: add more command entries. */
+/* ivrs_drv.c */
+int amdvi_ivrs_parse(amdvi_unit_t *, uint_t *, amdvi_devcfg_t *);
 
-/*
- * IOMMU event entry.
- */
-struct amdvi_event {
-	uint16_t	devid;
-	uint16_t	pasid_hi;
-	uint16_t	pasid_domid;	/* PASID low or DomainID */
-	uint16_t	flag:12;
-	uint8_t		opcode:4;
-	uint64_t	addr;
-} __attribute__((__packed__));
-CTASSERT(sizeof(struct amdvi_event) == 16);
+/* amdvi_hw.c */
+int amdvi_hw_init(void);
+void amdvi_hw_fini(void);
+void amdvi_hw_enable(void);
+void amdvi_hw_disable(void);
+uint_t amdvi_hw_max_levels(void);
+int amdvi_hw_attach(const amdvi_domain_t *, uint16_t);
+void amdvi_hw_detach(const amdvi_domain_t *, uint16_t);
+bool amdvi_hw_inv_domain(const amdvi_domain_t *);
 
-/* Various event types. */
-#define AMDVI_EVENT_INVALID_DTE		0x1
-#define AMDVI_EVENT_PFAULT		0x2
-#define AMDVI_EVENT_DTE_HW_ERROR	0x3
-#define AMDVI_EVENT_PAGE_HW_ERROR	0x4
-#define AMDVI_EVENT_ILLEGAL_CMD		0x5
-#define AMDVI_EVENT_CMD_HW_ERROR	0x6
-#define AMDVI_EVENT_IOTLB_TIMEOUT	0x7
-#define AMDVI_EVENT_INVALID_DTE_REQ	0x8
-#define AMDVI_EVENT_INVALID_PPR_REQ	0x9
-#define AMDVI_EVENT_COUNTER_ZERO	0xA
+#ifdef __cplusplus
+}
+#endif
 
-#define AMDVI_EVENT_FLAG_MASK           0x1FF	/* Mask for event flags. */
-#define AMDVI_EVENT_FLAG_TYPE(x)        (((x) >> 9) & 0x3)
-
-/*
- * IOMMU control block.
- */
-struct amdvi_ctrl {
-	struct {
-		uint16_t size:9;
-		uint16_t :3;
-		uint64_t base:40;	/* Devtable register base. */
-		uint16_t :12;
-	} dte;
-	struct {
-		uint16_t :12;
-		uint64_t base:40;
-		uint8_t  :4;
-		uint8_t	 len:4;
-		uint8_t  :4;
-	} cmd;
-	struct {
-		uint16_t :12;
-		uint64_t base:40;
-		uint8_t  :4;
-		uint8_t	 len:4;
-		uint8_t  :4;
-	} event;
-	uint16_t control :13;
-	uint64_t	 :51;
-	struct {
-		uint8_t	 enable:1;
-		uint8_t	 allow:1;
-		uint16_t :10;
-		uint64_t base:40;
-		uint16_t :12;
-		uint16_t :12;
-		uint64_t limit:40;
-		uint16_t :12;
-	} excl;
-	/*
-	 * Revision 2 only.
-	 */
-	uint64_t ex_feature;
-	struct {
-		uint16_t :12;
-		uint64_t base:40;
-		uint8_t  :4;
-		uint8_t	 len:4;
-		uint8_t  :4;
-	} ppr;
-	uint64_t first_event;
-	uint64_t second_event;
-	uint64_t event_status;
-	/* Revision 2 only, end. */
-	uint8_t	 pad1[0x1FA8];		/* Padding. */
-	uint32_t cmd_head:19;
-	uint64_t :45;
-	uint32_t cmd_tail:19;
-	uint64_t :45;
-	uint32_t evt_head:19;
-	uint64_t :45;
-	uint32_t evt_tail:19;
-	uint64_t :45;
-	uint32_t status:19;
-	uint64_t :45;
-	uint64_t pad2;
-	uint8_t  :4;
-	uint16_t ppr_head:15;
-	uint64_t :45;
-	uint8_t  :4;
-	uint16_t ppr_tail:15;
-	uint64_t :45;
-	uint8_t	 pad3[0x1FC0];		/* Padding. */
-
-	/* XXX: More for rev2. */
-} __attribute__((__packed__));
-CTASSERT(offsetof(struct amdvi_ctrl, pad1)== 0x58);
-CTASSERT(offsetof(struct amdvi_ctrl, pad2)== 0x2028);
-CTASSERT(offsetof(struct amdvi_ctrl, pad3)== 0x2040);
-
-#define AMDVI_MMIO_V1_SIZE	(4 * PAGE_SIZE)	/* v1 size */
-/*
- * AMF IOMMU v2 size including event counters
- */
-#define AMDVI_MMIO_V2_SIZE	(8 * PAGE_SIZE)
-
-CTASSERT(sizeof(struct amdvi_ctrl) == 0x4000);
-CTASSERT(sizeof(struct amdvi_ctrl) == AMDVI_MMIO_V1_SIZE);
-
-/* IVHD flag */
-#define IVHD_FLAG_HTT		BIT(0)	/* Hypertransport Tunnel. */
-#define IVHD_FLAG_PPW		BIT(1)	/* Pass posted write. */
-#define IVHD_FLAG_RPPW		BIT(2)	/* Response pass posted write. */
-#define IVHD_FLAG_ISOC		BIT(3)	/* Isoc support. */
-#define IVHD_FLAG_IOTLB		BIT(4)	/* IOTLB support. */
-#define IVHD_FLAG_COH		BIT(5)	/* Coherent control, default 1 */
-#define IVHD_FLAG_PFS		BIT(6)	/* Prefetch IOMMU pages. */
-#define IVHD_FLAG_PPRS		BIT(7)	/* Peripheral page support. */
-
-/* IVHD device entry data setting. */
-#define IVHD_DEV_LINT0_PASS	BIT(6)	/* LINT0 interrupts. */
-#define IVHD_DEV_LINT1_PASS	BIT(7)	/* LINT1 interrupts. */
-
-/* Bit[5:4] for System Mgmt. Bit3 is reserved. */
-#define IVHD_DEV_INIT_PASS	BIT(0)	/* INIT */
-#define IVHD_DEV_EXTINTR_PASS	BIT(1)	/* ExtInt */
-#define IVHD_DEV_NMI_PASS	BIT(2)	/* NMI */
-
-/* IVHD 8-byte extended data settings. */
-#define IVHD_DEV_EXT_ATS_DISABLE	BIT(31)	/* Disable ATS */
-
-/* IOMMU control register. */
-#define AMDVI_CTRL_EN		BIT(0)	/* IOMMU enable. */
-#define AMDVI_CTRL_HTT		BIT(1)	/* Hypertransport tunnel enable. */
-#define AMDVI_CTRL_ELOG		BIT(2)	/* Event log enable. */
-#define AMDVI_CTRL_ELOGINT	BIT(3)	/* Event log interrupt. */
-#define AMDVI_CTRL_COMINT	BIT(4)	/* Completion wait interrupt. */
-#define AMDVI_CTRL_PPW		BIT(8)
-#define AMDVI_CTRL_RPPW		BIT(9)
-#define AMDVI_CTRL_COH		BIT(10)
-#define AMDVI_CTRL_ISOC		BIT(11)
-#define AMDVI_CTRL_CMD		BIT(12)	/* Command buffer enable. */
-#define AMDVI_CTRL_PPRLOG	BIT(13)
-#define AMDVI_CTRL_PPRINT	BIT(14)
-#define AMDVI_CTRL_PPREN	BIT(15)
-#define AMDVI_CTRL_GTE		BIT(16)	/* Guest translation enable. */
-#define AMDVI_CTRL_GAE		BIT(17)	/* Guest APIC enable. */
-
-/* Invalidation timeout. */
-#define AMDVI_CTRL_INV_NO_TO	0	/* No timeout. */
-#define AMDVI_CTRL_INV_TO_1ms	1	/* 1 ms */
-#define AMDVI_CTRL_INV_TO_10ms	2	/* 10 ms */
-#define AMDVI_CTRL_INV_TO_100ms	3	/* 100 ms */
-#define AMDVI_CTRL_INV_TO_1S	4	/* 1 second */
-#define AMDVI_CTRL_INV_TO_10S	5	/* 10 second */
-#define AMDVI_CTRL_INV_TO_100S	6	/* 100 second */
-
-/*
- * Max number of PCI devices.
- * 256 bus x 32 slot/devices x 8 functions.
- */
-#define PCI_NUM_DEV_MAX		0x10000
-
-/* Maximum number of domains supported by IOMMU. */
-#define AMDVI_MAX_DOMAIN	(BIT(16) - 1)
-
-/*
- * IOMMU Page Table attributes.
- */
-#define AMDVI_PT_PRESENT	BIT(0)
-#define AMDVI_PT_COHERENT	BIT(60)
-#define AMDVI_PT_READ		BIT(61)
-#define AMDVI_PT_WRITE		BIT(62)
-
-#define AMDVI_PT_RW		(AMDVI_PT_READ | AMDVI_PT_WRITE)
-#define AMDVI_PT_MASK		0xFFFFFFFFFF000UL /* Only [51:12] for PA */
-
-#define AMDVI_PD_LEVEL_SHIFT	9
-#define AMDVI_PD_SUPER(x)	(((x) >> AMDVI_PD_LEVEL_SHIFT) == 7)
-/*
- * IOMMU Status, offset 0x2020
- */
-#define AMDVI_STATUS_EV_OF		BIT(0)	/* Event overflow. */
-#define AMDVI_STATUS_EV_INTR		BIT(1)	/* Event interrupt. */
-/* Completion wait command completed. */
-#define AMDVI_STATUS_CMP		BIT(2)
-
-#define	IVRS_CTRL_RID			1	/* MMIO RID */
-
-/* ACPI IVHD */
-struct ivhd_dev_cfg {
-	uint32_t start_id;
-	uint32_t end_id;
-	uint8_t	 data;			/* Device configuration. */
-	bool	 enable_ats;		/* ATS enabled for the device. */
-	int	 ats_qlen;		/* ATS invalidation queue depth. */
-};
-
-struct amdvi_domain {
-	uint64_t *ptp;			/* Highest level page table */
-	int	ptp_level;		/* Level of page tables */
-	u_int	id;			/* Domain id */
-	SLIST_ENTRY (amdvi_domain) next;
-};
-
-/*
- * Different type of IVHD.
- * XXX: Use AcpiIvrsType once new IVHD types are available.
-*/
-enum IvrsType
-{
-	IVRS_TYPE_HARDWARE_LEGACY = ACPI_IVRS_TYPE_HARDWARE1,
-					/* Legacy without EFRi support. */
-	IVRS_TYPE_HARDWARE_EFR	  = ACPI_IVRS_TYPE_HARDWARE2,
-						/* With EFR support. */
-	IVRS_TYPE_HARDWARE_MIXED  = 0x40, /* Mixed with EFR support. */
-};
-
-/*
- * AMD IOMMU softc.
- */
-struct amdvi_softc {
-	struct amdvi_ctrl *ctrl;	/* Control area. */
-	device_t	dev;		/* IOMMU device. */
-	device_t	pci_dev;	/* IOMMU PCI function device. */
-	enum IvrsType   ivhd_type;	/* IOMMU IVHD type. */
-	bool		iotlb;		/* IOTLB supported by IOMMU */
-	struct amdvi_cmd *cmd;		/* Command descriptor area. */
-	int		cmd_max;	/* Max number of commands. */
-	uint64_t	cmp_data;	/* Command completion write back. */
-	struct amdvi_event *event;	/* Event descriptor area. */
-	int		event_max;	/* Max number of events. */
-	/* ACPI various flags. */
-	uint32_t	ivhd_flag;	/* ACPI IVHD flag. */
-	uint32_t	ivhd_feature;	/* ACPI v1 Reserved or v2 attribute. */
-	uint64_t	ext_feature;	/* IVHD EFR */
-	/* PCI related. */
-	uint16_t	cap_off;	/* PCI Capability offset. */
-	uint8_t		pci_cap;	/* PCI capability. */
-	uint16_t	pci_seg;	/* IOMMU PCI domain/segment. */
-	uint16_t	pci_rid;	/* PCI BDF of IOMMU */
-	/* ACPI device configuration for end points. */
-	struct		ivhd_dev_cfg *dev_cfg;
-	int		dev_cfg_cnt;
-	int		dev_cfg_cap;
-
-	/* Software statistics. */
-	uint64_t	event_intr_cnt;	/* Total event INTR count. */
-	uint64_t	total_cmd;	/* Total number of commands. */
-};
-
-int	amdvi_setup_hw(struct amdvi_softc *softc);
-int	amdvi_teardown_hw(struct amdvi_softc *softc);
 #endif /* _AMDVI_PRIV_H_ */

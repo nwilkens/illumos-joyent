@@ -28,6 +28,7 @@
 # Copyright 2019 Peter Tribble.
 # Copyright 2025 Oxide Computer Company
 # Copyright 2023 Racktop Systems, Inc.
+# Copyright 2026 Edgecast Cloud LLC.
 #
 
 #
@@ -768,6 +769,7 @@ DRV_KMODS	+= viona
 #
 DRV_KMODS	+= ppt
 DRV_KMODS	+= vmm_vtd
+DRV_KMODS	+= vmm_amdvi
 
 #
 # bhyve drv test interface
