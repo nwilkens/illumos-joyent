@@ -19,7 +19,9 @@
  * A destroy that cannot issue its control command (the device is being
  * reset or has failed) taints the function; every DMA buffer freed after
  * that goes to ice's quarantine until the reset completes.  That includes
- * consumer buffers from rdk_dma_buf_alloc(), which come from ice too.
+ * consumer buffers from rdk_dma_buf_alloc(), which come from ice too.  A
+ * tainted function issues no more verbs commands and reuses no resource
+ * number; a command that fails on a healthy one also asks for a reset.
  */
 
 #include <sys/types.h>
@@ -49,10 +51,23 @@ irdma_vreq(irdma_t *irdma, uint8_t op)
 {
 	irdma_cqp_req_t *req;
 
-	if (!irdma_hw_ok(irdma) || (req = irdma_req_alloc(irdma)) == NULL)
+	if (!irdma_healthy(irdma) || (req = irdma_req_alloc(irdma)) == NULL)
 		return (NULL);
 	req->icr_cmd.cqp_cmd = op;
 	return (req);
+}
+
+/*
+ * A verbs command failed, so the device may still hold what it named.
+ * Nothing it touched is reused, and a healthy function asks for a reset.
+ */
+void
+irdma_verbs_uncertain(irdma_t *irdma, const char *what)
+{
+	if (irdma_healthy(irdma))
+		irdma_fatal(irdma, what);
+	else
+		irdma_taint(irdma);
 }
 
 /*
@@ -79,9 +94,12 @@ irdma_alloc_rsrc(irdma_t *irdma, ulong_t *map, uint32_t max, uint32_t *num,
 	return (ENOSPC);
 }
 
+/* Once the function is tainted a number stays used until the reset. */
 void
 irdma_free_rsrc(irdma_t *irdma, ulong_t *map, uint32_t num)
 {
+	if (!irdma_healthy(irdma))
+		return;
 	mutex_enter(&irdma->irdma_rsrc_lock);
 	BT_CLEAR(map, num);
 	mutex_exit(&irdma->irdma_rsrc_lock);

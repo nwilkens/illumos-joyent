@@ -595,7 +595,7 @@ irdma_create_qp(struct rdk_qp *rqp, struct rdk_qp_init_attr *init)
 	req->icr_cmd.in.u.qp_create.qp = &iqp->iqp_sc;
 	req->icr_cmd.in.u.qp_create.scratch = irdma_req_scratch(irdma, req);
 	if ((ret = irdma_cqp_exec(irdma, req, NULL)) != 0) {
-		irdma_taint(irdma);
+		irdma_verbs_uncertain(irdma, "failed to create a QP");
 		goto fail_qos;
 	}
 
@@ -839,7 +839,7 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 			ret = EIO;
 			goto out;
 		}
-		irdma_taint(irdma);
+		irdma_verbs_uncertain(irdma, "failed to move a QP to error");
 		ret = 0;
 	}
 	mutex_enter(&iqp->iqp_lock);

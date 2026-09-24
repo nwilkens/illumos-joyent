@@ -104,7 +104,7 @@ irdma_alloc_mr(struct rdk_pd *rpd, enum rdk_mr_type type, uint32_t max_sg,
 	ret = irdma_hw_alloc_stag(irdma, mr, IRDMA_PD(rpd)->ipd_sc.pd_id);
 	if (ret != 0) {
 		/* The device may hold the stag; keep its index and PBLEs. */
-		irdma_taint(irdma);
+		irdma_verbs_uncertain(irdma, "failed to allocate a stag");
 		kmem_free(mr, sizeof (*mr));
 		return (ret);
 	}
@@ -165,7 +165,11 @@ irdma_dereg_mr(struct rdk_mr *rmr)
 		irdma_free_pble(irdma->irdma_pble, &mr->imr_pble);
 		irdma_free_stag(irdma, mr->imr_stag);
 	} else {
-		irdma_taint(irdma);
+		if (req != NULL)
+			irdma_verbs_uncertain(irdma,
+			    "failed to deallocate a stag");
+		else
+			irdma_taint(irdma);
 		ret = EIO;
 	}
 	atomic_dec_32(&irdma->irdma_nmrs);

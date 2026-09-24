@@ -186,16 +186,24 @@ irdma_create_cq(struct rdk_cq *rcq, const struct rdk_cq_init_attr *attr)
 	req->icr_cmd.in.u.cq_create.scratch = irdma_req_scratch(irdma, req);
 	if ((ret = irdma_cqp_exec(irdma, req, NULL)) != 0) {
 		/* The command may have registered the CQ and reached it. */
+		irdma_verbs_uncertain(irdma, "failed to create a CQ");
 		mutex_enter(&irdma->irdma_ceq_lock);
+		icq->icq_dying = B_TRUE;
 		irdma_sc_remove_cq_ctx(&irdma->irdma_ceq0, &icq->icq_sc);
+		if ((irdma->irdma_progress & BIT(IRDMA_STEP_CEQ0)) != 0) {
+			irdma_sc_cleanup_ceqes(&icq->icq_sc,
+			    &irdma->irdma_ceq0);
+		}
 		mutex_exit(&irdma->irdma_ceq_lock);
-		irdma_taint(irdma);
 		goto fail;
 	}
 
 	mutex_enter(&irdma->irdma_cqtable_lock);
 	irdma->irdma_cq_table[num] = icq;
 	mutex_exit(&irdma->irdma_cqtable_lock);
+	mutex_enter(&irdma->irdma_ceq_lock);
+	icq->icq_live = B_TRUE;
+	mutex_exit(&irdma->irdma_ceq_lock);
 	atomic_inc_32(&irdma->irdma_ncqs);
 	return (0);
 
@@ -243,7 +251,7 @@ irdma_destroy_cq(struct rdk_cq *rcq)
 		req->icr_cmd.in.u.cq_destroy.scratch =
 		    irdma_req_scratch(irdma, req);
 		if (irdma_cqp_exec(irdma, req, NULL) != 0)
-			irdma_taint(irdma);
+			irdma_verbs_uncertain(irdma, "failed to destroy a CQ");
 	}
 	/* Entries the device queued before it dropped the CQ. */
 	mutex_enter(&irdma->irdma_ceq_lock);
@@ -277,7 +285,7 @@ irdma_cq_ceq_hold(irdma_t *irdma, struct irdma_sc_cq *sc_cq)
 	irdma_cq_t *icq = sc_cq->back_cq;
 
 	ASSERT(MUTEX_HELD(&irdma->irdma_ceq_lock));
-	if (icq == NULL || icq->icq_dying)
+	if (icq == NULL || !icq->icq_live || icq->icq_dying)
 		return (NULL);
 	icq->icq_refs++;
 	return (icq);

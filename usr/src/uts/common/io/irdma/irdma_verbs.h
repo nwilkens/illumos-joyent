@@ -88,6 +88,7 @@ typedef struct irdma_cq {
 	struct irdma_dma_mem	icq_shadow;
 	list_t			icq_gen;
 	uint32_t		icq_refs;
+	boolean_t		icq_live;	/* created; under ceq_lock */
 	boolean_t		icq_dying;
 	kcondvar_t		icq_cv;
 	uint64_t		icq_bad_cqes;
@@ -183,6 +184,8 @@ extern int irdma_alloc_rsrc(irdma_t *, ulong_t *, uint32_t, uint32_t *,
 extern void irdma_free_rsrc(irdma_t *, ulong_t *, uint32_t);
 extern int irdma_add_arp(irdma_t *, const uint32_t *, boolean_t,
     const uint8_t *);
+extern void irdma_arp_rele(irdma_t *, uint32_t);
+extern void irdma_verbs_uncertain(irdma_t *, const char *);
 extern boolean_t irdma_hw_ok(irdma_t *);
 extern boolean_t irdma_healthy(irdma_t *);
 extern irdma_cqp_req_t *irdma_vreq(irdma_t *, uint8_t);
