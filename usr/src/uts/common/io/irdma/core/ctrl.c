@@ -4570,8 +4570,12 @@ void *irdma_sc_process_ceq(struct irdma_sc_dev *dev, struct irdma_sc_ceq *ceq)
 	u8 polarity;
 	u32 cq_idx;
 	unsigned long flags;
+	u32 seen = 0;
 
 	do {
+		/* illumos: the device can keep every entry valid. */
+		if (seen++ >= ceq->elem_cnt)
+			return NULL;
 		cq_idx = 0;
 		ceqe = IRDMA_GET_CURRENT_CEQ_ELEM(ceq);
 		get_64bit_val(ceqe, 0, &temp);

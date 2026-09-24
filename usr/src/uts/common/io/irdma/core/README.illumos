@@ -73,6 +73,8 @@ device or firmware writes as untrusted where the upstream code does not.
 	result of irdma_osdep_fpm_commit_check(), which requires every
 	committed object to lie inside the SD table before it is allocated
 	and indexed.
+	irdma_sc_process_ceq(): stop after one pass over the CEQ, so that
+	entries with no registered CQ cannot keep the caller in the loop.
 
 The checks themselves are in ../irdma_osdep.c.  Other untrusted values are
 handled outside core/ without changes here: CEQ entries resolve only to CQs
