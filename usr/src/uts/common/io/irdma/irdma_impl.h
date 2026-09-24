@@ -59,6 +59,8 @@ typedef enum irdma_step {
 	IRDMA_STEP_MAX
 } irdma_step_t;
 
+#define	IRDMA_MAX_VECTORS	32
+
 /* irdma_flags */
 #define	IRDMA_F_TAINTED		0x01	/* device may still reach freed DMA */
 #define	IRDMA_F_CQP_DEAD	0x02	/* no more CQP commands */
@@ -137,7 +139,7 @@ typedef struct irdma {
 	const ice_rdma_ops_t	*irdma_ops;
 	ice_rdma_info_t		irdma_info;
 	ice_rdma_intr_t		irdma_intr;
-	uint_t			irdma_intr_added;
+	uint32_t		irdma_intr_mask;	/* handlers added */
 	uint_t			irdma_aeq_vec;	/* index into irdma_intr */
 	uint_t			irdma_ceq_vec;
 
@@ -230,7 +232,7 @@ extern void irdma_fatal(irdma_t *, const char *);
  * queues.  The step functions need irdma_cfg_lock.
  */
 extern int irdma_ctl_start(irdma_t *);
-extern void irdma_ctl_stop(irdma_t *);
+extern int irdma_ctl_stop(irdma_t *);
 extern uint_t irdma_intr(caddr_t, caddr_t);
 extern void irdma_intr_task(void *);
 extern int irdma_cqp_probe(irdma_t *);

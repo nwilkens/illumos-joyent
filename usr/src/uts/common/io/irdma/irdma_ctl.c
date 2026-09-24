@@ -861,6 +861,7 @@ irdma_step_dev(irdma_t *irdma)
 nomem:
 	ret = -ENOMEM;
 fail:
+	dev->hmc_info->hmc_obj = NULL;
 	kmem_free(irdma->irdma_hmc_mem, irdma->irdma_hmc_mem_size);
 	irdma->irdma_hmc_mem = NULL;
 	dma_free_coherent(&irdma->irdma_osdev, irdma->irdma_obj_mem.size,
@@ -872,6 +873,7 @@ fail:
 static void
 irdma_unstep_dev(irdma_t *irdma)
 {
+	irdma->irdma_sc.hmc_info->hmc_obj = NULL;
 	if (irdma->irdma_hmc_mem != NULL) {
 		kmem_free(irdma->irdma_hmc_mem, irdma->irdma_hmc_mem_size);
 		irdma->irdma_hmc_mem = NULL;
@@ -879,6 +881,34 @@ irdma_unstep_dev(irdma_t *irdma)
 	dma_free_coherent(&irdma->irdma_osdev, irdma->irdma_obj_mem.size,
 	    irdma->irdma_obj_mem.va, irdma->irdma_obj_mem.pa);
 	irdma->irdma_obj_mem.va = NULL;
+}
+
+/*
+ * A vector whose handler cannot be removed stays in irdma_intr_mask, and
+ * the handler's argument must then never be freed.
+ */
+static void
+irdma_intr_release(irdma_t *irdma)
+{
+	ice_rdma_intr_t *in = &irdma->irdma_intr;
+	uint_t i;
+	int rc;
+
+	for (i = 0; i < in->irin_count; i++) {
+		if ((irdma->irdma_intr_mask & BIT(i)) == 0)
+			continue;
+		rc = ddi_intr_disable(in->irin_handles[i]);
+		if (rc != DDI_SUCCESS)
+			irdma_error(irdma, "failed to disable RDMA vector "
+			    "%u: %d", i, rc);
+		rc = ddi_intr_remove_handler(in->irin_handles[i]);
+		if (rc != DDI_SUCCESS) {
+			irdma_error(irdma, "failed to remove the handler of "
+			    "RDMA vector %u: %d", i, rc);
+			continue;
+		}
+		irdma->irdma_intr_mask &= ~BIT(i);
+	}
 }
 
 static int
@@ -893,41 +923,25 @@ irdma_step_intr(irdma_t *irdma)
 		    (caddr_t)irdma, (caddr_t)(uintptr_t)i);
 		if (rc != DDI_SUCCESS)
 			goto fail;
-		irdma->irdma_intr_added = i + 1;
+		irdma->irdma_intr_mask |= BIT(i);
 		rc = ddi_intr_enable(in->irin_handles[i]);
-		if (rc != DDI_SUCCESS) {
-			(void) ddi_intr_remove_handler(in->irin_handles[i]);
-			irdma->irdma_intr_added = i;
+		if (rc != DDI_SUCCESS)
 			goto fail;
-		}
 	}
 	return (0);
 
 fail:
 	irdma_error(irdma, "failed to set up RDMA vector %u: %d", i, rc);
-	while (i-- > 0) {
-		(void) ddi_intr_disable(in->irin_handles[i]);
-		(void) ddi_intr_remove_handler(in->irin_handles[i]);
-	}
-	irdma->irdma_intr_added = 0;
+	irdma_intr_quiesce(irdma);
+	irdma_intr_release(irdma);
 	return (EIO);
 }
 
 static void
 irdma_unstep_intr(irdma_t *irdma)
 {
-	ice_rdma_intr_t *in = &irdma->irdma_intr;
-	uint_t i;
-
 	irdma_intr_quiesce(irdma);
-	for (i = 0; i < irdma->irdma_intr_added; i++) {
-		if (ddi_intr_disable(in->irin_handles[i]) != DDI_SUCCESS ||
-		    ddi_intr_remove_handler(in->irin_handles[i]) !=
-		    DDI_SUCCESS)
-			irdma_error(irdma, "failed to release RDMA vector %u",
-			    i);
-	}
-	irdma->irdma_intr_added = 0;
+	irdma_intr_release(irdma);
 }
 
 static int
@@ -1583,11 +1597,16 @@ irdma_ctl_start(irdma_t *irdma)
 	return (0);
 
 fail:
-	irdma_ctl_stop(irdma);
+	(void) irdma_ctl_stop(irdma);
 	return (ret);
 }
 
-void
+/*
+ * Returns EBUSY, with the INTR and DEV steps kept, if an interrupt handler
+ * could not be removed.  The caller must then keep the soft state, the
+ * interrupt lock and the taskq.
+ */
+int
 irdma_ctl_stop(irdma_t *irdma)
 {
 	uint_t s;
@@ -1595,11 +1614,17 @@ irdma_ctl_stop(irdma_t *irdma)
 	ASSERT(MUTEX_HELD(&irdma->irdma_cfg_lock));
 
 	for (s = IRDMA_STEP_MAX; s-- > IRDMA_STEP_DEV; ) {
-		if ((irdma->irdma_progress & BIT(s)) == 0)
+		if ((irdma->irdma_progress & BIT(s)) == 0 &&
+		    !(s == IRDMA_STEP_INTR && irdma->irdma_intr_mask != 0))
 			continue;
 		irdma_steps[s].is_down(irdma);
+		if (s == IRDMA_STEP_INTR && irdma->irdma_intr_mask != 0) {
+			irdma->irdma_progress |= BIT(s);
+			return (EBUSY);
+		}
 		irdma->irdma_progress &= ~BIT(s);
 	}
+	return (0);
 }
 
 void

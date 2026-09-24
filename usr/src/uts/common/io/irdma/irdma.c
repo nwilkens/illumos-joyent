@@ -271,23 +271,30 @@ irdma_locks_fini(irdma_t *irdma)
 	mutex_destroy(&irdma->irdma_cfg_lock);
 }
 
-/*
- * Release what attach set up around the control plane, in reverse.  The
- * caller has stopped the control plane.
- */
 static void
-irdma_unsetup(irdma_t *irdma)
+irdma_kstat_fini(irdma_t *irdma)
 {
 	if (irdma->irdma_kstat != NULL) {
 		kstat_delete(irdma->irdma_kstat);
 		irdma->irdma_kstat = NULL;
 	}
+}
+
+/*
+ * Release what attach set up around the control plane, in reverse.  The
+ * caller has stopped the control plane.  With an interrupt handler still
+ * registered, keep what the handler uses.
+ */
+static void
+irdma_unsetup(irdma_t *irdma)
+{
+	irdma_kstat_fini(irdma);
 	ddi_remove_minor_node(irdma->irdma_dip, NULL);
 	if (irdma->irdma_test_taskq != NULL) {
 		ddi_taskq_destroy(irdma->irdma_test_taskq);
 		irdma->irdma_test_taskq = NULL;
 	}
-	if (irdma->irdma_taskq != NULL) {
+	if (irdma->irdma_taskq != NULL && irdma->irdma_intr_mask == 0) {
 		ddi_taskq_destroy(irdma->irdma_taskq);
 		irdma->irdma_taskq = NULL;
 		mutex_destroy(&irdma->irdma_intr_lock);
@@ -357,7 +364,8 @@ irdma_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 
 	ret = irdma->irdma_ops->iro_intr_get(irdma->irdma_peer,
 	    &irdma->irdma_intr);
-	if (ret != 0 || irdma->irdma_intr.irin_count == 0) {
+	if (ret != 0 || irdma->irdma_intr.irin_count == 0 ||
+	    irdma->irdma_intr.irin_count > IRDMA_MAX_VECTORS) {
 		irdma_error(irdma, "no RDMA vectors: %d", ret);
 		goto fail;
 	}
@@ -389,7 +397,7 @@ irdma_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	    DDI_PSEUDO, 0) != DDI_SUCCESS) {
 		irdma_error(irdma, "failed to create the minor node");
 		mutex_enter(&irdma->irdma_cfg_lock);
-		irdma_ctl_stop(irdma);
+		(void) irdma_ctl_stop(irdma);
 		mutex_exit(&irdma->irdma_cfg_lock);
 		goto fail;
 	}
@@ -406,20 +414,26 @@ irdma_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 
 fail:
 	irdma_unsetup(irdma);
+	if (irdma->irdma_intr_mask != 0) {
+		irdma_error(irdma, "leaking the instance: an RDMA interrupt "
+		    "handler is still registered");
+		return (DDI_FAILURE);
+	}
 	irdma_locks_fini(irdma);
 	ddi_soft_state_free(irdma_state, instance);
 	return (DDI_FAILURE);
 }
 
 /*
- * Detach always completes.  Test work is released and drained first so
- * that nothing waits on the CQP while it goes away.
+ * Test work is released and drained first so that nothing waits on the CQP
+ * while it goes away.  Detach fails only if an interrupt handler cannot be
+ * removed.
  */
 static int
 irdma_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 {
 	irdma_t *irdma;
-	int instance;
+	int instance, ret;
 
 	if (cmd != DDI_DETACH)
 		return (DDI_FAILURE);
@@ -434,9 +448,12 @@ irdma_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	irdma_ctl_hold_release(irdma);
 	ddi_taskq_wait(irdma->irdma_test_taskq);
 
+	irdma_kstat_fini(irdma);
 	mutex_enter(&irdma->irdma_cfg_lock);
-	irdma_ctl_stop(irdma);
+	ret = irdma_ctl_stop(irdma);
 	mutex_exit(&irdma->irdma_cfg_lock);
+	if (ret != 0)
+		return (DDI_FAILURE);
 
 	irdma_unsetup(irdma);
 	irdma_locks_fini(irdma);
@@ -575,6 +592,12 @@ irdma_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cr,
 		st.irs_test_error = irdma->irdma_test_result.irs_test_error;
 		st.irs_test_runs = irdma->irdma_test_result.irs_test_runs;
 		st.irs_progress = irdma->irdma_progress;
+		hmc = irdma->irdma_sc.hmc_info;
+		if (hmc != NULL && hmc->hmc_obj != NULL) {
+			st.irs_hmc_sds = hmc->sd_table.sd_cnt;
+			st.irs_qp_cnt = hmc->hmc_obj[IRDMA_HMC_IW_QP].cnt;
+			st.irs_pble_cnt = hmc->hmc_obj[IRDMA_HMC_IW_PBLE].cnt;
+		}
 		mutex_exit(&irdma->irdma_cfg_lock);
 		st.irs_flags = irdma->irdma_flags;
 		st.irs_generation = irdma->irdma_info.iri_generation;
@@ -582,12 +605,6 @@ irdma_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *cr,
 		st.irs_cqp_submitted = irdma->irdma_cqp_submitted;
 		st.irs_cqp_completed = irdma->irdma_cqp_completed;
 		st.irs_cqp_timeouts = irdma->irdma_cqp_timeouts;
-		hmc = irdma->irdma_sc.hmc_info;
-		if (hmc != NULL && hmc->hmc_obj != NULL) {
-			st.irs_hmc_sds = hmc->sd_table.sd_cnt;
-			st.irs_qp_cnt = hmc->hmc_obj[IRDMA_HMC_IW_QP].cnt;
-			st.irs_pble_cnt = hmc->hmc_obj[IRDMA_HMC_IW_PBLE].cnt;
-		}
 		if (ddi_copyout(&st, (void *)arg, sizeof (st), mode) != 0)
 			return (EFAULT);
 		return (0);
