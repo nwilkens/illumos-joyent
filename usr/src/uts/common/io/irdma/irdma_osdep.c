@@ -553,11 +553,12 @@ irdma_osdep_fpm_query_check(struct irdma_sc_dev *dev,
 
 /*
  * The committed layout indexes the SD table, which the core allocates from
- * sd_cnt next: every object must lie inside it.
+ * sd_cnt next: every object must lie inside it, and no count may exceed
+ * what the driver asked for in req.
  */
 int
 irdma_osdep_fpm_commit_check(struct irdma_sc_dev *dev,
-    struct irdma_hmc_info *hmc)
+    struct irdma_hmc_info *hmc, const u32 *req)
 {
 	irdma_t *irdma = IRDMA_FROM_DEV(dev);
 	struct irdma_hmc_obj_info *o = hmc->hmc_obj;
@@ -575,11 +576,13 @@ irdma_osdep_fpm_commit_check(struct irdma_sc_dev *dev,
 	for (i = 0; i < IRDMA_HMC_IW_MAX; i++) {
 		if (o[i].cnt == 0)
 			continue;
-		if (o[i].cnt > o[i].max_cnt || o[i].base >= limit ||
+		if (o[i].cnt > o[i].max_cnt || o[i].cnt > req[i] ||
+		    o[i].base >= limit ||
 		    (u64)o[i].cnt * o[i].size > limit - o[i].base) {
 			irdma_error(irdma, "firmware committed object %u "
-			    "outside its limits: count %u of %u, base 0x%llx",
-			    i, o[i].cnt, o[i].max_cnt, o[i].base);
+			    "outside its limits: count %u of %u (asked %u), "
+			    "base 0x%llx", i, o[i].cnt, o[i].max_cnt, req[i],
+			    o[i].base);
 			return (-EINVAL);
 		}
 	}

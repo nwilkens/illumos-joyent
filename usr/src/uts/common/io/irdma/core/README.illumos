@@ -69,10 +69,11 @@ device or firmware writes as untrusted where the upstream code does not.
 	irdma_osdep_fpm_query_check(), which bounds the FPM counts, sizes,
 	block sizes and SD count before irdma_cfg_fpm_val() computes with
 	them in the same function.
-	irdma_sc_cfg_iw_fpm(): after parsing the commit buffer, return the
-	result of irdma_osdep_fpm_commit_check(), which requires every
-	committed object to lie inside the SD table before it is allocated
-	and indexed.
+	irdma_sc_cfg_iw_fpm(): keep the requested counts and, after parsing
+	the commit buffer, return the result of
+	irdma_osdep_fpm_commit_check(), which requires every committed
+	object to lie inside the SD table and to be no larger than requested
+	before it is allocated and indexed.
 	irdma_sc_process_ceq(): stop after one pass over the CEQ, so that
 	entries with no registered CQ cannot keep the caller in the loop.
 

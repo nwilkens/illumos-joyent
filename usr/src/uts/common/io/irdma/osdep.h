@@ -430,7 +430,7 @@ extern void irdma_unmap_vm_page_list(struct irdma_hw *, dma_addr_t *, u32);
 extern int irdma_osdep_fpm_query_check(struct irdma_sc_dev *,
     struct irdma_hmc_info *, struct irdma_hmc_fpm_misc *);
 extern int irdma_osdep_fpm_commit_check(struct irdma_sc_dev *,
-    struct irdma_hmc_info *);
+    struct irdma_hmc_info *, const u32 *);
 
 /*
  * illumos: the QP a CQE names, if it is live on the CQ (irdma_cq.c), and
