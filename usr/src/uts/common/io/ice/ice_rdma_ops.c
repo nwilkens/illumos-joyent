@@ -27,7 +27,7 @@
 #include "ice_switch.h"
 #include "ice_sched.h"
 
-static boolean_t ice_rdma_qset_node_ok(ice_t *, uint32_t);
+static boolean_t ice_rdma_qset_node_ok(ice_t *, uint32_t, uint8_t);
 
 /*
  * The admin queue gate for a peer operation.  The caller holds
@@ -157,9 +157,9 @@ ice_rdma_op_close(ice_rdma_peer_t *peer)
 
 		if (!q->iqr_used)
 			continue;
-		if (hw_ok && (!ice_rdma_qset_node_ok(ice, q->iqr_teid) ||
-		    ice_dis_vsi_rdma_qset(hw->port_info, 1, &q->iqr_teid,
-		    &q->iqr_handle) != ICE_SUCCESS)) {
+		if (hw_ok && (!ice_rdma_qset_node_ok(ice, q->iqr_teid,
+		    q->iqr_tc) || ice_dis_vsi_rdma_qset(hw->port_info, 1,
+		    &q->iqr_teid, &q->iqr_handle) != ICE_SUCCESS)) {
 			atomic_or_32(&ice->ice_state, ICE_STATE_PFR_REQ);
 			hw_ok = B_FALSE;
 		}
@@ -233,15 +233,35 @@ ice_rdma_teid_count(struct ice_sched_node *node, uint32_t teid)
 	return (n);
 }
 
+/* Whether node is in the subtree of the PF VSI's node for tc. */
+static boolean_t
+ice_rdma_in_pf_vsi(ice_t *ice, struct ice_sched_node *node, uint8_t tc)
+{
+	struct ice_vsi_ctx *ctx;
+	struct ice_sched_node *vsi;
+	uint_t depth;
+
+	if (tc >= ICE_MAX_TRAFFIC_CLASS ||
+	    (ctx = ice_get_vsi_ctx(&ice->ice_hw, ICE_PF_VSI_HANDLE)) == NULL ||
+	    (vsi = ctx->sched.vsi_node[tc]) == NULL)
+		return (B_FALSE);
+	for (depth = 0; node != NULL && depth < ICE_AQC_TOPO_MAX_LEVEL_NUM;
+	    depth++, node = node->parent) {
+		if (node == vsi)
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
 /*
  * Whether the TEID firmware returned for a qset names one RDMA leaf of the
  * PF VSI and nothing else.  The common code deletes a qset by a lookup of
- * its TEID and frees what it finds with its subtree, so a TEID that also
- * names another node must never be recorded.  The caller holds
- * ice_rebuild_lock.
+ * its TEID, disables it under the parent TEID recorded from firmware and
+ * frees what it finds with its subtree, so each of these must be checked.
+ * The caller holds ice_rebuild_lock.
  */
 static boolean_t
-ice_rdma_qset_node_ok(ice_t *ice, uint32_t teid)
+ice_rdma_qset_node_ok(ice_t *ice, uint32_t teid, uint8_t tc)
 {
 	struct ice_port_info *pi = ice->ice_hw.port_info;
 	struct ice_sched_node *node;
@@ -258,7 +278,9 @@ ice_rdma_qset_node_ok(ice_t *ice, uint32_t teid)
 	    node->tx_sched_layer == ice->ice_hw.num_tx_sched_layers - 1 &&
 	    node->parent != NULL &&
 	    node->parent->owner == ICE_SCHED_NODE_OWNER_RDMA &&
-	    node->parent->vsi_handle == ICE_PF_VSI_HANDLE &&
+	    LE32_TO_CPU(node->info.parent_teid) ==
+	    LE32_TO_CPU(node->parent->info.node_teid) &&
+	    ice_rdma_in_pf_vsi(ice, node->parent, tc) &&
 	    ice_rdma_teid_count(pi->root, teid) == 1;
 	ice_release_lock(&pi->sched_lock);
 	return (ok);
@@ -337,7 +359,7 @@ ice_rdma_op_qset_add(ice_rdma_peer_t *peer, ice_rdma_qset_t *qs, uint_t n)
 			ice_rdma_qset_lost(ice);
 			break;
 		}
-		if (!ice_rdma_qset_node_ok(ice, teid)) {
+		if (!ice_rdma_qset_node_ok(ice, teid, qs[i].irqs_tc)) {
 			ice_error(ice, "firmware returned a bad RDMA qset TEID "
 			    "0x%x", teid);
 			ret = EIO;
@@ -364,7 +386,7 @@ ice_rdma_op_qset_add(ice_rdma_peer_t *peer, ice_rdma_qset_t *qs, uint_t n)
 	while (i-- > 0) {
 		ice_rdma_qrec_t *q = &ir->ir_qsets[slot[i]];
 
-		if (!ice_rdma_qset_node_ok(ice, q->iqr_teid) ||
+		if (!ice_rdma_qset_node_ok(ice, q->iqr_teid, q->iqr_tc) ||
 		    ice_dis_vsi_rdma_qset(hw->port_info, 1, &q->iqr_teid,
 		    &q->iqr_handle) != ICE_SUCCESS)
 			ice_rdma_qset_lost(ice);
@@ -419,7 +441,7 @@ ice_rdma_op_qset_del(ice_rdma_peer_t *peer, ice_rdma_qset_t *qs, uint_t n)
 	for (i = 0; i < n; i++) {
 		ice_rdma_qrec_t *q = &ir->ir_qsets[idx[i]];
 
-		if (!ice_rdma_qset_node_ok(ice, q->iqr_teid) ||
+		if (!ice_rdma_qset_node_ok(ice, q->iqr_teid, q->iqr_tc) ||
 		    ice_dis_vsi_rdma_qset(hw->port_info, 1, &q->iqr_teid,
 		    &q->iqr_handle) != ICE_SUCCESS) {
 			ret = EIO;

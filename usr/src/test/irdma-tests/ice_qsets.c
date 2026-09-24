@@ -50,18 +50,26 @@ typedef uint8_t u8;
 #define	ICE_AQC_ELEM_TYPE_LEAF	5
 #define	ICE_SCHED_NODE_OWNER_LAN	0
 #define	ICE_SCHED_NODE_OWNER_RDMA	2
+#define	ICE_AQC_TOPO_MAX_LEVEL_NUM	9
 
 struct ice_sched_node {
 	struct ice_sched_node *parent;
 	struct ice_sched_node *children[80];
 	struct {
 		uint32_t node_teid;
+		uint32_t parent_teid;
 		struct { uint8_t elem_type; } data;
 	} info;
 	uint16_t vsi_handle;
 	uint8_t tx_sched_layer;
 	uint8_t num_children;
 	uint8_t owner;
+};
+
+struct ice_vsi_ctx {
+	struct {
+		struct ice_sched_node *vsi_node[ICE_MAX_TRAFFIC_CLASS];
+	} sched;
 };
 
 struct ice_port_info {
@@ -108,11 +116,17 @@ static int enas, dis, cfgs;
 static uint32_t next_teid = 100;
 static uint16_t cfg_max;
 
-/* A scheduler tree: root, an RDMA parent, and a LAN parent with a leaf. */
-static struct ice_sched_node root, rparent, lparent, lleaf, leaves[80];
+/*
+ * A scheduler tree: the root; the PF VSI node with an RDMA parent and a LAN
+ * parent that has a leaf; another VSI node with an RDMA parent.
+ */
+static struct ice_sched_node root, vsinode, rparent, lparent, lleaf;
+static struct ice_sched_node fvsinode, fparent, leaves[80];
 static struct ice_port_info pinfo;
+static struct ice_vsi_ctx vsictx;
 static uint_t nleaves;
 static uint32_t forge_teid;
+static int forge_parent;	/* 1: wrong parent TEID; 2: other VSI */
 static int errors;
 
 static void
@@ -141,7 +155,15 @@ static void
 link_child(struct ice_sched_node *p, struct ice_sched_node *c)
 {
 	c->parent = p;
+	c->info.parent_teid = p->info.node_teid;
 	p->children[p->num_children++] = c;
+}
+
+static struct ice_vsi_ctx *
+ice_get_vsi_ctx(struct ice_hw *hw, uint16_t handle)
+{
+	(void) hw;
+	return (handle == ICE_PF_VSI_HANDLE ? &vsictx : NULL);
 }
 
 static struct ice_sched_node *
@@ -164,11 +186,16 @@ static void
 tree(void)
 {
 	memset(&root, 0, sizeof (root));
+	memset(&vsinode, 0, sizeof (vsinode));
 	memset(&rparent, 0, sizeof (rparent));
 	memset(&lparent, 0, sizeof (lparent));
 	memset(&lleaf, 0, sizeof (lleaf));
+	memset(&fvsinode, 0, sizeof (fvsinode));
+	memset(&fparent, 0, sizeof (fparent));
 	nleaves = 0;
 	root.info.node_teid = 1;
+	vsinode.info.node_teid = 10;
+	vsinode.tx_sched_layer = 3;
 	rparent.info.node_teid = 2;
 	rparent.owner = ICE_SCHED_NODE_OWNER_RDMA;
 	rparent.tx_sched_layer = 4;
@@ -177,14 +204,24 @@ tree(void)
 	lleaf.info.node_teid = 50;
 	lleaf.tx_sched_layer = 5;
 	lleaf.info.data.elem_type = ICE_AQC_ELEM_TYPE_LEAF;
-	link_child(&root, &rparent);
-	link_child(&root, &lparent);
+	fvsinode.info.node_teid = 11;
+	fvsinode.tx_sched_layer = 3;
+	fparent.info.node_teid = 4;
+	fparent.owner = ICE_SCHED_NODE_OWNER_RDMA;
+	fparent.tx_sched_layer = 4;
+	link_child(&root, &vsinode);
+	link_child(&root, &fvsinode);
+	link_child(&vsinode, &rparent);
+	link_child(&vsinode, &lparent);
 	link_child(&lparent, &lleaf);
+	link_child(&fvsinode, &fparent);
+	memset(&vsictx, 0, sizeof (vsictx));
+	vsictx.sched.vsi_node[0] = &vsinode;
 	pinfo.root = &root;
 }
 
 static void
-add_leaf(uint32_t teid)
+add_leaf(struct ice_sched_node *parent, uint32_t teid)
 {
 	struct ice_sched_node *leaf = &leaves[nleaves++];
 
@@ -192,7 +229,7 @@ add_leaf(uint32_t teid)
 	leaf->info.node_teid = teid;
 	leaf->tx_sched_layer = 5;
 	leaf->info.data.elem_type = ICE_AQC_ELEM_TYPE_LEAF;
-	link_child(&rparent, leaf);
+	link_child(parent, leaf);
 }
 
 static void
@@ -251,7 +288,10 @@ ice_ena_vsi_rdma_qset(void *pi, uint16_t vsi, uint8_t tc, uint16_t *h,
 		*teid = 0;
 	else
 		*teid = forge_teid != 0 ? forge_teid : next_teid++;
-	add_leaf(*teid);
+	/* The common code files the node under the parent it chose. */
+	add_leaf(forge_parent == 2 ? &fparent : &rparent, *teid);
+	if (forge_parent == 1)	/* then records firmware's parent TEID */
+		leaves[nleaves - 1].info.parent_teid = lparent.info.node_teid;
 	return (ICE_SUCCESS);
 }
 
@@ -315,6 +355,7 @@ reset(void)
 	dev.ice_hw.num_tx_sched_layers = 6;
 	tree();
 	forge_teid = 0;
+	forge_parent = 0;
 	errors = 0;
 	hw_state = cfg_fail = ena_fail_at = dis_fail = redispatches = 0;
 	enas = dis = cfgs = 0;
@@ -393,10 +434,27 @@ main(void)
 	forge_teid = 0;
 	assert(errors == 4 && root.num_children == 2);
 	assert(lparent.num_children == 1 && lparent.children[0] == &lleaf);
+
+	/*
+	 * A new TEID whose recorded parent TEID is a LAN node, or that sits
+	 * under another VSI's RDMA parent, is not recorded either.
+	 */
+	for (i = 1; i <= 2; i++) {
+		forge_parent = (int)i;
+		b = q((uint16_t)(40 + i), 0, 3);
+		redispatches = 0;
+		assert(ice_rdma_op_qset_add(&dev, &b, 1) == EIO);
+		assert(rdma.ir_nqsets == 2 && redispatches == 1);
+		assert(b.irqs_teid == 0 && dis == 2);
+		dev.ice_state = 0;
+	}
+	forge_parent = 0;
+	assert(errors == 6);
+
 	/* The reset would rebuild the tree; model its result. */
 	tree();
-	add_leaf(a[0].irqs_teid);
-	add_leaf(a[1].irqs_teid);
+	add_leaf(&rparent, a[0].irqs_teid);
+	add_leaf(&rparent, a[1].irqs_teid);
 	redispatches = 0;
 
 	/* Delete needs the owner's handle, TC, VSI and TEID. */
