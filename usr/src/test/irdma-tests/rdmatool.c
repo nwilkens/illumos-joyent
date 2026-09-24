@@ -781,15 +781,55 @@ cpu_busy_ns(void)
 	return (sum);
 }
 
+static uint64_t
+now_ns(void)
+{
+	struct timespec ts;
+
+	(void) clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ((uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec);
+}
+
+/* A host's busy CPU time with the network idle, per wall second. */
+static double
+idle_rate(peer_t *p)
+{
+	uint64_t c0, c1, t0, t1;
+
+	t0 = now_ns();
+	if (p != NULL)
+		(void) rpc(p, C_CPU, &c0, 0, K_RESULT);
+	else
+		c0 = cpu_busy_ns();
+	(void) sleep(3);
+	if (p != NULL)
+		(void) rpc(p, C_CPU, &c1, 0, K_RESULT);
+	else
+		c1 = cpu_busy_ns();
+	t1 = now_ns();
+	return ((double)(c1 - c0) / (double)(t1 - t0));
+}
+
+/* CPU seconds per GB net of the idle rate. */
+static double
+cpu_per_gb(uint64_t busy, double idle, uint64_t wall, uint64_t bytes)
+{
+	double net = (double)busy - idle * (double)wall;
+
+	if (net < 0)
+		net = 0;
+	return (net / 1e9 / ((double)bytes / 1e9));
+}
+
 static void
 t_bw(peer_t *a, peer_t *b)
 {
 	static const uint32_t sizes[] = { 4096, 65536, 1 << 20 };
 	static const uint32_t ops[] = { RDMAT_OP_WRITE, RDMAT_OP_READ };
 	rdmat_run_t rr;
-	uint64_t c0, c1, r0 = 0, r1 = 0, count;
+	uint64_t c0, c1, r0 = 0, r1 = 0, w0, w1, count;
 	uint_t i, j;
-	double gbps, cpu;
+	double gbps, cpu, idle_a, idle_b = 0;
 	char rcpu[64];
 	int ret;
 
@@ -797,6 +837,11 @@ t_bw(peer_t *a, peer_t *b)
 		result(0, "bw", "setup failed");
 		return;
 	}
+	idle_a = idle_rate(NULL);
+	if (b->p_sock >= 0)
+		idle_b = idle_rate(b);
+	(void) printf("  idle CPU: %.2f on A, %.2f on B, subtracted below\n",
+	    idle_a, idle_b);
 	for (j = 0; j < 2; j++) {
 		for (i = 0; i < 3; i++) {
 			uint32_t s = sizes[i];
@@ -816,10 +861,12 @@ t_bw(peer_t *a, peer_t *b)
 			rr.rr_timeout_ms = (uint32_t)o_secs * 20000;
 			if (rr.rr_timeout_ms > RDMAT_MAX_TIMEOUT_MS)
 				rr.rr_timeout_ms = RDMAT_MAX_TIMEOUT_MS;
-			c0 = cpu_busy_ns();
 			if (b->p_sock >= 0)
 				(void) rpc(b, C_CPU, &r0, 0, K_RESULT);
+			c0 = cpu_busy_ns();
+			w0 = now_ns();
 			ret = run(a, &rr);
+			w1 = now_ns();
 			c1 = cpu_busy_ns();
 			if (b->p_sock >= 0)
 				(void) rpc(b, C_CPU, &r1, 0, K_RESULT);
@@ -830,12 +877,12 @@ t_bw(peer_t *a, peer_t *b)
 				return;
 			}
 			gbps = (double)rr.rr_bytes * 8 / rr.rr_ns;
-			cpu = (double)(c1 - c0) / 1e9 /
-			    ((double)rr.rr_bytes / 1e9);
+			cpu = cpu_per_gb(c1 - c0, idle_a, w1 - w0,
+			    rr.rr_bytes);
 			rcpu[0] = '\0';
 			if (b->p_sock >= 0) {
-				double bc = (double)(r1 - r0) / 1e9 /
-				    ((double)rr.rr_bytes / 1e9);
+				double bc = cpu_per_gb(r1 - r0, idle_b,
+				    w1 - w0, rr.rr_bytes);
 
 				(void) snprintf(rcpu, sizeof (rcpu),
 				    ", %.3f on B", bc);
@@ -928,6 +975,7 @@ t_tcp(peer_t *a, peer_t *b)
 	static char data[1 << 20];
 	uint64_t *lat, i, sent, c0, c1, sum = 0;
 	struct timespec t0, t1;
+	double idle_a, idle_b;
 	tcpreq_t tr;
 	char msg[64];
 	int s, ret;
@@ -937,6 +985,8 @@ t_tcp(peer_t *a, peer_t *b)
 		result(0, "tcp", "needs two hosts");
 		return;
 	}
+	idle_a = idle_rate(NULL);
+	idle_b = idle_rate(b);
 	bzero(&tr, sizeof (tr));
 	tr.tr_count = n;
 	tr.tr_size = sizeof (msg);
@@ -986,10 +1036,12 @@ t_tcp(peer_t *a, peer_t *b)
 		    (t1.tv_nsec - t0.tv_nsec);
 
 		result(1, "tcp", "bulk %llu GB in 1 MB writes: %.2f Gb/s, "
-		    "%.3f CPU-s per GB on A, %.3f on B",
-		    (u_longlong_t)(bulk >> 30), (double)bulk * 8 / ns,
-		    (double)(c1 - c0) / 1e9 / ((double)bulk / 1e9),
-		    (double)tr.tr_srv_cpu_ns / 1e9 / ((double)bulk / 1e9));
+		    "%.3f CPU-s per GB on A, %.3f on B (idle %.2f and %.2f "
+		    "subtracted)", (u_longlong_t)(bulk >> 30),
+		    (double)bulk * 8 / ns,
+		    cpu_per_gb(c1 - c0, idle_a, (uint64_t)ns, bulk),
+		    cpu_per_gb(tr.tr_srv_cpu_ns, idle_b, tr.tr_srv_ns, bulk),
+		    idle_a, idle_b);
 	}
 	free(lat);
 }

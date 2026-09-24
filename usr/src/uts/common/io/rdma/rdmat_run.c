@@ -766,6 +766,10 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 		return (EINVAL);
 	if (rr->rr_depth == 0)
 		rr->rr_depth = 1;
+	/* The remote window is walked in rr_size steps. */
+	if ((rr->rr_op == RDMAT_OP_WRITE || rr->rr_op == RDMAT_OP_READ) &&
+	    rr->rr_size == 0)
+		return (EINVAL);
 
 	/* The run's footprint in the local buffer. */
 	len = (uint64_t)rr->rr_size;
