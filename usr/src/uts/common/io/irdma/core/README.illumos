@@ -1,0 +1,60 @@
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+
+This directory contains the OS-independent "shared code" of the Intel irdma
+driver, imported from Linux v6.18-rc2-10-g552c50713f27, commit
+552c50713f273b494ac6c77052032a49bc9255e2 (drivers/infiniband/hw/irdma).
+
+Every file carries "SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB" (some
+spell it "or") and is used here under the Linux-OpenIB license; see
+THIRDPARTYLICENSE.  A file whose license line changes upstream must not be
+imported again without a new review.
+
+Only the code the E810 (GEN2) control plane and later the kernel verbs need
+is imported.  The Linux OS layer (main.c, hw.c, utils.c, verbs.c, cm.c,
+icrdma_if.c, osdep.h), the GEN1 and GEN3 hardware files (i40iw_*, ig3rdma_*),
+the virtual channel (virtchnl.c) and the trace files are not.  Linux osdep.h
+is to be replaced by an osdep.h written for illumos.  GEN1 and GEN3 paths stay
+in the files and are not to be reached: the driver will run only IRDMA_GEN_2.
+
+Files and their blob IDs at that commit (git rev-parse <commit>:<path>)
+-----------------------------------------------------------------------
+
+    ctrl.c         4ef1c29032f771ff567913ace5d18a7ce2e0c9e2
+    hmc.c          da18add141da01fad34712d07a9231719895e99c
+    pble.c         3091f9345f1249c8c7552e875ce0a72f5d5f5620
+    uk.c           ce1ae10c30fcadee179accf3717e5924ae9f0334
+    puda.c         694e5a9ed15d0fa633827ec2ae56a96328e1b5da
+    uda.c          84051266d948cb8b603549b333f40cb4705f1c77
+    ws.c           542bc0b1bb03c954fbbb141d678d00ea02ec16b5
+    icrdma_hw.c    32f26284a788bd730943b88c031da4beef2af204
+    defs.h         983b22d7ae233fc12ba4f518b5c5d2f54840a5a2
+    type.h         4ae77cdde9dc79be657a63651a3076961103eed8
+    hmc.h          257a5d22aa96f90e3072372acc85a5990cb88a1e
+    pble.h         160ad728e9fb8fe18d2adbdfbc91e07d1a822b9c
+    puda.h         d65041bee667c2ae6046ef250ab165d520e335cb
+    uda.h          27b8701cf21b24155429c1ae4ed79200d403be98
+    uda_d.h        4fb4daa20722566feafbcf4388e04dcca215d705
+    ws.h           45490031a389160f2c4e02ea7373caa2bb7a4c5a
+    icrdma_hw.h    d97944ab45dac7d23394077a4288456b05e27aed
+    irdma.h        ff938a01d70c4ddbcfe288c9a5cab5f1ce265f77
+    protos.h       324cfbf21764baf031828d6e8f785cac84d31e19
+    user.h         ab57f689827a024fbbde40b3487809baa60a8b8f
+    virtchnl.h     aa955a9125bdd96086a6f239e0e919bb425c52ea
+
+The files are unmodified.
+
+Re-import policy
+----------------
+
+1. Copy the files from one Linux commit without changes and record the
+   commit and blob IDs above.  Check each license line first.
+2. Put OS glue in ../osdep.h and the driver, not here.
