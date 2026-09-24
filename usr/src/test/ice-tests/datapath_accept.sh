@@ -20,10 +20,11 @@
 #
 # The test replumbs the link and changes its MTU, so it refuses a link that
 # has IP configuration.  With ICE_TEST_ALLOW_IP=1 it accepts one whose
-# addresses are all temporary static, DHCP or addrconf addresses; it records
-# them with the MTU and the default routes over the link, restores them when
-# it exits or is interrupted, and checks that the link matches the record.
-# All test changes are temporary.
+# addresses are all temporary static, DHCP or addrconf addresses and whose
+# only gateway routes are default routes; it records them with the MTU,
+# restores them when it exits or is interrupted, and checks that the link
+# and the system's default routes match the record exactly.  All test
+# changes are temporary.
 #
 # Exit status is 0 only if every check passes.
 #
@@ -79,10 +80,24 @@ if [[ ! "$ORIG_MTU" =~ ^[0-9]+$ ]]; then
 	exit 1
 fi
 
+# Every default route and every gateway route over the link, as sorted
+# "family|destination|gateway|interface" lines.  Interface routes follow the
+# addresses, and a redirect (D) is transient, so neither is recorded.
+route_state() {
+	local af
+
+	for af in inet inet6; do
+		netstat -rn -f "$af" 2>/dev/null | awk -v af="$af" -v l="$LINK" '
+		    $3 ~ /G/ && $3 !~ /D/ && ($1 == "default" || $6 == l ||
+		    index($6, l ":") == 1) { print af "|" $1 "|" $2 "|" $6 }'
+	done | sort
+}
+
 HAD_IF=0
 ORIG_ADDRS=()
 ORIG_ROUTES=()
 ORIG_ROUTES6=()
+ORIG_ROUTE_STATE=$(route_state)
 if ipadm show-if "$LINK" >/dev/null 2>&1; then
 	HAD_IF=1
 	if [[ "${ICE_TEST_ALLOW_IP:-0}" != 1 ]]; then
@@ -109,10 +124,16 @@ if ipadm show-if "$LINK" >/dev/null 2>&1; then
 		esac
 		ORIG_ADDRS+=("$type|$addr")
 	done
-	ORIG_ROUTES=($(netstat -rn -f inet 2>/dev/null |
-	    awk -v l="$LINK" '$1 == "default" && $6 == l { print $2 }'))
-	ORIG_ROUTES6=($(netstat -rn -f inet6 2>/dev/null |
-	    awk -v l="$LINK" '$1 == "default" && $6 == l { print $2 }'))
+	other=$(echo "$ORIG_ROUTE_STATE" | awk -F'|' -v l="$LINK" \
+	    '$2 != "default" && ($4 == l || index($4, l ":") == 1)')
+	if [[ -n "$other" ]]; then
+		fail "$LINK carries routes the test cannot restore:" $other
+		exit 1
+	fi
+	ORIG_ROUTES=($(echo "$ORIG_ROUTE_STATE" | awk -F'|' -v l="$LINK" \
+	    '$1 == "inet" && $4 == l { print $3 }'))
+	ORIG_ROUTES6=($(echo "$ORIG_ROUTE_STATE" | awk -F'|' -v l="$LINK" \
+	    '$1 == "inet6" && $4 == l { print $3 }'))
 	echo "saved $LINK: mtu $ORIG_MTU;" \
 	    "addresses ${ORIG_ADDRS[*]+${ORIG_ADDRS[*]}};" \
 	    "default routes ${ORIG_ROUTES[*]+${ORIG_ROUTES[*]}}" \
@@ -121,8 +142,7 @@ fi
 
 has_default() {
 	# has_default <inet|inet6> <gateway>
-	netstat -rn -f "$1" 2>/dev/null |
-	    awk -v g="$2" '$1 == "default" && $2 == g { f = 1 } END { exit !f }'
+	route_state | grep -qxF "$1|default|$2|$LINK"
 }
 
 # The link's addresses as sorted "type|address" lines.  A DHCP or addrconf
@@ -154,11 +174,18 @@ remove_ip() {
 
 # Compare the link with the snapshot taken before the test changed it.
 verify_restore() {
-	local rc=0 mtu state gw
+	local rc=0 mtu state routes
 
 	mtu=$(dladm show-linkprop -c -p mtu -o value "$LINK" 2>/dev/null)
 	if [[ "$mtu" != "$ORIG_MTU" ]]; then
 		echo "RESTORE FAILED: $LINK mtu is '$mtu', was $ORIG_MTU"
+		rc=1
+	fi
+	routes=$(route_state)
+	if [[ "$routes" != "$ORIG_ROUTE_STATE" ]]; then
+		echo "RESTORE FAILED: routes differ from the record"
+		diff <(echo "$ORIG_ROUTE_STATE") <(echo "$routes") |
+		    sed -n 's/^< /  missing /p; s/^> /  extra   /p'
 		rc=1
 	fi
 	if ! (( HAD_IF )); then
@@ -178,14 +205,6 @@ verify_restore() {
 		    "but were" $ORIG_STATE
 		rc=1
 	fi
-	for gw in ${ORIG_ROUTES[@]+"${ORIG_ROUTES[@]}"}; do
-		has_default inet "$gw" ||
-		    { echo "RESTORE FAILED: no default route $gw"; rc=1; }
-	done
-	for gw in ${ORIG_ROUTES6[@]+"${ORIG_ROUTES6[@]}"}; do
-		has_default inet6 "$gw" ||
-		    { echo "RESTORE FAILED: no default route $gw"; rc=1; }
-	done
 	return $rc
 }
 

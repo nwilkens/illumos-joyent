@@ -867,8 +867,14 @@ untouched without the override, and a run that finishes or takes `SIGTERM`
 leaves the MTU, addresses and default route as they were. A delete that
 fails while the object remains, and a restored address that silently goes
 missing, must each fail the run with `RESTORE FAILED`; a delete of an
-address that was never created must not. It also runs the `icetest` refusal
-under `ksh`.
+address that was never created must not. The script records every default
+route and every gateway route over the link as family, destination, gateway
+and interface, and after the restore the set must be the same: a route put
+back over another interface, a route restored twice, a default route over
+another interface that went missing, and one that appeared during the test
+each fail the run. A link carrying a gateway route other than a default
+route is refused, since the test cannot put it back. It also runs the
+`icetest` refusal under `ksh`.
 
 Historical validation recorded in commit `60beba06389` (2026-07-18) reported
 boston<->hunter at MTU 1500 (9.36 Gbps) and 9000 (9.59 Gbps), with all checks

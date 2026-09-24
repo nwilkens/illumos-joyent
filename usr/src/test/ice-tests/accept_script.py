@@ -49,7 +49,17 @@ create-if)
 delete-if)
 	[ -e "$S/fail_delete" ] && exit 1
 	[ -e "$S/if" ] || exit 1
-	rm -f "$S/if" "$S/addrs" "$S/routes" "$S/routes6" ;;
+	rm -f "$S/if" "$S/addrs"
+	# Routes over the link go with it; with drop_routes, every route does.
+	for r in routes routes6; do
+		[ -e "$S/$r" ] || continue
+		if [ -e "$S/drop_routes" ]; then
+			: > "$S/$r"
+		else
+			grep -v " $(cat "$S/link")\$" "$S/$r" > "$S/$r.new"
+			mv "$S/$r.new" "$S/$r"
+		fi
+	done ;;
 create-addr)
 	[ -e "$S/if" ] || exit 1
 	[ -e "$S/fail_create" ] && exit 1
@@ -82,10 +92,17 @@ esac
 ''',
     "route": r'''
 [ -e "$S/if" ] || exit 1
-case "$*" in
-*inet6*) echo "default $5 UG 1 0 $(cat "$S/link")" >> "$S/routes6" ;;
-*) echo "default $4 UG 1 0 $(cat "$S/link")" >> "$S/routes" ;;
-esac
+# The kernel picks the interface; route_ifp makes it pick another one, and
+# route_twice leaves a second copy.
+ifp=$(cat "$S/route_ifp" 2>/dev/null || cat "$S/link")
+n=1; [ -e "$S/route_twice" ] && n=2
+while [ $n -gt 0 ]; do
+	case "$*" in
+	*inet6*) echo "default $5 UG 1 0 $ifp" >> "$S/routes6" ;;
+	*) echo "default $4 UG 1 0 $ifp" >> "$S/routes" ;;
+	esac
+	n=$((n - 1))
+done
 ''',
     "modinfo": 'echo " 99 fffffffff 1000 1 1 ice (Intel E800 Series Ethernet)"',
     "ping": '[ -e "$S/term_on_ping" ] && rm "$S/term_on_ping" && kill -TERM $PPID\nexit 0',
@@ -118,8 +135,10 @@ class Host:
         if persistent:
             (self.state / "persist").write_text("46\n")
         if routes:
-            (self.state / "routes").write_text(
-                "".join(f"default {gw} UG 1 0 {link}\n" for gw in routes))
+            # A route is a gateway over the link, or (dest, gw, flags, if).
+            (self.state / "routes").write_text("".join(
+                f"default {r} UG 1 0 {link}\n" if isinstance(r, str) else
+                f"{r[0]} {r[1]} {r[2]} 1 0 {r[3]}\n" for r in routes))
         self.link = link
 
     def run(self, mtu="9000", **env):
@@ -266,6 +285,56 @@ def check_delete_failure(work):
         result.stdout
 
 
+def check_routes(work):
+    """The routes must come back exactly: same interface, nothing extra."""
+    other = ("default", "10.9.0.1", "UG", "net9")
+    host = fresh(work, addrs=ADDRS, routes=("10.1.2.1", other))
+    result = host.run(ICE_TEST_ALLOW_IP="1")
+    assert result.returncode == 0, result.stdout
+    assert "RESTORE FAILED" not in result.stdout, result.stdout
+    assert "default 10.9.0.1 UG 1 0 net9" in host.read("routes")
+
+    # Restored over another interface: present, but not the same route.
+    host = fresh(work, addrs=ADDRS, routes=("10.1.2.1",))
+    (host.state / "route_ifp").write_text("net9\n")
+    result = host.run(ICE_TEST_ALLOW_IP="1")
+    assert result.returncode == 1, result.stdout
+    assert "RESTORE FAILED: routes differ" in result.stdout, result.stdout
+    assert "missing inet|default|10.1.2.1|ice0" in result.stdout
+    assert "extra   inet|default|10.1.2.1|net9" in result.stdout
+
+    # A route restored twice.
+    host = fresh(work, addrs=ADDRS, routes=("10.1.2.1",))
+    (host.state / "route_twice").touch()
+    result = host.run(ICE_TEST_ALLOW_IP="1")
+    assert result.returncode == 1, result.stdout
+    assert "extra   inet|default|10.1.2.1|ice0" in result.stdout
+
+    # A default route over another interface that the test lost.
+    host = fresh(work, addrs=ADDRS, routes=("10.1.2.1", other))
+    (host.state / "drop_routes").touch()
+    result = host.run(ICE_TEST_ALLOW_IP="1")
+    assert result.returncode == 1, result.stdout
+    assert "missing inet|default|10.9.0.1|net9" in result.stdout
+
+    # One that appeared during the test, with a link that had no IP.
+    host = fresh(work)
+    (host.bin / "ipadm").write_text((host.bin / "ipadm").read_text().replace(
+        'create-if)\n', 'create-if)\n\techo "default 10.9.9.9 UG 1 0 '
+        'net9" >> "$S/routes"\n'))
+    result = host.run()
+    assert result.returncode == 1, result.stdout
+    assert "extra   inet|default|10.9.9.9|net9" in result.stdout
+
+    # A static gateway route over the link cannot be put back, so the test
+    # refuses the link.
+    host = fresh(work, addrs=ADDRS,
+                 routes=("10.1.2.1", ("10.20.0.0", "10.1.2.1", "UG", "ice0")))
+    result = host.run(ICE_TEST_ALLOW_IP="1")
+    assert result.returncode == 1 and "cannot restore" in result.stdout
+    assert host.changes() == []
+
+
 def check_wrapper(work):
     """icetest refuses a configured link before it runs a datapath test."""
     host = fresh(work, addrs=ADDRS)
@@ -299,11 +368,12 @@ def main():
         check_restore(work)
         check_restore_failure(work)
         check_delete_failure(work)
+        check_routes(work)
         if shutil.which("ksh") is not None:
             check_wrapper(work)
     print("PASS: datapath_accept.sh resolves the kstat instance from the "
           "device, refuses configured links and restores and verifies the "
-          "link")
+          "link and its routes")
 
 
 if __name__ == "__main__":
