@@ -2130,6 +2130,11 @@ IRDMA_CORE_OBJS = ctrl.o hmc.o pble.o uk.o puda.o uda.o ws.o icrdma_hw.o
 RDMAK_OBJS =	rdk_device.o rdk_verbs.o rdk_cq.o
 
 #
+#	rdmat: the rdmak test client
+#
+RDMAT_OBJS =	rdmat.o rdmat_run.o
+
+#
 #	Solarflare 1/10/40GbE NIC driver module
 #
 #	NB: The illumos specific sources are listed first, with the
