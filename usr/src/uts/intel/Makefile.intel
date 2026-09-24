@@ -628,6 +628,7 @@ MISC_KMODS	+= pci_autoconfig
 MISC_KMODS	+= pcicfg
 MISC_KMODS	+= pcihp
 MISC_KMODS	+= pcmcia
+MISC_KMODS	+= rdmak
 MISC_KMODS	+= rpcsec
 MISC_KMODS	+= rpcsec_gss
 MISC_KMODS	+= rsmops

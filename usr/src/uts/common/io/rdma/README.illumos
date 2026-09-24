@@ -1,0 +1,41 @@
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+
+rdmak, the kernel RDMA verbs framework, follows the Linux kernel verbs
+programming model.  Two files are derived from Linux v6.18-rc2-10-g552c50713f27,
+commit 552c50713f273b494ac6c77052032a49bc9255e2, and are used under the
+OpenIB.org BSD license that both offer; see THIRDPARTYLICENSE.
+
+    rdk.h        include/rdma/ib_verbs.h
+                 6139223e92e4c2f26686595279836af20a261da5
+                 "SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB"
+                 The object, attribute, work request and completion shapes
+                 and the enum values (the uverbs values come from
+                 include/uapi/rdma/ib_user_verbs.h,
+                 3b7bd99813e9526ead3f9fb124835a0b17e4d2a6, "(GPL-2.0 WITH
+                 Linux-syscall-note) OR Linux-OpenIB").  Names carry the
+                 rdk_ prefix; the ops vector and prototypes are illumos.
+
+    rdk_verbs.c  drivers/infiniband/core/verbs.c
+                 3a5f81402d2f8b3243fb69a103400bc437bf1354
+                 Dual GPL-2.0 / OpenIB.org BSD license text.
+                 The QP state table and rdk_modify_qp_is_ok() (from
+                 qp_state_table and ib_modify_qp_is_ok(), cut to RC, UD and
+                 GSI), rdk_sg_to_pages() (from ib_sg_to_pages(), walking DMA
+                 cookies instead of a scatterlist) and the drain functions
+                 (from __ib_drain_sq() and __ib_drain_rq()).
+
+rdk_device.c, rdk_cq.c and rdk_impl.h are written for illumos under the CDDL.
+rdk_cq.c is not derived from Linux drivers/infiniband/core/cq.c, which is
+GPL-2.0 only, nor from FreeBSD's ib_cq.c, which was taken from it.
+
+No other Linux or FreeBSD file is used, in particular none of the generic
+include/linux headers, rw.c, mr_pool.c or cq.c.

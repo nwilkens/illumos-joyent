@@ -13,6 +13,7 @@ TESTS = (
     "fpm_checks.py",
     "ice_qsets.py",
     "lock_order.py",
+    "rdk_verbs.py",
 )
 
 
