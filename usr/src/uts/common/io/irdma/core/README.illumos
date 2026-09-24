@@ -22,8 +22,10 @@ Only the code the E810 (GEN2) control plane and later the kernel verbs need
 is imported.  The Linux OS layer (main.c, hw.c, utils.c, verbs.c, cm.c,
 icrdma_if.c, osdep.h), the GEN1 and GEN3 hardware files (i40iw_*, ig3rdma_*),
 the virtual channel (virtchnl.c) and the trace files are not.  Linux osdep.h
-is to be replaced by an osdep.h written for illumos.  GEN1 and GEN3 paths stay
-in the files and are not to be reached: the driver will run only IRDMA_GEN_2.
+is replaced by ../osdep.h, written for illumos; the functions the shared code
+expects from the OS layer are in ../irdma_ctl.c and ../irdma_osdep.c.  GEN1
+and GEN3 paths stay in the files and are never reached: the driver runs only
+IRDMA_GEN_2, and i40iw_init_hw() and ig3rdma_init_hw() are empty.
 
 Files and their blob IDs at that commit (git rev-parse <commit>:<path>)
 -----------------------------------------------------------------------
@@ -58,3 +60,4 @@ Re-import policy
 1. Copy the files from one Linux commit without changes and record the
    commit and blob IDs above.  Check each license line first.
 2. Put OS glue in ../osdep.h and the driver, not here.
+3. Run a full module build with smatch before the change is committed.

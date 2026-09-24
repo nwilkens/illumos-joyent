@@ -2118,6 +2118,12 @@ ICE_INTC_OBJS =	ice_common.o ice_controlq.o ice_sched.o ice_switch.o \
 		ice_vlan_mode.o ice_fwlog.o
 
 #
+#	irdma: the E800 series RDMA function, and the Linux shared code it runs
+#
+IRDMA_OBJS =	irdma.o irdma_ctl.o irdma_osdep.o
+IRDMA_CORE_OBJS = ctrl.o hmc.o pble.o uk.o puda.o uda.o ws.o icrdma_hw.o
+
+#
 #	Solarflare 1/10/40GbE NIC driver module
 #
 #	NB: The illumos specific sources are listed first, with the

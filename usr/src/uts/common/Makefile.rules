@@ -1534,6 +1534,14 @@ $(OBJS_DIR)/%.o:		$(UTSBASE)/common/io/ice/core/%.c
 	$(COMPILE.c) -o $@ $<
 	$(CTFCONVERT_O)
 
+$(OBJS_DIR)/%.o:		$(UTSBASE)/common/io/irdma/%.c
+	$(COMPILE.c) -o $@ $<
+	$(CTFCONVERT_O)
+
+$(OBJS_DIR)/%.o:		$(UTSBASE)/common/io/irdma/core/%.c
+	$(COMPILE.c) -o $@ $<
+	$(CTFCONVERT_O)
+
 $(OBJS_DIR)/%.o:		$(UTSBASE)/common/io/ntxn/%.c
 	$(COMPILE.c) -o $@ $<
 	$(CTFCONVERT_O)
