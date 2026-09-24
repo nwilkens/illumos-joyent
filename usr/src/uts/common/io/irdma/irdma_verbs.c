@@ -107,18 +107,23 @@ irdma_free_rsrc(irdma_t *irdma, ulong_t *map, uint32_t num)
 
 /*
  * The hardware ARP table.  Index 0 is reserved.  An entry is keyed by the
- * IPv4 (in ip[0]) or IPv6 address in host order.
+ * IPv4 (in ip[0]) or IPv6 address in host order and the MAC, and each QP,
+ * AH and GID that uses it holds a reference.  A slot stays claimed from
+ * before the device learns of it until the device confirms the delete; a
+ * slot whose command failed is never reused.
  */
 static int
-irdma_arp_find(irdma_t *irdma, const uint32_t *ip)
+irdma_arp_find(irdma_t *irdma, const uint32_t *ip, const uint8_t *mac)
 {
+	irdma_arp_entry_t *e;
 	uint32_t i;
 
 	ASSERT(MUTEX_HELD(&irdma->irdma_arp_lock));
 	for (i = 1; i < irdma->irdma_arp_size; i++) {
-		if (BT_TEST(irdma->irdma_arp_map, i) &&
-		    bcmp(irdma->irdma_arp_table[i].iae_ip, ip,
-		    sizeof (irdma->irdma_arp_table[i].iae_ip)) == 0)
+		e = &irdma->irdma_arp_table[i];
+		if (e->iae_state == IRDMA_ARP_LIVE &&
+		    bcmp(e->iae_ip, ip, sizeof (e->iae_ip)) == 0 &&
+		    bcmp(e->iae_mac, mac, ETHERADDRL) == 0)
 			return ((int)i);
 	}
 	return (-1);
@@ -152,10 +157,14 @@ irdma_arp_cqp(irdma_t *irdma, uint32_t idx, const uint8_t *mac, boolean_t add)
 	return (irdma_cqp_exec(irdma, req, NULL));
 }
 
+/* Delete a slot the caller has made dying. */
 static void
 irdma_arp_del_idx(irdma_t *irdma, uint32_t idx)
 {
-	(void) irdma_arp_cqp(irdma, idx, NULL, B_FALSE);
+	if (irdma_arp_cqp(irdma, idx, NULL, B_FALSE) != 0) {
+		irdma_verbs_uncertain(irdma, "failed to delete an ARP entry");
+		return;
+	}
 	mutex_enter(&irdma->irdma_arp_lock);
 	bzero(&irdma->irdma_arp_table[idx], sizeof (irdma_arp_entry_t));
 	BT_CLEAR(irdma->irdma_arp_map, idx);
@@ -163,16 +172,16 @@ irdma_arp_del_idx(irdma_t *irdma, uint32_t idx)
 }
 
 /*
- * Return the ARP index for ip with mac, adding or replacing the entry, or
- * -1.  The table lock is not held across the command, so a slot is claimed
- * and filled under the lock before the device learns about it.
+ * Return the ARP index for ip and mac with a reference, adding the entry
+ * if needed, or -1.  The table lock is not held across the command.
  */
 int
 irdma_add_arp(irdma_t *irdma, const uint32_t *ip4, boolean_t ipv4,
     const uint8_t *mac)
 {
+	irdma_arp_entry_t *e;
 	uint32_t ip[4] = { 0 };
-	uint32_t idx = 0;
+	uint32_t idx;
 	int cur;
 
 	if (ipv4)
@@ -181,20 +190,8 @@ irdma_add_arp(irdma_t *irdma, const uint32_t *ip4, boolean_t ipv4,
 		bcopy(ip4, ip, sizeof (ip));
 
 	mutex_enter(&irdma->irdma_arp_lock);
-	cur = irdma_arp_find(irdma, ip);
-	if (cur >= 0 && bcmp(irdma->irdma_arp_table[cur].iae_mac, mac,
-	    ETHERADDRL) == 0) {
-		mutex_exit(&irdma->irdma_arp_lock);
-		return (cur);
-	}
-	mutex_exit(&irdma->irdma_arp_lock);
-	if (cur >= 0)
-		irdma_arp_del_idx(irdma, (uint32_t)cur);
-
-	mutex_enter(&irdma->irdma_arp_lock);
-	if (irdma_arp_find(irdma, ip) >= 0) {
-		/* Someone else added it meanwhile; use theirs. */
-		cur = irdma_arp_find(irdma, ip);
+	if ((cur = irdma_arp_find(irdma, ip, mac)) >= 0) {
+		irdma->irdma_arp_table[cur].iae_refs++;
 		mutex_exit(&irdma->irdma_arp_lock);
 		return (cur);
 	}
@@ -207,18 +204,41 @@ irdma_add_arp(irdma_t *irdma, const uint32_t *ip4, boolean_t ipv4,
 		return (-1);
 	}
 	BT_SET(irdma->irdma_arp_map, idx);
-	bcopy(ip, irdma->irdma_arp_table[idx].iae_ip, sizeof (ip));
-	bcopy(mac, irdma->irdma_arp_table[idx].iae_mac, ETHERADDRL);
+	e = &irdma->irdma_arp_table[idx];
+	bcopy(ip, e->iae_ip, sizeof (ip));
+	bcopy(mac, e->iae_mac, ETHERADDRL);
+	e->iae_refs = 1;
+	e->iae_state = IRDMA_ARP_PENDING;
 	mutex_exit(&irdma->irdma_arp_lock);
 
 	if (irdma_arp_cqp(irdma, idx, mac, B_TRUE) != 0) {
-		mutex_enter(&irdma->irdma_arp_lock);
-		bzero(&irdma->irdma_arp_table[idx], sizeof (irdma_arp_entry_t));
-		BT_CLEAR(irdma->irdma_arp_map, idx);
-		mutex_exit(&irdma->irdma_arp_lock);
+		irdma_verbs_uncertain(irdma, "failed to add an ARP entry");
 		return (-1);
 	}
+	mutex_enter(&irdma->irdma_arp_lock);
+	e->iae_state = IRDMA_ARP_LIVE;
+	mutex_exit(&irdma->irdma_arp_lock);
 	return ((int)idx);
+}
+
+void
+irdma_arp_rele(irdma_t *irdma, uint32_t idx)
+{
+	irdma_arp_entry_t *e;
+
+	if (idx == 0 || idx >= irdma->irdma_arp_size)
+		return;
+	e = &irdma->irdma_arp_table[idx];
+	mutex_enter(&irdma->irdma_arp_lock);
+	VERIFY3U(e->iae_state, ==, IRDMA_ARP_LIVE);
+	VERIFY3U(e->iae_refs, >, 0);
+	if (--e->iae_refs != 0) {
+		mutex_exit(&irdma->irdma_arp_lock);
+		return;
+	}
+	e->iae_state = IRDMA_ARP_DYING;
+	mutex_exit(&irdma->irdma_arp_lock);
+	irdma_arp_del_idx(irdma, idx);
 }
 
 /* The IP of a GID in host order; returns whether it is IPv4. */
@@ -336,10 +356,10 @@ irdma_del_gid(const struct rdk_gid_attr *attr)
 
 	(void) irdma_gid_ip(&attr->gid, ip);
 	mutex_enter(&irdma->irdma_arp_lock);
-	idx = irdma_arp_find(irdma, ip);
+	idx = irdma_arp_find(irdma, ip, attr->mac);
 	mutex_exit(&irdma->irdma_arp_lock);
 	if (idx > 0)
-		irdma_arp_del_idx(irdma, (uint32_t)idx);
+		irdma_arp_rele(irdma, (uint32_t)idx);
 }
 
 /*
@@ -441,10 +461,14 @@ irdma_create_ah(struct rdk_ah *rah, struct rdk_ah_attr *attr)
 
 	ret = irdma_alloc_rsrc(irdma, irdma->irdma_ah_map, irdma->irdma_max_ah,
 	    &id, &irdma->irdma_next_ah);
-	if (ret != 0)
+	if (ret != 0) {
+		irdma_arp_rele(irdma, (uint32_t)arp);
 		return (ret);
+	}
 	info->ah_idx = id;
 	if ((ret = irdma_ah_cqp(irdma, ah, B_TRUE)) != 0) {
+		irdma_verbs_uncertain(irdma, "failed to create an AH");
+		irdma_arp_rele(irdma, (uint32_t)arp);
 		irdma_free_rsrc(irdma, irdma->irdma_ah_map, id);
 		return (ret);
 	}
@@ -463,7 +487,8 @@ irdma_destroy_ah(struct rdk_ah *rah)
 	if (!ah->iah_created)
 		return;
 	if (irdma_ah_cqp(irdma, ah, B_FALSE) != 0)
-		irdma_taint(irdma);
+		irdma_verbs_uncertain(irdma, "failed to destroy an AH");
+	irdma_arp_rele(irdma, ah->iah_sc.ah_info.dst_arpindex);
 	irdma_free_rsrc(irdma, irdma->irdma_ah_map, ah->iah_sc.ah_info.ah_idx);
 	ah->iah_created = B_FALSE;
 	atomic_dec_32(&irdma->irdma_nahs);
@@ -645,7 +670,7 @@ irdma_verbs_fini(irdma_t *irdma)
 	ddi_taskq_destroy(irdma->irdma_wq);
 	irdma->irdma_wq = NULL;
 	for (i = 1; i < irdma->irdma_arp_size; i++) {
-		if (BT_TEST(irdma->irdma_arp_map, i))
+		if (irdma->irdma_arp_table[i].iae_state == IRDMA_ARP_LIVE)
 			irdma_arp_del_idx(irdma, i);
 	}
 	kmem_free(irdma->irdma_rsrc_mem, irdma->irdma_rsrc_size);

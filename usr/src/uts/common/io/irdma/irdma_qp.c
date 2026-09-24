@@ -692,8 +692,12 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 	struct irdma_roce_offload_info *roce = &iqp->iqp_roce;
 	struct irdma_udp_offload_info *udp = &iqp->iqp_udp;
 	struct irdma_modify_qp_info info;
+	struct irdma_udp_offload_info udp_old;
+	struct irdma_roce_offload_info roce_old;
 	boolean_t issue = B_FALSE, flush = B_FALSE;
-	uint32_t dest_qp;
+	uint32_t dest_qp, new_arp = 0, old_arp;
+	int access_old;
+	boolean_t ird_zero_old;
 	int ret = 0;
 
 	if ((mask & ~RDK_QP_ATTR_STANDARD_BITS) != 0)
@@ -717,11 +721,18 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 		return (EINVAL);
 
 	mutex_enter(&iqp->iqp_mod_lock);
+	mutex_enter(&iqp->iqp_lock);
+	udp_old = *udp;
+	roce_old = *roce;
+	access_old = iqp->iqp_access;
+	ird_zero_old = iqp->iqp_ird_zero;
+	mutex_exit(&iqp->iqp_lock);
 	dest_qp = (mask & RDK_QP_DEST_QPN) != 0 ? attr->dest_qp_num :
 	    roce->dest_qp;
 	if ((mask & RDK_QP_AV) != 0) {
 		if ((ret = irdma_qp_av(iqp, attr, dest_qp)) != 0)
 			goto out;
+		new_arp = udp->arp_idx;
 	}
 
 	bzero(&info, sizeof (info));
@@ -853,6 +864,22 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 		irdma_flush_wqes(iqp, IRDMA_FLUSH_SQ | IRDMA_FLUSH_RQ |
 		    IRDMA_FLUSH_WAIT);
 out:
+	if (ret != 0) {
+		/* A failed modify leaves the QP as it was. */
+		mutex_enter(&iqp->iqp_lock);
+		*udp = udp_old;
+		*roce = roce_old;
+		iqp->iqp_access = access_old;
+		iqp->iqp_ird_zero = ird_zero_old;
+		mutex_exit(&iqp->iqp_lock);
+		if (new_arp != 0)
+			irdma_arp_rele(irdma, new_arp);
+	} else if (new_arp != 0) {
+		old_arp = iqp->iqp_arp_idx;
+		iqp->iqp_arp_idx = new_arp;
+		if (old_arp != 0)
+			irdma_arp_rele(irdma, old_arp);
+	}
 	mutex_exit(&iqp->iqp_mod_lock);
 	return (ret);
 }
@@ -947,8 +974,10 @@ irdma_destroy_qp(struct rdk_qp *rqp)
 		req->icr_cmd.in.u.qp_destroy.scratch =
 		    irdma_req_scratch(irdma, req);
 		if (irdma_cqp_exec(irdma, req, NULL) != 0)
-			irdma_taint(irdma);
+			irdma_verbs_uncertain(irdma, "failed to destroy a QP");
 	}
+	irdma_arp_rele(irdma, iqp->iqp_arp_idx);
+	iqp->iqp_arp_idx = 0;
 	mutex_exit(&iqp->iqp_mod_lock);
 
 	mutex_enter(&irdma->irdma_qptable_lock);

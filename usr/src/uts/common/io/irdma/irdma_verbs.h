@@ -55,9 +55,19 @@ extern "C" {
 #define	IRDMA_REFLUSH		0x4
 #define	IRDMA_FLUSH_WAIT	0x8
 
+typedef enum irdma_arp_state {
+	IRDMA_ARP_FREE = 0,
+	IRDMA_ARP_PENDING,
+	IRDMA_ARP_LIVE,
+	IRDMA_ARP_DYING
+} irdma_arp_state_t;
+
+/* Under irdma_arp_lock. */
 typedef struct irdma_arp_entry {
-	uint32_t	iae_ip[4];
-	uint8_t		iae_mac[ETHERADDRL];
+	uint32_t		iae_ip[4];
+	uint8_t			iae_mac[ETHERADDRL];
+	irdma_arp_state_t	iae_state;
+	uint32_t		iae_refs;
 } irdma_arp_entry_t;
 
 typedef struct irdma_pd {
@@ -128,6 +138,9 @@ typedef struct irdma_qp {
 	boolean_t		iqp_flush_issued;
 	boolean_t		iqp_sig_all;
 	boolean_t		iqp_destroying;
+	int			iqp_access;	/* RDK_ACCESS_* */
+	boolean_t		iqp_ird_zero;
+	uint32_t		iqp_arp_idx;	/* held; iqp_mod_lock */
 	uint32_t		iqp_max_send_wr;
 	uint32_t		iqp_max_recv_wr;
 	struct irdma_dma_mem	iqp_q2ctx;
