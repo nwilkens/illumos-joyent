@@ -179,11 +179,13 @@ if dladm set-linkprop -p _reset=1 ice0 2>/dev/null; then
 	stream_wait $out 90
 	up 90
 	f1=$(k ice:0:rdma:quarantine_freed)
-	if grep -q 'No such device' $out && [ "$f1" -gt "$f0" ] &&
+	if grep -qE 'No such device|I/O error' $out &&
+	    [ "$f1" -gt "$f0" ] &&
 	    [ "$(k ice:0:rdma:generation)" -gt "$g0" ] &&
 	    [ "$(k ice:0:rdma:quarantine_bufs)" = 0 ] &&
 	    $TOOL -i "$LOCAL" loop send write > /dev/null 2>&1; then
-		pass "reset in flight: the stream ended with ENXIO," \
+		pass "reset in flight: the stream ended with" \
+		    "$(grep -oE 'No such device|I/O error' $out | head -1)," \
 		    "$((f1 - f0)) buffers held until the reset and then" \
 		    "freed, generation $g0 -> $(k ice:0:rdma:generation)," \
 		    "send and write checked after"

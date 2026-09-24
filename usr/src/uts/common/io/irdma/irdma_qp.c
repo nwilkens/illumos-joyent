@@ -343,6 +343,8 @@ irdma_flush_wqes(irdma_qp_t *iqp, uint32_t mask)
 	ret = irdma_cqp_exec(irdma, req, &cqe);
 	atomic_inc_64(&irdma->irdma_flushes);
 
+	if (ret != 0)
+		irdma_verbs_uncertain(irdma, "failed to flush a QP");
 	mutex_enter(&iqp->iqp_lock);
 	iqp->iqp_flush_issued = B_TRUE;
 	if (ret != 0) {
@@ -859,12 +861,13 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 
 	ctx->rem_endpoint_idx = udp->arp_idx;
 	if ((ret = irdma_hw_modify_qp(iqp, &info)) != 0) {
+		/* The device may have applied it, with its ARP index. */
+		irdma_verbs_uncertain(irdma, "failed to modify a QP");
 		/* An error transition still stops posting and flushes. */
 		if (info.next_iwarp_state != IRDMA_QP_STATE_ERROR) {
 			ret = EIO;
 			goto out;
 		}
-		irdma_verbs_uncertain(irdma, "failed to move a QP to error");
 		ret = 0;
 	}
 	mutex_enter(&iqp->iqp_lock);
