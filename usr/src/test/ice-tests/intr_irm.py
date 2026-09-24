@@ -24,10 +24,14 @@ def main():
         r"^typedef enum ice_attach_state \{[\s\S]*?^} ice_attach_state_t;")]
     parts = bodies(args.source, ("ice_prop_get_num_queues", "ice_queue_limit",
                                  "ice_intr_cb", "ice_intr_cb_fini",
-                                 "ice_free_intrs", "ice_alloc_intrs"))
+                                 "ice_free_intrs", "ice_alloc_intrs",
+                                 "ice_rem_intr_handlers",
+                                 "ice_add_intr_handlers"))
     parts += bodies(DRIVER / "ice_intr.c", ("ice_ring_vector",
                                             "ice_intr_rings_map",
-                                            "ice_intr_queue"))
+                                            "ice_intr_queue",
+                                            "ice_intr_enable",
+                                            "ice_intr_disable"))
     parts += bodies(DRIVER / "ice.c", ("ice_intr_adjust_locked",
                                        "ice_intr_adjust"))
     run_c(TESTDIR / "intr_irm.c", {"ice_intr_irm_types.h": "\n".join(types),

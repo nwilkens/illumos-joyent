@@ -788,7 +788,7 @@ extern ice_phy_fw_state_t ice_phy_fw_wait(ice_t *);
 extern boolean_t ice_alloc_intrs(ice_t *);
 extern void ice_free_intrs(ice_t *);
 extern boolean_t ice_add_intr_handlers(ice_t *);
-extern void ice_rem_intr_handlers(ice_t *);
+extern boolean_t ice_rem_intr_handlers(ice_t *);
 extern int ice_intr_adjust(ice_t *, ddi_cb_action_t, int);
 
 /*
@@ -798,7 +798,7 @@ extern uint_t ice_intr_msix(caddr_t, caddr_t);
 extern uint32_t ice_ring_vector(const ice_t *, uint_t);
 extern void ice_intr_rings_map(ice_t *);
 extern boolean_t ice_intr_enable(ice_t *);
-extern void ice_intr_disable(ice_t *);
+extern boolean_t ice_intr_disable(ice_t *);
 extern void ice_intr_oicr_setup(ice_t *, boolean_t);
 extern void ice_intr_oicr_disable(ice_t *);
 extern boolean_t ice_set_link_events(ice_t *);

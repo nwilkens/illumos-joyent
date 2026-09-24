@@ -646,13 +646,19 @@ ice_alloc_intrs(ice_t *ice)
 	return (B_TRUE);
 }
 
-void
+/* Returns B_FALSE if any handler could not be removed. */
+boolean_t
 ice_rem_intr_handlers(ice_t *ice)
 {
+	boolean_t ok = B_TRUE;
 	int i;
 
-	for (i = 0; i < ice->ice_intr_count; i++)
-		(void) ddi_intr_remove_handler(ice->ice_intr_handles[i]);
+	for (i = 0; i < ice->ice_intr_count; i++) {
+		if (ddi_intr_remove_handler(ice->ice_intr_handles[i]) !=
+		    DDI_SUCCESS)
+			ok = B_FALSE;
+	}
+	return (ok);
 }
 
 boolean_t

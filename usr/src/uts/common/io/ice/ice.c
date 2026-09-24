@@ -727,19 +727,25 @@ ice_intr_adjust_locked(ice_t *ice, ddi_cb_action_t action, int count)
 
 	if ((ice->ice_state & ICE_STATE_STARTED) != 0)
 		paused = ice_datapath_pause(ice);
-	ice_intr_disable(ice);
-	ice_rem_intr_handlers(ice);
+	/* A handler that may still run must keep its vector and handle. */
+	if (!ice_intr_disable(ice) || !ice_rem_intr_handlers(ice))
+		goto dead;
 
+	/* Vectors are freed from the top, so every live handle stays below. */
 	if (action == DDI_CB_INTR_REMOVE) {
-		for (i = target; i < old; i++) {
-			(void) ddi_intr_free(h[i]);
+		for (i = old - 1; i >= target; i--) {
+			if (ddi_intr_free(h[i]) != DDI_SUCCESS) {
+				ret = DDI_FAILURE;
+				break;
+			}
 			h[i] = NULL;
+			ice->ice_intr_count = i;
 		}
-		ice->ice_intr_count = target;
 	} else if (ddi_intr_alloc(ice->ice_dip, &h[old], DDI_INTR_TYPE_MSIX,
 	    old, target - old, &actual, DDI_INTR_ALLOC_NORMAL) != DDI_SUCCESS) {
 		ret = DDI_FAILURE;
 	} else {
+		ice->ice_intr_count = old + actual;
 		/* The ring and admin locks were made at the first priority. */
 		for (i = old; i < old + actual; i++) {
 			if (ddi_intr_get_pri(h[i], &pri) != DDI_SUCCESS ||
@@ -747,13 +753,14 @@ ice_intr_adjust_locked(ice_t *ice, ddi_cb_action_t action, int count)
 				break;
 		}
 		if (i < old + actual) {
-			while (actual > 0) {
-				(void) ddi_intr_free(h[old + --actual]);
-				h[old + actual] = NULL;
-			}
 			ret = DDI_FAILURE;
+			for (i = old + actual - 1; i >= old; i--) {
+				if (ddi_intr_free(h[i]) != DDI_SUCCESS)
+					goto dead;
+				h[i] = NULL;
+				ice->ice_intr_count = i;
+			}
 		}
-		ice->ice_intr_count = old + actual;
 	}
 
 	ice_intr_rings_map(ice);
@@ -786,10 +793,11 @@ ice_intr_adjust_locked(ice_t *ice, ddi_cb_action_t action, int count)
 	return (ret);
 
 dead:
-	atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
+	/* Without its handlers the instance cannot run until reloaded. */
+	atomic_or_32(&ice->ice_state, ICE_STATE_ERROR | ICE_STATE_RESET_FAILED);
 	ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
 	ice_link_report(ice, LINK_STATE_DOWN);
-	ice_error(ice, "cannot restore interrupts after an interrupt change");
+	ice_error(ice, "interrupt change failed; reload the ice driver");
 	return (DDI_FAILURE);
 }
 
@@ -848,14 +856,14 @@ ice_unconfigure(ice_t *ice)
 	 * Admin queue commands below are polled and need no interrupts.
 	 */
 	if (ice->ice_attach_progress & ICE_ATTACH_ENABLE_INTR) {
-		ice_intr_disable(ice);
+		(void) ice_intr_disable(ice);
 		ice_intr_oicr_disable(ice);
 		wr32(&ice->ice_hw, PFINT_OICR_ENA, 0);
 		ice_flush(&ice->ice_hw);
 	}
 
 	if (ice->ice_attach_progress & ICE_ATTACH_ADD_INTR)
-		ice_rem_intr_handlers(ice);
+		(void) ice_rem_intr_handlers(ice);
 
 	/*
 	 * ice_detach_quiesce() isolated packet DMA and reclaimed TX descriptors

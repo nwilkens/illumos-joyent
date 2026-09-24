@@ -29,6 +29,7 @@
 
 typedef unsigned int uint_t;
 typedef int boolean_t;
+typedef char *caddr_t;
 typedef int kmutex_t;
 typedef int kcondvar_t;
 typedef struct dev_info dev_info_t;
@@ -46,6 +47,7 @@ typedef int (*ddi_cb_func_t)(dev_info_t *, ddi_cb_action_t, void *, void *,
 #define	DDI_ENOTSUP		-7
 #define	DDI_INTR_CLAIMED	1
 #define	DDI_INTR_TYPE_MSIX	4
+#define	DDI_INTR_FLAG_BLOCK	0x100
 #define	DDI_INTR_ALLOC_NORMAL	0
 #define	DDI_CB_FLAG_INTR	1
 #define	DDI_CB_INTR_ADD		0
@@ -135,7 +137,8 @@ static int ncpus = 40, max_ncpus = 40, boot_max_ncpus = -1;
 
 /* IRM and the DDI: which MSI-X entries are allocated, and handler state. */
 static struct {
-	boolean_t fail_register, fail_alloc, fail_add, bad_pri;
+	boolean_t fail_register, fail_alloc, bad_pri;
+	int fail_add, fail_remove, fail_disable, fail_free;
 	int registered, unregisters, allocated, errors, notes;
 	int grant, nreq;
 	boolean_t live[64], handler[64], enabled[64];
@@ -278,6 +281,8 @@ ddi_intr_free(ddi_intr_handle_t h)
 {
 	int i = entry(h);
 
+	if (i == m.fail_free)
+		return (DDI_FAILURE);
 	assert(!m.handler[i] && !m.enabled[i]);
 	m.live[i] = B_FALSE;
 	m.allocated--;
@@ -356,52 +361,81 @@ cv_init(kcondvar_t *cv, void *name, int type, void *arg)
 
 static ice_t dev;
 
-/* The handler and enable steps of ice_hw.c and ice_intr.c. */
-static boolean_t
-ice_add_intr_handlers(ice_t *ice)
+/*
+ * The DDI handler and enable operations, each of which can be made to fail
+ * for one vector.
+ */
+static uint_t
+ice_intr_msix(char *arg1, char *arg2)
 {
-	int i;
-
-	assert(MUTEX_HELD(&ice->ice_rebuild_lock));
-	if (m.fail_add)
-		return (B_FALSE);
-	for (i = 0; i < ice->ice_intr_count; i++) {
-		assert(!m.handler[entry(ice->ice_intr_handles[i])]);
-		m.handler[i] = B_TRUE;
-	}
-	return (B_TRUE);
+	(void) arg1;
+	(void) arg2;
+	return (DDI_INTR_CLAIMED);
 }
 
-static void
-ice_rem_intr_handlers(ice_t *ice)
+static int
+ddi_intr_add_handler(ddi_intr_handle_t h, uint_t (*func)(char *, char *),
+    void *arg1, void *arg2)
 {
-	int i;
+	int i = entry(h);
 
-	for (i = 0; i < ice->ice_intr_count; i++) {
-		assert(!m.enabled[i]);
-		m.handler[entry(ice->ice_intr_handles[i])] = B_FALSE;
-	}
+	assert(func == ice_intr_msix && arg1 == &dev);
+	assert((int)(uintptr_t)arg2 == i && !m.handler[i] && !m.enabled[i]);
+	if (i == m.fail_add)
+		return (DDI_FAILURE);
+	m.handler[i] = B_TRUE;
+	return (DDI_SUCCESS);
 }
 
-static boolean_t
-ice_intr_enable(ice_t *ice)
+/* As in the DDI, an enabled vector keeps its handler. */
+static int
+ddi_intr_remove_handler(ddi_intr_handle_t h)
 {
-	int i;
+	int i = entry(h);
 
-	for (i = 0; i < ice->ice_intr_count; i++) {
-		assert(m.handler[i]);
-		m.enabled[i] = B_TRUE;
-	}
-	return (B_TRUE);
+	if (i == m.fail_remove || m.enabled[i] || !m.handler[i])
+		return (DDI_FAILURE);
+	m.handler[i] = B_FALSE;
+	return (DDI_SUCCESS);
 }
 
-static void
-ice_intr_disable(ice_t *ice)
+static int
+ddi_intr_enable(ddi_intr_handle_t h)
 {
-	int i;
+	int i = entry(h);
 
-	for (i = 0; i < ice->ice_intr_count; i++)
-		m.enabled[i] = B_FALSE;
+	assert(m.handler[i]);
+	m.enabled[i] = B_TRUE;
+	return (DDI_SUCCESS);
+}
+
+static int
+ddi_intr_disable(ddi_intr_handle_t h)
+{
+	int i = entry(h);
+
+	if (i == m.fail_disable)
+		return (DDI_FAILURE);
+	m.enabled[i] = B_FALSE;
+	return (DDI_SUCCESS);
+}
+
+static int
+ddi_intr_block_enable(ddi_intr_handle_t *h, int n)
+{
+	(void) h;
+	(void) n;
+	assert(!"block enable");
+	return (DDI_FAILURE);
+}
+
+static int
+ddi_intr_block_disable(ddi_intr_handle_t *h, int n)
+{
+	(void) h;
+	(void) n;
+	assert(!"block disable");
+	return (DDI_FAILURE);
 }
 
 static boolean_t
@@ -531,6 +565,7 @@ static void
 reset(int nintrs)
 {
 	memset(&m, 0, sizeof (m));
+	m.fail_add = m.fail_remove = m.fail_disable = m.fail_free = -1;
 	memset(&l, 0, sizeof (l));
 	memset(&dev, 0, sizeof (dev));
 	dip.nintrs = nintrs;
@@ -563,6 +598,8 @@ attached(int nintrs)
 	assert(ice_add_intr_handlers(&dev) && ice_intr_enable(&dev));
 	mutex_exit(&dev.ice_rebuild_lock);
 }
+
+static void finish(void);
 
 static int
 callback(int action, int count)
@@ -716,19 +753,88 @@ irm(void)
 	assert(dev.ice_intr_count == 3);
 	check_map();
 
-	/* Handlers that cannot be restored leave the instance fail-closed. */
+	/* Handlers that cannot be restored leave the instance down for good. */
 	dev.ice_state = 0;
-	m.fail_add = B_TRUE;
+	m.fail_add = 1;
 	assert(callback(DDI_CB_INTR_ADD, 1) == DDI_FAILURE);
-	assert((dev.ice_state & ICE_STATE_ERROR) != 0 && l.impacts == 1);
+	assert((dev.ice_state & ICE_STATE_RESET_FAILED) != 0 && l.impacts == 1);
 	assert((dev.ice_attach_progress & ICE_ATTACH_ADD_INTR) == 0);
 	assert(!dev.ice_irm_busy && !dev.ice_rebuild_lock);
-	m.fail_add = B_FALSE;
+	for (i = 0; i < 64; i++)
+		assert(!m.handler[i] && !m.enabled[i]);
+	finish();
+}
 
-	for (i = 0; i < (uint_t)dev.ice_intr_count; i++)
-		m.handler[i] = m.enabled[i] = B_FALSE;
+/* Tear an instance down whatever state a failure left its vectors in. */
+static void
+finish(void)
+{
+	int v;
+
+	m.fail_add = m.fail_remove = m.fail_disable = m.fail_free = -1;
+	for (v = 0; v < 64; v++)
+		m.handler[v] = m.enabled[v] = B_FALSE;
 	ice_free_intrs(&dev);
 	assert(m.allocated == 0 && m.unregisters == 1);
+}
+
+static void
+handles_intact(int n)
+{
+	int v;
+
+	assert(dev.ice_intr_count == n && m.allocated == n);
+	for (v = 0; v < n; v++)
+		assert(dev.ice_intr_handles[v] == &tokens[v]);
+	assert(!dev.ice_irm_busy && !dev.ice_rebuild_lock);
+}
+
+/*
+ * A DDI step that fails never leaves a vector that can still interrupt, or
+ * one IRM kept, without its handle below the count.
+ */
+static void
+irm_failures(void)
+{
+	/* A vector that stays enabled keeps its handler and handle. */
+	attached(1024);
+	m.fail_disable = 16;
+	assert(callback(DDI_CB_INTR_REMOVE, 9) == DDI_FAILURE);
+	handles_intact(17);
+	assert(m.enabled[16] && m.handler[16]);
+	assert((dev.ice_state & ICE_STATE_RESET_FAILED) != 0);
+	finish();
+
+	/* So does one whose handler will not come off. */
+	attached(1024);
+	m.fail_remove = 12;
+	assert(callback(DDI_CB_INTR_REMOVE, 9) == DDI_FAILURE);
+	handles_intact(17);
+	assert(m.handler[12] && !m.enabled[12]);
+	assert((dev.ice_state & ICE_STATE_RESET_FAILED) != 0);
+	finish();
+
+	/* A vector IRM cannot take back stays below the count, in use. */
+	attached(1024);
+	m.fail_free = 12;
+	assert(callback(DDI_CB_INTR_REMOVE, 9) == DDI_FAILURE);
+	assert(dev.ice_intr_count == 13 && dev.ice_intr_handles[13] == NULL);
+	assert((dev.ice_state & ICE_STATE_RESET_FAILED) == 0);
+	m.fail_free = -1;
+	check_map();
+	finish();
+
+	/* An offer at another priority that cannot be given back. */
+	attached(1024);
+	assert(callback(DDI_CB_INTR_REMOVE, 9) == DDI_SUCCESS);
+	m.bad_pri = B_TRUE;
+	m.fail_free = 10;
+	assert(callback(DDI_CB_INTR_ADD, 9) == DDI_FAILURE);
+	handles_intact(11);
+	assert(!m.handler[8] && !m.handler[10]);
+	assert((dev.ice_state & ICE_STATE_RESET_FAILED) != 0);
+	m.bad_pri = B_FALSE;
+	finish();
 }
 
 int
@@ -783,6 +889,7 @@ main(void)
 	assert(m.unregisters == 1);
 
 	irm();
+	irm_failures();
 
 	(void) puts("PASS: MSI-X sizing registers for interrupt resource "
 	    "management, and reclaims and offers keep every ring on a live "

@@ -1085,21 +1085,25 @@ ice_intr_enable(ice_t *ice)
 	return (B_TRUE);
 }
 
-void
+/* Returns B_FALSE if any vector could not be disabled. */
+boolean_t
 ice_intr_disable(ice_t *ice)
 {
+	boolean_t ok = B_TRUE;
 	int i;
 
 	if (ice->ice_intr_handles == NULL)
-		return;
+		return (B_TRUE);
 
 	if (ice->ice_intr_cap & DDI_INTR_FLAG_BLOCK) {
-		(void) ddi_intr_block_disable(ice->ice_intr_handles,
-		    ice->ice_intr_count);
-	} else {
-		for (i = 0; i < ice->ice_intr_count; i++)
-			(void) ddi_intr_disable(ice->ice_intr_handles[i]);
+		return (ddi_intr_block_disable(ice->ice_intr_handles,
+		    ice->ice_intr_count) == DDI_SUCCESS);
 	}
+	for (i = 0; i < ice->ice_intr_count; i++) {
+		if (ddi_intr_disable(ice->ice_intr_handles[i]) != DDI_SUCCESS)
+			ok = B_FALSE;
+	}
+	return (ok);
 }
 
 /*

@@ -62,7 +62,7 @@ def main() -> None:
     allocator = function(
         hw,
         "ice_alloc_intrs(ice_t *ice)\n{",
-        "\nvoid\nice_rem_intr_handlers",
+        "\n/* Returns B_FALSE if any handler could not be removed. */",
     )
     assert '"num_queues"' in hw
     limited = allocator.index("nreq = ice_queue_limit(ice);")

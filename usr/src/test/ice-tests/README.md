@@ -414,8 +414,14 @@ datapath is paused and restarted around the change; one that owes a reset,
 whose queues did not stop, or that fails to restart is only rerouted and left
 fail-closed. An offer that fails or comes at another interrupt priority
 changes nothing. Attach, detach and a change already in progress are
-refused. A terminally failed instance gives vectors back but takes none, and
-handlers that cannot be restored leave the instance fail-closed. The source
+refused. A terminally failed instance gives vectors back but takes none. The
+DDI handler operations are the actual helpers over a stub that can fail each
+one for a single vector: a vector that stays enabled or keeps its handler
+keeps its handle below the count and leaves the instance terminally failed,
+a vector IRM cannot take back stays in use below the count, an offer at
+another priority that cannot be given back is kept below the count without
+a handler, and handlers that cannot be restored leave the instance
+terminally failed. The source
 checks require the registration to precede the first vector count, the
 lifecycle lock to outlive the registration, and detach to refuse while a
 change is in progress.
