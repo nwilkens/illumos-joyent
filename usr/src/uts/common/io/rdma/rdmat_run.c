@@ -786,6 +786,9 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 	if ((rr->rr_op == RDMAT_OP_WRITE || rr->rr_op == RDMAT_OP_READ) &&
 	    rr->rr_size == 0)
 		return (EINVAL);
+	if ((rr->rr_op == RDMAT_OP_PING || rr->rr_op == RDMAT_OP_PONG) &&
+	    rr->rr_count == 0)
+		return (EINVAL);
 
 	/* The run's footprint in the local buffer. */
 	len = (uint64_t)rr->rr_size;
