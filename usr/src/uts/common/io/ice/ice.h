@@ -463,7 +463,7 @@ typedef struct ice_rx_ctrl_block {
  * only exchanged under it; while a ring holds it, the ring's irxr_* fields
  * carry its free stack and counts.  Each block is on the free stack, in a
  * slot, or out on loan.  A pool replaced while loans were out keeps only those
- * blocks, each freed as it returns, and the last reference frees the pool.
+ * blocks, each reaped once it returns, and the last reference frees the pool.
  */
 typedef struct ice_rx_pool {
 	ice_rx_ctrl_block_t	**irp_free;	/* [irp_nrcb] free stack */

@@ -1537,8 +1537,8 @@ ice_ring_rx_poll(void *arg, int poll_bytes)
 }
 
 /*
- * Interrupt-context service for one rx ring: drain up to
- * ice_rx_limit_per_intr frames and push the chain to mac.  Called from the
+ * Interrupt-context service for one rx ring: drain up to irxr_intr_limit
+ * frames and push the chain to mac.  Called from the
  * MSI-X handler after it maps the firing vector back to this ring.  Returns
  * B_TRUE when the drain stopped at the limit with frames still ready, so the
  * caller's re-arm can schedule a software interrupt for the residue.

@@ -1025,7 +1025,7 @@ ice_intr_queue(ice_t *ice, uint_t vector)
 		if (idx < ice->ice_num_rxr &&
 		    ice_rx_ring_intr(&ice->ice_rxr[idx])) {
 			/*
-			 * The rx drain yielded at ice_rx_limit_per_intr with
+			 * The rx drain yielded at irxr_intr_limit with
 			 * frames still ready.  Hardware consumed their events
 			 * when it wrote the descriptors back, so a plain
 			 * re-arm would strand the residue until new traffic
