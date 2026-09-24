@@ -431,11 +431,16 @@ rdmat_connect(rdmat_sess_t *ts, rdmat_connect_t *rc)
 	rdmat_qp_t *tq;
 	struct rdk_qp_attr a;
 	struct rdk_ah_attr ah;
+	uint32_t qacc = rc->rc_qp_access;
 	int ret, acc;
 
 	if ((tq = rdmat_qp(ts, rc->rc_qp)) == NULL || tq->tq_connected ||
 	    rc->rc_rqpn > 0xffffff || rc->rc_retry > 7 ||
 	    rc->rc_rnr_retry > 7 ||
+	    (qacc != 0 && ((qacc & RDMAT_QPACC_SET) == 0 ||
+	    (qacc & ~(RDMAT_QPACC_SET | RDMAT_QPACC_NO_IRD |
+	    RDMAT_ACC_LOCAL_WRITE | RDMAT_ACC_REMOTE_WRITE |
+	    RDMAT_ACC_REMOTE_READ)) != 0)) ||
 	    (rc->rc_path_mtu != 256 && rc->rc_path_mtu != 512 &&
 	    rc->rc_path_mtu != 1024 && rc->rc_path_mtu != 2048 &&
 	    rc->rc_path_mtu != 4096))
@@ -457,6 +462,15 @@ rdmat_connect(rdmat_sess_t *ts, rdmat_connect_t *rc)
 	if (ts->ts_qpt == RDMAT_QPT_RC) {
 		a.qp_access_flags = RDK_ACCESS_LOCAL_WRITE |
 		    RDK_ACCESS_REMOTE_WRITE | RDK_ACCESS_REMOTE_READ;
+		if (qacc != 0) {
+			a.qp_access_flags =
+			    ((qacc & RDMAT_ACC_LOCAL_WRITE) != 0 ?
+			    RDK_ACCESS_LOCAL_WRITE : 0) |
+			    ((qacc & RDMAT_ACC_REMOTE_WRITE) != 0 ?
+			    RDK_ACCESS_REMOTE_WRITE : 0) |
+			    ((qacc & RDMAT_ACC_REMOTE_READ) != 0 ?
+			    RDK_ACCESS_REMOTE_READ : 0);
+		}
 		ret = rdmat_modify(tq, &a, RDK_QP_STATE | RDK_QP_PKEY_INDEX |
 		    RDK_QP_PORT | RDK_QP_ACCESS_FLAGS);
 	} else {
@@ -474,7 +488,8 @@ rdmat_connect(rdmat_sess_t *ts, rdmat_connect_t *rc)
 		a.path_mtu = rdk_mtu_int_to_enum((int)rc->rc_path_mtu);
 		a.dest_qp_num = rc->rc_rqpn;
 		a.rq_psn = rc->rc_rpsn & 0xffffff;
-		a.max_dest_rd_atomic = 16;
+		a.max_dest_rd_atomic =
+		    (qacc & RDMAT_QPACC_NO_IRD) != 0 ? 0 : 16;
 		a.min_rnr_timer = 12;
 		ret = rdmat_modify(tq, &a, RDK_QP_STATE | RDK_QP_AV |
 		    RDK_QP_PATH_MTU | RDK_QP_DEST_QPN | RDK_QP_RQ_PSN |

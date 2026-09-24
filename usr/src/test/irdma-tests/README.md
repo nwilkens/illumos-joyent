@@ -68,7 +68,7 @@ rdmat installed; `rdmatool.c` drives rdmat:
 On one host it runs the rdmatool suite between two sessions (SEND/RECV,
 WRITE, READ and UD with every byte checked, FRWR with local and remote
 invalidate, rejection of a bad or zero rkey, an out-of-bounds address and
-missing rights, latency, bandwidth with CPU per GB, and teardown with work
+missing MR or QP rights, latency, bandwidth with CPU per GB, and teardown with work
 in flight), the same traffic with pings to the peer, irdma detached with a
 stream in flight, a PF reset (DEBUG ice `_reset`) with a stream in flight,
 and an interrupt resource management trim with a stream in flight.  With

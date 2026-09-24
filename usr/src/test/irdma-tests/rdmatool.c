@@ -31,8 +31,9 @@
  * addresses travel the same way.  Every data test fills the source with a
  * seeded pattern and checks every byte at the destination in the kernel.
  *
- * Tests: send write read frwr localinv badkey zerokey bounds access ud
- * pingpong bw inflight, and tcp for a TCP baseline between two hosts.
+ * Tests: send write read frwr localinv badkey zerokey bounds access
+ * qpaccess ud pingpong bw inflight, and tcp for a TCP baseline between two
+ * hosts.
  * Each prints PASS or FAIL with its numbers; the exit status is 0 only if
  * all pass.
  *
@@ -332,6 +333,9 @@ qp_state(peer_t *p)
 /*
  * Fresh sessions on both sides, set up and connected to each other.
  */
+/* The QP access B's next fresh() connection grants (rc_qp_access). */
+static uint32_t fresh_b_access;
+
 static int
 fresh(peer_t *a, peer_t *b, uint32_t qpt, uint32_t poll)
 {
@@ -377,6 +381,8 @@ fresh(peer_t *a, peer_t *b, uint32_t qpt, uint32_t poll)
 		bcopy(o->p_setup.rs_mac, rc.rc_dmac, sizeof (rc.rc_dmac));
 		rc.rc_retry = 7;
 		rc.rc_rnr_retry = 7;
+		if (p == b)
+			rc.rc_qp_access = fresh_b_access;
 		if ((ret = pio(p, RDMAT_IOC_CONNECT, &rc)) != 0) {
 			(void) fprintf(stderr, "%s: connect: %s\n", p->p_name,
 			    strerror(ret));
@@ -668,6 +674,66 @@ t_reject(peer_t *a, peer_t *b, const char *name)
 	result(1, name, "remote access error (status %u, vendor 0x%x) on A's "
 	    "send CQ, A's QP in error; B's QP state %u", rr.rr_status,
 	    rr.rr_vendor_err, qp_state(b));
+}
+
+/*
+ * B's QP grants less than B's MR.  The device has one right for inbound
+ * writes and read responses, which LOCAL_WRITE also turns on.
+ */
+static int
+qpacc_case(peer_t *a, peer_t *b, uint32_t acc, uint32_t ok_op,
+    uint32_t bad_op, char *out, size_t outlen)
+{
+	rdmat_run_t rr;
+	uint32_t st;
+	uint64_t ns;
+	int ret;
+
+	fresh_b_access = RDMAT_QPACC_SET | acc;
+	ret = fresh(a, b, RDMAT_QPT_RC, RDMAT_POLL_TASKQ);
+	fresh_b_access = 0;
+	if (ret != 0) {
+		(void) snprintf(out, outlen, "setup with access 0x%x failed",
+		    acc);
+		return (-1);
+	}
+	if (ok_op != 0 && xfer_check(a, b, ok_op, 4096, &ns) != 0) {
+		(void) snprintf(out, outlen, "access 0x%x: the allowed %s "
+		    "failed", acc, ok_op == RDMAT_OP_READ ? "read" : "write");
+		return (-1);
+	}
+	run_init(&rr, bad_op, 4096, 1);
+	rr.rr_raddr = b->p_setup.rs_qp[0].rqi_addr;
+	rr.rr_rlen = 4096;
+	rr.rr_rkey = b->p_setup.rs_qp[0].rqi_rkey;
+	ret = run(a, &rr);
+	st = qp_state(a);
+	if (ret != EIO || rr.rr_status == 0 || st != QPS_ERR) {
+		(void) snprintf(out, outlen, "access 0x%x: %s got ret %s "
+		    "status %u qp state %u", acc, bad_op == RDMAT_OP_READ ?
+		    "read" : "write", strerror(ret), rr.rr_status, st);
+		return (-1);
+	}
+	(void) snprintf(out, outlen, "access 0x%x: %s refused, status %u",
+	    acc, bad_op == RDMAT_OP_READ ? "read" : "write", rr.rr_status);
+	return (0);
+}
+
+static void
+t_qpaccess(peer_t *a, peer_t *b)
+{
+	char r1[96], r2[96], r3[96];
+	int bad = 0;
+
+	bad |= qpacc_case(a, b, RDMAT_ACC_REMOTE_READ, RDMAT_OP_READ,
+	    RDMAT_OP_WRITE, r1, sizeof (r1));
+	bad |= qpacc_case(a, b, RDMAT_ACC_LOCAL_WRITE | RDMAT_ACC_REMOTE_WRITE,
+	    RDMAT_OP_WRITE, RDMAT_OP_READ, r2, sizeof (r2));
+	bad |= qpacc_case(a, b, RDMAT_ACC_LOCAL_WRITE | RDMAT_ACC_REMOTE_WRITE |
+	    RDMAT_ACC_REMOTE_READ | RDMAT_QPACC_NO_IRD, RDMAT_OP_WRITE,
+	    RDMAT_OP_READ, r3, sizeof (r3));
+	result(bad == 0, "qpaccess", "B's QP rights under a full MR: %s; %s; "
+	    "%s, no inbound read resources", r1, r2, r3);
 }
 
 static void
@@ -1104,8 +1170,8 @@ static void
 run_tests(peer_t *a, peer_t *b, int argc, char **argv)
 {
 	static const char *all[] = { "send", "write", "read", "frwr",
-	    "localinv", "badkey", "zerokey", "bounds", "access", "ud",
-	    "pingpong", "bw", "inflight", NULL };
+	    "localinv", "badkey", "zerokey", "bounds", "access", "qpaccess",
+	    "ud", "pingpong", "bw", "inflight", NULL };
 	const char **list = (const char **)argv;
 	int i, n = argc;
 
@@ -1131,6 +1197,8 @@ run_tests(peer_t *a, peer_t *b, int argc, char **argv)
 		    strcmp(t, "zerokey") == 0 || strcmp(t, "bounds") == 0 ||
 		    strcmp(t, "access") == 0)
 			t_reject(a, b, t);
+		else if (strcmp(t, "qpaccess") == 0)
+			t_qpaccess(a, b);
 		else if (strcmp(t, "ud") == 0)
 			t_ud(a, b);
 		else if (strcmp(t, "pingpong") == 0)

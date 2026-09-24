@@ -230,7 +230,7 @@ else
 	out=/tmp/rv6.$$
 	list=
 	want 6 && list="send write read frwr localinv badkey zerokey bounds"
-	want 6 && list="$list access ud inflight"
+	want 6 && list="$list access qpaccess ud inflight"
 	want 7 && list="$list pingpong bw"
 	$TOOL -i "$LOCAL" -t 5 client "$SERVER" $list > $out 2>&1
 	rc=$?
