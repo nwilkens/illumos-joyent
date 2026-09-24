@@ -32,8 +32,9 @@
  * seeded pattern and checks every byte at the destination in the kernel.
  *
  * Tests: send write read frwr localinv badkey zerokey bounds access ud
- * pingpong bw inflight.  Each prints PASS or FAIL with its numbers; the
- * exit status is 0 only if all pass.
+ * pingpong bw inflight, and tcp for a TCP baseline between two hosts.
+ * Each prints PASS or FAIL with its numbers; the exit status is 0 only if
+ * all pass.
  *
  * Build: gcc -m64 -o rdmatool rdmatool.c -lkstat -lsocket -lnsl
  */
@@ -67,8 +68,19 @@
 #define	K_RESULT	2
 #define	C_FRESH		0x100	/* reopen the server's session */
 #define	C_BYE		0x101
+#define	C_CPU		0x102	/* the server's busy CPU nanoseconds */
+#define	C_TCP		0x103	/* a TCP ping-pong and bulk transfer */
 #define	ST_REM_ACCESS	10	/* RDK_WC_REM_ACCESS_ERR */
 #define	QPS_ERR		6	/* RDK_QPS_ERR */
+
+typedef struct tcpreq {
+	uint64_t	tr_count;	/* ping-pong round trips */
+	uint64_t	tr_bulk;	/* bytes the client then sends */
+	uint32_t	tr_size;	/* ping-pong message size */
+	uint32_t	tr_pad;
+	uint64_t	tr_srv_cpu_ns;	/* out: server busy time in the bulk */
+	uint64_t	tr_srv_ns;	/* out: server time from first byte */
+} tcpreq_t;
 
 typedef struct msg {
 	uint32_t	m_magic;
@@ -97,6 +109,9 @@ static uint32_t o_depth = 64;
 static int o_secs = 5;
 static int failures;
 static uint32_t path_mtu = 1024;
+static char *o_server;
+
+static uint64_t cpu_busy_ns(void);
 
 static void
 fatal(const char *fmt, ...)
@@ -144,6 +159,10 @@ cmd_len(uint32_t cmd)
 	case C_FRESH:
 	case C_BYE:
 		return (0);
+	case C_CPU:
+		return (sizeof (uint64_t));
+	case C_TCP:
+		return (sizeof (tcpreq_t));
 	default:
 		return ((size_t)-1);
 	}
@@ -768,9 +787,10 @@ t_bw(peer_t *a, peer_t *b)
 	static const uint32_t sizes[] = { 4096, 65536, 1 << 20 };
 	static const uint32_t ops[] = { RDMAT_OP_WRITE, RDMAT_OP_READ };
 	rdmat_run_t rr;
-	uint64_t c0, c1, count;
+	uint64_t c0, c1, r0 = 0, r1 = 0, count;
 	uint_t i, j;
 	double gbps, cpu;
+	char rcpu[64];
 	int ret;
 
 	if (fresh(a, b, RDMAT_QPT_RC, RDMAT_POLL_TASKQ) != 0) {
@@ -794,9 +814,15 @@ t_bw(peer_t *a, peer_t *b)
 			rr.rr_rlen = b->p_setup.rs_qp[0].rqi_len;
 			rr.rr_flags = RDMAT_F_UNSIGNALED;
 			rr.rr_timeout_ms = (uint32_t)o_secs * 20000;
+			if (rr.rr_timeout_ms > RDMAT_MAX_TIMEOUT_MS)
+				rr.rr_timeout_ms = RDMAT_MAX_TIMEOUT_MS;
 			c0 = cpu_busy_ns();
+			if (b->p_sock >= 0)
+				(void) rpc(b, C_CPU, &r0, 0, K_RESULT);
 			ret = run(a, &rr);
 			c1 = cpu_busy_ns();
+			if (b->p_sock >= 0)
+				(void) rpc(b, C_CPU, &r1, 0, K_RESULT);
 			if (ret != 0 || rr.rr_ns == 0) {
 				result(0, "bw", "%s %u: %s status %u done %llu",
 				    j == 0 ? "write" : "read", s, strerror(ret),
@@ -806,9 +832,18 @@ t_bw(peer_t *a, peer_t *b)
 			gbps = (double)rr.rr_bytes * 8 / rr.rr_ns;
 			cpu = (double)(c1 - c0) / 1e9 /
 			    ((double)rr.rr_bytes / 1e9);
+			rcpu[0] = '\0';
+			if (b->p_sock >= 0) {
+				double bc = (double)(r1 - r0) / 1e9 /
+				    ((double)rr.rr_bytes / 1e9);
+
+				(void) snprintf(rcpu, sizeof (rcpu),
+				    ", %.3f on B", bc);
+			}
 			result(1, "bw", "%s %7u B x %llu, depth %u: %.2f Gb/s, "
-			    "%.3f CPU-s per GB on A", j == 0 ? "write" : "read",
-			    s, (u_longlong_t)count, rr.rr_depth, gbps, cpu);
+			    "%.3f CPU-s per GB on A%s",
+			    j == 0 ? "write" : "read", s, (u_longlong_t)count,
+			    rr.rr_depth, gbps, cpu, rcpu);
 		}
 	}
 }
@@ -854,6 +889,165 @@ t_inflight(peer_t *a, peer_t *b)
 	    "flight, then a fresh 1 MB write checked");
 }
 
+static int
+xsock(const char *host, int port)
+{
+	struct sockaddr_in sin;
+	int s, one = 1;
+
+	bzero(&sin, sizeof (sin));
+	sin.sin_family = AF_INET;
+	sin.sin_port = htons((uint16_t)port);
+	if (inet_pton(AF_INET, host, &sin.sin_addr) != 1 ||
+	    (s = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+		return (-1);
+	if (connect(s, (struct sockaddr *)&sin, sizeof (sin)) != 0) {
+		(void) close(s);
+		return (-1);
+	}
+	(void) setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof (one));
+	return (s);
+}
+
+static int
+u64cmp(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return (x < y ? -1 : x > y ? 1 : 0);
+}
+
+/*
+ * The same exchanges over TCP between the same hosts, for comparison: a
+ * 64 byte ping-pong and a bulk transfer, with the CPU both hosts use.
+ */
+static void
+t_tcp(peer_t *a, peer_t *b)
+{
+	const uint64_t n = 20000, bulk = 8ULL << 30;
+	static char data[1 << 20];
+	uint64_t *lat, i, sent, c0, c1, sum = 0;
+	struct timespec t0, t1;
+	tcpreq_t tr;
+	char msg[64];
+	int s, ret;
+
+	(void) a;
+	if (b->p_sock < 0) {
+		result(0, "tcp", "needs two hosts");
+		return;
+	}
+	bzero(&tr, sizeof (tr));
+	tr.tr_count = n;
+	tr.tr_size = sizeof (msg);
+	tr.tr_bulk = bulk;
+	(void) rpc(b, C_TCP, &tr, 1, K_ACK);
+	(void) usleep(200000);
+	if ((s = xsock(o_server, o_port + 1)) < 0) {
+		result(0, "tcp", "connect: %s", strerror(errno));
+		return;
+	}
+	lat = calloc(n, sizeof (uint64_t));
+	bzero(msg, sizeof (msg));
+	for (i = 0; i < n; i++) {
+		(void) clock_gettime(CLOCK_MONOTONIC, &t0);
+		if (xfer(s, msg, sizeof (msg), 1) != 0 ||
+		    xfer(s, msg, sizeof (msg), 0) != 0)
+			break;
+		(void) clock_gettime(CLOCK_MONOTONIC, &t1);
+		lat[i] = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL +
+		    (uint64_t)t1.tv_nsec - (uint64_t)t0.tv_nsec;
+		sum += lat[i];
+	}
+	c0 = cpu_busy_ns();
+	(void) clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (sent = 0; i == n && sent < bulk; sent += sizeof (data)) {
+		if (xfer(s, data, sizeof (data), 1) != 0)
+			break;
+	}
+	/* The server answers once it has every byte. */
+	ret = rpc(b, C_TCP, &tr, 1, K_RESULT);
+	(void) clock_gettime(CLOCK_MONOTONIC, &t1);
+	c1 = cpu_busy_ns();
+	(void) close(s);
+	if (i != n || sent < bulk || ret != 0) {
+		result(0, "tcp", "round trips %llu of %llu, bulk %llu of %llu",
+		    (u_longlong_t)i, (u_longlong_t)n, (u_longlong_t)sent,
+		    (u_longlong_t)bulk);
+		free(lat);
+		return;
+	}
+	qsort(lat, n, sizeof (uint64_t), u64cmp);
+	result(1, "tcp", "64 B round trip over %llu: min %.1f us, p50 %.1f "
+	    "us, avg %.1f us, p99 %.1f us", (u_longlong_t)n, lat[0] / 1e3,
+	    lat[n / 2] / 1e3, sum / 1e3 / n, lat[n * 99 / 100] / 1e3);
+	{
+		double ns = (double)(t1.tv_sec - t0.tv_sec) * 1e9 +
+		    (t1.tv_nsec - t0.tv_nsec);
+
+		result(1, "tcp", "bulk %llu GB in 1 MB writes: %.2f Gb/s, "
+		    "%.3f CPU-s per GB on A, %.3f on B",
+		    (u_longlong_t)(bulk >> 30), (double)bulk * 8 / ns,
+		    (double)(c1 - c0) / 1e9 / ((double)bulk / 1e9),
+		    (double)tr.tr_srv_cpu_ns / 1e9 / ((double)bulk / 1e9));
+	}
+	free(lat);
+}
+
+/* The server side of t_tcp(), on a second port. */
+static int
+serve_tcp(tcpreq_t *tr)
+{
+	static char data[1 << 20];
+	struct sockaddr_in sin;
+	struct timespec t0, t1;
+	uint64_t i, got, c0;
+	char msg[256];
+	int l, s, one = 1;
+	ssize_t r;
+
+	if (tr->tr_size == 0 || tr->tr_size > sizeof (msg) ||
+	    tr->tr_count > 10000000 || tr->tr_bulk > (1ULL << 40))
+		return (EINVAL);
+	if ((l = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+		return (errno);
+	(void) setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof (one));
+	bzero(&sin, sizeof (sin));
+	sin.sin_family = AF_INET;
+	sin.sin_port = htons((uint16_t)(o_port + 1));
+	sin.sin_addr.s_addr = o_ip;
+	if (bind(l, (struct sockaddr *)&sin, sizeof (sin)) != 0 ||
+	    listen(l, 1) != 0 || (s = accept(l, NULL, NULL)) < 0) {
+		(void) close(l);
+		return (EIO);
+	}
+	(void) close(l);
+	(void) setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof (one));
+	for (i = 0; i < tr->tr_count; i++) {
+		if (xfer(s, msg, tr->tr_size, 0) != 0 ||
+		    xfer(s, msg, tr->tr_size, 1) != 0) {
+			(void) close(s);
+			return (EIO);
+		}
+	}
+	c0 = 0;
+	for (got = 0; got < tr->tr_bulk; got += (uint64_t)r) {
+		r = read(s, data, sizeof (data));
+		if (r <= 0)
+			break;
+		if (got == 0) {
+			c0 = cpu_busy_ns();
+			(void) clock_gettime(CLOCK_MONOTONIC, &t0);
+		}
+	}
+	(void) clock_gettime(CLOCK_MONOTONIC, &t1);
+	tr->tr_srv_cpu_ns = cpu_busy_ns() - c0;
+	tr->tr_srv_ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL +
+	    (uint64_t)t1.tv_nsec - (uint64_t)t0.tv_nsec;
+	(void) close(s);
+	return (got == tr->tr_bulk ? 0 : EIO);
+}
+
 static void
 run_tests(peer_t *a, peer_t *b, int argc, char **argv)
 {
@@ -893,6 +1087,8 @@ run_tests(peer_t *a, peer_t *b, int argc, char **argv)
 			t_bw(a, b);
 		else if (strcmp(t, "inflight") == 0)
 			t_inflight(a, b);
+		else if (strcmp(t, "tcp") == 0)
+			t_tcp(a, b);
 		else
 			fatal("unknown test %s", t);
 	}
@@ -941,6 +1137,8 @@ serve(int s)
 		rdmat_buf_t d;
 		rdmat_query_t e;
 		rdmat_devices_t f;
+		tcpreq_t g;
+		uint64_t h;
 	} u;
 	int fd = open_session();
 	msg_t m;
@@ -955,7 +1153,8 @@ serve(int s)
 			break;
 		if (m.m_cmd == C_BYE)
 			break;
-		if (m.m_cmd == RDMAT_IOC_RUN && m.m_err != 0) {
+		if ((m.m_cmd == RDMAT_IOC_RUN || m.m_cmd == C_TCP) &&
+		    m.m_err != 0) {
 			msg_t ack = { MAGIC, K_ACK, 0, 0 };
 
 			if (xfer(s, &ack, sizeof (ack), 1) != 0)
@@ -965,6 +1164,11 @@ serve(int s)
 			(void) close(fd);
 			fd = open_session();
 			m.m_err = 0;
+		} else if (m.m_cmd == C_CPU) {
+			u.h = cpu_busy_ns();
+			m.m_err = 0;
+		} else if (m.m_cmd == C_TCP) {
+			m.m_err = serve_tcp(&u.g);
 		} else {
 			if (m.m_cmd == RDMAT_IOC_SETUP) {
 				(void) strlcpy(u.a.rs_dev, o_dev,
@@ -1117,6 +1321,7 @@ main(int argc, char **argv)
 
 		if (argc < 2)
 			usage();
+		o_server = argv[1];
 		b.p_sock = connect_to(argv[1]);
 		bzero(&d, sizeof (d));
 		if (rpc(&b, RDMAT_IOC_DEVICES, &d, 0, K_RESULT) != 0 ||
