@@ -376,8 +376,8 @@ irdma_roce_ctx(irdma_qp_t *iqp)
 	udp->src_port = 0xc000;
 	udp->dst_port = IRDMA_ROCE_UDP_DPORT;
 	bcopy(irdma->irdma_info.iri_mac, roce->mac_addr, ETHERADDRL);
-	roce->rd_en = true;
-	roce->wr_rdresp_en = true;
+	/* An RC QP gets remote access only from RDK_QP_ACCESS_FLAGS. */
+	roce->rd_en = roce->wr_rdresp_en = iqp->iqp_rdk.qp_type != RDK_QPT_RC;
 	roce->dcqcn_en = false;
 	roce->rtomin = 5;
 	roce->ack_credits = IRDMA_ROCE_ACKCREDS_DEFAULT;
@@ -778,9 +778,7 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 			info.next_iwarp_state = IRDMA_QP_STATE_RTS;
 			issue = B_TRUE;
 			break;
-		case RDK_QPS_SQE:
 		case RDK_QPS_ERR:
-		case RDK_QPS_RESET:
 			if (iqp->iqp_hw_state == IRDMA_QP_STATE_ERROR) {
 				iqp->iqp_state = attr->qp_state;
 				mutex_exit(&iqp->iqp_lock);
@@ -789,6 +787,12 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 			info.next_iwarp_state = IRDMA_QP_STATE_ERROR;
 			issue = B_TRUE;
 			break;
+		case RDK_QPS_RESET:
+			/* The device cannot take a created QP back to reset. */
+			if (iqp->iqp_hw_state != IRDMA_QP_STATE_INVALID)
+				ret = ENOTSUP;
+			break;
+		case RDK_QPS_SQE:
 		case RDK_QPS_SQD:
 		default:
 			ret = ENOTSUP;
@@ -798,6 +802,13 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 			mutex_exit(&iqp->iqp_lock);
 			goto out;
 		}
+	}
+	/* The device reads these only when the QP changes state. */
+	if (!issue && iqp->iqp_hw_state > IRDMA_QP_STATE_IDLE &&
+	    (mask & (RDK_QP_ACCESS_FLAGS | RDK_QP_MAX_DEST_RD_ATOMIC)) != 0) {
+		mutex_exit(&iqp->iqp_lock);
+		ret = ENOTSUP;
+		goto out;
 	}
 
 	if ((mask & RDK_QP_DEST_QPN) != 0)
@@ -822,15 +833,18 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 		udp->rexmit_thresh = attr->retry_cnt;
 	if ((mask & RDK_QP_MAX_QP_RD_ATOMIC) != 0 && attr->max_rd_atomic != 0)
 		roce->ord_size = attr->max_rd_atomic;
-	if ((mask & RDK_QP_MAX_DEST_RD_ATOMIC) != 0 &&
-	    attr->max_dest_rd_atomic != 0)
-		roce->ird_size = attr->max_dest_rd_atomic;
-	if ((mask & RDK_QP_ACCESS_FLAGS) != 0) {
-		if ((attr->qp_access_flags & (RDK_ACCESS_LOCAL_WRITE |
-		    RDK_ACCESS_REMOTE_WRITE)) != 0)
-			roce->wr_rdresp_en = true;
-		if ((attr->qp_access_flags & RDK_ACCESS_REMOTE_READ) != 0)
-			roce->rd_en = true;
+	if ((mask & RDK_QP_MAX_DEST_RD_ATOMIC) != 0) {
+		iqp->iqp_ird_zero = attr->max_dest_rd_atomic == 0;
+		if (attr->max_dest_rd_atomic != 0)
+			roce->ird_size = attr->max_dest_rd_atomic;
+	}
+	if ((mask & RDK_QP_ACCESS_FLAGS) != 0)
+		iqp->iqp_access = attr->qp_access_flags;
+	if (iqp->iqp_rdk.qp_type == RDK_QPT_RC) {
+		roce->wr_rdresp_en = (iqp->iqp_access &
+		    (RDK_ACCESS_LOCAL_WRITE | RDK_ACCESS_REMOTE_WRITE)) != 0;
+		roce->rd_en = (iqp->iqp_access & RDK_ACCESS_REMOTE_READ) != 0 &&
+		    !iqp->iqp_ird_zero;
 	}
 	roce->pd_id = iqp->iqp_pd->ipd_sc.pd_id;
 	ctx->send_cq_num = iqp->iqp_scq->icq_num;
