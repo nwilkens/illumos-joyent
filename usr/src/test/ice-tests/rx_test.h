@@ -189,13 +189,12 @@ typedef struct ice_rx_ring {
 	uint32_t irxr_intr_limit;
 	uint16_t irxr_size, irxr_head, irxr_tail;
 	uint_t irxr_nrcb, irxr_nfree, irxr_nreserve, irxr_nloaned;
+	ice_rx_ctrl_block_t *volatile irxr_returned;
 	ice_rxq_stat_t irxr_stats;
 } ice_rx_ring_t;
 
 static unsigned live_mblks, live_dma, impacts, barriers, doorbells, delivered;
 static size_t live_kmem;
-static long lbolt;
-static void (*on_delay)(void);
 /* A free routine is running: it may not free memory or DMA itself. */
 static int in_free_routine;
 /* The reap taskq: one queued task at most, run when the test says. */
@@ -203,10 +202,13 @@ static void (*queued_task)(void *);
 static void *queued_arg;
 static unsigned dispatches, dispatch_fail;
 static int alloc_fail, desballoc_fail, acc_fail;
+/* Runs once inside the next loaner allocation. */
+static void (*on_desballoc)(void);
 static unsigned wb_reads, bad_wb_reads;
 static ice_rx_ring_t *active_ring;
 static mblk_t *checksum_head;
 static void ice_rx_recycle(caddr_t);
+static void ice_rx_harvest(ice_rx_ring_t *);
 static void ice_rx_pool_free(ice_rx_pool_t *);
 static void ice_rx_pool_release(ice_rx_ring_t *);
 
@@ -251,6 +253,33 @@ cv_broadcast(int *cv)
 {
 	(void) cv;
 	broadcasts++;
+}
+
+/* Nothing in these tests leaves an interrupt inside mac_rx_ring(). */
+static void
+cv_wait(int *cv, int *lock)
+{
+	(void) cv;
+	(void) lock;
+	assert(0);
+}
+
+static long lbolt;
+static void (*on_delay)(void);
+
+/* A wait lets the test return loans, then runs out at its time. */
+static long
+cv_timedwait(int *cv, int *lock, long when)
+{
+	(void) cv;
+	assert(*lock);
+	*lock = 0;
+	if (on_delay != NULL)
+		on_delay();
+	*lock = 1;
+	if (lbolt < when)
+		lbolt = when;
+	return (-1);
 }
 
 static void
@@ -485,6 +514,12 @@ desballoc(unsigned char *base, size_t length, int pri, frtn_t *frtn)
 
 	(void) length;
 	(void) pri;
+	if (frtn != NULL && on_desballoc != NULL) {
+		void (*hook)(void) = on_desballoc;
+
+		on_desballoc = NULL;
+		hook();
+	}
 	if (frtn != NULL && desballoc_fail)
 		return (NULL);
 	m = calloc(1, sizeof (*m));
@@ -627,6 +662,28 @@ post_pool(ice_rx_ring_t *r)
 	mutex_exit(&r->irxr_lock);
 }
 
+/* Count of loans waiting in the ring's return list. */
+static unsigned
+returned(const ice_rx_ring_t *r)
+{
+	const ice_rx_ctrl_block_t *rcb;
+	unsigned n = 0;
+
+	for (rcb = r->irxr_returned; rcb != NULL; rcb = rcb->ircb_next)
+		n++;
+	return (n);
+}
+
+/* Take back returned loans, as the next drain does. */
+static void
+harvest(ice_rx_ring_t *r)
+{
+	mutex_enter(&r->irxr_lock);
+	ice_rx_harvest(r);
+	mutex_exit(&r->irxr_lock);
+	assert(r->irxr_returned == NULL);
+}
+
 static void
 setup(ice_rx_ring_t *r, ice_t *ice)
 {
@@ -638,6 +695,7 @@ setup(ice_rx_ring_t *r, ice_t *ice)
 	impacts = barriers = doorbells = delivered = 0;
 	lbolt = 0;
 	on_delay = NULL;
+	on_desballoc = NULL;
 	queued_task = NULL;
 	dispatches = dispatch_fail = 0;
 	wb_reads = bad_wb_reads = 0;

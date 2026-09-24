@@ -77,6 +77,8 @@ fault(fault_site_t site, boolean_t intr, boolean_t dd, boolean_t loan,
 	assert(ring.irxr_stats.icrxs_packets.value.ui64 == 0);
 	assert(ring.irxr_stats.icrxs_bytes.value.ui64 == 0);
 	assert(ring.irxr_stats.icrxs_intr_limit.value.ui64 == 0);
+	/* A partial loan freed after the fault waits for the next harvest. */
+	harvest(&ring);
 	assert(ring.irxr_nloaned == 0 && ring.irxr_nfree == nfree);
 	if (site == FIRST) {
 		assert(ring.irxr_head == 0 && wb_reads == 0 && barriers == 0);
@@ -108,6 +110,8 @@ normal(boolean_t intr, boolean_t loan)
 	}
 	assert(ice.ice_state == 0 && impacts == 0 && bad_wb_reads == 0);
 	assert(doorbells == 1 && ring.irxr_stats.icrxs_packets.value.ui64 == 1);
+	assert(returned(&ring) == ring.irxr_nloaned);
+	harvest(&ring);
 	assert(ring.irxr_nloaned == 0);
 	teardown(&ring);
 }

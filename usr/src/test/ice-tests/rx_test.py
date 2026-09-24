@@ -10,7 +10,7 @@ from c_test import DRIVER, TESTDIR, extract, run_c
 FUNCTIONS = (
     "ice_rx_alloc_mp", "ice_rcb_alloc", "ice_rcb_free", "ice_rx_rcb_destroy",
     "ice_rx_reap_drain", "ice_rx_reap", "ice_rx_orphan_return",
-    "ice_rx_recycle", "ice_rx_reset_desc",
+    "ice_rx_harvest", "ice_rx_recycle", "ice_rx_reset_desc",
     "ice_rx_pool_alloc", "ice_rx_pool_sweep", "ice_rx_pool_free",
     "ice_rx_pool_swap", "ice_rx_pool_release", "ice_rx_pool_orphan",
     "ice_rx_pool_retire",
@@ -37,7 +37,7 @@ def run(test, functions=FUNCTIONS, optional=("ice_rx_desc_sync",)):
                                  args.header))
     for name in ("ICE_RX_LOAN_RESERVE", "ICE_RX_COPY_THRESHOLD",
                  "ICE_RX_HEADROOM", "ICE_RX_LOAN_WAIT_US",
-                 "ICE_RX_ORPHAN_POLL_US"):
+                 "ICE_RX_ORPHAN_POLL_US", "ICE_RX_RETURN_POLL_US"):
         # Optional headroom permits the original source to be a failing control.
         if re.search(rf"^#define\s+{name}\s+", source, re.MULTILINE):
             parts.append(extract(source, rf"^#define\s+{name}\s+.*", args.source))

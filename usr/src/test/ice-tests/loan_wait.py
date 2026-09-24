@@ -110,7 +110,10 @@ def main() -> None:
 
     # Detach waits for the replaced pools' loans too, within the same bound.
     drain = function(rx, "ice_rx_orphans_drain(ice_t *ice)\n{", "\n}\n")
-    assert "ice->ice_rx_orphan_loans != 0" in drain
+    assert "ice->ice_rx_orphan_loans == 0" in drain
+    # A returned loan of a replaced pool can wait in a ring's return list.
+    assert drain.index("ice_rx_harvest(irr)") < \
+        drain.index("ice->ice_rx_orphan_loans == 0")
     assert "ICE_RX_LOAN_WAIT_US" in drain
     assert "return (B_FALSE);" in drain
     lifecycle = (Path(__file__).resolve().parents[2] /

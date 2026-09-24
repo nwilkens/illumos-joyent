@@ -784,6 +784,21 @@ loaning resumes only below half the stop point. Detach's wait fails at the
 loan deadline while a loan is out, frees nothing, and succeeds as soon as the
 loans come back.
 
+A loan returned while its ring is open goes onto the ring's `irxr_returned`
+list without the ring lock, which the drain holds for a whole batch of
+frames; the loan counts as outstanding until `ice_rx_harvest()` takes it back
+under the lock. `rx_layout.py` and `rx_dma_faults.py` check that returns land
+there with a fresh loaner and that a harvest restores the counts. In
+`rx_orphan.py`, a restart that runs between a return's test of `irxr_pool` and
+its push leaves an old-pool block in the list; the harvest queues it for the
+reap without a taskq dispatch (it holds the ring lock) and the next start
+frees it. With the reserve on loan, a loan waiting in the list is taken back
+before a new loan is refused. `ice_rx_quiesce()` takes back what is already
+in the list at once,
+and polls for a return that tested `irxr_shutdown` before the quiesce set it,
+since that return sends no wakeup; a return after the close still takes the
+ring lock and goes to the free stack.
+
 `safe_mode.py` verifies that safe mode withholds the hardware offloads the DDP
 package would have provided: the checksum and LSO capabilities are refused
 outright rather than advertised with no flags, each guard precedes its

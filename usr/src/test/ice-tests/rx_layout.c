@@ -83,6 +83,13 @@ layout(size_t length, boolean_t tagged, boolean_t force_copy)
 		assert(ring.irxr_nloaned == nsegs);
 	}
 	freemsg(mp);
+	/* A loan returns to an open ring's list without the ring lock. */
+	if (length >= ICE_RX_COPY_THRESHOLD && !force_copy) {
+		assert(returned(&ring) == nsegs);
+		assert(ring.irxr_nloaned == nsegs);
+		assert(ring.irxr_returned->ircb_mp != NULL);
+	}
+	harvest(&ring);
 	assert(ring.irxr_nloaned == 0 && ring.irxr_nfree == nfree);
 	/* The posted address plus the full DBUF fits every allocation. */
 	for (i = 0; i < ring.irxr_size; i++) {

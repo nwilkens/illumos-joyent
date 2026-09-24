@@ -541,6 +541,15 @@ typedef struct ice_rx_ring {
 	uint_t			irxr_nreserve;	/* loan high-water */
 	uint_t			irxr_nloaned;	/* outstanding loans */
 
+	/*
+	 * Loans that ice_rx_recycle() gave back without irxr_lock; they count
+	 * as outstanding until ice_rx_harvest() takes them.  The pads keep
+	 * the returning CPUs off the cache lines the drain writes.
+	 */
+	uint64_t		irxr_returned_pad0[7];
+	ice_rx_ctrl_block_t	*volatile irxr_returned;
+	uint64_t		irxr_returned_pad1[7];
+
 	kstat_t			*irxr_kstat;
 	ice_rxq_stat_t		irxr_stats;
 } ice_rx_ring_t;

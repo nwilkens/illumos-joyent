@@ -117,6 +117,8 @@ set_aside(void)
 	held[0] = loan(&ring, 5);
 	assert(ring.irxr_nloaned == 1);
 	freemsg(held[0]);
+	assert(returned(&ring) == 1 && ring.irxr_nloaned == 1);
+	harvest(&ring);
 	assert(ring.irxr_nloaned == 0 && ring.irxr_nfree == nfree);
 
 	/* Returns before the reaper runs share one dispatch. */
@@ -235,6 +237,7 @@ teardown_rings(ice_t *ice)
 	run_taskq();
 	assert(ice->ice_rx_orphan_loans == 0 && ice->ice_rx_reap == NULL);
 	for (i = 0; i < NR; i++) {
+		harvest(&rings[i]);
 		assert(rings[i].irxr_nloaned == 0);
 		stop(&rings[i]);
 		ice_rx_pool_release(&rings[i]);
@@ -438,16 +441,178 @@ reap_undispatched(void)
 	teardown(&ring);
 }
 
+static ice_rx_ring_t *race_ring;
+
+/*
+ * Another CPU restarts the ring between the return's test of irxr_pool and
+ * its push.  The free routine's own allocation is where it pauses.
+ */
+static void
+restart_in_race(void)
+{
+	int saved = in_free_routine;
+
+	in_free_routine = 0;
+	assert(restart(race_ring));
+	in_free_routine = saved;
+}
+
+/*
+ * A loan whose pool was replaced after the return tested it still reaches
+ * the reap: the harvest finds it in the ring's return list.  The harvest runs
+ * under the ring lock, so it queues the block without a taskq dispatch.
+ */
+static void
+return_races_restart(void)
+{
+	ice_rx_ring_t ring;
+	ice_t ice;
+	mblk_t *held;
+	uint_t dma;
+
+	setup(&ring, &ice);
+	held = loan(&ring, 0);
+	race_ring = &ring;
+	on_desballoc = restart_in_race;
+	freemsg(held);
+	assert(on_desballoc == NULL);
+	/* The restart counted the loan as its old pool's. */
+	assert(returned(&ring) == 1 && ice.ice_rx_orphan_loans == 1);
+	assert(ring.irxr_nloaned == 0 && ring.irxr_nfree == ring.irxr_nrcb -
+	    ring.irxr_size);
+	dma = live_dma;
+	harvest(&ring);
+	assert(ice.ice_rx_orphan_loans == 0 && dispatches == 0);
+	assert(ring.irxr_stats.icrxs_orphan_loans.value.ui64 == 0);
+	assert(ring.irxr_nfree == ring.irxr_nrcb - ring.irxr_size);
+	assert(ice.ice_rx_reap != NULL && live_dma == dma);
+	/* The next start frees it. */
+	assert(restart(&ring));
+	assert(ice.ice_rx_reap == NULL && live_dma == dma - 1);
+	stop(&ring);
+	teardown(&ring);
+}
+
+static mblk_t *late[2];
+static ice_rx_ring_t *late_ring;
+
+/* The return tested irxr_shutdown before the quiesce set it. */
+static void
+return_late(void)
+{
+	uint_t i;
+
+	for (i = 0; i < 2; i++) {
+		if (late[i] != NULL) {
+			late_ring->irxr_shutdown = B_FALSE;
+			freemsg(late[i]);
+			late_ring->irxr_shutdown = B_TRUE;
+			late[i] = NULL;
+			return;
+		}
+	}
+}
+
+/*
+ * A quiesce takes back loans already in the return list at once, and polls
+ * for one that lands there while it waits, since that return sends no
+ * wakeup.  A loan returned after the ring closed takes the ring lock.
+ */
+static void
+quiesce_polls(void)
+{
+	ice_rx_ring_t ring;
+	ice_t ice;
+	mblk_t *held[3];
+
+	setup(&ring, &ice);
+	held[0] = loan(&ring, 0);
+	held[1] = loan(&ring, 1);
+	held[2] = loan(&ring, 2);
+	freemsg(held[0]);
+	assert(returned(&ring) == 1 && ring.irxr_nloaned == 3);
+
+	late[0] = held[1];
+	late[1] = NULL;
+	late_ring = &ring;
+	on_delay = return_late;
+	lbolt = 0;
+	/* The third loan never returns: the wait runs to the deadline. */
+	assert(!ice_rx_quiesce(&ice));
+	assert(ring.irxr_shutdown && ring.irxr_returned == NULL);
+	assert(ring.irxr_nloaned == 1 && late[0] == NULL);
+	assert(lbolt >= drv_usectohz(ICE_RX_LOAN_WAIT_US));
+
+	/* Returned after the close, the last loan goes to the free stack. */
+	on_delay = NULL;
+	freemsg(held[2]);
+	assert(ring.irxr_returned == NULL && ring.irxr_nloaned == 0);
+	assert(ring.irxr_nfree == ring.irxr_nrcb - ring.irxr_size);
+
+	/* Every loan in the list: the quiesce takes them without waiting. */
+	ring.irxr_shutdown = B_FALSE;
+	ring.irxr_started = B_TRUE;
+	held[0] = loan(&ring, 3);
+	freemsg(held[0]);
+	lbolt = 0;
+	assert(ice_rx_quiesce(&ice));
+	assert(lbolt == 0 && ring.irxr_nloaned == 0);
+	teardown(&ring);
+}
+
+/*
+ * With the reserve on loan, a loan waiting in the return list is taken back
+ * before a new loan is refused.
+ */
+static void
+reserve_harvest(void)
+{
+	ice_rx_ring_t ring;
+	ice_t ice;
+	mblk_t **held, *mp;
+	uint_t i, n;
+
+	setup(&ring, &ice);
+	n = ring.irxr_nreserve;
+	held = calloc(n, sizeof (*held));
+	assert(held != NULL);
+	for (i = 0; i < n; i++)
+		held[i] = loan(&ring, (uint16_t)(i % ring.irxr_size));
+	assert(ring.irxr_nloaned == n);
+	mutex_enter(&ring.irxr_lock);
+	assert(ice_rx_bind(&ring, 0, ring.irxr_rcbs[0], 1500) == NULL);
+	mutex_exit(&ring.irxr_lock);
+	assert(ring.irxr_stats.icrxs_no_rcb.value.ui64 == 1);
+
+	freemsg(held[0]);
+	assert(returned(&ring) == 1 && ring.irxr_nloaned == n);
+	mutex_enter(&ring.irxr_lock);
+	mp = ice_rx_bind(&ring, 0, ring.irxr_rcbs[0], 1500);
+	mutex_exit(&ring.irxr_lock);
+	assert(mp != NULL && ring.irxr_returned == NULL);
+	assert(ring.irxr_nloaned == n);
+	held[0] = mp;
+	for (i = 0; i < n; i++)
+		freemsg(held[i]);
+	free(held);
+	harvest(&ring);
+	teardown(&ring);
+}
+
 int
 main(void)
 {
 	set_aside();
+	reserve_harvest();
+	return_races_restart();
+	quiesce_polls();
 	return_during_sweep();
 	unbounded_restarts();
 	limit();
 	detach_wait();
 	reap_undispatched();
-	puts("RX orphan: replaced pools keep only their loans, reap each as it "
-	    "returns, never stop a start, and stay within ICE_RX_ORPHAN_MAX");
+	puts("RX orphan: loans return without the ring lock, replaced pools "
+	    "keep only their loans, reap each as it returns, never stop a "
+	    "start, and stay within ICE_RX_ORPHAN_MAX");
 	return (0);
 }

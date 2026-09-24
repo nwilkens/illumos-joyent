@@ -40,6 +40,7 @@
 static void ice_rx_pool_free(ice_rx_pool_t *);
 static void ice_rx_pool_release(ice_rx_ring_t *);
 static void ice_rx_reap_drain(ice_t *);
+static void ice_rx_harvest(ice_rx_ring_t *);
 
 /*
  * Free a single rx ring's DMA and per-slot state.  Safe to call on a ring that
@@ -59,6 +60,7 @@ ice_rx_ring_free(ice_rx_ring_t *irr)
 	ASSERT(!irr->irxr_intr_busy);
 	ice_rx_pool_release(irr);
 	VERIFY3P(irr->irxr_pool, ==, NULL);
+	VERIFY3P(irr->irxr_returned, ==, NULL);
 
 	if (irr->irxr_kstat != NULL) {
 		kstat_delete(irr->irxr_kstat);
@@ -451,7 +453,9 @@ ice_rx_ring_unprogram(ice_t *ice, ice_rx_ring_t *irr)
  * desballoc(9F) loaner mblk; a large segment is loaned up the stack (the slot
  * is refilled from a spare control block), a small segment is copied into a
  * fresh mblk and the buffer is left on the ring.  Loaned buffers return through
- * ice_rx_recycle(); teardown blocks until every loan is back.
+ * ice_rx_recycle(); teardown blocks until every loan is back.  While the ring
+ * is open, a returning loan goes onto irxr_returned without irxr_lock, and the
+ * drain takes the list back under the lock (ice_rx_harvest()).
  *
  * irxr_lock is taken at interrupt priority, so no allocation, DMA release or
  * freemsg(9F) happens under it.  A pool is built and freed outside the lock
@@ -481,6 +485,9 @@ ice_rx_ring_unprogram(ice_t *ice, ice_rx_ring_t *irr)
 
 /* How often detach checks for the loans of replaced pools. */
 #define	ICE_RX_ORPHAN_POLL_US	10000
+
+/* How often a teardown takes back the loans returned to irxr_returned. */
+#define	ICE_RX_RETURN_POLL_US	10000
 
 static mblk_t *ice_ring_rx(ice_rx_ring_t *, int, boolean_t *, mblk_t **);
 
@@ -516,6 +523,9 @@ ice_rcb_alloc(ice_rx_ring_t *irr, boolean_t loan)
 
 	ASSERT(MUTEX_HELD(&irr->irxr_lock));
 
+	if (irr->irxr_nfree == 0 ||
+	    (loan && irr->irxr_nloaned >= irr->irxr_nreserve))
+		ice_rx_harvest(irr);
 	if (irr->irxr_nfree == 0)
 		return (NULL);
 
@@ -599,10 +609,12 @@ ice_rx_reap(void *arg)
  * its own locks, even at interrupt priority, so the block is queued and its
  * DMA teardown runs on the reap taskq.  The instance count is dropped last:
  * detach waits for it to reach zero, and then every returned block is queued
- * and no callback has still to touch the taskq.
+ * and no callback has still to touch the taskq.  Without dispatch, the block
+ * waits for the next dispatch or for ice_rx_start() or detach to drain it.
  */
 static void
-ice_rx_orphan_return(ice_rx_ring_t *irr, ice_rx_ctrl_block_t *rcb)
+ice_rx_orphan_return(ice_rx_ring_t *irr, ice_rx_ctrl_block_t *rcb,
+    boolean_t dispatch)
 {
 	ice_t *ice = irr->irxr_ice;
 	ice_rx_ctrl_block_t *head;
@@ -613,12 +625,38 @@ ice_rx_orphan_return(ice_rx_ring_t *irr, ice_rx_ctrl_block_t *rcb)
 		rcb->ircb_next = head;
 		membar_producer();
 	} while (atomic_cas_ptr(&ice->ice_rx_reap, head, rcb) != head);
-	if (atomic_cas_32(&ice->ice_rx_reap_queued, 0, 1) == 0 &&
+	if (dispatch && atomic_cas_32(&ice->ice_rx_reap_queued, 0, 1) == 0 &&
 	    ddi_taskq_dispatch(ice->ice_rx_reap_taskq, ice_rx_reap, ice,
 	    DDI_NOSLEEP) != DDI_SUCCESS)
 		(void) atomic_swap_32(&ice->ice_rx_reap_queued, 0);
 	atomic_dec_64(&irr->irxr_stats.icrxs_orphan_loans.value.ui64);
 	atomic_dec_32(&ice->ice_rx_orphan_loans);
+}
+
+/*
+ * Take back the loans that ice_rx_recycle() returned without irxr_lock.  A
+ * loan of a pool that the ring replaced after the recycle read irxr_pool is
+ * queued for the reap; a taskq dispatch is not allowed under this lock.
+ */
+static void
+ice_rx_harvest(ice_rx_ring_t *irr)
+{
+	ice_rx_ctrl_block_t *rcb, *next;
+
+	ASSERT(MUTEX_HELD(&irr->irxr_lock));
+
+	if (irr->irxr_returned == NULL)
+		return;
+	rcb = atomic_swap_ptr(&irr->irxr_returned, NULL);
+	membar_consumer();
+	for (; rcb != NULL; rcb = next) {
+		next = rcb->ircb_next;
+		ASSERT3S(rcb->ircb_state, ==, IRXB_ONLOAN);
+		if (rcb->ircb_pool != irr->irxr_pool)
+			ice_rx_orphan_return(irr, rcb, B_FALSE);
+		else
+			ice_rcb_free(irr, rcb);
+	}
 }
 
 /*
@@ -632,6 +670,7 @@ ice_rx_recycle(caddr_t arg)
 {
 	ice_rx_ctrl_block_t *rcb = (ice_rx_ctrl_block_t *)arg;
 	ice_rx_ring_t *irr = rcb->ircb_ring;
+	ice_rx_ctrl_block_t *head;
 
 	/* The mblk that called us is gone; a fresh one is built below. */
 	rcb->ircb_mp = NULL;
@@ -644,12 +683,30 @@ ice_rx_recycle(caddr_t arg)
 	if (rcb->ircb_state != IRXB_ONLOAN)
 		return;
 
+	/*
+	 * The drain holds irxr_lock for a whole batch of frames, so an open
+	 * ring takes its loans back through irxr_returned.  ice_rx_harvest()
+	 * handles a pool replaced after this test, and a teardown that starts
+	 * after it polls for the loan.  Once the push lands, a harvest can
+	 * free the ring, so the push is the last access to it.
+	 */
+	if (!irr->irxr_shutdown && rcb->ircb_pool == irr->irxr_pool) {
+		(void) ice_rx_alloc_mp(rcb);
+		do {
+			head = irr->irxr_returned;
+			rcb->ircb_next = head;
+			membar_producer();
+		} while (atomic_cas_ptr(&irr->irxr_returned, head, rcb) !=
+		    head);
+		return;
+	}
+
 	mutex_enter(&irr->irxr_lock);
 
 	/* A replaced pool is never current again, so this cannot change. */
 	if (rcb->ircb_pool != irr->irxr_pool) {
 		mutex_exit(&irr->irxr_lock);
-		ice_rx_orphan_return(irr, rcb);
+		ice_rx_orphan_return(irr, rcb, B_TRUE);
 		return;
 	}
 
@@ -799,6 +856,7 @@ ice_rx_pool_swap(ice_rx_ring_t *irr, ice_rx_pool_t *np)
 	ASSERT(MUTEX_HELD(&irr->irxr_lock));
 	ASSERT(!irr->irxr_started);
 
+	ice_rx_harvest(irr);
 	if (op != NULL) {
 		op->irp_nfree = irr->irxr_nfree;
 		op->irp_nloaned = irr->irxr_nloaned;
@@ -831,6 +889,7 @@ ice_rx_pool_release(ice_rx_ring_t *irr)
 	ice_rx_pool_t *p = NULL;
 
 	mutex_enter(&irr->irxr_lock);
+	ice_rx_harvest(irr);
 	if (irr->irxr_nloaned == 0)
 		p = ice_rx_pool_swap(irr, NULL);
 	mutex_exit(&irr->irxr_lock);
@@ -1386,6 +1445,7 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp,
 	if ((ice->ice_state & ICE_STATE_ERROR) != 0)
 		return (NULL);
 
+	ice_rx_harvest(irr);
 	ice_rx_loan_mode(irr);
 
 	for (;;) {
@@ -1854,10 +1914,25 @@ ice_rx_quiesce(ice_t *ice)
 		while (irr->irxr_intr_busy)
 			cv_wait(&irr->irxr_intr_cv, &irr->irxr_lock);
 
-		while (irr->irxr_nloaned > 0) {
-			if (cv_timedwait(&irr->irxr_cv, &irr->irxr_lock,
-			    deadline) == -1)
+		/*
+		 * A loan returned through irxr_returned sends no wakeup, so
+		 * the wait also polls.
+		 */
+		for (;;) {
+			clock_t next;
+
+			ice_rx_harvest(irr);
+			if (irr->irxr_nloaned == 0)
 				break;
+			next = ddi_get_lbolt() +
+			    drv_usectohz(ICE_RX_RETURN_POLL_US);
+			if (next - deadline > 0)
+				next = deadline;
+			if (cv_timedwait(&irr->irxr_cv, &irr->irxr_lock,
+			    next) == -1 && ddi_get_lbolt() - deadline >= 0) {
+				ice_rx_harvest(irr);
+				break;
+			}
 		}
 
 		if (irr->irxr_nloaned > 0)
@@ -1877,8 +1952,19 @@ boolean_t
 ice_rx_orphans_drain(ice_t *ice)
 {
 	clock_t deadline = ddi_get_lbolt() + drv_usectohz(ICE_RX_LOAN_WAIT_US);
+	uint_t i;
 
-	while (ice->ice_rx_orphan_loans != 0) {
+	for (;;) {
+		/* A loan that raced its pool's replacement waits in a ring. */
+		for (i = 0; i < ice->ice_num_rxr; i++) {
+			ice_rx_ring_t *irr = &ice->ice_rxr[i];
+
+			mutex_enter(&irr->irxr_lock);
+			ice_rx_harvest(irr);
+			mutex_exit(&irr->irxr_lock);
+		}
+		if (ice->ice_rx_orphan_loans == 0)
+			break;
 		if (ddi_get_lbolt() - deadline >= 0)
 			return (B_FALSE);
 		delay(drv_usectohz(ICE_RX_ORPHAN_POLL_US));
