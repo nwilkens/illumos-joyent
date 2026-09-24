@@ -577,6 +577,7 @@ enum rdk_poll_context {
 struct rdk_cq {
 	struct rdk_device	*device;
 	rdk_comp_handler_t	comp_handler;
+	/* It must not destroy the CQ: destroy waits for it to return. */
 	void			(*event_handler)(struct rdk_event *, void *);
 	void			*cq_context;
 	int			cqe;
@@ -590,6 +591,7 @@ struct rdk_qp {
 	struct rdk_pd		*pd;
 	struct rdk_cq		*send_cq;
 	struct rdk_cq		*recv_cq;
+	/* It must not destroy the QP: destroy waits for it to return. */
 	void			(*event_handler)(struct rdk_event *, void *);
 	void			*qp_context;
 	uint32_t		qp_num;

@@ -171,6 +171,17 @@ rdk_create_cq(struct rdk_device *dev, rdk_comp_handler_t comp,
     void (*event)(struct rdk_event *, void *), void *ctx,
     const struct rdk_cq_init_attr *attr, struct rdk_cq **cqp)
 {
+	return (rdk_create_cq_poll(dev, comp, event, ctx, attr,
+	    RDK_POLL_DIRECT, NULL, cqp));
+}
+
+/* The poller is set before the provider can send an event. */
+int
+rdk_create_cq_poll(struct rdk_device *dev, rdk_comp_handler_t comp,
+    void (*event)(struct rdk_event *, void *), void *ctx,
+    const struct rdk_cq_init_attr *attr, enum rdk_poll_context poll_ctx,
+    struct rdk_cq_poller *poller, struct rdk_cq **cqp)
+{
 	struct rdk_cq *cq;
 	int ret;
 
@@ -187,7 +198,8 @@ rdk_create_cq(struct rdk_device *dev, rdk_comp_handler_t comp,
 	cq->event_handler = event;
 	cq->cq_context = ctx;
 	cq->cqe = (int)attr->cqe;
-	cq->poll_ctx = RDK_POLL_DIRECT;
+	cq->poll_ctx = poll_ctx;
+	cq->poller = poller;
 	if ((ret = dev->rd_ops->create_cq(cq, attr)) != 0) {
 		kmem_free(cq, dev->rd_ops->size_cq);
 		rdk_obj_rele(dev);
@@ -497,6 +509,9 @@ rdk_destroy_qp(struct rdk_qp *qp)
 	struct rdk_device *dev = qp->device;
 
 	dev->rd_ops->destroy_qp(qp);
+	rdk_cq_barrier(qp->send_cq);
+	if (qp->recv_cq != qp->send_cq)
+		rdk_cq_barrier(qp->recv_cq);
 	rdk_put_gid_attr(qp->av_sgid_attr);
 	atomic_dec_32(&qp->pd->usecnt);
 	atomic_dec_32(&qp->send_cq->usecnt);
