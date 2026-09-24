@@ -71,6 +71,8 @@ static struct {
 	boolean_t quiesce_attempted, quiesce_done, wait_entered;
 	pthread_t quiesce_thread;
 	boolean_t quiesce_thread_valid;
+	boolean_t hold_release, release_entered, release_ok;
+	unsigned int notice_after_frees;
 } fixture;
 static pthread_mutex_t schedule_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t schedule_cv = PTHREAD_COND_INITIALIZER;
@@ -113,6 +115,12 @@ cv_wait(kcondvar_t *cv, kmutex_t *m)
 }
 
 static void
+cv_signal(kcondvar_t *cv)
+{
+	assert(pthread_cond_signal(cv) == 0);
+}
+
+static void
 atomic_or_32(uint32_t *p, uint32_t value)
 {
 	*p |= value;
@@ -147,14 +155,24 @@ ddi_fm_service_impact(void *dip, int impact)
 	assert(!"unexpected DMA error");
 }
 
-/* Completed TCBs are released only once the ring lock is dropped. */
+/*
+ * Completed TCBs are released only once the ring lock is dropped.  A release
+ * can be held midway to race a quiesce against it.
+ */
 static void
 ice_tx_done(ice_tx_ring_t *itr, ice_tx_ctrl_block_t *list)
 {
 	assert(!MUTEX_HELD(&itr->itxr_lock));
 	assert(list == NULL || (list == &block && block.itcb_next == NULL));
-	if (list != NULL)
-		fixture.frees++;
+	if (list == NULL)
+		return;
+	assert(pthread_mutex_lock(&schedule_lock) == 0);
+	fixture.release_entered = B_TRUE;
+	assert(pthread_cond_broadcast(&schedule_cv) == 0);
+	while (fixture.hold_release && !fixture.release_ok)
+		assert(pthread_cond_wait(&schedule_cv, &schedule_lock) == 0);
+	fixture.frees++;
+	assert(pthread_mutex_unlock(&schedule_lock) == 0);
 }
 
 static void
@@ -163,6 +181,7 @@ mac_tx_ring_update(void *mac, void *macring)
 	assert(mac == &device && macring == &ring);
 	assert(MUTEX_HELD(&ring.itxr_lock));
 	fixture.notices++;
+	fixture.notice_after_frees = fixture.frees;
 	assert(pthread_mutex_lock(&schedule_lock) == 0);
 	fixture.notice_entered = B_TRUE;
 	assert(pthread_cond_broadcast(&schedule_cv) == 0);
@@ -224,6 +243,14 @@ late_interrupt(boolean_t completed)
 static void empty_late(void) { late_interrupt(B_FALSE); }
 static void completed_late(void) { late_interrupt(B_TRUE); }
 
+static void *
+interrupt_worker(void *arg)
+{
+	(void) arg;
+	ice_tx_ring_intr(&ring);
+	return (NULL);
+}
+
 static void
 healthy_recycle(void)
 {
@@ -235,10 +262,13 @@ healthy_recycle(void)
 	init(B_TRUE);
 	ice_tx_ring_intr(&ring);
 	assert(fixture.notices == 1 && fixture.frees == 1);
+	/* MAC hears only once the TCBs are back. */
+	assert(fixture.notice_after_frees == 1);
 	assert(!ring.itxr_blocked && ring.itxr_avail == RING_SIZE);
-	assert(ring.itxr_tcbs[0] == NULL);
+	assert(ring.itxr_tcbs[0] == NULL && ring.itxr_tx_active == 0);
 	fini();
 }
+
 
 static void *
 quiesce_worker(void *arg)
@@ -254,6 +284,35 @@ quiesce_worker(void *arg)
 	assert(pthread_cond_broadcast(&schedule_cv) == 0);
 	assert(pthread_mutex_unlock(&schedule_lock) == 0);
 	return (NULL);
+}
+
+/* A quiesce waits for an interrupt that is still releasing TCBs. */
+static void
+release_in_flight(void)
+{
+	pthread_t interrupt, quiesce;
+
+	init(B_TRUE);
+	fixture.hold_release = B_TRUE;
+	assert(pthread_create(&interrupt, NULL, interrupt_worker, NULL) == 0);
+	assert(pthread_mutex_lock(&schedule_lock) == 0);
+	while (!fixture.release_entered)
+		assert(pthread_cond_wait(&schedule_cv, &schedule_lock) == 0);
+	assert(pthread_mutex_unlock(&schedule_lock) == 0);
+	assert(pthread_create(&quiesce, NULL, quiesce_worker, NULL) == 0);
+	assert(pthread_mutex_lock(&schedule_lock) == 0);
+	while (!fixture.wait_entered)
+		assert(pthread_cond_wait(&schedule_cv, &schedule_lock) == 0);
+	assert(!fixture.quiesce_done && fixture.frees == 0);
+	fixture.release_ok = B_TRUE;
+	assert(pthread_cond_broadcast(&schedule_cv) == 0);
+	assert(pthread_mutex_unlock(&schedule_lock) == 0);
+	assert(pthread_join(interrupt, NULL) == 0);
+	assert(pthread_join(quiesce, NULL) == 0);
+	assert(fixture.quiesce_done && fixture.frees == 1);
+	/* The quiesced ring does not wake MAC. */
+	assert(fixture.notices == 0 && !ring.itxr_blocked);
+	fini();
 }
 
 static void
@@ -282,13 +341,6 @@ active_builder(void)
 	fini();
 }
 
-static void *
-interrupt_worker(void *arg)
-{
-	(void) arg;
-	ice_tx_ring_intr(&ring);
-	return (NULL);
-}
 
 static void
 prior_notification(void)
@@ -327,7 +379,8 @@ main(int argc, char **argv)
 		{ "completed_late", completed_late },
 		{ "healthy_recycle", healthy_recycle },
 		{ "active_builder", active_builder },
-		{ "prior_notification", prior_notification }
+		{ "prior_notification", prior_notification },
+		{ "release_in_flight", release_in_flight }
 	};
 	unsigned int i, ran = 0;
 

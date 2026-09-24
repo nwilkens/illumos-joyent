@@ -282,7 +282,7 @@ recycle(void)
 	uint_t returns = f.returns[0] + f.returns[1];
 
 	assert(f.ring.itxr_lock);
-	n = ice_tx_recycle(&f.ring, &done);
+	n = ice_tx_recycle(&f.ring, &done, B_TRUE);
 	assert(f.ring.itxr_tcb_nfree == nfree && f.mp.frees == frees);
 	assert(f.returns[0] + f.returns[1] == returns);
 	f.ring.itxr_lock = B_FALSE;

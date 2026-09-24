@@ -35,7 +35,7 @@ def main() -> None:
     assert enter < arm
 
     # ... and reclaim is re-driven after arming, before dropping the lock
-    recycle = nores.index("ice_tx_recycle(itr, &done)")
+    recycle = nores.index("ice_tx_recycle(itr, &done, B_TRUE)")
     exit_ = nores.index("mutex_exit(&itr->itxr_lock)")
     assert arm < recycle < exit_
 
@@ -49,7 +49,7 @@ def main() -> None:
     drop = drop[:drop.index("return (B_TRUE);")]
     assert drop.index("mutex_enter(&itr->itxr_lock)") < \
         drop.index("if (itr->itxr_blocked)") < \
-        drop.index("ice_tx_recycle(itr, &done)") < \
+        drop.index("ice_tx_recycle(itr, &done, B_TRUE)") < \
         drop.index("mutex_exit(&itr->itxr_lock)")
 
     # the TX path never waits on an LSO allocation: MAC start made the pool
@@ -68,18 +68,28 @@ def main() -> None:
 
     # the sibling arm path still recycles before arming
     sibling = one[one.index("if (itr->itxr_avail <= ndesc)"):]
-    assert sibling.index("ice_tx_recycle(itr, &done)") < sibling.index(
+    assert sibling.index("ice_tx_recycle(itr, &done, B_TRUE)") < sibling.index(
         "itr->itxr_blocked = B_TRUE")
 
     # recycle still owns the wakeup in both of its exits
     rec = function(
         tx,
-        "ice_tx_recycle(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **donep)\n{",
+        "ice_tx_recycle(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **donep, boolean_t wake)\n{",
         "\nstatic boolean_t\nice_tx_one",
     )
     assert rec.count("mac_tx_ring_update(") == 2
     assert rec.count("itr->itxr_blocked = B_FALSE") == 2
     assert "ASSERT(MUTEX_HELD(&itr->itxr_lock));" in rec
+
+    # the interrupt wakes MAC only after its TCBs are back, and counts the
+    # release as ring activity so a quiesce waits for it
+    intr = function(tx, "ice_tx_ring_intr(ice_tx_ring_t *itr)\n{", "\n}\n")
+    assert "ice_tx_recycle(itr, &done, B_FALSE)" in intr
+    assert intr.index("itr->itxr_tx_active++") < \
+        intr.index("ice_tx_done(itr, done)") < \
+        intr.index("mac_tx_ring_update(") < \
+        intr.index("--itr->itxr_tx_active")
+    assert "!itr->itxr_quiesce" in intr
 
     print("PASS: ice tx back-pressure source invariants")
 

@@ -91,7 +91,7 @@ def main() -> None:
     assert done.count("ddi_dma_sync(") == 1
 
     # recycle no longer syncs the whole ring; it walks the report-status queue
-    rec = function(tx, "ice_tx_recycle(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **donep)", "\n/*")
+    rec = function(tx, "ice_tx_recycle(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **donep,", "\n/*")
     assert "ddi_dma_sync(" not in rec
     assert "itr->itxr_rsq[rs_cidx]" in rec
     assert "ice_check_dma_handle(itr->itxr_dma.idb_dma_handle)" in rec

@@ -1629,13 +1629,13 @@ ice_tx_desc_done(const ice_tx_ring_t *itr, uint16_t slot)
  * that descriptor is ever rewritten to DESC_DONE.  Packets complete in order,
  * so probing one slot per outstanding packet finds the completed run at a cost
  * proportional to the packets freed rather than to the in-flight window.  We
- * free each completed packet's TCBs and slots, clear back-pressure, and notify
- * MAC when space frees up.  The completed TCBs are chained on *donep for the
- * caller to pass to ice_tx_done() after it drops itxr_lock.  Returns
- * descriptors reclaimed.
+ * free each completed packet's slots and chain its TCBs on *donep for the
+ * caller to pass to ice_tx_done() after it drops itxr_lock.  With wake set,
+ * back-pressure is cleared and MAC notified here; the interrupt instead waits
+ * until the TCBs are back.  Returns descriptors reclaimed.
  */
 static uint_t
-ice_tx_recycle(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **donep)
+ice_tx_recycle(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **donep, boolean_t wake)
 {
 	ice_t *ice = itr->itxr_ice;
 	uint16_t head, rs_cidx;
@@ -1716,7 +1716,7 @@ ice_tx_recycle(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **donep)
 	itr->itxr_rs_cidx = rs_cidx;
 	itr->itxr_avail += nrecycled;
 
-	if (itr->itxr_blocked) {
+	if (wake && itr->itxr_blocked) {
 		itr->itxr_blocked = B_FALSE;
 		mac_tx_ring_update(ice->ice_mac_hdl, itr->itxr_mactxring);
 	}
@@ -1827,7 +1827,7 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 		 * flag set: a fully drained ring gets no further completion
 		 * interrupt and would otherwise stay blocked at MAC forever.
 		 */
-		(void) ice_tx_recycle(itr, &done);
+		(void) ice_tx_recycle(itr, &done, B_TRUE);
 		mutex_exit(&itr->itxr_lock);
 		ice_tx_done(itr, done);
 		return (B_FALSE);
@@ -1845,7 +1845,7 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 		 * completion would wake MAC for it.
 		 */
 		if (itr->itxr_blocked)
-			(void) ice_tx_recycle(itr, &done);
+			(void) ice_tx_recycle(itr, &done, B_TRUE);
 		mutex_exit(&itr->itxr_lock);
 		ice_tx_done(itr, done);
 		return (B_TRUE);
@@ -1855,7 +1855,7 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 	mutex_enter(&itr->itxr_lock);
 
 	if (itr->itxr_avail <= ndesc) {
-		(void) ice_tx_recycle(itr, &done);
+		(void) ice_tx_recycle(itr, &done, B_TRUE);
 		if (itr->itxr_avail <= ndesc) {
 			itr->itxr_blocked = B_TRUE;
 			itr->itxr_stats.ictxs_blocked.value.ui64++;
@@ -2084,9 +2084,26 @@ ice_tx_ring_intr(ice_tx_ring_t *itr)
 	ice_tx_ctrl_block_t *done = NULL;
 
 	mutex_enter(&itr->itxr_lock);
-	(void) ice_tx_recycle(itr, &done);
+	(void) ice_tx_recycle(itr, &done, B_FALSE);
+	if (done == NULL) {
+		mutex_exit(&itr->itxr_lock);
+		return;
+	}
+	/* Quiesce waits for the release, which reaches the ring's pools. */
+	itr->itxr_tx_active++;
 	mutex_exit(&itr->itxr_lock);
+
 	ice_tx_done(itr, done);
+
+	mutex_enter(&itr->itxr_lock);
+	if (itr->itxr_blocked && !itr->itxr_quiesce) {
+		itr->itxr_blocked = B_FALSE;
+		mac_tx_ring_update(itr->itxr_ice->ice_mac_hdl,
+		    itr->itxr_mactxring);
+	}
+	if (--itr->itxr_tx_active == 0)
+		cv_signal(&itr->itxr_cv);
+	mutex_exit(&itr->itxr_lock);
 }
 
 int

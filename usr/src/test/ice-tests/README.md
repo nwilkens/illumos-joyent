@@ -243,11 +243,13 @@ python3 usr/src/test/ice-tests/tx_quiesce.py
 ```
 
 The runner compiles the actual TX recycle, quiesce, and interrupt functions
-with small DMA/MAC boundary stubs. Five named scenarios cover empty and
-completed blocked rings after quiescence, both healthy wakeup paths, a builder
-rearming backpressure during the active-call drain, and a prior notification
-holding the ring lock while quiescence waits. The last two use pthread mutex
-and condition-variable handshakes without sleeps. Assertions check callback
+with small DMA/MAC boundary stubs. Six named scenarios cover empty and
+completed blocked rings after quiescence, both healthy wakeup paths (the
+interrupt wakes MAC only after its TCBs are back), a builder rearming
+backpressure during the active-call drain, a prior notification holding the
+ring lock while quiescence waits, and an interrupt still releasing its TCBs,
+which quiescence must wait out. The last three use pthread mutex and
+condition-variable handshakes without sleeps. Assertions check callback
 counts, retained descriptors/control blocks, and the completed quiescence gate.
 This validates software callback ownership; hardware DMA isolation remains a
 separate queue-disable/reset requirement.
