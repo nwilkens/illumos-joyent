@@ -535,7 +535,7 @@ rdmat_sge(rdmat_sess_t *ts, rdmat_qp_t *tq, uint64_t off, uint32_t len,
 {
 	uint64_t c;
 
-	if (off > tq->tq_len || len > tq->tq_len - off)
+	if (off >= tq->tq_len || len > tq->tq_len - off)
 		return (EINVAL);
 	if (dma_lkey || tq->tq_lmr == NULL) {
 		c = off / RDMAT_CHUNK;
@@ -779,7 +779,7 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 	if (rr->rr_op == RDMAT_OP_POST_RECV || rr->rr_op == RDMAT_OP_PING ||
 	    rr->rr_op == RDMAT_OP_PONG)
 		len *= ts->ts_depth;
-	if (rr->rr_offset > tq->tq_len || len > tq->tq_len - rr->rr_offset)
+	if (rr->rr_offset >= tq->tq_len || len > tq->tq_len - rr->rr_offset)
 		return (EINVAL);
 	if (ts->ts_qpt == RDMAT_QPT_UD && rr->rr_op != RDMAT_OP_SEND &&
 	    rr->rr_op != RDMAT_OP_POST_RECV &&
