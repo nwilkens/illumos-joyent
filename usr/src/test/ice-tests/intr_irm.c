@@ -772,7 +772,9 @@ irm(void)
 	m.fail_add = 1;
 	assert(callback(DDI_CB_INTR_ADD, 1) == DDI_FAILURE);
 	assert((dev.ice_state & ICE_STATE_RESET_FAILED) != 0 && l.impacts == 1);
-	assert((dev.ice_attach_progress & ICE_ATTACH_ADD_INTR) == 0);
+	/* Detach still tries every vector, in case a rollback failed. */
+	assert((dev.ice_attach_progress & ICE_ATTACH_ADD_INTR) != 0);
+	assert((dev.ice_attach_progress & ICE_ATTACH_ENABLE_INTR) != 0);
 	assert(!dev.ice_irm_busy && !dev.ice_rebuild_lock);
 	for (i = 0; i < 64; i++)
 		assert(!m.handler[i] && !m.enabled[i]);

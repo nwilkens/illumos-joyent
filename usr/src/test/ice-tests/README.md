@@ -425,7 +425,8 @@ keeps its handle below the count and leaves the instance terminally failed,
 a vector IRM cannot take back stays in use below the count, an offer at
 another priority that cannot be given back is kept below the count without
 a handler, and handlers that cannot be restored leave the instance
-terminally failed. The source
+terminally failed with its interrupt attach progress kept, so detach tries
+every vector again. The source
 checks require the registration to precede the first vector count, the
 lifecycle lock to outlive the registration, and detach to refuse while a
 change is in progress.

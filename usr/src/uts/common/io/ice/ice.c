@@ -763,16 +763,14 @@ ice_intr_adjust_locked(ice_t *ice, ddi_cb_action_t action, int count)
 		}
 	}
 
+	/*
+	 * A failed rollback inside these can leave a handler or an enabled
+	 * vector, so the attach progress stays set and detach tries every
+	 * vector again.
+	 */
 	ice_intr_rings_map(ice);
-	if (!ice_add_intr_handlers(ice)) {
-		ice->ice_attach_progress &=
-		    ~(ICE_ATTACH_ADD_INTR | ICE_ATTACH_ENABLE_INTR);
+	if (!ice_add_intr_handlers(ice) || !ice_intr_enable(ice))
 		goto dead;
-	}
-	if (!ice_intr_enable(ice)) {
-		ice->ice_attach_progress &= ~ICE_ATTACH_ENABLE_INTR;
-		goto dead;
-	}
 
 	if (paused && (ice->ice_state & down) == 0) {
 		if (ice_start_datapath(ice) != 0 || !ice_rx_rings_resume(ice)) {
