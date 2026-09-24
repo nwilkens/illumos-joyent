@@ -3598,7 +3598,8 @@ static int irdma_sc_parse_fpm_query_buf(struct irdma_sc_dev *dev, __le64 *buf,
 			return -EINVAL;
 	}
 
-	return 0;
+	/* illumos: firmware values size and index everything that follows. */
+	return irdma_osdep_fpm_query_check(dev, hmc_info, hmc_fpm_misc);
 }
 
 /**
@@ -4087,7 +4088,10 @@ int irdma_sc_ccq_get_cqe_info(struct irdma_sc_cq *ccq,
 	dma_rmb();
 
 	get_64bit_val(cqe, 8, &qp_ctx);
-	cqp = (struct irdma_sc_cqp *)(unsigned long)qp_ctx;
+	/* illumos: the entry names the CQP; use ours and reject another. */
+	cqp = ccq->dev->cqp;
+	if (qp_ctx != (u64)(uintptr_t)cqp)
+		return -EIO;
 	info->error = (bool)FIELD_GET(IRDMA_CQ_ERROR, temp);
 	info->maj_err_code = IRDMA_CQPSQ_MAJ_NO_ERROR;
 	info->min_err_code = (u16)FIELD_GET(IRDMA_CQ_MINERR, temp);
@@ -4099,6 +4103,9 @@ int irdma_sc_ccq_get_cqe_info(struct irdma_sc_cq *ccq,
 	}
 
 	wqe_idx = (u32)FIELD_GET(IRDMA_CQ_WQEIDX, temp);
+	/* illumos: the index comes from the device. */
+	if (wqe_idx >= cqp->sq_size)
+		return -EIO;
 	info->scratch = cqp->scratch_array[wqe_idx];
 
 	get_64bit_val(cqe, 16, &temp1);
@@ -5216,10 +5223,13 @@ static int irdma_sc_cfg_iw_fpm(struct irdma_sc_dev *dev, u8 hmc_fn_id)
 			     false);
 	ret_code = irdma_sc_commit_fpm_val(dev->cqp, 0, hmc_info->hmc_fn_id,
 					   &commit_fpm_mem, true, wait_type);
-	if (!ret_code)
+	if (!ret_code) {
 		irdma_sc_parse_fpm_commit_buf(dev, dev->fpm_commit_buf,
 					      hmc_info->hmc_obj,
 					      &hmc_info->sd_table.sd_cnt);
+		/* illumos: check the committed layout before it is allocated. */
+		ret_code = irdma_osdep_fpm_commit_check(dev, hmc_info);
+	}
 	print_hex_dump_debug("HMC: COMMIT FPM BUFFER", DUMP_PREFIX_OFFSET, 16,
 			     8, commit_fpm_mem.va, IRDMA_COMMIT_FPM_BUF_SIZE,
 			     false);
