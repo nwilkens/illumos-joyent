@@ -235,10 +235,11 @@ typedef struct irdma {
 	 * Verbs (irdma_verbs.c).  irdma_rdk_lock guards irdma_rdk_live so
 	 * that events are not dispatched to an unregistered device.  The
 	 * tables and bitmaps are sized from the HMC once the control plane
-	 * is up.  Lock order: a QP's iqp_mod_lock, then a CQ's icq_lock, then
-	 * the QP's iqp_lock, then irdma_cqtable_lock, irdma_qptable_lock and
-	 * irdma_ceq_lock, then irdma_rsrc_lock and irdma_arp_lock.  None is
-	 * held across a CQP command except iqp_mod_lock.
+	 * is up.  Lock order: a QP's iqp_mod_lock, then irdma_arp_cmd_lock,
+	 * then a CQ's icq_lock, then the QP's iqp_lock, then
+	 * irdma_cqtable_lock, irdma_qptable_lock and irdma_ceq_lock, then
+	 * irdma_rsrc_lock and irdma_arp_lock.  Only iqp_mod_lock and
+	 * irdma_arp_cmd_lock are held across a CQP command.
 	 */
 	struct rdk_device	irdma_rdk;
 	krwlock_t		irdma_rdk_lock;
@@ -271,6 +272,7 @@ typedef struct irdma {
 	kmutex_t		irdma_cqtable_lock;
 	struct irdma_cq		**irdma_cq_table;
 	kmutex_t		irdma_arp_lock;
+	kmutex_t		irdma_arp_cmd_lock;	/* ARP adds, deletes */
 	struct irdma_arp_entry	*irdma_arp_table;
 	kmutex_t		irdma_ceq_lock;
 	ddi_taskq_t		*irdma_wq;	/* QP errors and flushes */

@@ -48,7 +48,8 @@ def main():
     # Every other irdma lock is adaptive.
     for lock in ("irdma_cfg_lock", "irdma_req_lock", "irdma_ccq_lock",
                  "irdma_ws_lock", "irdma_rsrc_lock", "irdma_qptable_lock",
-                 "irdma_cqtable_lock", "irdma_arp_lock", "irdma_ceq_lock"):
+                 "irdma_cqtable_lock", "irdma_arp_lock", "irdma_arp_cmd_lock",
+                 "irdma_ceq_lock"):
         assert re.search(rf"\(mutex_init\)\(&irdma->{lock}, NULL, "
                          rf"MUTEX_DRIVER, NULL\);", drv), lock
     assert "spin_lock_init(l)" in osdep and \
