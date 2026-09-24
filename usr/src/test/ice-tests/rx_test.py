@@ -9,7 +9,8 @@ from c_test import DRIVER, TESTDIR, extract, run_c
 
 FUNCTIONS = (
     "ice_rx_alloc_mp", "ice_rcb_alloc", "ice_rcb_free", "ice_rx_rcb_destroy",
-    "ice_rx_orphan_return", "ice_rx_recycle", "ice_rx_reset_desc",
+    "ice_rx_reap_drain", "ice_rx_reap", "ice_rx_orphan_return",
+    "ice_rx_recycle", "ice_rx_reset_desc",
     "ice_rx_pool_alloc", "ice_rx_pool_sweep", "ice_rx_pool_free",
     "ice_rx_pool_swap", "ice_rx_pool_release", "ice_rx_pool_orphan",
     "ice_rx_pool_retire",

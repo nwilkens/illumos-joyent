@@ -757,9 +757,12 @@ entry point and the detach wait through the RX harness, which accounts for
 every kernel allocation by size. A peer can keep a loaned frame in a TCP
 reassembly queue for as long as its connection lives, so a start replaces a
 pool with loans outstanding instead of waiting. The replaced pool's arrays and
-every block not on loan are freed at once; each loaned block is freed when it
-returns, never put on the new free list, and the last return frees the pool
-record, also when it races the start's sweep. A loan from the new pool still
+every block not on loan are freed at once; each loaned block is queued for the
+reap taskq when it returns, never put on the new free list, and the reaper
+frees it and, with the last return, the pool record, also when that races the
+start's sweep. The harness fails any free of memory or DMA made inside a free
+routine. Returns before the reaper runs share one dispatch, and a return
+whose dispatch fails is reaped by the next dispatch or the next start. A loan from the new pool still
 returns to the new pool. A peer that keeps one loan across 40 restarts never
 fails a start. Once the instance holds `ICE_RX_ORPHAN_BUDGET` such loans, the
 next drain copies a large frame instead of loaning it and counts the switch,

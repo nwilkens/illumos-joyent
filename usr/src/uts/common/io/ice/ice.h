@@ -448,6 +448,7 @@ struct ice_rx_ring;
 struct ice_rx_pool;
 
 typedef struct ice_rx_ctrl_block {
+	struct ice_rx_ctrl_block *ircb_next;	/* returned, to reap */
 	mblk_t			*ircb_mp;
 	struct ice_rx_ring	*ircb_ring;
 	struct ice_rx_pool	*ircb_pool;	/* owner; set at allocation */
@@ -696,6 +697,10 @@ typedef struct ice {
 	uint_t			ice_num_rxr;
 	/* Loans of replaced rx pools still out; see ICE_RX_ORPHAN_BUDGET. */
 	volatile uint32_t	ice_rx_orphan_loans;
+	/* Their returned blocks, freed on ice_rx_reap_taskq. */
+	ice_rx_ctrl_block_t	*volatile ice_rx_reap;
+	volatile uint32_t	ice_rx_reap_queued;
+	ddi_taskq_t		*ice_rx_reap_taskq;
 	uint_t			ice_num_rx_groups;
 	ice_tx_ring_t		*ice_txr;	/* [ice_num_txr] */
 	ice_rx_ring_t		*ice_rxr;	/* [ice_num_rxr] */

@@ -13,8 +13,9 @@
 /*
  * A start must not wait on buffers a peer can hold up the stack.  The actual
  * pool functions and ice_rx_start() replace such a pool, free all of it but
- * the loaned blocks at once, free each of those as it returns, and stop
- * loaning while the instance holds too many of them.
+ * the loaned blocks at once, queue each of those for the reap taskq as it
+ * returns, and stop loaning while the instance holds too many of them.  The
+ * harness fails any free of memory or DMA made inside a free routine.
  */
 #include "rx_test.h"
 
@@ -100,11 +101,17 @@ set_aside(void)
 	assert(live_kmem == kmem);
 	nfree = ring.irxr_nfree;
 
-	/* A returning loan is freed at once, not put on the new free list. */
+	/*
+	 * A returning loan is queued for the reaper, not put on the new free
+	 * list, and freed when the reaper runs.
+	 */
 	freemsg(held[0]);
-	assert(ice.ice_rx_orphan_loans == 2 && live_dma == 1 + 2 + nrcb);
-	assert(live_kmem == kmem - sizeof (ice_rx_ctrl_block_t));
+	assert(ice.ice_rx_orphan_loans == 2 && live_dma == 1 + 3 + nrcb);
+	assert(ice.ice_rx_reap != NULL && dispatches == 1);
 	assert(ring.irxr_nfree == nfree && ring.irxr_nloaned == 0);
+	run_taskq();
+	assert(ice.ice_rx_reap == NULL && live_dma == 1 + 2 + nrcb);
+	assert(live_kmem == kmem - sizeof (ice_rx_ctrl_block_t));
 
 	/* A new-pool loan still returns to the new pool. */
 	held[0] = loan(&ring, 5);
@@ -112,9 +119,12 @@ set_aside(void)
 	freemsg(held[0]);
 	assert(ring.irxr_nloaned == 0 && ring.irxr_nfree == nfree);
 
-	/* The last return frees the record too. */
+	/* Returns before the reaper runs share one dispatch. */
 	freemsg(held[1]);
 	freemsg(held[2]);
+	assert(dispatches == 2);
+	run_taskq();
+	/* The last return frees the record too. */
 	assert(ice.ice_rx_orphan_loans == 0 && live_dma == 1 + nrcb);
 	assert(ring.irxr_stats.icrxs_orphan_loans.value.ui64 == 0);
 	assert(live_kmem == pool);
@@ -141,6 +151,7 @@ return_during_sweep(void)
 	mutex_exit(&ring.irxr_lock);
 	assert(old->irp_refs == 2);
 	freemsg(held);
+	run_taskq();
 	assert(old->irp_refs == 1 && ice.ice_rx_orphan_loans == 0);
 	ice_rx_pool_retire(old);
 	assert(live_kmem == pool);
@@ -167,6 +178,7 @@ unbounded_restarts(void)
 	for (i = 0; i < 40; i++)
 		freemsg(held[i]);
 	assert(ice.ice_rx_orphan_loans == 0);
+	run_taskq();
 	assert(live_kmem == pool_kmem(ring.irxr_nrcb, ring.irxr_size));
 	stop(&ring);
 	teardown(&ring);
@@ -225,6 +237,7 @@ budget(void)
 	assert(mp->b_datap->frtn == NULL);
 	freemsg(mp);
 	assert(restart(&ring) && restart(&ring));
+	run_taskq();
 	assert(live_dma == 1 + n + nrcb);
 
 	/* Copy mode holds down to the low-water mark. */
@@ -307,6 +320,43 @@ detach_wait(void)
 	teardown(&ring);
 }
 
+/* A reap that cannot be dispatched waits for the next return or start. */
+static void
+reap_undispatched(void)
+{
+	ice_rx_ring_t ring;
+	ice_t ice;
+	mblk_t *held[2];
+	uint_t dma;
+
+	setup(&ring, &ice);
+	held[0] = loan(&ring, 0);
+	held[1] = loan(&ring, 1);
+	assert(restart(&ring));
+	dma = live_dma;
+	dispatch_fail = 1;
+	freemsg(held[0]);
+	assert(dispatches == 0 && ice.ice_rx_reap_queued == 0);
+	assert(ice.ice_rx_reap != NULL && live_dma == dma);
+	dispatch_fail = 0;
+	freemsg(held[1]);
+	assert(dispatches == 1);
+	run_taskq();
+	assert(ice.ice_rx_reap == NULL && live_dma == dma - 2);
+
+	held[0] = loan(&ring, 0);
+	assert(restart(&ring));
+	dma = live_dma;
+	dispatch_fail = 1;
+	freemsg(held[0]);
+	dispatch_fail = 0;
+	assert(ice.ice_rx_reap != NULL && live_dma == dma);
+	assert(restart(&ring));
+	assert(ice.ice_rx_reap == NULL && live_dma == dma - 1);
+	stop(&ring);
+	teardown(&ring);
+}
+
 int
 main(void)
 {
@@ -315,7 +365,8 @@ main(void)
 	unbounded_restarts();
 	budget();
 	detach_wait();
-	puts("RX orphan: replaced pools keep only their loans, free each as it "
+	reap_undispatched();
+	puts("RX orphan: replaced pools keep only their loans, reap each as it "
 	    "returns, never stop a start, and copy past the budget");
 	return (0);
 }

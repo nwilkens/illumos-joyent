@@ -39,6 +39,7 @@
 
 static void ice_rx_pool_free(ice_rx_pool_t *);
 static void ice_rx_pool_release(ice_rx_ring_t *);
+static void ice_rx_reap_drain(ice_t *);
 
 /*
  * Free a single rx ring's DMA and per-slot state.  Safe to call on a ring that
@@ -200,6 +201,13 @@ ice_rx_rings_alloc(ice_t *ice)
 
 	ASSERT3U(ice->ice_num_rxr, >, 0);
 
+	ice->ice_rx_reap_taskq = ddi_taskq_create(ice->ice_dip, "ice_rx_reap",
+	    1, TASKQ_DEFAULTPRI, 0);
+	if (ice->ice_rx_reap_taskq == NULL) {
+		ice_error(ice, "failed to create rx reap taskq");
+		return (B_FALSE);
+	}
+
 	ice->ice_rxr = kmem_zalloc(
 	    ice->ice_num_rxr * sizeof (ice_rx_ring_t), KM_SLEEP);
 
@@ -210,6 +218,8 @@ ice_rx_rings_alloc(ice_t *ice)
 			kmem_free(ice->ice_rxr,
 			    ice->ice_num_rxr * sizeof (ice_rx_ring_t));
 			ice->ice_rxr = NULL;
+			ddi_taskq_destroy(ice->ice_rx_reap_taskq);
+			ice->ice_rx_reap_taskq = NULL;
 			return (B_FALSE);
 		}
 	}
@@ -227,6 +237,9 @@ ice_rx_rings_free(ice_t *ice)
 
 	/* A replaced pool's loan still calls into the driver. */
 	VERIFY0(ice->ice_rx_orphan_loans);
+	ddi_taskq_destroy(ice->ice_rx_reap_taskq);
+	ice->ice_rx_reap_taskq = NULL;
+	ice_rx_reap_drain(ice);
 	for (i = 0; i < ice->ice_num_rxr; i++)
 		ice_rx_ring_free(&ice->ice_rxr[i]);
 
@@ -552,22 +565,57 @@ ice_rx_rcb_destroy(ice_rx_ctrl_block_t *rcb)
 	kmem_free(rcb, sizeof (*rcb));
 }
 
+/* Free returned blocks of replaced pools, and each pool with its last. */
+static void
+ice_rx_reap_drain(ice_t *ice)
+{
+	ice_rx_ctrl_block_t *rcb, *next;
+
+	while ((rcb = atomic_swap_ptr(&ice->ice_rx_reap, NULL)) != NULL) {
+		membar_consumer();
+		for (; rcb != NULL; rcb = next) {
+			ice_rx_pool_t *p = rcb->ircb_pool;
+
+			next = rcb->ircb_next;
+			ice_rx_rcb_destroy(rcb);
+			if (atomic_dec_32_nv(&p->irp_refs) == 0)
+				kmem_free(p, sizeof (*p));
+		}
+	}
+}
+
+static void
+ice_rx_reap(void *arg)
+{
+	ice_t *ice = arg;
+
+	(void) atomic_swap_32(&ice->ice_rx_reap_queued, 0);
+	ice_rx_reap_drain(ice);
+}
+
 /*
- * A loan from a replaced pool came back.  Nothing else refers to the block, so
- * it is freed here, and the pool with its last reference.  The instance count
- * is dropped last: detach waits for it to reach zero, and after that this
- * callback touches no driver memory.
+ * A loan from a replaced pool came back.  The caller of freemsg(9F) can hold
+ * its own locks, even at interrupt priority, so the block is queued and its
+ * DMA teardown runs on the reap taskq.  The instance count is dropped last:
+ * detach waits for it to reach zero, and then every returned block is queued
+ * and no callback has still to touch the taskq.
  */
 static void
 ice_rx_orphan_return(ice_rx_ring_t *irr, ice_rx_ctrl_block_t *rcb)
 {
 	ice_t *ice = irr->irxr_ice;
-	ice_rx_pool_t *p = rcb->ircb_pool;
+	ice_rx_ctrl_block_t *head;
 
 	rcb->ircb_state = IRXB_FREE;
-	ice_rx_rcb_destroy(rcb);
-	if (atomic_dec_32_nv(&p->irp_refs) == 0)
-		kmem_free(p, sizeof (*p));
+	do {
+		head = ice->ice_rx_reap;
+		rcb->ircb_next = head;
+		membar_producer();
+	} while (atomic_cas_ptr(&ice->ice_rx_reap, head, rcb) != head);
+	if (atomic_cas_32(&ice->ice_rx_reap_queued, 0, 1) == 0 &&
+	    ddi_taskq_dispatch(ice->ice_rx_reap_taskq, ice_rx_reap, ice,
+	    DDI_NOSLEEP) != DDI_SUCCESS)
+		(void) atomic_swap_32(&ice->ice_rx_reap_queued, 0);
 	atomic_dec_64(&irr->irxr_stats.icrxs_orphan_loans.value.ui64);
 	atomic_dec_32(&ice->ice_rx_orphan_loans);
 }
@@ -1718,6 +1766,9 @@ boolean_t
 ice_rx_start(ice_t *ice)
 {
 	uint_t i;
+
+	/* Catches blocks whose reap could not be dispatched. */
+	ice_rx_reap_drain(ice);
 
 	for (i = 0; i < ice->ice_num_rxr; i++) {
 		ice_rx_ring_t *irr = &ice->ice_rxr[i];

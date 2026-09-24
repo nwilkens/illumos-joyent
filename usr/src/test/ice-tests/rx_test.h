@@ -138,6 +138,9 @@ typedef struct {
 	uint32_t ice_state, ice_rx_limit_per_intr;
 	uint_t ice_num_rxr;
 	volatile uint32_t ice_rx_orphan_loans;
+	struct ice_rx_ctrl_block *volatile ice_rx_reap;
+	volatile uint32_t ice_rx_reap_queued;
+	int *ice_rx_reap_taskq;
 	int ice_dip, ice_mac_hdl;
 } ice_t;
 typedef enum {
@@ -147,7 +150,8 @@ typedef enum {
 } ice_rcb_state_t;
 struct ice_rx_ring;
 struct ice_rx_pool;
-typedef struct {
+typedef struct ice_rx_ctrl_block {
+	struct ice_rx_ctrl_block *ircb_next;
 	mblk_t *ircb_mp;
 	struct ice_rx_ring *ircb_ring;
 	struct ice_rx_pool *ircb_pool;
@@ -191,6 +195,12 @@ static unsigned live_mblks, live_dma, impacts, barriers, doorbells, delivered;
 static size_t live_kmem;
 static long lbolt;
 static void (*on_delay)(void);
+/* A free routine is running: it may not free memory or DMA itself. */
+static int in_free_routine;
+/* The reap taskq: one queued task at most, run when the test says. */
+static void (*queued_task)(void *);
+static void *queued_arg;
+static unsigned dispatches, dispatch_fail;
 static int alloc_fail, desballoc_fail, acc_fail;
 static unsigned wb_reads, bad_wb_reads;
 static ice_rx_ring_t *active_ring;
@@ -288,9 +298,81 @@ kmem_free(void *v, size_t n)
 {
 	size_t *p = (size_t *)v - 1;
 
+	assert(!in_free_routine);
 	assert(*p == n && live_kmem >= n);
 	live_kmem -= n;
 	free(p);
+}
+
+static void *
+atomic_swap_ptr(volatile void *target, void *value)
+{
+	void *volatile *p = (void *volatile *)target;
+	void *old = *p;
+
+	*p = value;
+	return (old);
+}
+
+static void *
+atomic_cas_ptr(volatile void *target, void *cmp, void *value)
+{
+	void *volatile *p = (void *volatile *)target;
+	void *old = *p;
+
+	if (old == cmp)
+		*p = value;
+	return (old);
+}
+
+static uint32_t
+atomic_cas_32(volatile uint32_t *p, uint32_t cmp, uint32_t value)
+{
+	uint32_t old = *p;
+
+	if (old == cmp)
+		*p = value;
+	return (old);
+}
+
+static uint32_t
+atomic_swap_32(volatile uint32_t *p, uint32_t value)
+{
+	uint32_t old = *p;
+
+	*p = value;
+	return (old);
+}
+
+static void
+membar_producer(void)
+{
+}
+
+#define	DDI_NOSLEEP	1
+
+static int
+ddi_taskq_dispatch(int *tq, void (*func)(void *), void *arg, int flags)
+{
+	assert(tq != NULL && flags == DDI_NOSLEEP);
+	if (dispatch_fail)
+		return (-1);
+	assert(queued_task == NULL || queued_task == func);
+	queued_task = func;
+	queued_arg = arg;
+	dispatches++;
+	return (DDI_SUCCESS);
+}
+
+static void
+run_taskq(void)
+{
+	void (*func)(void *) = queued_task;
+
+	if (func != NULL) {
+		queued_task = NULL;
+		func(queued_arg);
+	}
 }
 
 static uint32_t
@@ -386,6 +468,7 @@ ice_dma_alloc(ice_t *ice, ice_dma_buffer_t *d, ddi_dma_attr_t *attr,
 static void
 ice_dma_free(ice_dma_buffer_t *d)
 {
+	assert(!in_free_routine);
 	if (d->idb_va == NULL)
 		return;
 	free(d->idb_va);
@@ -433,7 +516,9 @@ freeb(mblk_t *m)
 	if (m->b_datap->frtn != NULL) {
 		frtn_t *f = m->b_datap->frtn;
 
+		in_free_routine++;
 		f->free_func(f->free_arg);
+		in_free_routine--;
 	} else {
 		free(m->b_datap->db_base);
 	}
@@ -552,6 +637,8 @@ setup(ice_rx_ring_t *r, ice_t *ice)
 	impacts = barriers = doorbells = delivered = 0;
 	lbolt = 0;
 	on_delay = NULL;
+	queued_task = NULL;
+	dispatches = dispatch_fail = 0;
 	wb_reads = bad_wb_reads = 0;
 	alloc_fail = desballoc_fail = acc_fail = 0;
 	checksum_head = NULL;
@@ -560,6 +647,7 @@ setup(ice_rx_ring_t *r, ice_t *ice)
 	ice->ice_rx_limit_per_intr = 256;
 	ice->ice_num_rxr = 1;
 	ice->ice_rxr = r;
+	ice->ice_rx_reap_taskq = &ice->ice_dip;
 	r->irxr_ice = ice;
 	r->irxr_size = 16;
 	r->irxr_dbuf = ICE_RX_BUF_SIZE;
@@ -573,6 +661,8 @@ static void
 teardown(ice_rx_ring_t *r)
 {
 	assert(r->irxr_nloaned == 0 && r->irxr_ice->ice_rx_orphan_loans == 0);
+	run_taskq();
+	assert(r->irxr_ice->ice_rx_reap == NULL);
 	ice_rx_pool_release(r);
 	assert(r->irxr_pool == NULL && r->irxr_rcbs == NULL);
 	ice_dma_free(&r->irxr_desc_dma);
