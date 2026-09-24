@@ -198,60 +198,143 @@ receive(ice_rx_ring_t *r)
 	return (mp);
 }
 
+#define	NR	16
+static ice_rx_ring_t rings[NR];
+
+/* An instance of NR rings, each started on its own pool. */
+static void
+setup_rings(ice_t *ice)
+{
+	ddi_dma_attr_t attr = 0;
+	ddi_device_acc_attr_t acc = 0;
+	uint_t i;
+
+	setup(&rings[0], ice);
+	ice->ice_num_rxr = NR;
+	ice->ice_rxr = rings;
+	for (i = 1; i < NR; i++) {
+		ice_rx_ring_t *r = &rings[i];
+
+		memset(r, 0, sizeof (*r));
+		r->irxr_ice = ice;
+		r->irxr_index = i;
+		r->irxr_size = rings[0].irxr_size;
+		r->irxr_dbuf = ICE_RX_BUF_SIZE;
+		assert(ice_dma_alloc(ice, &r->irxr_desc_dma, &attr, &acc,
+		    B_TRUE, r->irxr_size * sizeof (*r->irxr_descs), B_TRUE));
+		r->irxr_descs = (void *)r->irxr_desc_dma.idb_va;
+		post_pool(r);
+	}
+}
+
+static void
+teardown_rings(ice_t *ice)
+{
+	uint_t i;
+
+	run_taskq();
+	assert(ice->ice_rx_orphan_loans == 0 && ice->ice_rx_reap == NULL);
+	for (i = 0; i < NR; i++) {
+		assert(rings[i].irxr_nloaned == 0);
+		stop(&rings[i]);
+		ice_rx_pool_release(&rings[i]);
+		ice_dma_free(&rings[i].irxr_desc_dma);
+	}
+	assert(live_mblks == 0 && live_dma == 0 && live_kmem == 0);
+}
+
+static void
+restart_all(void)
+{
+	uint_t i, j;
+
+	for (i = 0; i < NR; i++)
+		stop(&rings[i]);
+	assert(ice_rx_start(rings[0].irxr_ice));
+	for (i = 0; i < NR; i++) {
+		ice_rx_ring_t *r = &rings[i];
+
+		mutex_enter(&r->irxr_lock);
+		for (j = 0; j < r->irxr_size; j++)
+			ice_rx_reset_desc(r, j, ice_rcb_alloc(r, B_FALSE));
+		r->irxr_head = 0;
+		r->irxr_tail = r->irxr_size - 1;
+		r->irxr_shutdown = B_FALSE;
+		r->irxr_started = B_TRUE;
+		mutex_exit(&r->irxr_lock);
+	}
+}
+
+static mblk_t *
+receive_on(ice_rx_ring_t *r)
+{
+	active_ring = r;
+	return (receive(r));
+}
+
 /*
- * At the budget the rings copy instead of loaning, and a start still
- * succeeds; below the low-water mark they loan again.
+ * A restart adds at most every ring's reserve to the count, so the rings copy
+ * from that far below ICE_RX_ORPHAN_MAX: with every ring's reserve out one
+ * below that point, a restart takes the count to the limit and no further,
+ * and restarts still succeed.  Below half that point loaning resumes.
  */
 static void
-budget(void)
+limit(void)
 {
-	ice_rx_ring_t ring;
 	ice_t ice;
 	mblk_t **held, *mp;
-	uint_t n = 0, per, nrcb;
-	ice_rxq_stat_t *st = &ring.irxr_stats;
+	uint_t n = 0, i, per, stop_at;
+	ice_rxq_stat_t *st = &rings[0].irxr_stats;
 
-	setup(&ring, &ice);
-	per = ring.irxr_nreserve;
-	nrcb = ring.irxr_nrcb;
-	held = calloc(ICE_RX_ORPHAN_BUDGET + 2 * per, sizeof (*held));
+	setup_rings(&ice);
+	per = rings[0].irxr_nreserve;
+	stop_at = ICE_RX_ORPHAN_MAX - per * NR;
+	assert(per == 1024 && stop_at == 8192);
+	held = calloc(ICE_RX_ORPHAN_MAX + 1, sizeof (*held));
 	assert(held != NULL);
 
-	/* Below the budget a large frame is loaned. */
-	mp = receive(&ring);
-	assert(ring.irxr_nloaned == 1);
-	assert(st->icrxs_copy_mode_enter.value.ui64 == 0);
-	held[n++] = mp;
-	while (ice.ice_rx_orphan_loans < ICE_RX_ORPHAN_BUDGET) {
-		while (ring.irxr_nloaned < per)
-			held[n++] = loan(&ring, 0);
-		assert(restart(&ring));
+	for (i = 0; n < stop_at - 1; i++) {
+		while (rings[i].irxr_nloaned < per && n < stop_at - 1)
+			held[n++] = loan(&rings[i], 0);
 	}
-	assert(ice.ice_rx_orphan_loans == n);
+	restart_all();
+	assert(ice.ice_rx_orphan_loans == stop_at - 1);
 
-	/* At the budget the next drain copies, and restarts still succeed. */
-	mp = receive(&ring);
-	assert(ring.irxr_copy_only && ring.irxr_nloaned == 0);
+	/* One below the stop point a large frame is still loaned. */
+	held[n++] = mp = receive_on(&rings[0]);
+	assert(mp->b_datap->frtn != NULL && rings[0].irxr_nloaned == 1);
+	assert(st->icrxs_copy_mode_enter.value.ui64 == 0);
+
+	for (i = 0; i < NR; i++) {
+		while (rings[i].irxr_nloaned < per)
+			held[n++] = loan(&rings[i], 0);
+	}
+	restart_all();
+	assert(ice.ice_rx_orphan_loans == n && n == ICE_RX_ORPHAN_MAX - 1);
+
+	/* Past the stop point the next drain copies. */
+	mp = receive_on(&rings[0]);
+	assert(rings[0].irxr_copy_only && rings[0].irxr_nloaned == 0);
 	assert(st->icrxs_copy_mode_enter.value.ui64 == 1);
 	assert(st->icrxs_copy_mode_segs.value.ui64 == 1);
 	assert(mp->b_datap->frtn == NULL);
 	freemsg(mp);
-	assert(restart(&ring) && restart(&ring));
-	run_taskq();
-	assert(live_dma == 1 + n + nrcb);
+	restart_all();
+	restart_all();
+	assert(ice.ice_rx_orphan_loans == ICE_RX_ORPHAN_MAX - 1);
 
-	/* Copy mode holds down to the low-water mark. */
-	while (ice.ice_rx_orphan_loans > ICE_RX_ORPHAN_LOWAT)
+	/* Copy mode holds down to half the stop point. */
+	while (ice.ice_rx_orphan_loans > stop_at / 2)
 		freemsg(held[--n]);
-	mp = receive(&ring);
-	assert(ring.irxr_copy_only && ring.irxr_nloaned == 0);
+	mp = receive_on(&rings[0]);
+	assert(rings[0].irxr_copy_only && rings[0].irxr_nloaned == 0);
 	assert(st->icrxs_copy_mode_exit.value.ui64 == 0);
 	freemsg(mp);
 
 	/* Below it, loaning resumes. */
 	freemsg(held[--n]);
-	mp = receive(&ring);
-	assert(!ring.irxr_copy_only && ring.irxr_nloaned == 1);
+	mp = receive_on(&rings[0]);
+	assert(!rings[0].irxr_copy_only && rings[0].irxr_nloaned == 1);
 	assert(st->icrxs_copy_mode_exit.value.ui64 == 1);
 	assert(mp->b_datap->frtn != NULL);
 	freemsg(mp);
@@ -259,9 +342,7 @@ budget(void)
 	while (n > 0)
 		freemsg(held[--n]);
 	free(held);
-	assert(ice.ice_rx_orphan_loans == 0 && ring.irxr_nloaned == 0);
-	stop(&ring);
-	teardown(&ring);
+	teardown_rings(&ice);
 }
 
 static mblk_t *returning[2];
@@ -363,10 +444,10 @@ main(void)
 	set_aside();
 	return_during_sweep();
 	unbounded_restarts();
-	budget();
+	limit();
 	detach_wait();
 	reap_undispatched();
 	puts("RX orphan: replaced pools keep only their loans, reap each as it "
-	    "returns, never stop a start, and copy past the budget");
+	    "returns, never stop a start, and stay within ICE_RX_ORPHAN_MAX");
 	return (0);
 }

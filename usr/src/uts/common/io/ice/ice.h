@@ -202,11 +202,12 @@ CTASSERT(ISP2(ICE_TX_SMALL_ALIGN) && ICE_TX_SMALL_ALIGN < ICE_TX_SMALL_PKT);
 #define	ICE_RX_LOAN_RESERVE_MAX	16384
 CTASSERT(ICE_RX_LOAN_RESERVE_MAX / ICE_MAX_QUEUES >= 1);
 /*
- * Loans of replaced pools an instance may hold before its rings stop loaning
- * and copy every frame, and the count below which they loan again.
+ * Loans of replaced pools an instance may hold.  A restart adds at most every
+ * ring's reserve, so the rings copy every frame instead of loaning from that
+ * far below the limit, and loan again below half that point.
  */
-#define	ICE_RX_ORPHAN_BUDGET	8192
-#define	ICE_RX_ORPHAN_LOWAT	(ICE_RX_ORPHAN_BUDGET / 2)
+#define	ICE_RX_ORPHAN_MAX	(3 * ICE_RX_LOAN_RESERVE_MAX / 2)
+CTASSERT(ICE_RX_ORPHAN_MAX > ICE_RX_LOAN_RESERVE_MAX);
 /* ceil(ICE_AQ_SET_MAC_FRAME_SIZE_MAX / ICE_RX_BUF_SIZE) */
 #define	ICE_RX_MAX_DESC		5
 
@@ -695,7 +696,7 @@ typedef struct ice {
 	 */
 	uint_t			ice_num_txr;
 	uint_t			ice_num_rxr;
-	/* Loans of replaced rx pools still out; see ICE_RX_ORPHAN_BUDGET. */
+	/* Loans of replaced rx pools still out; see ICE_RX_ORPHAN_MAX. */
 	volatile uint32_t	ice_rx_orphan_loans;
 	/* Their returned blocks, freed on ice_rx_reap_taskq. */
 	ice_rx_ctrl_block_t	*volatile ice_rx_reap;

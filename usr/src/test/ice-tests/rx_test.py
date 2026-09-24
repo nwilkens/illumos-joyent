@@ -30,8 +30,7 @@ def run(test, functions=FUNCTIONS, optional=("ice_rx_desc_sync",)):
     parts = [extract(header, r"^typedef enum ice_state \{[\s\S]*?^} ice_state_t;",
                      args.header)]
     for name in ("ICE_RX_BUF_SIZE", "ICE_RX_MAX_DESC", "ICE_RX_LOAN_RESERVE",
-                 "ICE_RX_LOAN_RESERVE_MAX", "ICE_RX_ORPHAN_BUDGET",
-                 "ICE_RX_ORPHAN_LOWAT"):
+                 "ICE_RX_LOAN_RESERVE_MAX", "ICE_RX_ORPHAN_MAX"):
         # Older revisions kept the reserve in the source; see below.
         if re.search(rf"^#define\s+{name}\s+", header, re.MULTILINE):
             parts.append(extract(header, rf"^#define\s+{name}\s+.*",

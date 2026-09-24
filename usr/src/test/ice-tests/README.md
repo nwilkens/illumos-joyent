@@ -762,13 +762,16 @@ reap taskq when it returns, never put on the new free list, and the reaper
 frees it and, with the last return, the pool record, also when that races the
 start's sweep. The harness fails any free of memory or DMA made inside a free
 routine. Returns before the reaper runs share one dispatch, and a return
-whose dispatch fails is reaped by the next dispatch or the next start. A loan from the new pool still
-returns to the new pool. A peer that keeps one loan across 40 restarts never
-fails a start. Once the instance holds `ICE_RX_ORPHAN_BUDGET` such loans, the
-next drain copies a large frame instead of loaning it and counts the switch,
-restarts still succeed, and loaning resumes only below
-`ICE_RX_ORPHAN_LOWAT`. Detach's wait fails at the loan deadline while a loan
-is out, frees nothing, and succeeds as soon as the loans come back.
+whose dispatch fails is reaped by the next dispatch or the next start. A loan
+from the new pool still returns to the new pool. A peer that keeps one loan
+across 40 restarts never fails a start. With 16 rings, whose reserves a
+restart can add at once, the rings stop loaning that far below
+`ICE_RX_ORPHAN_MAX`: one below that point a large frame is still loaned, a
+restart with every reserve out takes the count to the limit and no further,
+the next drain copies and counts the switch, restarts still succeed, and
+loaning resumes only below half the stop point. Detach's wait fails at the
+loan deadline while a loan is out, frees nothing, and succeeds as soon as the
+loans come back.
 
 `safe_mode.py` verifies that safe mode withholds the hardware offloads the DDP
 package would have provided: the checksum and LSO capabilities are refused

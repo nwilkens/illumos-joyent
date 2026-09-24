@@ -1324,24 +1324,28 @@ assemble_fail:
 }
 
 /*
- * Stop loaning while the loans of replaced pools are at the budget, and resume
- * below the low-water mark.  Every loan made in the meantime could be
- * stranded by the next restart as well, so this bounds what a peer that holds
- * frames can pin.
+ * Stop loaning while one more restart could strand enough loans to take the
+ * replaced pools' count past ICE_RX_ORPHAN_MAX, and resume below half that
+ * point.  Only a restart adds to the count, and the first drain after it
+ * decides before any frame is loaned, so the count never passes the limit.
  */
 static void
 ice_rx_loan_mode(ice_rx_ring_t *irr)
 {
-	uint32_t held = irr->irxr_ice->ice_rx_orphan_loans;
+	ice_t *ice = irr->irxr_ice;
+	uint32_t held = ice->ice_rx_orphan_loans;
+	uint32_t stop;
+
+	stop = ICE_RX_ORPHAN_MAX - irr->irxr_nreserve * ice->ice_num_rxr;
 
 	ASSERT(MUTEX_HELD(&irr->irxr_lock));
 
 	if (!irr->irxr_copy_only) {
-		if (held >= ICE_RX_ORPHAN_BUDGET) {
+		if (held >= stop) {
 			irr->irxr_copy_only = B_TRUE;
 			irr->irxr_stats.icrxs_copy_mode_enter.value.ui64++;
 		}
-	} else if (held < ICE_RX_ORPHAN_LOWAT) {
+	} else if (held < stop / 2) {
 		irr->irxr_copy_only = B_FALSE;
 		irr->irxr_stats.icrxs_copy_mode_exit.value.ui64++;
 	}
@@ -1758,8 +1762,8 @@ ice_ring_rx_stat(mac_ring_driver_t rh, uint_t stat, uint64_t *val)
  *
  * The old pool is never reused: ice_rx_recycle()'s shutdown path returns
  * control blocks without re-arming them.  If a teardown timed out waiting for
- * its loans, it keeps only the loaned blocks until they return.  Past
- * ICE_RX_ORPHAN_BUDGET such loans the rings copy instead of loaning
+ * its loans, it keeps only the loaned blocks until they return.  Near
+ * ICE_RX_ORPHAN_MAX such loans the rings copy instead of loaning
  * (ice_rx_loan_mode()), so a start never fails for them.
  */
 boolean_t
