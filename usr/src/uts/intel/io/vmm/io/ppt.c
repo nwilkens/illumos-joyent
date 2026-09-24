@@ -666,6 +666,27 @@ static struct cb_ops ppt_cb_ops = {
 	CB_REV
 };
 
+/*
+ * Stop the device's DMA.  While it is assigned to a guest the IOMMU is still
+ * translating for it, and a fast reboot would leave the IOMMU enabled under a
+ * kernel that knows nothing of it, so fail and force a full reset instead.
+ */
+static int
+ppt_ddi_quiesce(dev_info_t *dip)
+{
+	struct pptdev *ppt = ddi_get_driver_private(dip);
+	uint16_t cmd;
+
+	if (ppt == NULL || ppt->pptd_cfg == NULL)
+		return (DDI_SUCCESS);
+
+	cmd = pci_config_get16(ppt->pptd_cfg, PCI_CONF_COMM);
+	cmd &= ~(PCI_COMM_ME | PCI_COMM_MAE | PCI_COMM_IO);
+	pci_config_put16(ppt->pptd_cfg, PCI_CONF_COMM, cmd);
+
+	return (ppt->vm != NULL ? DDI_FAILURE : DDI_SUCCESS);
+}
+
 static struct dev_ops ppt_ops = {
 	DEVO_REV,
 	0,
@@ -676,7 +697,9 @@ static struct dev_ops ppt_ops = {
 	ppt_ddi_detach,
 	nodev,		/* reset */
 	&ppt_cb_ops,
-	(struct bus_ops *)NULL
+	(struct bus_ops *)NULL,
+	NULL,		/* power */
+	ppt_ddi_quiesce
 };
 
 static struct modldrv modldrv = {
