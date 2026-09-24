@@ -347,14 +347,15 @@ if (( RXB1 > RXB0 )); then pass "rx_bytes advanced ($RXB0 -> $RXB1)"; else fail 
 if (( TXB1 > TXB0 )); then pass "tx_bytes advanced ($TXB0 -> $TXB1)"; else fail "tx_bytes did not advance"; fi
 
 # 8b. LSO is on by default: TCP bulk transmit must use it, and no request
-# may be refused for its checksum or segmentation metadata.
+# may be refused for its checksum or segmentation metadata.  tx_lso_nohck
+# counts LSO packets segmented in software, not refusals.
 LSO1=$(ringsum tx_lso_packets)
 if (( LSO1 > LSO0 )); then
 	pass "tx_lso_packets advanced ($LSO0 -> $LSO1)"
 else
 	fail "tx_lso_packets did not advance (LSO not in use?)"
 fi
-for k in tx_lso_badmss tx_lso_badhdr tx_lso_nohck tx_hck_hdrlen \
+for k in tx_lso_badmss tx_lso_badhdr tx_hck_hdrlen \
     tx_hck_nol3 tx_hck_nol4 tx_hck_badl4; do
 	v=$(ringsum "$k")
 	if [[ "$v" == "0" ]]; then pass "$k = 0"; else fail "$k = $v"; fi
