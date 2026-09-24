@@ -26,6 +26,7 @@
  * Copyright 2021 Joyent, Inc.
  * Copyright (c) 2016, 2017 by Delphix. All rights reserved.
  * Copyright 2019 Joshua M. Clulow <josh@sysmgr.org>
+ * Copyright 2026 Edgecast Cloud LLC.
  */
 
 /*
@@ -1880,10 +1881,16 @@ apic_pci_msi_unconfigure(dev_info_t *rdip, int type, int inum)
 		off = (uintptr_t)msix_p->msix_tbl_addr +
 		    (inum * PCI_MSIX_VECTOR_SIZE);
 
-		/* Reset the "data" and "addr" bits */
+		/*
+		 * Reset the "data" and "addr" bits.  Some devices, such as the
+		 * BCM5720, reject 64-bit writes to the table.
+		 */
 		ddi_put32(msix_p->msix_tbl_hdl,
 		    (uint32_t *)(off + PCI_MSIX_DATA_OFFSET), 0);
-		ddi_put64(msix_p->msix_tbl_hdl, (uint64_t *)off, 0);
+		ddi_put32(msix_p->msix_tbl_hdl,
+		    (uint32_t *)(off + PCI_MSIX_LOWER_ADDR_OFFSET), 0);
+		ddi_put32(msix_p->msix_tbl_hdl,
+		    (uint32_t *)(off + PCI_MSIX_UPPER_ADDR_OFFSET), 0);
 	}
 }
 
