@@ -178,7 +178,12 @@ extern "C" {
 #define	AMDVI_IVHD_FLAG_RESPASSPW (1U << 2)
 #define	AMDVI_IVHD_FLAG_ISOC	(1U << 3)
 
+#define	AMDVI_IVMD_TYPE_ALL	0x20
+#define	AMDVI_IVMD_TYPE_SELECT	0x21
+#define	AMDVI_IVMD_TYPE_RANGE	0x22
+
 #define	AMDVI_MAX_UNITS		32
+#define	AMDVI_MAX_IVMD		32
 #define	AMDVI_UNIT_NONE		0xff
 
 /*
@@ -192,6 +197,17 @@ typedef struct amdvi_devcfg {
 	uint8_t		adc_unit;
 	uint8_t		adc_data;
 } amdvi_devcfg_t;
+
+/*
+ * A memory range that firmware requires to stay identity-mapped for the
+ * requester IDs from aim_rid_lo to aim_rid_hi.
+ */
+typedef struct amdvi_ivmd {
+	uint64_t	aim_start;
+	uint64_t	aim_end;
+	uint16_t	aim_rid_lo;
+	uint16_t	aim_rid_hi;
+} amdvi_ivmd_t;
 
 typedef struct amdvi_unit {
 	uint16_t	au_devid;
@@ -221,13 +237,15 @@ typedef struct amdvi_domain {
 	list_node_t	ad_node;
 	uint64_t	*ad_root;
 	uint64_t	ad_root_pa;
+	uint64_t	ad_maxaddr;
 	uint_t		ad_levels;
 	uint16_t	ad_id;
 	bool		ad_host;
 } amdvi_domain_t;
 
 /* ivrs_drv.c */
-int amdvi_ivrs_parse(amdvi_unit_t *, uint_t *, amdvi_devcfg_t *);
+int amdvi_ivrs_parse(amdvi_unit_t *, uint_t *, amdvi_devcfg_t *,
+    amdvi_ivmd_t *, uint_t *);
 
 /* amdvi_hw.c */
 int amdvi_hw_init(void);
@@ -235,6 +253,7 @@ void amdvi_hw_fini(void);
 void amdvi_hw_enable(void);
 void amdvi_hw_disable(void);
 uint_t amdvi_hw_max_levels(void);
+uint_t amdvi_hw_ivmd(const amdvi_ivmd_t **);
 int amdvi_hw_attach(const amdvi_domain_t *, uint16_t);
 void amdvi_hw_detach(const amdvi_domain_t *, uint16_t);
 bool amdvi_hw_inv_domain(const amdvi_domain_t *);

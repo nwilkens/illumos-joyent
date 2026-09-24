@@ -45,9 +45,14 @@
 #include <sys/types.h>
 #include <sys/cmn_err.h>
 #include <sys/errno.h>
+#include <sys/sysmacros.h>
 #include <sys/acpi/acpi.h>
 
 #include "amdvi_priv.h"
+
+/* IVMD flags */
+#define	IVMD_FLAG_UNITY		(1U << 0)
+#define	IVMD_FLAG_EXCL		(1U << 3)
 
 /* IVHD types 0x11 and 0x40 append EFR and EFR2 register images. */
 #define	IVHD_TYPE10_LEN		sizeof (ACPI_IVRS_HARDWARE)
@@ -175,13 +180,53 @@ bad_range:
 	return (EINVAL);
 }
 
+static int
+ivmd_parse(const ACPI_IVRS_MEMORY *m, amdvi_ivmd_t *ivmd, uint_t *nivmdp)
+{
+	amdvi_ivmd_t *im;
+
+	if ((m->Header.Flags & (IVMD_FLAG_UNITY | IVMD_FLAG_EXCL)) == 0)
+		return (0);
+	if (m->MemoryLength == 0 ||
+	    m->StartAddress + m->MemoryLength < m->StartAddress) {
+		cmn_err(CE_WARN, "!amdvi: malformed IVMD range");
+		return (EINVAL);
+	}
+	if (*nivmdp == AMDVI_MAX_IVMD) {
+		cmn_err(CE_WARN, "!amdvi: more than %u IVMD ranges",
+		    AMDVI_MAX_IVMD);
+		return (ENOTSUP);
+	}
+
+	im = &ivmd[(*nivmdp)++];
+	im->aim_start = P2ALIGN(m->StartAddress, AMDVI_PAGE_SIZE);
+	im->aim_end = P2ROUNDUP(m->StartAddress + m->MemoryLength,
+	    AMDVI_PAGE_SIZE);
+	switch (m->Header.Type) {
+	case AMDVI_IVMD_TYPE_ALL:
+		im->aim_rid_lo = 0;
+		im->aim_rid_hi = AMDVI_NUM_DEVID - 1;
+		break;
+	case AMDVI_IVMD_TYPE_SELECT:
+		im->aim_rid_lo = im->aim_rid_hi = m->Header.DeviceId;
+		break;
+	default:
+		im->aim_rid_lo = m->Header.DeviceId;
+		im->aim_rid_hi = MAX(m->Header.DeviceId, m->AuxData);
+		break;
+	}
+	return (0);
+}
+
 /*
- * Find the IOMMUs described by the IVRS table and which requester IDs each
- * one translates.  Firmware may describe the same unit with IVHD types 0x10,
- * 0x11 and 0x40; the highest type supersedes the others.
+ * Find the IOMMUs described by the IVRS table, which requester IDs each one
+ * translates, and the memory ranges firmware needs identity-mapped.  Firmware
+ * may describe the same unit with IVHD types 0x10, 0x11 and 0x40; the highest
+ * type supersedes the others.
  */
 int
-amdvi_ivrs_parse(amdvi_unit_t *units, uint_t *nunitsp, amdvi_devcfg_t *devcfg)
+amdvi_ivrs_parse(amdvi_unit_t *units, uint_t *nunitsp, amdvi_devcfg_t *devcfg,
+    amdvi_ivmd_t *ivmd, uint_t *nivmdp)
 {
 	const ACPI_IVRS_HEADER *ivhds[AMDVI_MAX_UNITS];
 	ACPI_TABLE_IVRS *ivrs;
@@ -212,6 +257,20 @@ amdvi_ivrs_parse(amdvi_unit_t *units, uint_t *nunitsp, amdvi_devcfg_t *devcfg)
 			goto out;
 		}
 		p += sub->Length;
+
+		if (sub->Type == AMDVI_IVMD_TYPE_ALL ||
+		    sub->Type == AMDVI_IVMD_TYPE_SELECT ||
+		    sub->Type == AMDVI_IVMD_TYPE_RANGE) {
+			if (sub->Length < sizeof (ACPI_IVRS_MEMORY)) {
+				err = EINVAL;
+				goto out;
+			}
+			err = ivmd_parse((const ACPI_IVRS_MEMORY *)sub, ivmd,
+			    nivmdp);
+			if (err != 0)
+				goto out;
+			continue;
+		}
 
 		hdr_len = ivhd_hdr_len(sub->Type);
 		if (hdr_len == 0)

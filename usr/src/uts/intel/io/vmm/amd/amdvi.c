@@ -85,6 +85,9 @@ static id_space_t	*amdvi_domids;
 static uint_t		amdvi_levels_max;
 static bool		amdvi_expect_host;
 
+static uint64_t amdvi_create_mapping(void *, vm_paddr_t, vm_paddr_t,
+    uint64_t);
+
 static uint64_t
 amdvi_domain_limit(uint_t levels)
 {
@@ -175,10 +178,46 @@ amdvi_cleanup(void)
 	}
 }
 
+/*
+ * io/iommu.c identity-maps host memory below maxaddr.  Firmware-reserved
+ * ranges above that must be mapped too before translation is enabled.
+ */
+static void
+amdvi_map_host_ivmd(amdvi_domain_t *host)
+{
+	const amdvi_ivmd_t *ivmd;
+	const uint_t n = amdvi_hw_ivmd(&ivmd);
+
+	for (uint_t i = 0; i < n; i++) {
+		uint64_t start = MAX(ivmd[i].aim_start, host->ad_maxaddr);
+		const uint64_t end = ivmd[i].aim_end;
+
+		if (start >= end)
+			continue;
+		if (end > amdvi_domain_limit(host->ad_levels)) {
+			cmn_err(CE_WARN, "amdvi: cannot map firmware-reserved "
+			    "range 0x%lx-0x%lx", ivmd[i].aim_start, end);
+			continue;
+		}
+		while (start < end) {
+			start += amdvi_create_mapping(host, start, start,
+			    end - start);
+		}
+	}
+}
+
 static void
 amdvi_enable(void)
 {
 	amdvi_domain_t *dom;
+
+	mutex_enter(&amdvi_lock);
+	for (dom = list_head(&amdvi_domains); dom != NULL;
+	    dom = list_next(&amdvi_domains, dom)) {
+		if (dom->ad_host)
+			amdvi_map_host_ivmd(dom);
+	}
+	mutex_exit(&amdvi_lock);
 
 	amdvi_hw_enable();
 
@@ -219,6 +258,7 @@ amdvi_create_domain(vm_paddr_t maxaddr)
 
 	dom = kmem_zalloc(sizeof (*dom), KM_SLEEP);
 	dom->ad_id = (uint16_t)id;
+	dom->ad_maxaddr = maxaddr;
 	dom->ad_levels = levels;
 	dom->ad_root = vmm_ptp_alloc();
 	dom->ad_root_pa = vtophys(dom->ad_root);

@@ -81,6 +81,8 @@ static kmutex_t		amdvi_hw_lock;
 static amdvi_unit_t	amdvi_units[AMDVI_MAX_UNITS];
 static uint_t		amdvi_nunits;
 static amdvi_devcfg_t	*amdvi_devcfg;
+static amdvi_ivmd_t	amdvi_ivmds[AMDVI_MAX_IVMD];
+static uint_t		amdvi_nivmd;
 static uint64_t		*amdvi_devtab;
 static uint64_t		amdvi_devtab_pa;
 static ddi_periodic_t	amdvi_evpoll;
@@ -353,6 +355,24 @@ amdvi_dte_write(amdvi_unit_t *u, uint16_t rid, const uint64_t dte[4])
 	return (amdvi_cmd_sync(u));
 }
 
+static bool
+amdvi_rid_has_ivmd(uint16_t rid)
+{
+	for (uint_t i = 0; i < amdvi_nivmd; i++) {
+		if (rid >= amdvi_ivmds[i].aim_rid_lo &&
+		    rid <= amdvi_ivmds[i].aim_rid_hi)
+			return (true);
+	}
+	return (false);
+}
+
+uint_t
+amdvi_hw_ivmd(const amdvi_ivmd_t **ivmdp)
+{
+	*ivmdp = amdvi_ivmds;
+	return (amdvi_nivmd);
+}
+
 static void
 amdvi_bdf_str(uint16_t rid, char *buf, size_t len)
 {
@@ -387,6 +407,17 @@ amdvi_hw_attach(const amdvi_domain_t *dom, uint16_t rid)
 		    "%02x:%02x.%x with other devices", bdf,
 		    PCI_RID2BUS(cfg->adc_alias), PCI_RID2SLOT(cfg->adc_alias),
 		    PCI_RID2FUNC(cfg->adc_alias));
+		return (ENOTSUP);
+	}
+
+	/*
+	 * Firmware needs these devices to reach memory at fixed addresses,
+	 * which a guest's address space cannot provide.
+	 */
+	if (!dom->ad_host && (amdvi_rid_has_ivmd(rid) ||
+	    amdvi_rid_has_ivmd(cfg->adc_alias))) {
+		cmn_err(CE_WARN, "amdvi: device %s has firmware-reserved "
+		    "memory and cannot be assigned", bdf);
 		return (ENOTSUP);
 	}
 
@@ -642,7 +673,8 @@ amdvi_hw_init(void)
 		amdvi_devcfg[rid].adc_data = 0;
 	}
 
-	err = amdvi_ivrs_parse(amdvi_units, &amdvi_nunits, amdvi_devcfg);
+	err = amdvi_ivrs_parse(amdvi_units, &amdvi_nunits, amdvi_devcfg,
+	    amdvi_ivmds, &amdvi_nivmd);
 	if (err != 0)
 		goto fail;
 
@@ -673,6 +705,7 @@ amdvi_hw_fini(void)
 	for (uint_t i = 0; i < AMDVI_MAX_UNITS; i++)
 		amdvi_unit_fini(&amdvi_units[i]);
 	amdvi_nunits = 0;
+	amdvi_nivmd = 0;
 
 	if (amdvi_devtab != NULL) {
 		contig_free(amdvi_devtab, AMDVI_DEVTAB_SIZE);
