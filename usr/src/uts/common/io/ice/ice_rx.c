@@ -630,6 +630,8 @@ ice_rx_orphan_return(ice_rx_ring_t *irr, ice_rx_ctrl_block_t *rcb,
 	    DDI_NOSLEEP) != DDI_SUCCESS)
 		(void) atomic_swap_32(&ice->ice_rx_reap_queued, 0);
 	atomic_dec_64(&irr->irxr_stats.icrxs_orphan_loans.value.ui64);
+	/* Detach reads a zero count as proof that the block is queued. */
+	membar_producer();
 	atomic_dec_32(&ice->ice_rx_orphan_loans);
 }
 
@@ -1963,8 +1965,10 @@ ice_rx_orphans_drain(ice_t *ice)
 			ice_rx_harvest(irr);
 			mutex_exit(&irr->irxr_lock);
 		}
-		if (ice->ice_rx_orphan_loans == 0)
+		if (ice->ice_rx_orphan_loans == 0) {
+			membar_consumer();
 			break;
+		}
 		if (ddi_get_lbolt() - deadline >= 0)
 			return (B_FALSE);
 		delay(drv_usectohz(ICE_RX_ORPHAN_POLL_US));

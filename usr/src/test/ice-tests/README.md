@@ -776,7 +776,10 @@ loan count is zero or to be set aside, pools are freed after the lock is
 dropped, a surviving pool is not clobbered on restart, and a single bounded
 stop serves both the unplumb and reset callers. A start replaces a pool with
 loans outstanding instead of failing, and detach waits, within the same
-bound, for the loans of the replaced pools.
+bound, for the loans of the replaced pools. A replaced-pool return queues its
+block before a producer barrier and the count decrement, and the drain issues
+a consumer barrier once it reads zero, so the zero proves every block is on
+the reap list.
 
 `rx_orphan.py` runs the actual pool functions, `ice_rx_start()`, the poll
 entry point and the detach wait through the RX harness, which accounts for

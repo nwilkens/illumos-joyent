@@ -114,6 +114,14 @@ def main() -> None:
     # A returned loan of a replaced pool can wait in a ring's return list.
     assert drain.index("ice_rx_harvest(irr)") < \
         drain.index("ice->ice_rx_orphan_loans == 0")
+    # A zero count proves every returned block is on the reap list only with
+    # a barrier on each side.
+    assert drain.index("ice->ice_rx_orphan_loans == 0") < \
+        drain.index("membar_consumer()")
+    ret = function(rx, "ice_rx_orphan_return(ice_rx_ring_t *irr,", "\n}\n")
+    assert ret.index("atomic_cas_ptr(&ice->ice_rx_reap") < \
+        ret.rindex("membar_producer()") < \
+        ret.index("atomic_dec_32(&ice->ice_rx_orphan_loans)")
     assert "ICE_RX_LOAN_WAIT_US" in drain
     assert "return (B_FALSE);" in drain
     lifecycle = (Path(__file__).resolve().parents[2] /
