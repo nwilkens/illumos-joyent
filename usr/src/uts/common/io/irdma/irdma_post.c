@@ -194,7 +194,8 @@ irdma_post_send(struct rdk_qp *rqp, const struct rdk_send_wr *wr,
 				break;
 			}
 			pi.op_type = IRDMA_OP_TYPE_INV_STAG;
-			pi.local_fence = pi.read_fence;
+			/* Earlier work may still use the MR. */
+			pi.local_fence = true;
 			pi.op.inv_local_stag.target_stag =
 			    wr->ex.invalidate_rkey;
 			err = irdma_uk_stag_local_invalidate(uk, &pi, false);

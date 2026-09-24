@@ -245,6 +245,11 @@ irdma_destroy_cq(struct rdk_cq *rcq)
 		if (irdma_cqp_exec(irdma, req, NULL) != 0)
 			irdma_taint(irdma);
 	}
+	/* Entries the device queued before it dropped the CQ. */
+	mutex_enter(&irdma->irdma_ceq_lock);
+	if ((irdma->irdma_progress & BIT(IRDMA_STEP_CEQ0)) != 0)
+		irdma_sc_cleanup_ceqes(&icq->icq_sc, &irdma->irdma_ceq0);
+	mutex_exit(&irdma->irdma_ceq_lock);
 
 	mutex_enter(&icq->icq_lock);
 	while ((g = list_remove_head(&icq->icq_gen)) != NULL)
