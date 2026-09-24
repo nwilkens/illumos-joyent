@@ -44,6 +44,8 @@ def main() -> None:
     # the cap is hoisted once, disarmed for byte-budgeted polls, and covers
     # nonpositive budgets so no caller can drain unbounded
     hoist = ring_rx.index("cap = (poll_bytes <= 0)")
+    # the cap is the ring's share of the limit when rings share a vector
+    assert "irr->irxr_intr_limit : UINT32_MAX" in ring_rx
     check = ring_rx.index("frames >= cap")
     assert hoist < check
     assert "icrxs_intr_limit.value.ui64++" in ring_rx

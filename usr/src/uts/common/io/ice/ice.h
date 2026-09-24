@@ -517,6 +517,7 @@ typedef struct ice_rx_ring {
 	boolean_t		irxr_intr_armed;
 	boolean_t		irxr_intr_busy;	/* ISR is in mac_rx_ring */
 	boolean_t		irxr_copy_only;	/* no loans; irxr_lock */
+	uint32_t		irxr_intr_limit; /* frames per interrupt */
 
 	kmutex_t		irxr_lock;
 	kcondvar_t		irxr_cv;	/* teardown waits on loans */
@@ -796,6 +797,7 @@ extern int ice_intr_adjust(ice_t *, ddi_cb_action_t, int);
  */
 extern uint_t ice_intr_msix(caddr_t, caddr_t);
 extern uint32_t ice_ring_vector(const ice_t *, uint_t);
+extern uint32_t ice_rx_intr_limit(const ice_t *);
 extern void ice_intr_rings_map(ice_t *);
 extern boolean_t ice_intr_enable(ice_t *);
 extern boolean_t ice_intr_disable(ice_t *);

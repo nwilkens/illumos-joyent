@@ -28,6 +28,7 @@ def main():
                                  "ice_rem_intr_handlers",
                                  "ice_add_intr_handlers"))
     parts += bodies(DRIVER / "ice_intr.c", ("ice_ring_vector",
+                                            "ice_rx_intr_limit",
                                             "ice_intr_rings_map",
                                             "ice_intr_queue",
                                             "ice_intr_enable",

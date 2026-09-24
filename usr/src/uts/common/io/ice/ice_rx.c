@@ -153,6 +153,7 @@ ice_rx_ring_alloc(ice_t *ice, ice_rx_ring_t *irr, uint_t index)
 	irr->irxr_index = index;
 
 	irr->irxr_vec = ice_ring_vector(ice, index);
+	irr->irxr_intr_limit = ice_rx_intr_limit(ice);
 
 	irr->irxr_size = ice->ice_rx_ring_size;
 	irr->irxr_dbuf = ICE_RX_BUF_SIZE;
@@ -1356,7 +1357,7 @@ ice_rx_loan_mode(ice_rx_ring_t *irr)
  * within a frame are linked with b_cont by ice_ring_rx_frame().
  *
  * poll_bytes > 0 caps the bytes delivered (mac polling); otherwise the drain
- * is interrupt context, capped at ice_rx_limit_per_intr consumed frames so a
+ * is interrupt context, capped at irxr_intr_limit consumed frames so a
  * flooded ring cannot hold the ring lock and interrupt context for an
  * unbounded burst.  A capped drain that left ready frames behind is reported
  * through *limitp so the ISR can schedule a software interrupt for them; see
@@ -1374,7 +1375,7 @@ ice_ring_rx(ice_rx_ring_t *irr, int poll_bytes, boolean_t *limitp,
 	struct ice_hw *hw = &ice->ice_hw;
 	mblk_t *mp_head = NULL, *mp_tail = NULL;
 	const uint32_t cap = (poll_bytes <= 0) ?
-	    ice->ice_rx_limit_per_intr : UINT32_MAX;
+	    irr->irxr_intr_limit : UINT32_MAX;
 	uint32_t bytes = 0;
 	uint_t npkts = 0, nposted = 0, frames = 0;
 

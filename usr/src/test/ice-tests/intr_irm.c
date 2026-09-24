@@ -64,6 +64,8 @@ typedef int (*ddi_cb_func_t)(dev_info_t *, ddi_cb_action_t, void *, void *,
 #define	ICE_DEF_QUEUES		16
 #define	ICE_MAX_QUEUES		127
 #define	ICE_ITR_IDX_0		0
+#define	ICE_MIN_RX_LIMIT_PER_INTR	16
+#define	howmany(x, y)		(((x) + ((y) - 1)) / (y))
 #define	ICE_GLINT_DYN_CTL_REARM	0x1
 #define	GLINT_DYN_CTL_SWINT_TRIG_M	0x4
 #define	GLINT_DYN_CTL_SW_ITR_INDX_ENA_M	0x8
@@ -102,7 +104,7 @@ struct ice_hw {
 };
 
 typedef struct {
-	uint32_t irxr_vec;
+	uint32_t irxr_vec, irxr_intr_limit;
 	kmutex_t irxr_lock;
 	int irxr_serviced, irxr_limit;
 	void *irxr_macrxring;
@@ -127,6 +129,7 @@ typedef struct ice {
 	uint32_t ice_state;
 	ice_attach_state_t ice_attach_progress;
 	uint_t ice_num_rxr, ice_num_txr;
+	uint32_t ice_rx_limit_per_intr;
 	ice_rx_ring_t *ice_rxr;
 	ice_tx_ring_t *ice_txr;
 	kmutex_t ice_lock, ice_lse_lock, ice_rebuild_lock;
@@ -585,12 +588,14 @@ attached(int nintrs)
 	reset(nintrs);
 	assert(ice_alloc_intrs(&dev));
 	dev.ice_num_rxr = dev.ice_num_txr = dev.ice_nqueues;
+	dev.ice_rx_limit_per_intr = 256;
 	dev.ice_rxr = rxr;
 	dev.ice_txr = txr;
 	memset(rxr, 0, sizeof (rxr));
 	memset(txr, 0, sizeof (txr));
 	for (i = 0; i < dev.ice_num_rxr; i++) {
 		rxr[i].irxr_vec = ice_ring_vector(&dev, i);
+		rxr[i].irxr_intr_limit = ice_rx_intr_limit(&dev);
 		txr[i].itxr_vec = ice_ring_vector(&dev, i);
 	}
 	dev.ice_attach_progress = ICE_ATTACH_ADD_INTR | ICE_ATTACH_ENABLE_INTR;
@@ -609,12 +614,14 @@ callback(int action, int count)
 
 /*
  * Every ring names an allocated vector other than 0, each handler services
- * exactly the rings mapped to it, and MAC holds each ring's handle.
+ * exactly the rings mapped to it, the rings on a vector split the rx work
+ * limit, and MAC holds each ring's handle.
  */
 static void
 check_map(void)
 {
-	uint_t i;
+	uint_t i, share = (NRINGS + dev.ice_intr_count - 2) /
+	    (dev.ice_intr_count - 1);
 	int v;
 
 	assert(m.allocated == dev.ice_intr_count && !l.mac_cleared);
@@ -629,6 +636,8 @@ check_map(void)
 		assert(rxr[i].irxr_vec >= 1 &&
 		    (int)rxr[i].irxr_vec < dev.ice_intr_count);
 		assert(txr[i].itxr_vec == rxr[i].irxr_vec);
+		assert(rxr[i].irxr_intr_limit == MAX(16, 256 / share));
+		assert(rxr[i].irxr_intr_limit * share <= MAX(256, 16 * share));
 		assert(l.mac_rx[i] == dev.ice_intr_handles[rxr[i].irxr_vec]);
 		assert(l.mac_tx[i] == dev.ice_intr_handles[txr[i].itxr_vec]);
 	}

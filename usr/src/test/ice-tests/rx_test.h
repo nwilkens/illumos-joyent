@@ -186,6 +186,7 @@ typedef struct ice_rx_ring {
 	ice_rx_ctrl_block_t **irxr_rcbs, **irxr_free_rcbs;
 	ice_rx_pool_t *irxr_pool;
 	boolean_t irxr_copy_only;
+	uint32_t irxr_intr_limit;
 	uint16_t irxr_size, irxr_head, irxr_tail;
 	uint_t irxr_nrcb, irxr_nfree, irxr_nreserve, irxr_nloaned;
 	ice_rxq_stat_t irxr_stats;
@@ -649,6 +650,7 @@ setup(ice_rx_ring_t *r, ice_t *ice)
 	ice->ice_rxr = r;
 	ice->ice_rx_reap_taskq = &ice->ice_dip;
 	r->irxr_ice = ice;
+	r->irxr_intr_limit = ice->ice_rx_limit_per_intr;
 	r->irxr_size = 16;
 	r->irxr_dbuf = ICE_RX_BUF_SIZE;
 	assert(ice_dma_alloc(ice, &r->irxr_desc_dma, &attr, &acc, B_TRUE,

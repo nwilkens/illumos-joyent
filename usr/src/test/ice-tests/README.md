@@ -408,7 +408,9 @@ back to one each and never past what the rings can use; a reclaim may not
 take vector 0 or the last queue vector. After every change each ring names an
 allocated vector other than 0, each vector's handler services exactly the rx
 and tx rings mapped to it, a limit hit on any of them requests a refire, the
-freed vectors have no handler, and MAC holds each ring's current handle. MAC's
+freed vectors have no handler, the rings on a vector split the rx
+per-interrupt limit (at least 16 frames each) so one interrupt does no more
+work than an unshared one, and MAC holds each ring's current handle. MAC's
 handles are cleared and restored with no driver lock held. A started
 datapath is paused and restarted around the change; one that owes a reset,
 whose queues did not stop, or that fails to restart is only rerouted and left

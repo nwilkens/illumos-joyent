@@ -42,7 +42,7 @@ fault(fault_site_t site, boolean_t intr, boolean_t dd, boolean_t loan,
 			post(&ring, 1, data, length, B_TRUE, B_FALSE);
 	}
 	if (site == LIMIT_PEEK)
-		ice.ice_rx_limit_per_intr = 1;
+		ring.irxr_intr_limit = 1;
 	if (site == ACCESS) {
 		acc_fail = 1;
 	} else {

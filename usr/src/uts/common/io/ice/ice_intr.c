@@ -969,6 +969,20 @@ ice_ring_vector(const ice_t *ice, uint_t index)
 }
 
 /*
+ * Rings that share a vector split rx_limit_per_intr, so one interrupt does no
+ * more work than an unshared one; each keeps enough to make progress.
+ */
+uint32_t
+ice_rx_intr_limit(const ice_t *ice)
+{
+	uint32_t nrings = MAX(ice->ice_num_rxr, ice->ice_num_txr);
+	uint32_t share = howmany(nrings, (uint32_t)ice->ice_intr_count - 1);
+
+	return (MAX(ICE_MIN_RX_LIMIT_PER_INTR,
+	    ice->ice_rx_limit_per_intr / MAX(share, 1)));
+}
+
+/*
  * Point every ring at its vector for the current count.  The handlers are
  * removed while the count changes; MAC's poll callbacks read irxr_vec under
  * the ring lock.
@@ -976,6 +990,7 @@ ice_ring_vector(const ice_t *ice, uint_t index)
 void
 ice_intr_rings_map(ice_t *ice)
 {
+	uint32_t limit = ice_rx_intr_limit(ice);
 	uint_t i;
 
 	for (i = 0; i < ice->ice_num_txr; i++)
@@ -985,6 +1000,7 @@ ice_intr_rings_map(ice_t *ice)
 
 		mutex_enter(&irr->irxr_lock);
 		irr->irxr_vec = ice_ring_vector(ice, i);
+		irr->irxr_intr_limit = limit;
 		mutex_exit(&irr->irxr_lock);
 	}
 }
