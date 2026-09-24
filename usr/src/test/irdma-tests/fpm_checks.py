@@ -11,7 +11,11 @@ def main():
     text = osdep.read_text(encoding="utf-8")
     defines = "\n".join(re.findall(r"^#define\tIRDMA_FPM_\w+\t.*$", text,
                                    re.MULTILINE))
-    parts = [defines] + [function(osdep, name) for name in (
+    bits = re.search(r"^#define\tBIT_ULL\(n\)\t.*$",
+                     (IRDMA / "osdep.h").read_text(encoding="utf-8"),
+                     re.MULTILINE)
+    assert bits, "BIT_ULL not found in osdep.h"
+    parts = [defines, bits.group(0)] + [function(osdep, name) for name in (
         "irdma_osdep_fpm_query_check", "irdma_osdep_fpm_commit_check")]
     run_c(TESTDIR / "fpm_checks.c", {"fpm_bodies.h": "\n".join(parts)},
           cflags=("-Wno-unused-parameter", "-Wno-format"))

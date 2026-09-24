@@ -166,6 +166,17 @@ main(void)
 	REJECT_OBJ(IRDMA_HMC_IW_CQ, max_cnt, 0);
 	REJECT_OBJ(IRDMA_HMC_IW_Q1, max_cnt, 1023);	/* irdma_q1_cnt loop */
 	REJECT_OBJ(IRDMA_HMC_IW_PBLE, max_cnt, 1023);
+	/* The core sets each size to BIT_ULL(size field from firmware). */
+	{
+		volatile u32 shift[] = { 64, 65, 255, UINT32_MAX };
+		uint_t i;
+
+		for (i = 0; i < sizeof (shift) / sizeof (shift[0]); i++) {
+			REJECT_OBJ(IRDMA_HMC_IW_QP, size, BIT_ULL(shift[i]));
+			REJECT_OBJ(IRDMA_HMC_IW_TIMER, size, BIT_ULL(shift[i]));
+		}
+		assert(BIT_ULL(shift[0] - 1) == 1ULL << 63);
+	}
 	/* An absent object may report no size. */
 	good();
 	obj[IRDMA_HMC_IW_SRQ].max_cnt = 0;

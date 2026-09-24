@@ -84,8 +84,12 @@ typedef int		gfp_t;
 #define	ETH_ALEN		ETHERADDRL
 #define	DSCP_MAX		64
 
-#define	BIT(n)			(1UL << (n))
-#define	BIT_ULL(n)		(1ULL << (n))
+/*
+ * The core decodes object sizes from firmware with BIT_ULL(); a shift of 64
+ * or more yields 0, which irdma_osdep_fpm_query_check() rejects.
+ */
+#define	BIT(n)			((n) < 64 ? 1UL << (n) : 0UL)
+#define	BIT_ULL(n)		((n) < 64 ? 1ULL << (n) : 0ULL)
 #define	GENMASK(h, l)		\
 	((~0UL >> (63 - (h))) & ~((1UL << (l)) - 1UL))
 #define	GENMASK_ULL(h, l)	\
