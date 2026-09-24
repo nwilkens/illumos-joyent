@@ -215,7 +215,7 @@ extern void irdma_qp_to_error(irdma_qp_t *);
 extern void irdma_qp_event(irdma_qp_t *, enum irdma_qp_event_type);
 extern void irdma_flush_wqes(irdma_qp_t *, uint32_t);
 extern void irdma_flush_later(irdma_qp_t *);
-extern void irdma_generate_flush_completions(irdma_qp_t *);
+extern boolean_t irdma_generate_flush_completions(irdma_qp_t *);
 
 /*
  * irdma_post.c

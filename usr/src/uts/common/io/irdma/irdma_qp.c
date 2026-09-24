@@ -174,11 +174,14 @@ static void
 irdma_qp_flush_task(void *arg)
 {
 	irdma_qp_t *iqp = arg;
+	boolean_t later;
 
-	irdma_generate_flush_completions(iqp);
+	later = irdma_generate_flush_completions(iqp);
 	mutex_enter(&iqp->iqp_lock);
 	iqp->iqp_flush_queued = B_FALSE;
 	mutex_exit(&iqp->iqp_lock);
+	if (later)
+		irdma_flush_later(iqp);
 	irdma_qp_work_done(iqp);
 }
 
@@ -196,10 +199,10 @@ irdma_set_cpi(struct irdma_cq_poll_info *cpi, irdma_qp_t *iqp)
 
 /*
  * Complete, with a flush error, the work requests the device did not
- * flush.  Waits for the device's own entries by rescheduling while the CQ
- * is not empty.
+ * flush.  Returns whether to try again later: the device's own entries are
+ * still in a CQ, or memory ran out.
  */
-void
+boolean_t
 irdma_generate_flush_completions(irdma_qp_t *iqp)
 {
 	struct irdma_qp_uk *qp = &iqp->iqp_sc.qp_uk;
@@ -207,7 +210,7 @@ irdma_generate_flush_completions(irdma_qp_t *iqp)
 	irdma_cq_t *cqs[2] = { iqp->iqp_scq, iqp->iqp_rcq };
 	boolean_t made[2] = { B_FALSE, B_FALSE };
 	boolean_t later = B_FALSE;
-	irdma_cmpl_gen_t *g;
+	irdma_cmpl_gen_t *g = NULL;
 	uint32_t idx, n;
 	uint_t i;
 	u64 qword;
@@ -224,6 +227,12 @@ irdma_generate_flush_completions(irdma_qp_t *iqp)
 		mutex_enter(&iqp->iqp_lock);
 		for (n = 0; i == 0 && IRDMA_RING_MORE_WORK(*sq) &&
 		    n < sq->size; n++) {
+			if (g == NULL)
+				g = kmem_zalloc(sizeof (*g), KM_NOSLEEP);
+			if (g == NULL) {
+				later = B_TRUE;
+				break;
+			}
 			idx = sq->tail;
 			get_64bit_val(qp->sq_base[idx].elem, 24, &qword);
 			IRDMA_RING_SET_TAIL(*sq, idx +
@@ -231,41 +240,44 @@ irdma_generate_flush_completions(irdma_qp_t *iqp)
 			if (FIELD_GET(IRDMAQPSQ_OPCODE, qword) ==
 			    IRDMAQP_OP_NOP)
 				continue;
-			g = kmem_zalloc(sizeof (*g), KM_NOSLEEP);
-			if (g == NULL)
-				break;
 			irdma_set_cpi(&g->icg_cpi, iqp);
 			g->icg_cpi.wr_id = qp->sq_wrtrk_array[idx].wrid;
 			g->icg_cpi.op_type = (u8)FIELD_GET(IRDMAQPSQ_OPCODE,
 			    qword);
 			g->icg_cpi.q_type = IRDMA_CQE_QTYPE_SQ;
 			list_insert_tail(&icq->icq_gen, g);
+			g = NULL;
 			made[i] = B_TRUE;
 		}
 		for (n = 0; i == 1 && IRDMA_RING_MORE_WORK(*rq) &&
 		    n < rq->size; n++) {
-			idx = rq->tail;
-			g = kmem_zalloc(sizeof (*g), KM_NOSLEEP);
 			if (g == NULL)
+				g = kmem_zalloc(sizeof (*g), KM_NOSLEEP);
+			if (g == NULL) {
+				later = B_TRUE;
 				break;
+			}
+			idx = rq->tail;
 			irdma_set_cpi(&g->icg_cpi, iqp);
 			g->icg_cpi.wr_id = qp->rq_wrid_array[idx];
 			g->icg_cpi.op_type = IRDMA_OP_TYPE_REC;
 			g->icg_cpi.q_type = IRDMA_CQE_QTYPE_RQ;
 			IRDMA_RING_SET_TAIL(*rq, idx + 1);
 			list_insert_tail(&icq->icq_gen, g);
+			g = NULL;
 			made[i] = B_TRUE;
 		}
 		mutex_exit(&iqp->iqp_lock);
 		mutex_exit(&icq->icq_lock);
 	}
+	if (g != NULL)
+		kmem_free(g, sizeof (*g));
 
 	for (i = 0; i < 2; i++) {
 		if (made[i])
 			irdma_comp_handler(cqs[i]);
 	}
-	if (later)
-		irdma_flush_later(iqp);
+	return (later);
 }
 
 /* A CQP QP_MODIFY with info; the caller holds iqp_mod_lock. */
