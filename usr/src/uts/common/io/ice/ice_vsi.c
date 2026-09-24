@@ -407,8 +407,12 @@ ice_vsi_rebuild(ice_t *ice)
 		goto done;
 
 	/* Restore promiscuous mode if it was enabled before the reset. */
-	if (ice_filters_replay_promisc(ice) != 0)
+	if (ice_filters_replay_promisc(ice) != 0) {
 		status = ICE_ERR_CFG;
+		goto done;
+	}
+
+	ice_rdma_vsi_replay(ice);
 
 done:
 	/*

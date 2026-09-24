@@ -11,7 +11,7 @@
 .\"
 .\" Copyright 2026 Edgecast Cloud LLC.
 .\"
-.Dd September 23, 2026
+.Dd September 24, 2026
 .Dt ICE 4D
 .Os
 .Sh NAME
@@ -216,6 +216,23 @@ interrupt before it schedules a throttled software interrupt for the rest.
 The value is clamped to the range 16 to 4096.
 The default is
 .Sy 256 .
+.It Sy rdma_enable
+Set to
+.Sy 1
+to run the RDMA function of the port as a child device for the
+.Sy irdma
+driver.
+RDMA also needs the RDMA capability in the firmware and the DDP package.
+The default is
+.Sy 0 .
+.It Sy rdma_vectors
+The number of MSI-X vectors kept for the RDMA function, from 1 to 16.
+They are taken before the queue vectors, so the driver uses fewer queue pairs
+when vectors are scarce.
+If the system grants too few vectors for them and one queue pair, RDMA stays
+off.
+The default is
+.Sy 2 .
 .El
 .Sh FIRMWARE
 The controller runs firmware from its NVM.

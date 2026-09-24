@@ -536,6 +536,7 @@ ice_oicr_fatal(ice_t *ice, uint32_t cause, boolean_t mdd)
 		ice_error(ice, "global reset detected; datapath halted");
 	if (mdd && ice_oicr_mdd(ice))
 		fault = B_TRUE;
+	ice_rdma_crit_notify(ice, cause);
 
 	/*
 	 * Only fail the link closed when this function actually faulted; a
@@ -761,6 +762,7 @@ ice_oicr_task(void *arg)
 	 * from its admin timer for this reason (if_ice_iflib.c:2477).
 	 */
 	ice_link_status_update_impl(ice, NULL);
+	ice_rdma_link_notify(ice);
 
 	/*
 	 * Belt and braces for a re-arm the ISR lost to a faulted register

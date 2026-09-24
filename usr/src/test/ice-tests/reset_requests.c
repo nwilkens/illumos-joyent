@@ -58,6 +58,7 @@ typedef struct ice {
 	void *ice_reset_taskq;
 	void *ice_dip;
 	struct ice_hw ice_hw;
+	void *ice_rdma;
 } ice_t;
 
 #include "ice_reset_types.h"
@@ -83,6 +84,10 @@ void ice_reset_task(void *);
 void ice_reset_dispatch(ice_t *);
 static ice_t device;
 static unsigned queued, prepared, pfrs, global_waits, starts, errors;
+/* RDMA peer hooks: offline before, barrier after the reset, online last. */
+static unsigned rdma_prepares, rdma_barriers, rdma_dones, rdma_ok;
+static uint32_t rdma_at_prepare;
+static boolean_t rdma_detach_at_prepare;
 static int fail_dispatch, fail_reset, start_result, resume_ok;
 static unsigned down_reports;
 static uint32_t at_lock, after_barrier, at_rearm, at_complete;
@@ -378,6 +383,41 @@ ice_tx_lso_free(ice_t *ice)
 	lso_frees++;
 }
 
+static void
+ice_rdma_reset_prepare(ice_t *ice)
+{
+	assert(ice == &device && !device.ice_rebuild_lock);
+	assert(prepared == 0 && rdma_prepares == rdma_dones);
+	rdma_prepares++;
+	/* The child's detach can ask for another reset meanwhile. */
+	if (rdma_at_prepare != 0) {
+		device.ice_state |= rdma_at_prepare;
+		rdma_at_prepare = 0;
+	}
+	if (rdma_detach_at_prepare)
+		device.ice_detaching = B_TRUE;
+}
+
+static void
+ice_rdma_reset_barrier(ice_t *ice)
+{
+	assert(ice == &device && device.ice_rebuild_lock);
+	assert(global_waits + pfrs > 0);
+	if (ice->ice_rdma == NULL)
+		return;
+	assert(rdma_prepares == rdma_dones + 1);
+	rdma_barriers++;
+}
+
+static void
+ice_rdma_reset_done(ice_t *ice, boolean_t ok)
+{
+	assert(ice == &device && !device.ice_rebuild_lock);
+	assert(rdma_prepares == rdma_dones + 1);
+	rdma_dones++;
+	rdma_ok = ok;
+}
+
 #include "ice_reset_body.h"
 
 static void
@@ -397,6 +437,9 @@ reset(void)
 	resume_ok = 1;
 	down_reports = 0;
 	at_lock = after_barrier = at_rearm = at_complete = at_consume = 0;
+	rdma_prepares = rdma_barriers = rdma_dones = rdma_ok = 0;
+	rdma_at_prepare = 0;
+	rdma_detach_at_prepare = B_FALSE;
 }
 
 static void
@@ -621,6 +664,63 @@ check_restart_failure(void)
 	}
 }
 
+/*
+ * With an RDMA peer, the child is taken offline before the reset and brought
+ * back after it, both with no lifecycle lock held, and its quarantined memory
+ * is released only past the reset barrier.
+ */
+static void
+check_rdma(void)
+{
+	static int peer;
+
+	reset();
+	device.ice_rdma = &peer;
+	device.ice_state = ICE_STATE_STARTED;
+	request(ICE_STATE_PFR_REQ);
+	run_one();
+	assert(rdma_prepares == 1 && rdma_barriers == 1 && rdma_dones == 1);
+	assert(rdma_ok && pfrs == 1 && starts == 1);
+
+	/* A request made while the child detaches joins this reset. */
+	reset();
+	device.ice_rdma = &peer;
+	request(ICE_STATE_PFR_REQ);
+	rdma_at_prepare = ICE_STATE_RESET_PENDING;
+	run_one();
+	assert(rdma_prepares == 1 && rdma_dones == 1 && queued == 0);
+	assert(global_waits == 1 && pfrs == 0);
+
+	/*
+	 * A failed rebuild keeps the child offline, and like the packet
+	 * buffers its quarantine is not released before the firmware check.
+	 */
+	reset();
+	device.ice_rdma = &peer;
+	fw_state = ICE_FW_RECOVERY;
+	request(ICE_STATE_PFR_REQ);
+	run_one();
+	assert(rdma_prepares == 1 && rdma_dones == 1 && !rdma_ok);
+	assert(rdma_barriers == 0);
+
+	/* Nothing owed: the peer is left alone. */
+	reset();
+	device.ice_rdma = &peer;
+	ice_reset_dispatch(&device);
+	run_one();
+	assert(rdma_prepares == 0 && rdma_dones == 0);
+
+	/* A detach that starts while the child goes offline wins. */
+	reset();
+	device.ice_rdma = &peer;
+	request(ICE_STATE_PFR_REQ);
+	rdma_detach_at_prepare = B_TRUE;
+	run_one();
+	assert(rdma_prepares == 1 && rdma_dones == 1 && !rdma_ok);
+	assert(prepared == 0 && pfrs == 0 && queued == 0);
+	assert((device.ice_state & ICE_STATE_PFR_REQ) != 0);
+}
+
 int
 main(void)
 {
@@ -631,6 +731,7 @@ main(void)
 	check_fw_recovery();
 	check_phy_fw();
 	check_restart_failure();
+	check_rdma();
 	(void) puts("PASS: ICE reset ownership and rebuild interleavings");
 	return (0);
 }
