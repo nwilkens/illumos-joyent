@@ -610,11 +610,16 @@ rdk_sg_to_pages(struct rdk_mr *mr, const ddi_dma_cookie_t *cookies, uint_t n,
 		do {
 			ret = set_page(mr, page_addr);
 			if (ret < 0) {
-				offset = prev_addr - cookies[i].dmac_laddress;
-				mr->length += prev_addr - dma_addr;
-				if (offset_p != NULL)
-					*offset_p = offset;
-				return (i != 0 || offset != 0 ? (int)i : ret);
+				/* The first page may start below dma_addr. */
+				uint64_t stop = MAX(prev_addr, dma_addr);
+
+				mr->length += stop - dma_addr;
+				if (offset_p != NULL) {
+					*offset_p = stop -
+					    cookies[i].dmac_laddress;
+				}
+				return (i != 0 || stop != dma_addr ? (int)i :
+				    ret);
 			}
 			prev_addr = page_addr;
 next_page:

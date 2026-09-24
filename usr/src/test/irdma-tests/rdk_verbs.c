@@ -26,6 +26,7 @@ typedef int boolean_t;
 typedef unsigned int uint_t;
 #define	B_TRUE	1
 #define	B_FALSE	0
+#define	MAX(a, b)	((a) > (b) ? (a) : (b))
 
 typedef struct {
 	uint64_t	dmac_laddress;
@@ -158,6 +159,17 @@ page_walk(void)
 	off = 0;
 	n = walk(c, 3, &off, 5, &mr);
 	assert(n == 2 && npages == 5 && off == PG && mr.length == 4 * PG);
+
+	/*
+	 * With an offset, the first page starts below the mapped range; a
+	 * list that fills after it maps nothing and leaves the length alone.
+	 */
+	off = 100;
+	n = walk(c, 3, &off, 1, &mr);
+	assert(n < 0 && off == 100 && mr.length == 0);
+	off = 100;
+	n = walk(c, 3, &off, 2, &mr);
+	assert(n == 1 && off == 0 && mr.length == 2 * PG - 100);
 
 	/* A cookie whose end wraps the address space is not mapped. */
 	c[1].dmac_laddress = UINT64_MAX - PG + 1;
