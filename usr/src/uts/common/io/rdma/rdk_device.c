@@ -284,8 +284,8 @@ rdk_unregister_device(struct rdk_device *dev)
 	while (p->rdp_nobjs != 0) {
 		if (cv_reltimedwait(&p->rdp_cv, &p->rdp_lock,
 		    SEC_TO_TICK(RDK_UNREG_WARN_SEC), TR_SEC) == -1) {
-			dev_err(dev->rd_dip, CE_WARN, "!%s: waiting for %llu "
-			    "RDMA objects to be destroyed", dev->rd_name,
+			dev_err(dev->rd_dip, CE_WARN, "!waiting for %llu RDMA "
+			    "objects to be destroyed",
 			    (u_longlong_t)p->rdp_nobjs);
 		}
 	}

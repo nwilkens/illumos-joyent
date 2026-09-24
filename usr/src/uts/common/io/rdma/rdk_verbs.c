@@ -154,8 +154,8 @@ rdk_dealloc_pd(struct rdk_pd *pd)
 	struct rdk_device *dev = pd->device;
 
 	if (pd->usecnt != 0) {
-		dev_err(dev->rd_dip, CE_WARN, "!%s: PD freed with %u users; "
-		    "leaking it", dev->rd_name, pd->usecnt);
+		dev_err(dev->rd_dip, CE_WARN, "!PD freed with %u users; "
+		    "leaking it", pd->usecnt);
 		return;
 	}
 	dev->rd_ops->dealloc_pd(pd);
@@ -203,8 +203,8 @@ rdk_destroy_cq(struct rdk_cq *cq)
 	struct rdk_device *dev = cq->device;
 
 	if (cq->usecnt != 0) {
-		dev_err(dev->rd_dip, CE_WARN, "!%s: CQ freed with %u QPs; "
-		    "leaking it", dev->rd_name, cq->usecnt);
+		dev_err(dev->rd_dip, CE_WARN, "!CQ freed with %u QPs; "
+		    "leaking it", cq->usecnt);
 		return;
 	}
 	dev->rd_ops->destroy_cq(cq);
@@ -757,11 +757,17 @@ rdk_drain_sq(struct rdk_qp *qp)
 	bzero(&attr, sizeof (attr));
 	attr.qp_state = RDK_QPS_ERR;
 	if ((ret = rdk_modify_qp(qp, &attr, RDK_QP_STATE)) != 0) {
-		dev_err(qp->device->rd_dip, CE_WARN, "!%s: QP %u: failed to "
-		    "drain the send queue: %d", qp->device->rd_name,
-		    qp->qp_num, ret);
+		dev_err(qp->device->rd_dip, CE_WARN, "!QP %u: failed to drain "
+		    "the send queue: %d", qp->qp_num, ret);
 		return;
 	}
+
+	/*
+	 * A datagram QP has no RDMA write to post and needs an AH to send;
+	 * moving it to the error state has flushed its send queue.
+	 */
+	if (qp->qp_type != RDK_QPT_RC)
+		return;
 
 	rdk_drain_init(&d);
 	bzero(&swr, sizeof (swr));
@@ -769,9 +775,8 @@ rdk_drain_sq(struct rdk_qp *qp)
 	swr.wr.opcode = RDK_WR_RDMA_WRITE;
 	swr.wr.send_flags = RDK_SEND_SIGNALED;
 	if ((ret = rdk_post_send(qp, &swr.wr, NULL)) != 0) {
-		dev_err(qp->device->rd_dip, CE_WARN, "!%s: QP %u: failed to "
-		    "drain the send queue: %d", qp->device->rd_name,
-		    qp->qp_num, ret);
+		dev_err(qp->device->rd_dip, CE_WARN, "!QP %u: failed to drain "
+		    "the send queue: %d", qp->qp_num, ret);
 	} else {
 		rdk_drain_wait(qp->send_cq, &d);
 	}
@@ -791,9 +796,8 @@ rdk_drain_rq(struct rdk_qp *qp)
 	bzero(&attr, sizeof (attr));
 	attr.qp_state = RDK_QPS_ERR;
 	if ((ret = rdk_modify_qp(qp, &attr, RDK_QP_STATE)) != 0) {
-		dev_err(qp->device->rd_dip, CE_WARN, "!%s: QP %u: failed to "
-		    "drain the receive queue: %d", qp->device->rd_name,
-		    qp->qp_num, ret);
+		dev_err(qp->device->rd_dip, CE_WARN, "!QP %u: failed to drain "
+		    "the receive queue: %d", qp->qp_num, ret);
 		return;
 	}
 
@@ -801,9 +805,8 @@ rdk_drain_rq(struct rdk_qp *qp)
 	bzero(&rwr, sizeof (rwr));
 	rwr.wr_cqe = &d.rdc_cqe;
 	if ((ret = rdk_post_recv(qp, &rwr, NULL)) != 0) {
-		dev_err(qp->device->rd_dip, CE_WARN, "!%s: QP %u: failed to "
-		    "drain the receive queue: %d", qp->device->rd_name,
-		    qp->qp_num, ret);
+		dev_err(qp->device->rd_dip, CE_WARN, "!QP %u: failed to drain "
+		    "the receive queue: %d", qp->qp_num, ret);
 	} else {
 		rdk_drain_wait(qp->recv_cq, &d);
 	}
