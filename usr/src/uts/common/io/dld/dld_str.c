@@ -537,7 +537,14 @@ dld_fini_ops(struct dev_ops *ops)
 	struct qinit *rq, *wq;
 	struct module_info *modinfo;
 
+	/*
+	 * mac_init_ops() skips dld_init_ops() when the driver has no major
+	 * number, and the driver's _init() then calls mac_fini_ops() after
+	 * mod_install() fails.
+	 */
 	stream = ops->devo_cb_ops->cb_str;
+	if (stream == NULL)
+		return;
 	rq = stream->st_rdinit;
 	wq = stream->st_wrinit;
 	modinfo = rq->qi_minfo;
