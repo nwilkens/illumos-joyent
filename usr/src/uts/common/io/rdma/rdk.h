@@ -758,6 +758,7 @@ extern int rdk_query_qp(struct rdk_qp *, struct rdk_qp_attr *, int,
 extern void rdk_destroy_qp(struct rdk_qp *);
 extern boolean_t rdk_modify_qp_is_ok(enum rdk_qp_state, enum rdk_qp_state,
     enum rdk_qp_type, int);
+/* A QP's drain and its destroy must not run at the same time. */
 extern void rdk_drain_qp(struct rdk_qp *);
 extern void rdk_drain_sq(struct rdk_qp *);
 extern void rdk_drain_rq(struct rdk_qp *);

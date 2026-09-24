@@ -735,6 +735,7 @@ rdk_drain_reap(struct rdk_qp *qp)
 	boolean_t undone;
 
 	d = atomic_swap_ptr(&qp->drain_orphans, NULL);
+	membar_consumer();
 	for (; d != NULL; d = next) {
 		next = d->rdc_next;
 		mutex_enter(&d->rdc_lock);
@@ -762,6 +763,7 @@ rdk_drain_orphan(struct rdk_qp *qp, rdk_drain_cqe_t *d)
 	do {
 		old = qp->drain_orphans;
 		d->rdc_next = old;
+		membar_producer();
 	} while (atomic_cas_ptr(&qp->drain_orphans, old, d) != old);
 }
 
