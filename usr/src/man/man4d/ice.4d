@@ -276,10 +276,13 @@ blocked transmits, LSO packets, and the reasons for refused offload requests
 .Sy tx_hck_nol3 ,
 .Sy tx_hck_nol4 ,
 .Sy tx_hck_badl4 ,
-.Sy tx_lso_nohck ,
 .Sy tx_lso_badhdr ,
 and
 .Sy tx_lso_badmss .
+.Sy tx_lso_nohck
+counts LSO packets that arrived without checksum offload, which the driver
+segments and checksums in software.
+IP can send these while it renegotiates the offloads of an interface.
 .El
 .Sh FAULT MANAGEMENT
 The driver checks register and DMA access with the fault management

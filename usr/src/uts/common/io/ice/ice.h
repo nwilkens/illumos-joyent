@@ -337,7 +337,6 @@ typedef enum ice_tx_hck_drop {
 	ICE_TX_HCK_NOL3,	/* no usable L2/L3 metadata */
 	ICE_TX_HCK_NOL4,	/* no usable L4 metadata */
 	ICE_TX_HCK_BADL4,	/* L4 protocol the hardware cannot sum */
-	ICE_TX_LSO_NOHCK,	/* LSO without the checksum offload it needs */
 	ICE_TX_LSO_BADHDR,	/* LSO headers unusable for segmentation */
 	ICE_TX_LSO_BADMSS	/* MSS outside the hardware range */
 } ice_tx_hck_drop_t;

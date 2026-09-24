@@ -40,13 +40,13 @@ def main() -> None:
     assert arm < recycle < exit_
 
     # the caller still keeps the chain for MAC to retry
-    assert "return (B_FALSE);" in nores
+    assert "return (ICE_TX_ONE_FULL);" in nores
     # completed packets are freed once the ring lock is dropped
     assert exit_ < nores.index("ice_tx_done(itr, done)")
 
     # a drop that returns resources rewakes a ring another sender blocked
     drop = build[build.index("if (res == ICE_TX_BUILD_DROP)"):]
-    drop = drop[:drop.index("return (B_TRUE);")]
+    drop = drop[:drop.index("return (ICE_TX_ONE_DONE);")]
     assert drop.index("mutex_enter(&itr->itxr_lock)") < \
         drop.index("if (itr->itxr_blocked)") < \
         drop.index("ice_tx_recycle(itr, &done, B_TRUE)") < \
@@ -75,7 +75,7 @@ def main() -> None:
     rec = function(
         tx,
         "ice_tx_recycle(ice_tx_ring_t *itr, ice_tx_ctrl_block_t **donep, boolean_t wake)\n{",
-        "\nstatic boolean_t\nice_tx_one",
+        "\n/* What ice_tx_one() did with a packet. */",
     )
     assert rec.count("mac_tx_ring_update(") == 2
     assert rec.count("itr->itxr_blocked = B_FALSE") == 2

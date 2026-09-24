@@ -76,6 +76,7 @@ TESTS = (
     "tx_emit.py",
     "tx_frame_limit.py",
     "tx_quiesce.py",
+    "tx_swlso.py",
     "viona_tx_guards.py",
     "vlan_rx.py",
     "vsi_replay.py",

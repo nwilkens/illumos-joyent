@@ -272,6 +272,21 @@ MSS values from 64 through 87 are rejected: the datasheet (10.5.8.4.4) makes
 an MSS below 88 a malicious-driver event, and an earlier minimum of 64 let
 those requests reach the queue.
 
+While IP renegotiates an interface's offloads (unplumb, or an aggregation
+port change), it clears the checksum capability before LSO and can send an
+LSO packet whose checksums it computed in software over the whole packet.
+The hardware cannot segment it: TSO writes the checksums, and the TCP field
+holds no pseudo-header sum. `ice_tx_context()` returns `ICE_TX_BUILD_SWLSO`
+for such a packet once it passes every check the hardware path makes, and a
+datagram larger than `IP_MAXPACKET` is refused. `tx_swlso.py` runs the actual
+`ice_tx_swlso()` against a controlled `mac_hw_emul()`: the packet is marked
+for full software checksums (and the IPv4 header checksum) with the MSS kept,
+a packet of one segment's payload is only checksummed (`mac_sw_lso()` drops
+it), the segments carry no offload request and precede the rest of the chain, the
+`tx_lso_nohck` counter records each such packet, and one that cannot be
+segmented counts as a drop. It also checks that the send loop gives the
+unconsumed packet to the fallback after the LSO-enable and MTU checks.
+
 Use `--source /path/to/ice_tx.c` to run the same regression against an earlier
 implementation. The reviewed baseline fails the small-MSS case. The test does
 not emulate the NIC or establish wire checksum correctness. LSO is on by

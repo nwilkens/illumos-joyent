@@ -144,11 +144,42 @@ check_protocol(boolean_t ipv6)
 	assert(ctx.itc_data_cmd == (ipv6 ? 0x120 : 0x160));
 	assert(ctx.itc_data_off == (ipv6 ? 0x14507 : 0x14287));
 
-	/* Invalid requests must not turn into ordinary transmission. */
-	mp = packet(ipv6, 128, 63);
+	/*
+	 * An LSO request without checksum offload, which IP sends while it
+	 * renegotiates offloads, goes to software segmentation, but only once
+	 * it passes every check the hardware path makes.
+	 */
+	mp = packet(ipv6, 1500, 1000);
+	mp.checksum_flags = 0;
+	assert(context(&mp, &ctx) == ICE_TX_BUILD_SWLSO);
+	assert(ctx.itc_use_ctx && ctx.itc_drop == ICE_TX_HCK_NONE);
+	assert(ctx.itc_mss == 1000 && ctx.itc_hdrlen == (ipv6 ? 74 : 54));
+	mp = packet(ipv6, 1500, 1000);
+	mp.checksum_flags = HCK_PARTIALCKSUM;
+	assert(context(&mp, &ctx) ==
+	    (ipv6 ? ICE_TX_BUILD_OK : ICE_TX_BUILD_SWLSO));
+	mp = packet(ipv6, 1500, 1000);
+	mp.checksum_flags = HCK_IPV4_HDRCKSUM;
+	assert(context(&mp, &ctx) == (ipv6 ? ICE_TX_BUILD_DROP :
+	    ICE_TX_BUILD_SWLSO));
+	mp = packet(ipv6, 1500, 63);
 	mp.checksum_flags = 0;
 	assert(context(&mp, &ctx) == ICE_TX_BUILD_DROP);
-	assert(ctx.itc_drop == ICE_TX_LSO_NOHCK);
+	assert(ctx.itc_drop == ICE_TX_LSO_BADMSS);
+	mp = packet(ipv6, ipv6 ? 74 : 54, 1000);
+	mp.checksum_flags = 0;
+	assert(context(&mp, &ctx) == ICE_TX_BUILD_DROP);
+	assert(ctx.itc_drop == ICE_TX_LSO_BADHDR);
+	/* Software segmentation takes no more than an IP datagram. */
+	mp = packet(ipv6, 14 + IP_MAXPACKET + 1, 1000);
+	mp.checksum_flags = 0;
+	assert(context(&mp, &ctx) == ICE_TX_BUILD_DROP);
+	assert(ctx.itc_drop == ICE_TX_LSO_BADHDR);
+	mp = packet(ipv6, 14 + IP_MAXPACKET, 1000);
+	mp.checksum_flags = 0;
+	assert(context(&mp, &ctx) == ICE_TX_BUILD_SWLSO);
+
+	/* Invalid requests must not turn into ordinary transmission. */
 	mp = packet(ipv6, ipv6 ? 74 : 54, 63);
 	assert(context(&mp, &ctx) == ICE_TX_BUILD_DROP);
 	assert(ctx.itc_drop == ICE_TX_LSO_BADHDR);
@@ -186,6 +217,7 @@ main(void)
 {
 	check_protocol(B_FALSE);
 	check_protocol(B_TRUE);
-	(void) puts("PASS: ICE LSO MSS rejection and IPv4/IPv6 contexts");
+	(void) puts("PASS: ICE LSO MSS rejection, software segmentation, and "
+	    "IPv4/IPv6 contexts");
 	return (0);
 }

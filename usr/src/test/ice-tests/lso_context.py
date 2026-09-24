@@ -32,6 +32,7 @@ def main() -> None:
         (DRIVER / "core/ice_defs.h", ("ICE_BYTES_PER_WORD", "ICE_BYTES_PER_DWORD")),
         (REPO / "usr/src/uts/common/sys/pattr.h",
          ("HCK_IPV4_HDRCKSUM", "HCK_PARTIALCKSUM", "HW_LSO")),
+        (REPO / "usr/src/uts/common/netinet/ip.h", ("IP_MAXPACKET",)),
     )
     for path, names in definitions:
         for name in names:

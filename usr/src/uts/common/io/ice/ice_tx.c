@@ -30,7 +30,9 @@
 #include <sys/strsun.h>
 #include <sys/pattr.h>
 #include <sys/ethernet.h>
+#include <sys/mac_client.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 
 #include "ice.h"
 #include "ice_common.h"
@@ -504,12 +506,14 @@ ice_tx_ring_unprogram(ice_t *ice, ice_tx_ring_t *itr)
  * Outcome of assembling a packet's TCB chain.  NORES is transient (no buffers
  * or descriptors right now) and the packet should be retried; DROP means the
  * packet can never be sent on this configuration and must be discarded.
+ * SWLSO is an LSO packet that must be segmented in software first.
  */
 typedef enum ice_tx_build {
 	ICE_TX_BUILD_OK,
 	ICE_TX_BUILD_NORES,
 	ICE_TX_BUILD_DROP,
-	ICE_TX_BUILD_PULLUP
+	ICE_TX_BUILD_PULLUP,
+	ICE_TX_BUILD_SWLSO
 } ice_tx_build_t;
 
 static inline uint16_t
@@ -1036,11 +1040,6 @@ ice_tx_context(mblk_t *mp, ice_tx_ctx_t *ctx)
 	if ((lsoflags & HW_LSO) == 0)
 		return (ICE_TX_BUILD_OK);
 
-	if ((chkflags & HCK_PARTIALCKSUM) == 0 ||
-	    (meo.meoi_l3proto == ETHERTYPE_IP &&
-	    (chkflags & HCK_IPV4_HDRCKSUM) == 0))
-		return (ice_tx_context_drop(ctx, ICE_TX_LSO_NOHCK));
-
 	if ((meo.meoi_flags & (l23 | MEOI_L4INFO_SET)) !=
 	    (l23 | MEOI_L4INFO_SET) ||
 	    (meo.meoi_l3proto != ETHERTYPE_IP &&
@@ -1072,6 +1071,20 @@ ice_tx_context(mblk_t *mp, ice_tx_ctx_t *ctx)
 	ctx->itc_tsolen = (uint32_t)tsolen;
 	ctx->itc_hdrlen = (uint32_t)hdrlen;
 	ASSERT3U(ctx->itc_mss, <=, ICE_TXD_CTX_MAX_MSS);
+
+	/*
+	 * IP can checksum an LSO packet in software while it renegotiates the
+	 * offloads.  TSO needs a pseudo-header sum in the TCP checksum field,
+	 * so such a packet is segmented in software (ice_tx_swlso()).
+	 */
+	if ((chkflags & HCK_PARTIALCKSUM) == 0 ||
+	    (meo.meoi_l3proto == ETHERTYPE_IP &&
+	    (chkflags & HCK_IPV4_HDRCKSUM) == 0)) {
+		/* mac_hw_emul() takes no more than an IP datagram. */
+		if (meo.meoi_len - meo.meoi_l2hlen > IP_MAXPACKET)
+			return (ice_tx_context_drop(ctx, ICE_TX_LSO_BADHDR));
+		return (ICE_TX_BUILD_SWLSO);
+	}
 
 	return (ICE_TX_BUILD_OK);
 }
@@ -1750,9 +1763,6 @@ ice_tx_count_drop(ice_tx_ring_t *itr, const ice_tx_ctx_t *ctx)
 	case ICE_TX_HCK_BADL4:
 		st->ictxs_hck_badl4.value.ui64++;
 		break;
-	case ICE_TX_LSO_NOHCK:
-		st->ictxs_lso_nohck.value.ui64++;
-		break;
 	case ICE_TX_LSO_BADHDR:
 		st->ictxs_lso_badhdr.value.ui64++;
 		break;
@@ -1764,12 +1774,18 @@ ice_tx_count_drop(ice_tx_ring_t *itr, const ice_tx_ctx_t *ctx)
 	}
 }
 
+/* What ice_tx_one() did with a packet. */
+typedef enum ice_tx_one {
+	ICE_TX_ONE_DONE,	/* placed on the ring or dropped */
+	ICE_TX_ONE_FULL,	/* not taken; return it to MAC */
+	ICE_TX_ONE_SWLSO	/* not taken; segment it in software */
+} ice_tx_one_t;
+
 /*
- * Transmit a single packet.  Returns B_TRUE if the packet was placed on the
- * ring (mp consumed/retained), B_FALSE if the ring is full and the caller must
- * back off (mp left intact for the caller to return to MAC).
+ * Transmit a single packet.  Only ICE_TX_ONE_DONE consumes mp; otherwise the
+ * caller still owns it.
  */
-static boolean_t
+static ice_tx_one_t
 ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 {
 	ice_t *ice = itr->itxr_ice;
@@ -1784,18 +1800,20 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 	msglen = msgdsize(mp);
 
 	res = ice_tx_context(mp, &ctx);
-	if (res == ICE_TX_BUILD_OK && ctx.itc_use_ctx &&
-	    !ice->ice_tx_lso_enable)
+	if ((res == ICE_TX_BUILD_OK || res == ICE_TX_BUILD_SWLSO) &&
+	    ctx.itc_use_ctx && !ice->ice_tx_lso_enable)
 		res = ICE_TX_BUILD_DROP;
-	if (res == ICE_TX_BUILD_OK &&
+	if ((res == ICE_TX_BUILD_OK || res == ICE_TX_BUILD_SWLSO) &&
 	    !ice_tx_frame_fits(ice->ice_mtu, &ctx, msglen)) {
 		itr->itxr_stats.ictxs_oversize_drops.value.ui64++;
 		res = ICE_TX_BUILD_DROP;
 	}
+	if (res == ICE_TX_BUILD_SWLSO)
+		return (ICE_TX_ONE_SWLSO);
 	if (res != ICE_TX_BUILD_OK) {
 		freemsg(mp);
 		ice_tx_count_drop(itr, &ctx);
-		return (B_TRUE);
+		return (ICE_TX_ONE_DONE);
 	}
 
 	if (ctx.itc_use_ctx) {
@@ -1830,7 +1848,7 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 		(void) ice_tx_recycle(itr, &done, B_TRUE);
 		mutex_exit(&itr->itxr_lock);
 		ice_tx_done(itr, done);
-		return (B_FALSE);
+		return (ICE_TX_ONE_FULL);
 	}
 	if (res == ICE_TX_BUILD_DROP) {
 		/* Undeliverable (too large to copy, unbindable); drop it. */
@@ -1848,7 +1866,7 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 			(void) ice_tx_recycle(itr, &done, B_TRUE);
 		mutex_exit(&itr->itxr_lock);
 		ice_tx_done(itr, done);
-		return (B_TRUE);
+		return (ICE_TX_ONE_DONE);
 	}
 	ASSERT3U(res, ==, ICE_TX_BUILD_OK);
 
@@ -1866,7 +1884,7 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 			ice_tx_free_tcbs(itr, tcbs, ntcb);
 			if (txmp != mp)
 				freemsg(txmp);
-			return (B_FALSE);
+			return (ICE_TX_ONE_FULL);
 		}
 	}
 
@@ -1884,7 +1902,7 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 		freemsg(txmp);
 		if (txmp != mp)
 			freemsg(mp);
-		return (B_TRUE);
+		return (ICE_TX_ONE_DONE);
 	}
 
 	itr->itxr_stats.ictxs_bytes.value.ui64 += msglen;
@@ -1898,7 +1916,53 @@ ice_tx_one(ice_tx_ring_t *itr, mblk_t *mp)
 	if (txmp != mp)
 		freemsg(mp);
 
-	return (B_TRUE);
+	return (ICE_TX_ONE_DONE);
+}
+
+/*
+ * Segment an LSO packet that arrived without checksum offload (see
+ * ice_tx_context()) and compute each segment's checksums, and return the
+ * segments followed by next.  A packet mac_hw_emul() cannot segment is
+ * dropped there.
+ */
+static mblk_t *
+ice_tx_swlso(ice_tx_ring_t *itr, mblk_t *mp, mblk_t *next)
+{
+	mac_ether_offload_info_t meo;
+	mac_emul_t emul = MAC_HWCKSUM_EMULS;
+	uint32_t flags = HCK_FULLCKSUM;
+	uint32_t mss = 0, lsoflags;
+	mblk_t *seg, *tail = NULL;
+
+	mac_ether_offload_info(mp, &meo);
+	mac_lso_get(mp, &mss, &lsoflags);
+	if (meo.meoi_l3proto == ETHERTYPE_IP)
+		flags |= HCK_IPV4_HDRCKSUM;
+	/* mac_sw_lso() drops a packet that makes one segment. */
+	if (meo.meoi_len - meo.meoi_l2hlen - meo.meoi_l3hlen -
+	    meo.meoi_l4hlen > mss) {
+		flags |= HW_LSO;
+		emul |= MAC_LSO_EMUL;
+	}
+	/* This keeps the MSS, which is stored apart from the flags. */
+	mac_hcksum_set(mp, 0, 0, 0, 0, flags);
+	mac_hw_emul(&mp, &tail, NULL, emul);
+
+	mutex_enter(&itr->itxr_lock);
+	itr->itxr_stats.ictxs_lso_nohck.value.ui64++;
+	if (mp == NULL) {
+		itr->itxr_stats.ictxs_drops.value.ui64++;
+		itr->itxr_stats.ictxs_lso_drops.value.ui64++;
+	}
+	mutex_exit(&itr->itxr_lock);
+	if (mp == NULL)
+		return (next);
+
+	/* The checksums are final; the segments ask the hardware for none. */
+	for (seg = mp; seg != NULL; seg = seg->b_next)
+		mac_hcksum_set(seg, 0, 0, 0, 0, 0);
+	tail->b_next = next;
+	return (mp);
 }
 
 /*
@@ -1933,14 +1997,17 @@ ice_ring_tx(void *arg, mblk_t *mp)
 
 	while (mp != NULL) {
 		mblk_t *next = mp->b_next;
+		ice_tx_one_t res;
 
 		mp->b_next = NULL;
-		if (!ice_tx_one(itr, mp)) {
+		res = ice_tx_one(itr, mp);
+		if (res == ICE_TX_ONE_FULL) {
 			/* Ring full: return this and the rest to MAC. */
 			mp->b_next = next;
 			break;
 		}
-		mp = next;
+		mp = (res == ICE_TX_ONE_SWLSO) ? ice_tx_swlso(itr, mp, next) :
+		    next;
 	}
 
 	/* Every exit, a full ring included, must post what this call wrote. */
