@@ -45,7 +45,7 @@ typedef struct ice {
 	uint32_t ice_state;
 	uint32_t ice_acc_errors, ice_acc_clears;
 	uint32_t ice_attach_progress;
-	boolean_t ice_detaching;
+	boolean_t ice_detaching, ice_irm_busy;
 } ice_t;
 
 static ice_t device;
@@ -319,6 +319,14 @@ main(void)
 	assert(!fixture.tx_closed && !fixture.rx_closed);
 	failed();
 
+	/* An interrupt change swapping MAC's ring handles defers detach. */
+	init();
+	device.ice_irm_busy = B_TRUE;
+	assert(ice_detach(NULL, DDI_DETACH) == DDI_FAILURE);
+	assert(fixture.disables == 0 && fixture.unregisters == 0);
+	assert(!fixture.tx_closed && !fixture.rx_closed);
+	failed();
+
 	/* Queue stop suffices without resetting healthy hardware. */
 	init();
 	assert(ice_detach(NULL, DDI_DETACH) == DDI_SUCCESS);
@@ -409,6 +417,6 @@ main(void)
 	assert(fixture.resets == 1 && fixture.reclaims == 0);
 	failed();
 
-	(void) puts("detach quiescence: PASS (14 scenarios)");
+	(void) puts("detach quiescence: PASS (15 scenarios)");
 	return (0);
 }

@@ -252,13 +252,7 @@ ice_tx_ring_alloc(ice_t *ice, ice_tx_ring_t *itr, uint_t index)
 	 */
 	itr->itxr_index = index;
 
-	/*
-	 * Vector 0 is the OICR; queue vectors begin at 1.  A simple 1:1 map,
-	 * capped so queues beyond the vector count share the last vector.
-	 */
-	itr->itxr_vec = 1 + index;
-	if (itr->itxr_vec >= (uint32_t)ice->ice_intr_count)
-		itr->itxr_vec = ice->ice_intr_count - 1;
+	itr->itxr_vec = ice_ring_vector(ice, index);
 
 	itr->itxr_size = ice->ice_tx_ring_size != 0 ?
 	    ice->ice_tx_ring_size : ICE_DEF_TX_RING_SIZE;

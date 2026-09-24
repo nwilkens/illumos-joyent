@@ -139,7 +139,13 @@ def main() -> None:
         "ice_intr_queue(ice_t *ice, uint_t vector)\n{",
         "\nuint_t\nice_intr_msix",
     )
-    assert "uint_t idx = vector - 1;" in queue_isr
+    # The ISR indexes the rings mapped to its vector instead of scanning.
+    assert "for (idx = vector - 1; idx < nrings; idx += stride)" in queue_isr
+    assert "stride = (uint_t)ice->ice_intr_count - 1" in queue_isr
+    vector = function(intr_source,
+                      "ice_ring_vector(const ice_t *ice, uint_t index)\n{",
+                      "\n}\n")
+    assert "1 + index % (uint32_t)(ice->ice_intr_count - 1)" in vector
     assert "ice->ice_rxr[idx]" in queue_isr
     assert "ice->ice_txr[idx]" in queue_isr
     assert "idx < ice->ice_num_rxr" in queue_isr

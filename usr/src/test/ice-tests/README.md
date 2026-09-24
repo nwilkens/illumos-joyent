@@ -228,9 +228,9 @@ python3 usr/src/test/ice-tests/detach_quiesce.py
 ```
 
 This compiles the actual detach, FMA observer, reset redispatch, and MAC-start
-functions. Fourteen scenarios cover the hardware barrier before unregister,
-resource retention on failure, the bounded RX fence, start admission, and FMA
-errors consumed by another observer. `--source` selects an older detach body
+functions. Fifteen scenarios cover the hardware barrier before unregister,
+resource retention on failure, the bounded RX fence, start admission, an
+interrupt change in progress, and FMA errors consumed by another observer. `--source` selects an older detach body
 while retaining the current FMA boundary; `--gld-source` selects the start
 callback. The test stubs hardware and atomics and does not prove live DMA or
 CPU memory ordering.
@@ -396,13 +396,28 @@ management callback (`ddi_cb_register(DDI_CB_FLAG_INTR)`), which left the
 driver 7 queue pairs. `intr_irm.py` compiles the actual `ice_alloc_intrs()`,
 `ice_free_intrs()` and the callback against a model of that limit. With the
 callback the default 16 queue pairs get 17 vectors; if registration fails the
-driver logs it and runs with 7. The callback declines offers and reclaims,
-so the driver keeps its vectors as a driver without a callback does; a
-partial grant cuts the request to the grant with `ddi_intr_set_nreq()`, so
-IRM does not hold back vectors for an offer the driver would decline.
-Every failure after registration unregisters, and teardown frees the vectors
-before it unregisters. The source check requires the registration to precede
-the first vector count.
+driver logs it and runs with 7. A partial grant keeps the full request, so
+IRM can offer the rest later. Every failure after registration unregisters,
+and teardown frees the vectors before it unregisters.
+
+The test then drives the actual callback, `ice_intr_adjust()`, the ring map
+and the queue interrupt handler through reclaims and offers. A reclaim of 9 of
+17 vectors folds the 16 rings onto 7 queue vectors; an offer spreads them
+back to one each and never past what the rings can use; a reclaim may not
+take vector 0 or the last queue vector. After every change each ring names an
+allocated vector other than 0, each vector's handler services exactly the rx
+and tx rings mapped to it, a limit hit on any of them requests a refire, the
+freed vectors have no handler, and MAC holds each ring's current handle. MAC's
+handles are cleared and restored with no driver lock held. A started
+datapath is paused and restarted around the change; one that owes a reset,
+whose queues did not stop, or that fails to restart is only rerouted and left
+fail-closed. An offer that fails or comes at another interrupt priority
+changes nothing. Attach, detach and a change already in progress are
+refused. A terminally failed instance gives vectors back but takes none, and
+handlers that cannot be restored leave the instance fail-closed. The source
+checks require the registration to precede the first vector count, the
+lifecycle lock to outlive the registration, and detach to refuse while a
+change is in progress.
 
 ## Firmware command lock check
 

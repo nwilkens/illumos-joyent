@@ -122,6 +122,29 @@ ice_fill_tx_ring(void *arg, mac_ring_type_t rtype, const int group_index,
 	}
 }
 
+/*
+ * Give MAC each ring's interrupt handle, or none while the vectors change.
+ * mac_ring_intr_set() takes the MAC perimeter, so no driver lock is held.
+ */
+void
+ice_mac_intr_set(ice_t *ice, boolean_t set)
+{
+	uint_t i;
+
+	for (i = 0; i < ice->ice_num_rxr; i++) {
+		ice_rx_ring_t *rxr = &ice->ice_rxr[i];
+
+		mac_ring_intr_set(rxr->irxr_macrxring, set ?
+		    ice->ice_intr_handles[rxr->irxr_vec] : NULL);
+	}
+	for (i = 0; i < ice->ice_num_txr; i++) {
+		ice_tx_ring_t *txr = &ice->ice_txr[i];
+
+		mac_ring_intr_set(txr->itxr_mactxring, set ?
+		    ice->ice_intr_handles[txr->itxr_vec] : NULL);
+	}
+}
+
 static void
 ice_fill_group(void *arg, mac_ring_type_t rtype, const int index,
     mac_group_info_t *infop, mac_group_handle_t gh)
@@ -644,6 +667,20 @@ ice_m_setprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 		atomic_or_32(&ice->ice_state, ICE_STATE_PFR_REQ);
 		ice_reset_dispatch(ice);
 		return (0);
+	}
+	/*
+	 * "_irm=-N" and "_irm=N" run the interrupt resource management
+	 * reclaim and offer of N vectors, which IRM itself rarely sends.
+	 */
+	if (pr_num == MAC_PROP_PRIVATE && strcmp(pr_name, "_irm") == 0) {
+		long n;
+
+		if (ddi_strtol(pr_val, NULL, 10, &n) != 0 || n == 0 ||
+		    n < -ICE_HW_MAX_MSIX || n > ICE_HW_MAX_MSIX)
+			return (EINVAL);
+		return (ice_intr_adjust(ice, n < 0 ? DDI_CB_INTR_REMOVE :
+		    DDI_CB_INTR_ADD, (int)(n < 0 ? -n : n)) == DDI_SUCCESS ?
+		    0 : EIO);
 	}
 #else
 	_NOTE(ARGUNUSED(pr_name));

@@ -262,7 +262,7 @@ typedef enum ice_attach_state {
 	ICE_ATTACH_ALLOC_INTR	= 1 << 5,
 	ICE_ATTACH_ADD_INTR	= 1 << 6,
 	ICE_ATTACH_OICR_TASKQ	= 1 << 7,
-	ICE_ATTACH_RESET_TASKQ	= 1 << 8,	/* reset taskq + rebuild lock */
+	ICE_ATTACH_RESET_TASKQ	= 1 << 8,	/* reset taskq */
 	ICE_ATTACH_ENABLE_INTR	= 1 << 9,
 	ICE_ATTACH_VSI		= 1 << 10,
 	ICE_ATTACH_RINGS	= 1 << 11,	/* ring DMA allocated */
@@ -626,6 +626,7 @@ typedef struct ice {
 	size_t			ice_intr_size;
 	ddi_intr_handle_t	*ice_intr_handles;
 	ddi_cb_handle_t		ice_intr_cb;	/* IRM registration */
+	boolean_t		ice_irm_busy;	/* ice_rebuild_lock */
 	uint16_t		ice_nqueues;
 
 	/* OICR deferred async work; thread context, serialized via ice_lock. */
@@ -781,11 +782,14 @@ extern boolean_t ice_alloc_intrs(ice_t *);
 extern void ice_free_intrs(ice_t *);
 extern boolean_t ice_add_intr_handlers(ice_t *);
 extern void ice_rem_intr_handlers(ice_t *);
+extern int ice_intr_adjust(ice_t *, ddi_cb_action_t, int);
 
 /*
  * ice_intr.c
  */
 extern uint_t ice_intr_msix(caddr_t, caddr_t);
+extern uint32_t ice_ring_vector(const ice_t *, uint_t);
+extern void ice_intr_rings_map(ice_t *);
 extern boolean_t ice_intr_enable(ice_t *);
 extern void ice_intr_disable(ice_t *);
 extern void ice_intr_oicr_setup(ice_t *, boolean_t);
@@ -912,6 +916,7 @@ extern int ice_ring_rx_intr_disable(mac_intr_handle_t);
  */
 extern boolean_t ice_mac_register(ice_t *);
 extern int ice_mac_unregister(ice_t *);
+extern void ice_mac_intr_set(ice_t *, boolean_t);
 extern void ice_link_state_publish(ice_t *);
 extern link_state_t ice_link_state_effective(ice_t *, link_state_t);
 

@@ -151,14 +151,7 @@ ice_rx_ring_alloc(ice_t *ice, ice_rx_ring_t *irr, uint_t index)
 	/* Absolute HW rx queue index; the single PF VSI's queues start at 0. */
 	irr->irxr_index = index;
 
-	/*
-	 * MSI-X vector 0 is the OICR; queue vectors begin at 1.  A 1:1 mapping
-	 * is used while there are at least as many vectors as rings; otherwise
-	 * the last vector absorbs the overflow.
-	 */
-	irr->irxr_vec = 1 + index;
-	if (irr->irxr_vec >= (uint32_t)ice->ice_intr_count)
-		irr->irxr_vec = ice->ice_intr_count - 1;
+	irr->irxr_vec = ice_ring_vector(ice, index);
 
 	irr->irxr_size = ice->ice_rx_ring_size;
 	irr->irxr_dbuf = ICE_RX_BUF_SIZE;

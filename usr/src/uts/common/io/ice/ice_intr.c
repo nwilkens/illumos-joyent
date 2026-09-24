@@ -957,41 +957,77 @@ rearm:
 	return (DDI_INTR_CLAIMED);
 }
 
+/*
+ * Queue pair i is served by vector 1 + i modulo the queue vectors.  Until
+ * interrupt resource management takes vectors away there is one per pair.
+ */
+uint32_t
+ice_ring_vector(const ice_t *ice, uint_t index)
+{
+	ASSERT3S(ice->ice_intr_count, >=, ICE_INTR_MSIX_MIN);
+	return (1 + index % (uint32_t)(ice->ice_intr_count - 1));
+}
+
+/*
+ * Point every ring at its vector for the current count.  The handlers are
+ * removed while the count changes; MAC's poll callbacks read irxr_vec under
+ * the ring lock.
+ */
+void
+ice_intr_rings_map(ice_t *ice)
+{
+	uint_t i;
+
+	for (i = 0; i < ice->ice_num_txr; i++)
+		ice->ice_txr[i].itxr_vec = ice_ring_vector(ice, i);
+	for (i = 0; i < ice->ice_num_rxr; i++) {
+		ice_rx_ring_t *irr = &ice->ice_rxr[i];
+
+		mutex_enter(&irr->irxr_lock);
+		irr->irxr_vec = ice_ring_vector(ice, i);
+		mutex_exit(&irr->irxr_lock);
+	}
+}
+
 static uint_t
 ice_intr_queue(ice_t *ice, uint_t vector)
 {
 	struct ice_hw *hw = &ice->ice_hw;
-	uint_t idx = vector - 1;
+	const uint_t stride = (uint_t)ice->ice_intr_count - 1;
+	const uint_t nrings = MAX(ice->ice_num_rxr, ice->ice_num_txr);
 	uint32_t dyn_ctl = ICE_GLINT_DYN_CTL_REARM;
+	uint_t idx;
 
 	/*
-	 * Data queue i (rx and tx) is wired to vector i + 1 (ice_rx.c,
-	 * ice_tx.c) and ice_nqueues never exceeds ice_intr_count - 1, so the
-	 * firing vector maps directly to ring index vector - 1.  Indexing
-	 * instead of scanning every ring keeps each ISR off the other queues'
-	 * cache lines.  Vector 0 (OICR) never reaches here.  Rx delivery is
-	 * suppressed while mac polls the ring (ice_rx_ring_intr).
+	 * Walk the rings ice_ring_vector() maps to this vector: one, unless
+	 * vectors were taken away.  Indexing instead of scanning every ring
+	 * keeps each ISR off the other queues' cache lines.  Vector 0 (OICR)
+	 * never reaches here.  Rx delivery is suppressed while mac polls the
+	 * ring (ice_rx_ring_intr).
 	 */
-	if (idx < ice->ice_num_rxr &&
-	    ice_rx_ring_intr(&ice->ice_rxr[idx])) {
-		/*
-		 * The rx drain yielded at ice_rx_limit_per_intr with frames
-		 * still ready.  Hardware consumed their events when it wrote
-		 * the descriptors back, so a plain re-arm would strand the
-		 * residue until new traffic arrives (datasheet 9.1.2.6
-		 * prescribes a software interrupt for this).  SW_ITR_INDX
-		 * selects the queues' ITR slot rather than No-ITR so the
-		 * refire train is paced, not immediate.  If mac switches the
-		 * ring to poll mode first, the refire finds irxr_intr_poll
-		 * set and no-ops.
-		 */
-		dyn_ctl |= GLINT_DYN_CTL_SWINT_TRIG_M |
-		    GLINT_DYN_CTL_SW_ITR_INDX_ENA_M |
-		    ((ICE_ITR_IDX_0 << GLINT_DYN_CTL_SW_ITR_INDX_S) &
-		    GLINT_DYN_CTL_SW_ITR_INDX_M);
+	for (idx = vector - 1; idx < nrings; idx += stride) {
+		if (idx < ice->ice_num_rxr &&
+		    ice_rx_ring_intr(&ice->ice_rxr[idx])) {
+			/*
+			 * The rx drain yielded at ice_rx_limit_per_intr with
+			 * frames still ready.  Hardware consumed their events
+			 * when it wrote the descriptors back, so a plain
+			 * re-arm would strand the residue until new traffic
+			 * arrives (datasheet 9.1.2.6 prescribes a software
+			 * interrupt for this).  SW_ITR_INDX selects the
+			 * queues' ITR slot rather than No-ITR so the refire
+			 * train is paced, not immediate.  If mac switches the
+			 * ring to poll mode first, the refire finds
+			 * irxr_intr_poll set and no-ops.
+			 */
+			dyn_ctl |= GLINT_DYN_CTL_SWINT_TRIG_M |
+			    GLINT_DYN_CTL_SW_ITR_INDX_ENA_M |
+			    ((ICE_ITR_IDX_0 << GLINT_DYN_CTL_SW_ITR_INDX_S) &
+			    GLINT_DYN_CTL_SW_ITR_INDX_M);
+		}
+		if (idx < ice->ice_num_txr)
+			ice_tx_ring_intr(&ice->ice_txr[idx]);
 	}
-	if (idx < ice->ice_num_txr)
-		ice_tx_ring_intr(&ice->ice_txr[idx]);
 
 	wr32(hw, GLINT_DYN_CTL(vector), dyn_ctl);
 	ice_flush(hw);

@@ -174,7 +174,9 @@
  * vector, and the num_queues property.  That property defaults to 16 and is
  * clamped to 1 through MAX_RINGS_PER_GROUP - 1.  The count need not be a
  * power of two: the VSI TC map rounds up, while the rings and the RSS table
- * use the exact count.
+ * use the exact count.  Interrupt resource management can later take vectors
+ * back or offer them again (ice_intr_adjust()); the ring count MAC sees stays
+ * fixed, so the rings share the queue vectors that are left.
  *
  * Each tx ring has its own copy-buffer pools, sized for the copied packets
  * it can have in flight rather than for its descriptors, within a cap per
@@ -660,6 +662,173 @@ ice_stop(ice_t *ice)
 	mutex_exit(&ice->ice_rebuild_lock);
 }
 
+/*
+ * Close the data path for a change the queues must not see, releasing what
+ * the disabled queues held.  A queue that does not confirm its disable can
+ * still write to memory, so nothing is released and a PF reset is owed.
+ */
+static boolean_t
+ice_datapath_pause(ice_t *ice)
+{
+	boolean_t disabled;
+
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+
+	ice_queues_intr_dissociate(ice);
+	disabled = ice_queues_disable(ice);
+	ice_tx_quiesce(ice);
+	(void) ice_rx_quiesce(ice);
+	if (!disabled) {
+		atomic_or_32(&ice->ice_state,
+		    ICE_STATE_ERROR | ICE_STATE_PFR_REQ);
+		ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
+		ice_reset_redispatch(ice);
+		return (B_FALSE);
+	}
+	ice_tx_reclaim(ice);
+	ice_rx_reclaim(ice);
+	return (B_TRUE);
+}
+
+/*
+ * Change the vector count by count and spread the rings over what is left.
+ * The rings MAC sees cannot change, so a removal makes rings share vectors;
+ * vector 0 stays with the other causes.  Returns the DDI status for IRM.
+ */
+static int
+ice_intr_adjust_locked(ice_t *ice, ddi_cb_action_t action, int count)
+{
+	const uint32_t down = ICE_STATE_ERROR | ICE_STATE_PFR_REQ |
+	    ICE_STATE_RESET_PENDING | ICE_STATE_RESET_FAILED;
+	ddi_intr_handle_t *h = ice->ice_intr_handles;
+	int cap = (int)(ice->ice_intr_size / sizeof (ddi_intr_handle_t));
+	int use = 1 + (int)MAX(ice->ice_num_rxr, ice->ice_num_txr);
+	int old = ice->ice_intr_count, target, actual = 0, i;
+	boolean_t paused = B_FALSE;
+	int ret = DDI_SUCCESS;
+	uint_t pri;
+
+	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
+
+	if (action == DDI_CB_INTR_REMOVE) {
+		if (count > old - ICE_INTR_MSIX_MIN)
+			return (DDI_FAILURE);
+		target = old - count;
+	} else {
+		if ((ice->ice_state & ICE_STATE_RESET_FAILED) != 0)
+			return (DDI_FAILURE);
+		target = MIN(cap, use);
+		if (count < target - old)
+			target = old + count;
+		if (target <= old)
+			return (DDI_SUCCESS);
+	}
+
+	if ((ice->ice_state & ICE_STATE_STARTED) != 0)
+		paused = ice_datapath_pause(ice);
+	ice_intr_disable(ice);
+	ice_rem_intr_handlers(ice);
+
+	if (action == DDI_CB_INTR_REMOVE) {
+		for (i = target; i < old; i++) {
+			(void) ddi_intr_free(h[i]);
+			h[i] = NULL;
+		}
+		ice->ice_intr_count = target;
+	} else if (ddi_intr_alloc(ice->ice_dip, &h[old], DDI_INTR_TYPE_MSIX,
+	    old, target - old, &actual, DDI_INTR_ALLOC_NORMAL) != DDI_SUCCESS) {
+		ret = DDI_FAILURE;
+	} else {
+		/* The ring and admin locks were made at the first priority. */
+		for (i = old; i < old + actual; i++) {
+			if (ddi_intr_get_pri(h[i], &pri) != DDI_SUCCESS ||
+			    pri != ice->ice_intr_pri)
+				break;
+		}
+		if (i < old + actual) {
+			while (actual > 0) {
+				(void) ddi_intr_free(h[old + --actual]);
+				h[old + actual] = NULL;
+			}
+			ret = DDI_FAILURE;
+		}
+		ice->ice_intr_count = old + actual;
+	}
+
+	ice_intr_rings_map(ice);
+	if (!ice_add_intr_handlers(ice)) {
+		ice->ice_attach_progress &=
+		    ~(ICE_ATTACH_ADD_INTR | ICE_ATTACH_ENABLE_INTR);
+		goto dead;
+	}
+	if (!ice_intr_enable(ice)) {
+		ice->ice_attach_progress &= ~ICE_ATTACH_ENABLE_INTR;
+		goto dead;
+	}
+
+	if (paused && (ice->ice_state & down) == 0) {
+		if (ice_start_datapath(ice) != 0 || !ice_rx_rings_resume(ice)) {
+			atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
+			ice_link_report(ice, LINK_STATE_DOWN);
+			ice_error(ice, "datapath restart after an interrupt "
+			    "change failed");
+		} else {
+			ice_tx_wake(ice);
+		}
+	} else {
+		ice_queues_intr_map(ice);
+	}
+
+	dev_err(ice->ice_dip, CE_NOTE, "!MSI-X vectors: %d -> %d for %u "
+	    "queue pairs", old, ice->ice_intr_count,
+	    MAX(ice->ice_num_rxr, ice->ice_num_txr));
+	return (ret);
+
+dead:
+	atomic_or_32(&ice->ice_state, ICE_STATE_ERROR);
+	ddi_fm_service_impact(ice->ice_dip, DDI_SERVICE_LOST);
+	ice_link_report(ice, LINK_STATE_DOWN);
+	ice_error(ice, "cannot restore interrupts after an interrupt change");
+	return (DDI_FAILURE);
+}
+
+/*
+ * Interrupt resource management takes away or offers count MSI-X vectors.
+ * The callback runs on the IRM balance thread with the pool locked, and MAC
+ * takes its perimeter to swap ring handles, so the handles are cleared and
+ * restored with no driver lock held.  ice_irm_busy keeps detach from
+ * unregistering MAC meanwhile.  During attach and detach the change is
+ * refused and IRM leaves the vectors in place.
+ */
+int
+ice_intr_adjust(ice_t *ice, ddi_cb_action_t action, int count)
+{
+	int ret;
+
+	if (count <= 0)
+		return (count == 0 ? DDI_SUCCESS : DDI_EINVAL);
+
+	mutex_enter(&ice->ice_rebuild_lock);
+	if (ice->ice_attaching || ice->ice_detaching || ice->ice_irm_busy) {
+		mutex_exit(&ice->ice_rebuild_lock);
+		return (DDI_FAILURE);
+	}
+	ice->ice_irm_busy = B_TRUE;
+	mutex_exit(&ice->ice_rebuild_lock);
+
+	ice_mac_intr_set(ice, B_FALSE);
+	mutex_enter(&ice->ice_rebuild_lock);
+	ret = ice_intr_adjust_locked(ice, action, count);
+	mutex_exit(&ice->ice_rebuild_lock);
+	ice_mac_intr_set(ice, B_TRUE);
+
+	mutex_enter(&ice->ice_rebuild_lock);
+	ice->ice_irm_busy = B_FALSE;
+	mutex_exit(&ice->ice_rebuild_lock);
+
+	return (ret);
+}
+
 static void
 ice_unconfigure(ice_t *ice)
 {
@@ -730,7 +899,6 @@ ice_unconfigure(ice_t *ice)
 	if (ice->ice_attach_progress & ICE_ATTACH_RESET_TASKQ) {
 		ddi_taskq_destroy(ice->ice_reset_taskq);
 		ice->ice_reset_taskq = NULL;
-		mutex_destroy(&ice->ice_rebuild_lock);
 	}
 
 	/*
@@ -790,6 +958,7 @@ ice_unconfigure(ice_t *ice)
 		ice_fm_fini(ice);
 
 	ice_diag_fini(ice);
+	mutex_destroy(&ice->ice_rebuild_lock);
 	mutex_destroy(&ice->ice_loopback_lock);
 	mutex_destroy(&ice->ice_lock);
 	ice->ice_attach_progress = 0;
@@ -849,6 +1018,13 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	ice->ice_attaching = B_TRUE;
 	mutex_init(&ice->ice_lock, NULL, MUTEX_DRIVER, NULL);
 	mutex_init(&ice->ice_loopback_lock, NULL, MUTEX_DRIVER, NULL);
+	/*
+	 * ice_rebuild_lock is adaptive (NULL cookie): it is taken only in
+	 * thread context.  The interrupt resource management callback takes it
+	 * from registration in ice_alloc_intrs() until teardown frees the
+	 * vectors, so it lives for the whole instance.
+	 */
+	mutex_init(&ice->ice_rebuild_lock, NULL, MUTEX_DRIVER, NULL);
 	ice_diag_init(ice);
 
 	/*
@@ -938,8 +1114,6 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	/*
 	 * The reset rebuild runs on its own single-thread taskq so a multi-
 	 * second rebuild cannot starve the OICR worker's admin-queue drain.
-	 * ice_rebuild_lock is adaptive (NULL cookie): it is taken only in
-	 * thread context and never at interrupt priority.
 	 */
 	ice->ice_reset_taskq = ddi_taskq_create(dip, "ice_reset", 1,
 	    TASKQ_DEFAULTPRI, 0);
@@ -947,7 +1121,6 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		ice_error(ice, "failed to create reset taskq");
 		goto fail;
 	}
-	mutex_init(&ice->ice_rebuild_lock, NULL, MUTEX_DRIVER, NULL);
 	ice->ice_attach_progress |= ICE_ATTACH_RESET_TASKQ;
 
 	/*
@@ -1173,12 +1346,13 @@ ice_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 		return (DDI_FAILURE);
 
 	/*
-	 * Leave an active datapath alone.  The same lock makes the detaching
+	 * Leave an active datapath alone, and an interrupt adjustment that
+	 * is changing MAC's ring handles.  The same lock makes the detaching
 	 * gate atomic with ice_start(), and waits out a stop or rebuild.
 	 * Workers honor the gate until teardown or the failure rollback below.
 	 */
 	mutex_enter(&ice->ice_rebuild_lock);
-	if ((ice->ice_state & ICE_STATE_STARTED) != 0) {
+	if ((ice->ice_state & ICE_STATE_STARTED) != 0 || ice->ice_irm_busy) {
 		mutex_exit(&ice->ice_rebuild_lock);
 		return (DDI_FAILURE);
 	}

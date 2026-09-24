@@ -483,18 +483,20 @@ ice_queue_limit(ice_t *ice)
 	return (MAX(n, 1));
 }
 
-/*
- * Interrupt resource management calls this to offer or reclaim vectors.  The
- * rings are bound one to one to the vectors allocated at attach, so the
- * driver keeps what it has, as a driver without a callback does; IRM logs a
- * declined reclaim.  The request is cut to the grant, so no offer comes.
- */
+/* Interrupt resource management offers or reclaims cbarg vectors. */
 static int
 ice_intr_cb(dev_info_t *dip, ddi_cb_action_t action, void *cbarg, void *arg1,
     void *arg2)
 {
-	_NOTE(ARGUNUSED(dip, action, cbarg, arg1, arg2));
-	return (DDI_ENOTSUP);
+	_NOTE(ARGUNUSED(dip, arg2));
+
+	switch (action) {
+	case DDI_CB_INTR_ADD:
+	case DDI_CB_INTR_REMOVE:
+		return (ice_intr_adjust(arg1, action, (int)(uintptr_t)cbarg));
+	default:
+		return (DDI_ENOTSUP);
+	}
 }
 
 static void
@@ -600,8 +602,6 @@ ice_alloc_intrs(ice_t *ice)
 	/* Set before ice_free_intrs() so cleanup frees the real handles. */
 	ice->ice_intr_count = actual;
 	ice->ice_intr_type = DDI_INTR_TYPE_MSIX;
-	if (ice->ice_intr_cb != NULL && actual < request)
-		(void) ddi_intr_set_nreq(dip, actual);
 
 	if (actual < ICE_INTR_MSIX_MIN) {
 		ice_error(ice, "too few MSI-X interrupts allocated: %d",
@@ -610,13 +610,6 @@ ice_alloc_intrs(ice_t *ice)
 		return (B_FALSE);
 	}
 	ice->ice_nqueues = (uint16_t)MIN(nreq, (uint32_t)actual - 1);
-
-	/*
-	 * The direct vector->ring ISR dispatch (ice_intr_queue) and the 1:1
-	 * ring-to-vector map (irxr_vec/itxr_vec = 1 + index) require every data
-	 * queue to own a distinct vector.  Enforce it at the source so a future
-	 * sizing change cannot silently fold rings onto a shared vector.
-	 */
 	ASSERT3U((uint_t)ice->ice_nqueues, <=, (uint_t)ice->ice_intr_count - 1);
 
 	/*
