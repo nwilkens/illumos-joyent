@@ -145,7 +145,7 @@ static list_t		pptdev_list;
 static ddi_device_acc_attr_t ppt_attr = {
 	DDI_DEVICE_ATTR_V0,
 	DDI_NEVERSWAP_ACC,
-	DDI_STORECACHING_OK_ACC,
+	DDI_STRICTORDER_ACC,
 	DDI_DEFAULT_ACC
 };
 
@@ -379,7 +379,7 @@ ppt_devmap(dev_t dev, devmap_cookie_t dhp, offset_t off, size_t len,
 		return (EINVAL);
 
 	err = devmap_devmem_setup(dhp, ppt->pptd_dip, NULL, ddireg, off, len,
-	    PROT_USER | PROT_READ | PROT_WRITE, IOMEM_DATA_CACHED, &ppt_attr);
+	    PROT_USER | PROT_READ | PROT_WRITE, DEVMAP_DEFAULTS, &ppt_attr);
 
 	if (err == DDI_SUCCESS)
 		*maplen = len;
