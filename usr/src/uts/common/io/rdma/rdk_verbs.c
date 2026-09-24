@@ -409,6 +409,8 @@ rdk_modify_qp_is_ok(enum rdk_qp_state cur, enum rdk_qp_state next,
 	return (B_TRUE);
 }
 
+static void rdk_drain_reap(struct rdk_qp *);
+
 /*
  * Queue pairs.
  */
@@ -512,6 +514,7 @@ rdk_destroy_qp(struct rdk_qp *qp)
 	rdk_cq_barrier(qp->send_cq);
 	if (qp->recv_cq != qp->send_cq)
 		rdk_cq_barrier(qp->recv_cq);
+	rdk_drain_reap(qp);
 	rdk_put_gid_attr(qp->av_sgid_attr);
 	atomic_dec_32(&qp->pd->usecnt);
 	atomic_dec_32(&qp->send_cq->usecnt);
@@ -708,18 +711,59 @@ rdk_destroy_ah(struct rdk_ah *ah)
  * Draining: move the QP to the error state, post one more work request and
  * wait until its flushed completion is processed.  Only CQs from
  * rdk_alloc_cq() dispatch the completion to the waiter.  A drain that times
- * out leaves the sentinel to its completion, or leaks it if the QP is
- * destroyed first.
+ * out leaves the sentinel on the QP, and destroy releases it once no
+ * completion can come.
  */
 uint_t rdk_drain_timeout_ms = 10000;
 
 typedef struct rdk_drain_cqe {
-	struct rdk_cqe	rdc_cqe;
-	kmutex_t	rdc_lock;
-	kcondvar_t	rdc_cv;
-	boolean_t	rdc_done;
-	uint_t		rdc_refs;
+	struct rdk_cqe		rdc_cqe;
+	kmutex_t		rdc_lock;
+	kcondvar_t		rdc_cv;
+	boolean_t		rdc_done;
+	uint_t			rdc_refs;
+	struct rdk_drain_cqe	*rdc_next;	/* on the QP's orphans */
 } rdk_drain_cqe_t;
+
+static void rdk_drain_rele(rdk_drain_cqe_t *);
+
+/* The QP's timed-out sentinels, after its completions have stopped. */
+static void
+rdk_drain_reap(struct rdk_qp *qp)
+{
+	rdk_drain_cqe_t *d, *next;
+	boolean_t undone;
+
+	d = atomic_swap_ptr(&qp->drain_orphans, NULL);
+	for (; d != NULL; d = next) {
+		next = d->rdc_next;
+		mutex_enter(&d->rdc_lock);
+		undone = !d->rdc_done;
+		d->rdc_done = B_TRUE;
+		mutex_exit(&d->rdc_lock);
+		if (undone)
+			rdk_drain_rele(d);
+		rdk_drain_rele(d);
+	}
+}
+
+static void
+rdk_drain_orphan(struct rdk_qp *qp, rdk_drain_cqe_t *d)
+{
+	void *old;
+
+	mutex_enter(&d->rdc_lock);
+	if (d->rdc_done) {
+		mutex_exit(&d->rdc_lock);
+		return;
+	}
+	d->rdc_refs++;
+	mutex_exit(&d->rdc_lock);
+	do {
+		old = qp->drain_orphans;
+		d->rdc_next = old;
+	} while (atomic_cas_ptr(&qp->drain_orphans, old, d) != old);
+}
 
 static void
 rdk_drain_rele(rdk_drain_cqe_t *d)
@@ -761,10 +805,11 @@ rdk_drain_alloc(void)
 	return (d);
 }
 
-static void
+static boolean_t
 rdk_drain_wait(struct rdk_qp *qp, struct rdk_cq *cq, rdk_drain_cqe_t *d,
     const char *what)
 {
+	boolean_t done;
 	clock_t deadline = ddi_get_lbolt() +
 	    drv_usectohz((clock_t)rdk_drain_timeout_ms * MILLISEC);
 
@@ -787,7 +832,9 @@ rdk_drain_wait(struct rdk_qp *qp, struct rdk_cq *cq, rdk_drain_cqe_t *d,
 			break;
 		}
 	}
+	done = d->rdc_done;
 	mutex_exit(&d->rdc_lock);
+	return (done);
 }
 
 static int
@@ -833,8 +880,8 @@ rdk_drain_sq(struct rdk_qp *qp)
 		d->rdc_refs--;
 		dev_err(qp->device->rd_dip, CE_WARN, "!QP %u: failed to drain "
 		    "the send queue: %d", qp->qp_num, ret);
-	} else {
-		rdk_drain_wait(qp, qp->send_cq, d, "send queue");
+	} else if (!rdk_drain_wait(qp, qp->send_cq, d, "send queue")) {
+		rdk_drain_orphan(qp, d);
 	}
 	rdk_drain_rele(d);
 }
@@ -858,8 +905,8 @@ rdk_drain_rq(struct rdk_qp *qp)
 		d->rdc_refs--;
 		dev_err(qp->device->rd_dip, CE_WARN, "!QP %u: failed to drain "
 		    "the receive queue: %d", qp->qp_num, ret);
-	} else {
-		rdk_drain_wait(qp, qp->recv_cq, d, "receive queue");
+	} else if (!rdk_drain_wait(qp, qp->recv_cq, d, "receive queue")) {
+		rdk_drain_orphan(qp, d);
 	}
 	rdk_drain_rele(d);
 }

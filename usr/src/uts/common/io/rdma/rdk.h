@@ -314,7 +314,8 @@ struct rdk_wc;
 /*
  * A consumer that allocates its CQ with rdk_alloc_cq() puts a struct
  * rdk_cqe in each work request instead of a wr_id; done() runs for the
- * completion.
+ * completion.  done() must not destroy the QP or the CQ: completions
+ * polled with it may still name them.
  */
 struct rdk_cqe {
 	void	(*done)(struct rdk_cq *, struct rdk_wc *);
@@ -576,8 +577,8 @@ enum rdk_poll_context {
 
 struct rdk_cq {
 	struct rdk_device	*device;
+	/* Neither handler may destroy the CQ: destroy waits for them. */
 	rdk_comp_handler_t	comp_handler;
-	/* It must not destroy the CQ: destroy waits for it to return. */
 	void			(*event_handler)(struct rdk_event *, void *);
 	void			*cq_context;
 	int			cqe;
@@ -598,6 +599,7 @@ struct rdk_qp {
 	uint32_t		port;
 	enum rdk_qp_type	qp_type;
 	const struct rdk_gid_attr *av_sgid_attr;	/* framework */
+	void			*drain_orphans;		/* framework */
 };
 
 struct rdk_mr {

@@ -257,6 +257,7 @@ rdk_cq_barrier(struct rdk_cq *cq)
 	if (cp == NULL)
 		return;
 	mutex_enter(&cp->rcp_lock);
+	ASSERT3P(cp->rcp_runner, !=, curthread);
 	gen = cp->rcp_batches;
 	while (cp->rcp_runner != NULL && cp->rcp_runner != curthread &&
 	    cp->rcp_batches == gen)
