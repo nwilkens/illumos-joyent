@@ -821,6 +821,28 @@ rdk_req_notify_cq(struct rdk_cq *cq, enum rdk_cq_notify_flags flags)
 	return (cq->device->rd_ops->req_notify_cq(cq, flags));
 }
 
+/*
+ * The RoCEv2 UDP source port for a flow label, or for the QP pair when the
+ * label is 0, so that both ends pick the same one.
+ */
+static inline uint16_t
+rdk_get_udp_sport(uint32_t fl, uint32_t lqpn, uint32_t rqpn)
+{
+	uint32_t lo, hi;
+
+	if (fl == 0) {
+		uint64_t v = (uint64_t)lqpn * rqpn;
+
+		v ^= v >> 20;
+		v ^= v >> 40;
+		fl = (uint32_t)(v & 0xfffff);
+	}
+	lo = fl & 0x03fff;
+	hi = fl & 0xfc000;
+	lo ^= hi >> 14;
+	return ((uint16_t)(lo | 0xc000));
+}
+
 static inline void
 rdk_update_fast_reg_key(struct rdk_mr *mr, uint8_t newkey)
 {

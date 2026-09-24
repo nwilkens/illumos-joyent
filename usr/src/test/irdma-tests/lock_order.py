@@ -47,11 +47,28 @@ def main():
 
     # Every other irdma lock is adaptive.
     for lock in ("irdma_cfg_lock", "irdma_req_lock", "irdma_ccq_lock",
-                 "irdma_ws_lock"):
+                 "irdma_ws_lock", "irdma_rsrc_lock", "irdma_qptable_lock",
+                 "irdma_cqtable_lock", "irdma_arp_lock", "irdma_ceq_lock"):
         assert re.search(rf"\(mutex_init\)\(&irdma->{lock}, NULL, "
                          rf"MUTEX_DRIVER, NULL\);", drv), lock
     assert "spin_lock_init(l)" in osdep and \
         "mutex_init(&(l)->sl_lock, NULL, MUTEX_DRIVER, NULL)" in osdep
+
+    # Consumer completion handlers run from the interrupt task with no
+    # driver lock held, and never from the interrupt handler.
+    ceq = body(ctl, "irdma_ceq0_process")
+    call = ceq.index("irdma_cq_ceq_dispatch(icq);")
+    assert ceq.rindex("mutex_exit(&irdma->irdma_ceq_lock);", 0, call) > \
+        ceq.rindex("mutex_enter(&irdma->irdma_ceq_lock);", 0, call)
+    cq = (IRDMA / "irdma_cq.c").read_text(encoding="utf-8")
+    dispatch = body(cq, "irdma_cq_ceq_dispatch")
+    handler = dispatch.index("rcq->comp_handler(rcq, rcq->cq_context);")
+    assert dispatch.rindex("mutex_exit(&icq->icq_lock);", 0, handler) > \
+        dispatch.rindex("mutex_enter(&icq->icq_lock);", 0, handler)
+    assert "comp_handler" not in isr
+    # Waiting work (QP errors, flushes) runs on irdma_wq, not in the task.
+    aeq = (IRDMA / "irdma_aeq.c").read_text(encoding="utf-8")
+    assert "irdma_modify_qp(" not in aeq and "irdma_cqp_exec(" not in aeq
 
     deliver = body(peer, "ice_rdma_deliver")
     ev = deliver.index("client->irc_event(arg, ev);")

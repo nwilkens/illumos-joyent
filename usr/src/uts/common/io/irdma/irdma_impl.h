@@ -32,6 +32,7 @@
 #include "icrdma_hw.h"
 #include "ice_rdma.h"
 #include "irdma_ioctl.h"
+#include "rdk.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -99,6 +100,10 @@ struct ib_device {
 	dev_info_t		*ib_dip;
 };
 
+struct irdma_qp;
+struct irdma_cq;
+struct irdma_arp_entry;
+
 typedef struct irdma_kstats {
 	kstat_named_t	ik_progress;
 	kstat_named_t	ik_flags;
@@ -120,6 +125,14 @@ typedef struct irdma_kstats {
 	kstat_named_t	ik_pble_cnt;
 	kstat_named_t	ik_link;
 	kstat_named_t	ik_mtu;
+	kstat_named_t	ik_qps;
+	kstat_named_t	ik_cqs;
+	kstat_named_t	ik_mrs;
+	kstat_named_t	ik_pds;
+	kstat_named_t	ik_ahs;
+	kstat_named_t	ik_bad_cqes;
+	kstat_named_t	ik_qp_errors;
+	kstat_named_t	ik_flushes;
 } irdma_kstats_t;
 
 typedef struct irdma {
@@ -216,6 +229,59 @@ typedef struct irdma {
 	uint64_t		irdma_crit_errors;
 	link_state_t		irdma_link;
 	uint32_t		irdma_mtu;
+	uint64_t		irdma_speed;
+
+	/*
+	 * Verbs (irdma_verbs.c).  irdma_rdk_lock guards irdma_rdk_live so
+	 * that events are not dispatched to an unregistered device.  The
+	 * tables and bitmaps are sized from the HMC once the control plane
+	 * is up.  Lock order: a QP's iqp_mod_lock, then a CQ's icq_lock, then
+	 * the QP's iqp_lock, then irdma_cqtable_lock, irdma_qptable_lock and
+	 * irdma_ceq_lock, then irdma_rsrc_lock and irdma_arp_lock.  None is
+	 * held across a CQP command except iqp_mod_lock.
+	 */
+	struct rdk_device	irdma_rdk;
+	krwlock_t		irdma_rdk_lock;
+	boolean_t		irdma_rdk_live;
+	boolean_t		irdma_verbs_live;
+	kmutex_t		irdma_rsrc_lock;
+	void			*irdma_rsrc_mem;
+	size_t			irdma_rsrc_size;
+	ulong_t			*irdma_qp_map;
+	ulong_t			*irdma_cq_map;
+	ulong_t			*irdma_mr_map;
+	ulong_t			*irdma_pd_map;
+	ulong_t			*irdma_ah_map;
+	ulong_t			*irdma_arp_map;
+	uint32_t		irdma_max_qp;
+	uint32_t		irdma_max_cq;
+	uint32_t		irdma_max_mr;
+	uint32_t		irdma_max_pd;
+	uint32_t		irdma_max_ah;
+	uint32_t		irdma_arp_size;
+	uint32_t		irdma_next_qp;
+	uint32_t		irdma_next_cq;
+	uint32_t		irdma_next_pd;
+	uint32_t		irdma_next_ah;
+	uint32_t		irdma_next_arp;
+	uint32_t		irdma_mr_stagmask;
+	boolean_t		irdma_gsi_used;
+	kmutex_t		irdma_qptable_lock;
+	struct irdma_qp		**irdma_qp_table;
+	kmutex_t		irdma_cqtable_lock;
+	struct irdma_cq		**irdma_cq_table;
+	kmutex_t		irdma_arp_lock;
+	struct irdma_arp_entry	*irdma_arp_table;
+	kmutex_t		irdma_ceq_lock;
+	ddi_taskq_t		*irdma_wq;	/* QP errors and flushes */
+	uint32_t		irdma_nqps;
+	uint32_t		irdma_ncqs;
+	uint32_t		irdma_nmrs;
+	uint32_t		irdma_npds;
+	uint32_t		irdma_nahs;
+	uint64_t		irdma_bad_cqes;
+	uint64_t		irdma_qp_errors;
+	uint64_t		irdma_flushes;
 } irdma_t;
 
 #define	IRDMA_FROM_DEV(d)	container_of((d), irdma_t, irdma_sc)
@@ -232,6 +298,10 @@ extern void irdma_fatal(irdma_t *, const char *);
  * queues.  The step functions need irdma_cfg_lock.
  */
 extern int irdma_ctl_start(irdma_t *);
+extern irdma_cqp_req_t *irdma_req_alloc(irdma_t *);
+extern u64 irdma_req_scratch(irdma_t *, irdma_cqp_req_t *);
+extern int irdma_cqp_exec(irdma_t *, irdma_cqp_req_t *,
+    struct irdma_ccq_cqe_info *);
 extern int irdma_ctl_stop(irdma_t *);
 extern uint_t irdma_intr(caddr_t, caddr_t);
 extern void irdma_intr_task(void *);
@@ -252,6 +322,9 @@ extern boolean_t irdma_quiesced(irdma_t *);
 extern void irdma_taint(irdma_t *);
 extern void irdma_osdep_defer(irdma_t *);
 extern void irdma_osdep_release(irdma_t *, boolean_t);
+extern void irdma_osdep_free_consumer(irdma_t *, void *, uint64_t, size_t);
+extern boolean_t irdma_hw_ok(irdma_t *);
+extern boolean_t irdma_healthy(irdma_t *);
 
 #ifdef __cplusplus
 }

@@ -22,7 +22,9 @@
  * qsets in the transmit scheduler, the PE filter, and resets.  This driver
  * brings up the control plane of the engine (irdma_ctl.c) on top of the
  * Intel shared code in core/, which is imported from Linux; core/README.illumos
- * lists its provenance and local changes.  There are no verbs yet.
+ * lists its provenance and local changes.  Once the control plane is up the
+ * function registers with rdmak as an RDMA device (irdma_verbs.c) and
+ * unregisters, which destroys every consumer object, before it goes down.
  *
  * Lifecycle: attach opens the peer and runs the bring-up steps of
  * irdma_ctl.c; any failure undoes the completed steps.  Detach runs them in
@@ -48,7 +50,7 @@
 #include <sys/zone.h>
 #include <sys/varargs.h>
 
-#include "irdma_impl.h"
+#include "irdma_verbs.h"
 
 #define	IRDMA_DEF_QP_LIMIT	1024
 #define	IRDMA_MIN_QP_LIMIT	128
@@ -120,6 +122,9 @@ irdma_event(void *arg, const ice_rdma_event_t *ev)
 	switch (ev->ire_type) {
 	case ICE_RDMA_EV_LINK:
 		irdma->irdma_link = ev->ire_link;
+		irdma->irdma_speed = ev->ire_speed;
+		irdma_verbs_event(irdma, ev->ire_link == LINK_STATE_UP ?
+		    RDK_EVENT_PORT_ACTIVE : RDK_EVENT_PORT_ERR);
 		break;
 	case ICE_RDMA_EV_MTU:
 		irdma->irdma_mtu = ev->ire_mtu;
@@ -129,6 +134,7 @@ irdma_event(void *arg, const ice_rdma_event_t *ev)
 		irdma_error(irdma, "critical error from ice (OICR 0x%x)",
 		    ev->ire_oicr);
 		irdma_taint(irdma);
+		irdma_verbs_event(irdma, RDK_EVENT_DEVICE_FATAL);
 		break;
 	case ICE_RDMA_EV_RESET_PREP:
 		irdma_taint(irdma);
@@ -136,6 +142,7 @@ irdma_event(void *arg, const ice_rdma_event_t *ev)
 		irdma->irdma_intr_off = B_TRUE;
 		mutex_exit(&irdma->irdma_intr_lock);
 		irdma_cqp_fail_all(irdma);
+		irdma_verbs_event(irdma, RDK_EVENT_DEVICE_FATAL);
 		break;
 	case ICE_RDMA_EV_RESET_DONE:
 		irdma_error(irdma, "the PF was reset under this instance; "
@@ -172,6 +179,14 @@ irdma_kstat_update(kstat_t *ksp, int rw)
 	k->ik_dma_bufs.value.ui32 = irdma->irdma_osdev.od_nbufs;
 	k->ik_link.value.ui32 = irdma->irdma_link;
 	k->ik_mtu.value.ui32 = irdma->irdma_mtu;
+	k->ik_qps.value.ui32 = irdma->irdma_nqps;
+	k->ik_cqs.value.ui32 = irdma->irdma_ncqs;
+	k->ik_mrs.value.ui32 = irdma->irdma_nmrs;
+	k->ik_pds.value.ui32 = irdma->irdma_npds;
+	k->ik_ahs.value.ui32 = irdma->irdma_nahs;
+	k->ik_bad_cqes.value.ui64 = irdma->irdma_bad_cqes;
+	k->ik_qp_errors.value.ui64 = irdma->irdma_qp_errors;
+	k->ik_flushes.value.ui64 = irdma->irdma_flushes;
 	if (hmc != NULL && hmc->hmc_obj != NULL) {
 		k->ik_hmc_sds.value.ui32 = hmc->sd_table.sd_cnt;
 		k->ik_qp_cnt.value.ui32 = hmc->hmc_obj[IRDMA_HMC_IW_QP].cnt;
@@ -222,6 +237,14 @@ irdma_kstat_init(irdma_t *irdma)
 	kstat_named_init(&k->ik_pble_cnt, "pble_count", KSTAT_DATA_UINT32);
 	kstat_named_init(&k->ik_link, "link_state", KSTAT_DATA_UINT32);
 	kstat_named_init(&k->ik_mtu, "mtu", KSTAT_DATA_UINT32);
+	kstat_named_init(&k->ik_qps, "verbs_qps", KSTAT_DATA_UINT32);
+	kstat_named_init(&k->ik_cqs, "verbs_cqs", KSTAT_DATA_UINT32);
+	kstat_named_init(&k->ik_mrs, "verbs_mrs", KSTAT_DATA_UINT32);
+	kstat_named_init(&k->ik_pds, "verbs_pds", KSTAT_DATA_UINT32);
+	kstat_named_init(&k->ik_ahs, "verbs_ahs", KSTAT_DATA_UINT32);
+	kstat_named_init(&k->ik_bad_cqes, "bad_cqes", KSTAT_DATA_UINT64);
+	kstat_named_init(&k->ik_qp_errors, "qp_errors", KSTAT_DATA_UINT64);
+	kstat_named_init(&k->ik_flushes, "flushes", KSTAT_DATA_UINT64);
 
 	kstat_install(ksp);
 	irdma->irdma_kstat = ksp;
@@ -252,6 +275,12 @@ irdma_locks_init(irdma_t *irdma)
 	(mutex_init)(&irdma->irdma_req_lock, NULL, MUTEX_DRIVER, NULL);
 	(mutex_init)(&irdma->irdma_ccq_lock, NULL, MUTEX_DRIVER, NULL);
 	(mutex_init)(&irdma->irdma_ws_lock, NULL, MUTEX_DRIVER, NULL);
+	(mutex_init)(&irdma->irdma_rsrc_lock, NULL, MUTEX_DRIVER, NULL);
+	(mutex_init)(&irdma->irdma_qptable_lock, NULL, MUTEX_DRIVER, NULL);
+	(mutex_init)(&irdma->irdma_cqtable_lock, NULL, MUTEX_DRIVER, NULL);
+	(mutex_init)(&irdma->irdma_arp_lock, NULL, MUTEX_DRIVER, NULL);
+	(mutex_init)(&irdma->irdma_ceq_lock, NULL, MUTEX_DRIVER, NULL);
+	rw_init(&irdma->irdma_rdk_lock, NULL, RW_DRIVER, NULL);
 	cv_init(&irdma->irdma_req_cv, NULL, CV_DRIVER, NULL);
 	for (i = 0; i < IRDMA_CQP_NREQS; i++)
 		cv_init(&irdma->irdma_reqs[i].icr_cv, NULL, CV_DRIVER, NULL);
@@ -265,6 +294,12 @@ irdma_locks_fini(irdma_t *irdma)
 	for (i = 0; i < IRDMA_CQP_NREQS; i++)
 		cv_destroy(&irdma->irdma_reqs[i].icr_cv);
 	cv_destroy(&irdma->irdma_req_cv);
+	rw_destroy(&irdma->irdma_rdk_lock);
+	mutex_destroy(&irdma->irdma_ceq_lock);
+	mutex_destroy(&irdma->irdma_arp_lock);
+	mutex_destroy(&irdma->irdma_cqtable_lock);
+	mutex_destroy(&irdma->irdma_qptable_lock);
+	mutex_destroy(&irdma->irdma_rsrc_lock);
 	mutex_destroy(&irdma->irdma_ws_lock);
 	mutex_destroy(&irdma->irdma_ccq_lock);
 	mutex_destroy(&irdma->irdma_req_lock);
@@ -360,6 +395,7 @@ irdma_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	irdma->irdma_progress |= BIT(IRDMA_STEP_OPEN);
 	irdma->irdma_link = irdma->irdma_info.iri_link;
 	irdma->irdma_mtu = irdma->irdma_info.iri_mtu;
+	irdma->irdma_speed = irdma->irdma_info.iri_speed;
 	irdma_osdep_init(irdma);
 
 	ret = irdma->irdma_ops->iro_intr_get(irdma->irdma_peer,
@@ -402,6 +438,19 @@ irdma_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		goto fail;
 	}
 	irdma_kstat_init(irdma);
+
+	mutex_enter(&irdma->irdma_cfg_lock);
+	ret = irdma_verbs_init(irdma);
+	mutex_exit(&irdma->irdma_cfg_lock);
+	if (ret == 0 && (ret = irdma_verbs_register(irdma)) != 0)
+		irdma_verbs_fini(irdma);
+	if (ret != 0) {
+		irdma_kstat_fini(irdma);
+		mutex_enter(&irdma->irdma_cfg_lock);
+		(void) irdma_ctl_stop(irdma);
+		mutex_exit(&irdma->irdma_cfg_lock);
+		goto fail;
+	}
 
 	dev_err(dip, CE_NOTE, "!RDMA control plane up: PF %u, VSI %u, "
 	    "%u vectors, %u QPs, %u CQs, %u SDs",
@@ -447,6 +496,8 @@ irdma_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 		irdma_cqp_fail_all(irdma);
 	irdma_ctl_hold_release(irdma);
 	ddi_taskq_wait(irdma->irdma_test_taskq);
+	irdma_verbs_unregister(irdma);
+	irdma_verbs_fini(irdma);
 
 	irdma_kstat_fini(irdma);
 	mutex_enter(&irdma->irdma_cfg_lock);

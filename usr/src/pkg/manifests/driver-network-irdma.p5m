@@ -30,3 +30,4 @@ license lic_CDDL license=lic_CDDL
 license usr/src/uts/common/io/irdma/core/THIRDPARTYLICENSE \
     license=usr/src/uts/common/io/irdma/core/THIRDPARTYLICENSE
 depend fmri=driver/network/ice type=require
+depend fmri=system/kernel/rdma type=require

@@ -25,6 +25,9 @@ include $(UTSBASE)/intel/Makefile.intel
 CPPFLAGS	+= -I$(UTSBASE)/common/io/irdma
 CPPFLAGS	+= -I$(UTSBASE)/common/io/irdma/core
 CPPFLAGS	+= -I$(UTSBASE)/common/io/ice
+CPPFLAGS	+= -I$(UTSBASE)/common/io/rdma
+
+LDFLAGS		+= -N misc/rdmak
 
 ALL_TARGET	= $(BINARY)
 INSTALL_TARGET	= $(BINARY) $(ROOTMODULE) $(ROOT_CONFFILE)
