@@ -31,6 +31,7 @@ struct ice_hw_common_caps {
 
 typedef struct ice {
 	void *ice_dip;
+	unsigned ice_intr_rdma;
 	struct {
 		struct {
 			struct ice_hw_common_caps common_cap;
@@ -64,10 +65,14 @@ ddi_prop_get_int(int dev, void *dip, int flags, const char *name, int dflt)
 static uint32_t ice_prop_get_num_queues(ice_t *);
 #include "ice_queue_body.h"
 
+static unsigned rdma;
+
 static uint32_t
 limit(int cpus, u32 rxq, u32 txq, u32 msix, u32 width, int conf)
 {
 	ice_t ice = { 0 };
+
+	ice.ice_intr_rdma = rdma;
 
 	ncpus = cpus;
 	boot_max_ncpus = -1;
@@ -116,6 +121,12 @@ main(void)
 	/* One CPU seen early in boot uses the boot CPU count instead. */
 	assert(limit(1, 256, 256, 1025, 8, -2000) == 16);
 	assert(limit(1, 256, 256, 1025, 8, 127) == 32);
+	/* The RDMA block takes firmware vectors before the queues do. */
+	rdma = 2;
+	assert(limit(64, 256, 256, 9, 8, 127) == 6);
+	assert(limit(64, 256, 256, 1025, 8, -2000) == 16);
+	assert(limit(64, 256, 256, 4, 8, 127) == 1);
+	rdma = 0;
 	(void) puts("PASS: queue pair count defaults to 16 and follows CPUs, "
 	    "firmware and MAC limits");
 	return (0);

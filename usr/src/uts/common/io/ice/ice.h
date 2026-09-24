@@ -58,6 +58,19 @@ extern "C" {
 CTASSERT(ICE_INTR_MSIX_MIN == 2);
 
 /*
+ * With RDMA enabled, vectors 1 through ice_intr_rdma belong to the RDMA
+ * child and the LAN queue vectors follow them.
+ */
+#define	ICE_RDMA_FIRST_VECTOR	1
+#define	ICE_INTR_LAN_FIRST(ice)	(ICE_RDMA_FIRST_VECTOR + (ice)->ice_intr_rdma)
+#define	ICE_INTR_LAN_COUNT(ice)	\
+	((uint32_t)(ice)->ice_intr_count - ICE_INTR_LAN_FIRST(ice))
+#define	ICE_INTR_IS_RDMA(ice, v)	\
+	((uint_t)(v) >= ICE_RDMA_FIRST_VECTOR &&	\
+	(uint_t)(v) < ICE_INTR_LAN_FIRST(ice))
+
+
+/*
  * Ceiling and default of the num_queues property; ice_queue_limit() applies
  * the CPU, firmware and vector limits.  MAC keeps one SRS per rx ring plus
  * one for software classification in an array of MAX_RINGS_PER_GROUP
@@ -640,6 +653,7 @@ typedef struct ice {
 	ddi_cb_handle_t		ice_intr_cb;	/* IRM registration */
 	boolean_t		ice_irm_busy;	/* ice_rebuild_lock */
 	uint16_t		ice_nqueues;
+	uint_t			ice_intr_rdma;	/* fixed after attach */
 
 	/* OICR deferred async work; thread context, serialized via ice_lock. */
 	ddi_taskq_t		*ice_oicr_taskq;

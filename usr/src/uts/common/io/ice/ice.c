@@ -172,12 +172,13 @@
  *
  * The queue pair count is the lowest of the CPU count, the queues and vectors
  * firmware gives this PF, the vectors the platform grants less the OICR
- * vector, and the num_queues property.  That property defaults to 16 and is
- * clamped to 1 through MAX_RINGS_PER_GROUP - 1.  The count need not be a
- * power of two: the VSI TC map rounds up, while the rings and the RSS table
- * use the exact count.  Interrupt resource management can later take vectors
- * back or offer them again (ice_intr_adjust()); the ring count MAC sees stays
- * fixed, so the rings share the queue vectors that are left.
+ * vector and any RDMA block, and the num_queues property.  That property
+ * defaults to 16 and is clamped to 1 through MAX_RINGS_PER_GROUP - 1.  The
+ * count need not be a power of two: the VSI TC map rounds up, while the rings
+ * and the RSS table use the exact count.  Interrupt resource management can
+ * later take vectors back or offer them again (ice_intr_adjust()); the ring
+ * count MAC sees stays fixed, so the rings share the queue vectors that are
+ * left.
  *
  * Each tx ring has its own copy-buffer pools, sized for the copied packets
  * it can have in flight rather than for its descriptors, within a cap per
@@ -694,7 +695,8 @@ ice_datapath_pause(ice_t *ice)
 /*
  * Change the vector count by count and spread the rings over what is left.
  * The rings MAC sees cannot change, so a removal makes rings share vectors;
- * vector 0 stays with the other causes.  Returns the DDI status for IRM.
+ * vector 0 stays with the other causes and the RDMA block below the LAN
+ * vectors is never taken.  Returns the DDI status for IRM.
  */
 static int
 ice_intr_adjust_locked(ice_t *ice, ddi_cb_action_t action, int count)
@@ -703,7 +705,8 @@ ice_intr_adjust_locked(ice_t *ice, ddi_cb_action_t action, int count)
 	    ICE_STATE_RESET_PENDING | ICE_STATE_RESET_FAILED;
 	ddi_intr_handle_t *h = ice->ice_intr_handles;
 	int cap = (int)(ice->ice_intr_size / sizeof (ddi_intr_handle_t));
-	int use = 1 + (int)MAX(ice->ice_num_rxr, ice->ice_num_txr);
+	int rdma = (int)ice->ice_intr_rdma;
+	int use = 1 + rdma + (int)MAX(ice->ice_num_rxr, ice->ice_num_txr);
 	int old = ice->ice_intr_count, target, actual = 0, i;
 	boolean_t paused = B_FALSE;
 	int ret = DDI_SUCCESS;
@@ -712,7 +715,7 @@ ice_intr_adjust_locked(ice_t *ice, ddi_cb_action_t action, int count)
 	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
 
 	if (action == DDI_CB_INTR_REMOVE) {
-		if (count > old - ICE_INTR_MSIX_MIN)
+		if (count > old - ICE_INTR_MSIX_MIN - rdma)
 			return (DDI_FAILURE);
 		target = old - count;
 	} else {
@@ -786,8 +789,8 @@ ice_intr_adjust_locked(ice_t *ice, ddi_cb_action_t action, int count)
 	}
 
 	dev_err(ice->ice_dip, CE_NOTE, "!MSI-X vectors: %d -> %d for %u "
-	    "queue pairs", old, ice->ice_intr_count,
-	    MAX(ice->ice_num_rxr, ice->ice_num_txr));
+	    "queue pairs, rdma=%d", old, ice->ice_intr_count,
+	    MAX(ice->ice_num_rxr, ice->ice_num_txr), rdma);
 	return (ret);
 
 dead:

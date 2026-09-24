@@ -62,23 +62,31 @@ def main() -> None:
     allocator = function(
         hw,
         "ice_alloc_intrs(ice_t *ice)\n{",
-        "\n/* Returns B_FALSE if any handler could not be removed. */",
+        "\n/*\n * Returns B_FALSE if any handler could not be removed.",
     )
     assert '"num_queues"' in hw
     limited = allocator.index("nreq = ice_queue_limit(ice);")
-    requested = allocator.index("request = (int)MIN(1 + nreq,")
+    requested = allocator.index(
+        "request = (int)MIN(1 + ice->ice_intr_rdma + nreq,")
     assert limited < requested
     assert "ddi_intr_alloc" in allocator
     actual_guard = allocator.index("if (actual < ICE_INTR_MSIX_MIN)")
     final_count = allocator.index("ice->ice_nqueues")
     assert allocator.index("ddi_intr_alloc") < actual_guard < final_count
-    assert "ice->ice_nqueues = (uint16_t)MIN(nreq, (uint32_t)actual - 1);" \
-        in allocator
+    # The RDMA block sits between the OICR and the LAN vectors.
+    assert re.search(
+        r"ice->ice_nqueues = \(uint16_t\)MIN\(nreq,\s*"
+        r"\(uint32_t\)actual - 1 - ice->ice_intr_rdma\);",
+        allocator,
+    )
+    rdma_ask = allocator.index("ice->ice_intr_rdma = ice_rdma_vectors(ice);")
+    rdma_fallback = allocator.index("ice->ice_intr_rdma = 0;")
+    assert rdma_ask < limited < requested < rdma_fallback < final_count
     # The direct-index ISR dispatch requires a 1:1 ring<->vector map; the
     # sizing site must assert it so a future vector-cap change fails loudly.
     assert re.search(
         r"ASSERT3U\(\(uint_t\)ice->ice_nqueues,\s*<=,"
-        r"\s*\(uint_t\)ice->ice_intr_count - 1\)",
+        r"\s*\(uint_t\)ice->ice_intr_count - ICE_INTR_LAN_FIRST\(ice\)\)",
         allocator,
     )
     # Vector accounting must be logged so the scaling ceiling is observable.
@@ -140,12 +148,14 @@ def main() -> None:
         "\nuint_t\nice_intr_msix",
     )
     # The ISR indexes the rings mapped to its vector instead of scanning.
-    assert "for (idx = vector - 1; idx < nrings; idx += stride)" in queue_isr
-    assert "stride = (uint_t)ice->ice_intr_count - 1" in queue_isr
+    assert re.search(r"for \(idx = vector - ICE_INTR_LAN_FIRST\(ice\); "
+                     r"idx < nrings;\s*idx \+= stride\)", queue_isr)
+    assert "stride = ICE_INTR_LAN_COUNT(ice)" in queue_isr
     vector = function(intr_source,
                       "ice_ring_vector(const ice_t *ice, uint_t index)\n{",
                       "\n}\n")
-    assert "1 + index % (uint32_t)(ice->ice_intr_count - 1)" in vector
+    assert "ICE_INTR_LAN_FIRST(ice) + index % ICE_INTR_LAN_COUNT(ice)" \
+        in vector
     assert "ice->ice_rxr[idx]" in queue_isr
     assert "ice->ice_txr[idx]" in queue_isr
     assert "idx < ice->ice_num_rxr" in queue_isr
@@ -160,6 +170,7 @@ def main() -> None:
         "\nboolean_t\nice_intr_enable",
     )
     assert "vector >= (uint_t)ice->ice_intr_count" in dispatch
+    assert "ICE_INTR_IS_RDMA(ice, vector)" in dispatch
 
     print("PASS: ice multiqueue and RSS source invariants")
 

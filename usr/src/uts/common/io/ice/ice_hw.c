@@ -433,6 +433,47 @@ ice_phy_fw_wait(ice_t *ice)
 	return (state);
 }
 
+/* Defaults and bounds of the RDMA properties in ice.conf. */
+#define	ICE_RDMA_DEF_VECTORS	2
+#define	ICE_RDMA_MAX_VECTORS	16
+
+/*
+ * The MSI-X vectors to keep for the RDMA function, before the grant.  RDMA
+ * needs the firmware capability, the DDP package and rdma_enable.
+ */
+static uint_t
+ice_rdma_vectors(ice_t *ice)
+{
+	struct ice_hw_common_caps *c = &ice->ice_hw.func_caps.common_cap;
+	int value;
+
+	if (ddi_prop_get_int(DDI_DEV_T_ANY, ice->ice_dip, DDI_PROP_DONTPASS,
+	    "rdma_enable", 0) == 0)
+		return (0);
+	if (!c->iwarp) {
+		dev_err(ice->ice_dip, CE_NOTE, "!rdma_enable is set but "
+		    "firmware reports no RDMA capability");
+		return (0);
+	}
+	if (ice->ice_safe_mode) {
+		dev_err(ice->ice_dip, CE_NOTE, "!RDMA needs the DDP package; "
+		    "it stays disabled in safe mode");
+		return (0);
+	}
+
+	value = ddi_prop_get_int(DDI_DEV_T_ANY, ice->ice_dip, DDI_PROP_DONTPASS,
+	    "rdma_vectors", ICE_RDMA_DEF_VECTORS);
+	if (value < 1 || value > ICE_RDMA_MAX_VECTORS) {
+		ice_error(ice, "rdma_vectors %d is outside 1 to %d; using %d",
+		    value, ICE_RDMA_MAX_VECTORS, ICE_RDMA_DEF_VECTORS);
+		value = ICE_RDMA_DEF_VECTORS;
+	}
+	/* The OICR and one LAN queue vector come first. */
+	if (c->num_msix_vectors < (uint32_t)value + ICE_INTR_MSIX_MIN)
+		return (0);
+	return ((uint_t)value);
+}
+
 /* The ice.conf ceiling on the queue pair count. */
 static uint32_t
 ice_prop_get_num_queues(ice_t *ice)
@@ -451,7 +492,8 @@ ice_prop_get_num_queues(ice_t *ice)
 
 /*
  * The queue pair count before the vector grant.  Each queue pair owns one
- * MSI-X vector, and vector 0 serves the other causes.  The count follows the
+ * MSI-X vector, vector 0 serves the other causes, and the RDMA block follows
+ * it.  The count follows the
  * CPUs and need not be a power of two: the VSI TC map rounds it up
  * (ice_vsi_ctx_fill()), but the rings and the RSS table use the exact count.
  */
@@ -471,8 +513,8 @@ ice_queue_limit(ice_t *ice)
 
 	n = MIN(c->num_rxq, c->num_txq);
 	n = MIN(n, cpus);
-	if (c->num_msix_vectors > 1)
-		n = MIN(n, c->num_msix_vectors - 1);
+	if (c->num_msix_vectors > 1 + ice->ice_intr_rdma)
+		n = MIN(n, c->num_msix_vectors - 1 - ice->ice_intr_rdma);
 	/* A narrow RSS entry cannot name every queue. */
 	if (c->rss_table_entry_width > 0 && c->rss_table_entry_width < 8)
 		n = MIN(n, 1u << c->rss_table_entry_width);
@@ -525,6 +567,7 @@ ice_free_intrs(ice_t *ice)
 	kmem_free(ice->ice_intr_handles, ice->ice_intr_size);
 	ice->ice_intr_handles = NULL;
 	ice->ice_intr_count = 0;
+	ice->ice_intr_rdma = 0;
 	ice->ice_intr_size = 0;
 	ice->ice_intr_type = 0;
 	ice->ice_intr_cap = 0;
@@ -583,8 +626,10 @@ ice_alloc_intrs(ice_t *ice)
 		return (B_FALSE);
 	}
 
+	ice->ice_intr_rdma = ice_rdma_vectors(ice);
 	nreq = ice_queue_limit(ice);
-	request = (int)MIN(1 + nreq, (uint32_t)MIN(nintrs, navail));
+	request = (int)MIN(1 + ice->ice_intr_rdma + nreq,
+	    (uint32_t)MIN(nintrs, navail));
 	ice->ice_intr_size = request * sizeof (ddi_intr_handle_t);
 	ice->ice_intr_handles = kmem_zalloc(ice->ice_intr_size, KM_SLEEP);
 
@@ -609,17 +654,6 @@ ice_alloc_intrs(ice_t *ice)
 		ice_free_intrs(ice);
 		return (B_FALSE);
 	}
-	ice->ice_nqueues = (uint16_t)MIN(nreq, (uint32_t)actual - 1);
-	ASSERT3U((uint_t)ice->ice_nqueues, <=, (uint_t)ice->ice_intr_count - 1);
-
-	/*
-	 * Report the vector accounting so the scaling ceiling is visible:
-	 * firmware advertised, platform available, requested, granted, and the
-	 * resulting data-queue count.
-	 */
-	dev_err(ice->ice_dip, CE_NOTE, "!MSI-X vectors: fw=%u avail=%d "
-	    "requested=%d granted=%d data-queues=%u", nvec, navail, request,
-	    actual, ice->ice_nqueues);
 
 	if (ddi_intr_get_pri(ice->ice_intr_handles[0], &ice->ice_intr_pri) !=
 	    DDI_SUCCESS ||
@@ -629,6 +663,32 @@ ice_alloc_intrs(ice_t *ice)
 		ice_free_intrs(ice);
 		return (B_FALSE);
 	}
+
+	/*
+	 * The RDMA block needs a LAN queue vector above it, and the LAN
+	 * vectors are enabled apart from it, which block enable cannot do.
+	 */
+	if (ice->ice_intr_rdma != 0 &&
+	    (actual < ICE_INTR_MSIX_MIN + (int)ice->ice_intr_rdma ||
+	    (ice->ice_intr_cap & DDI_INTR_FLAG_BLOCK) != 0)) {
+		ice->ice_intr_rdma = 0;
+		dev_err(ice->ice_dip, CE_NOTE, "!RDMA disabled: the MSI-X "
+		    "grant does not cover its vectors");
+	}
+
+	ice->ice_nqueues = (uint16_t)MIN(nreq,
+	    (uint32_t)actual - 1 - ice->ice_intr_rdma);
+	ASSERT3U((uint_t)ice->ice_nqueues, <=,
+	    (uint_t)ice->ice_intr_count - ICE_INTR_LAN_FIRST(ice));
+
+	/*
+	 * Report the vector accounting so the scaling ceiling is visible:
+	 * firmware advertised, platform available, requested, granted, the
+	 * RDMA block and the resulting data-queue count.
+	 */
+	dev_err(ice->ice_dip, CE_NOTE, "!MSI-X vectors: fw=%u avail=%d "
+	    "requested=%d granted=%d rdma=%u data-queues=%u", nvec, navail,
+	    request, actual, ice->ice_intr_rdma, ice->ice_nqueues);
 
 	/*
 	 * ice_lock and ice_lse_lock are taken from the OICR interrupt and its
@@ -646,7 +706,10 @@ ice_alloc_intrs(ice_t *ice)
 	return (B_TRUE);
 }
 
-/* Returns B_FALSE if any handler could not be removed. */
+/*
+ * Returns B_FALSE if any handler could not be removed.  The RDMA block is the
+ * child's.
+ */
 boolean_t
 ice_rem_intr_handlers(ice_t *ice)
 {
@@ -654,6 +717,8 @@ ice_rem_intr_handlers(ice_t *ice)
 	int i;
 
 	for (i = 0; i < ice->ice_intr_count; i++) {
+		if (ICE_INTR_IS_RDMA(ice, i))
+			continue;
 		if (ddi_intr_remove_handler(ice->ice_intr_handles[i]) !=
 		    DDI_SUCCESS)
 			ok = B_FALSE;
@@ -667,12 +732,16 @@ ice_add_intr_handlers(ice_t *ice)
 	int i, rc;
 
 	for (i = 0; i < ice->ice_intr_count; i++) {
+		if (ICE_INTR_IS_RDMA(ice, i))
+			continue;
 		rc = ddi_intr_add_handler(ice->ice_intr_handles[i],
 		    ice_intr_msix, ice, (caddr_t)(uintptr_t)i);
 		if (rc != DDI_SUCCESS) {
 			ice_error(ice, "failed to add MSI-X handler %d: %d",
 			    i, rc);
 			while (--i >= 0) {
+				if (ICE_INTR_IS_RDMA(ice, i))
+					continue;
 				(void) ddi_intr_remove_handler(
 				    ice->ice_intr_handles[i]);
 			}

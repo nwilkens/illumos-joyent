@@ -958,14 +958,16 @@ rearm:
 }
 
 /*
- * Queue pair i is served by vector 1 + i modulo the queue vectors.  Until
- * interrupt resource management takes vectors away there is one per pair.
+ * Queue pair i is served by the first LAN vector plus i modulo the queue
+ * vectors.  Until interrupt resource management takes vectors away there is
+ * one per pair.
  */
 uint32_t
 ice_ring_vector(const ice_t *ice, uint_t index)
 {
-	ASSERT3S(ice->ice_intr_count, >=, ICE_INTR_MSIX_MIN);
-	return (1 + index % (uint32_t)(ice->ice_intr_count - 1));
+	ASSERT3S(ice->ice_intr_count, >=,
+	    ICE_INTR_MSIX_MIN + (int)ice->ice_intr_rdma);
+	return (ICE_INTR_LAN_FIRST(ice) + index % ICE_INTR_LAN_COUNT(ice));
 }
 
 /*
@@ -976,7 +978,7 @@ uint32_t
 ice_rx_intr_limit(const ice_t *ice)
 {
 	uint32_t nrings = MAX(ice->ice_num_rxr, ice->ice_num_txr);
-	uint32_t share = howmany(nrings, (uint32_t)ice->ice_intr_count - 1);
+	uint32_t share = howmany(nrings, ICE_INTR_LAN_COUNT(ice));
 
 	return (MAX(ICE_MIN_RX_LIMIT_PER_INTR,
 	    ice->ice_rx_limit_per_intr / MAX(share, 1)));
@@ -1009,7 +1011,7 @@ static uint_t
 ice_intr_queue(ice_t *ice, uint_t vector)
 {
 	struct ice_hw *hw = &ice->ice_hw;
-	const uint_t stride = (uint_t)ice->ice_intr_count - 1;
+	const uint_t stride = ICE_INTR_LAN_COUNT(ice);
 	const uint_t nrings = MAX(ice->ice_num_rxr, ice->ice_num_txr);
 	uint32_t dyn_ctl = ICE_GLINT_DYN_CTL_REARM;
 	uint_t idx;
@@ -1021,7 +1023,8 @@ ice_intr_queue(ice_t *ice, uint_t vector)
 	 * never reaches here.  Rx delivery is suppressed while mac polls the
 	 * ring (ice_rx_ring_intr).
 	 */
-	for (idx = vector - 1; idx < nrings; idx += stride) {
+	for (idx = vector - ICE_INTR_LAN_FIRST(ice); idx < nrings;
+	    idx += stride) {
 		if (idx < ice->ice_num_rxr &&
 		    ice_rx_ring_intr(&ice->ice_rxr[idx])) {
 			/*
@@ -1061,11 +1064,12 @@ ice_intr_msix(caddr_t arg1, caddr_t arg2)
 		return (ice_intr_oicr(ice));
 
 	/*
-	 * Only ice_intr_count handlers are registered, so vector is always in
-	 * range; guard defensively so a stray vector cannot re-arm
-	 * GLINT_DYN_CTL() for a vector this function does not own.
+	 * ice registers no handler on the RDMA block, so vector is always a
+	 * LAN vector; guard defensively so a stray vector cannot re-arm
+	 * GLINT_DYN_CTL() for a vector this driver does not own.
 	 */
-	if (vector >= (uint_t)ice->ice_intr_count)
+	if (vector >= (uint_t)ice->ice_intr_count ||
+	    ICE_INTR_IS_RDMA(ice, vector))
 		return (DDI_INTR_CLAIMED);
 
 	return (ice_intr_queue(ice, vector));
@@ -1087,10 +1091,14 @@ ice_intr_enable(ice_t *ice)
 	}
 
 	for (i = 0; i < ice->ice_intr_count; i++) {
+		if (ICE_INTR_IS_RDMA(ice, i))
+			continue;
 		rc = ddi_intr_enable(ice->ice_intr_handles[i]);
 		if (rc != DDI_SUCCESS) {
 			ice_error(ice, "interrupt enable %d failed: %d", i, rc);
 			while (--i >= 0) {
+				if (ICE_INTR_IS_RDMA(ice, i))
+					continue;
 				(void) ddi_intr_disable(
 				    ice->ice_intr_handles[i]);
 			}
@@ -1116,6 +1124,8 @@ ice_intr_disable(ice_t *ice)
 		    ice->ice_intr_count) == DDI_SUCCESS);
 	}
 	for (i = 0; i < ice->ice_intr_count; i++) {
+		if (ICE_INTR_IS_RDMA(ice, i))
+			continue;
 		if (ddi_intr_disable(ice->ice_intr_handles[i]) != DDI_SUCCESS)
 			ok = B_FALSE;
 	}

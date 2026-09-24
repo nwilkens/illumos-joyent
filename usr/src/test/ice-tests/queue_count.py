@@ -25,9 +25,11 @@ def main():
     for code in (header, source, (DRIVER / "ice_vsi.c").read_text()):
         assert "ICE_MAX_INTR_QUEUES" not in code
     assert "ice_ilog2" not in source
-    # The vector grant can still lower the count, never raise it.
-    assert re.search(r"ice->ice_nqueues = \(uint16_t\)MIN\(nreq, "
-                     r"\(uint32_t\)actual - 1\);", source)
+    # The vector grant can still lower the count, never raise it; the RDMA
+    # block is not a queue vector.
+    assert re.search(r"ice->ice_nqueues = \(uint16_t\)MIN\(nreq,\s*"
+                     r"\(uint32_t\)actual - 1 - ice->ice_intr_rdma\);",
+                     source)
 
 
 if __name__ == "__main__":
