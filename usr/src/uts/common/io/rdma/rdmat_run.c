@@ -334,6 +334,7 @@ rdmat_setup(rdmat_sess_t *ts, rdmat_setup_t *rs)
 	if ((ret = rdk_add_gid(dev, 1, &gid, RDK_VLAN_NONE, pa.mac,
 	    &ts->ts_gid_index)) != 0)
 		goto fail;
+	ts->ts_gid_added = B_TRUE;
 	if ((ret = rdk_alloc_pd(dev, 0, &ts->ts_pd)) != 0)
 		goto fail;
 	for (i = 0; i < rs->rs_nqp; i++) {
@@ -975,5 +976,9 @@ rdmat_teardown(rdmat_sess_t *ts, boolean_t removing)
 	if (ts->ts_pd != NULL) {
 		rdk_dealloc_pd(ts->ts_pd);
 		ts->ts_pd = NULL;
+	}
+	if (ts->ts_gid_added) {
+		(void) rdk_del_gid(ts->ts_dev, 1, ts->ts_gid_index);
+		ts->ts_gid_added = B_FALSE;
 	}
 }

@@ -724,6 +724,7 @@ extern int rdk_query_port(struct rdk_device *, uint32_t,
     struct rdk_port_attr *);
 extern int rdk_add_gid(struct rdk_device *, uint32_t, const rdk_gid_t *,
     uint16_t, const uint8_t *, uint16_t *);
+/* Each successful rdk_add_gid() needs its own rdk_del_gid(). */
 extern int rdk_del_gid(struct rdk_device *, uint32_t, uint16_t);
 extern int rdk_query_gid(struct rdk_device *, uint32_t, uint16_t,
     rdk_gid_t *);

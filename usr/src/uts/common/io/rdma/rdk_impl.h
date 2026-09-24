@@ -28,6 +28,7 @@ extern "C" {
 typedef struct rdk_gid_ent {
 	struct rdk_gid_attr	rge_attr;
 	boolean_t		rge_valid;
+	uint32_t		rge_owners;	/* rdp_gid_lock */
 	uint32_t		rge_refs;	/* rdp_lock */
 } rdk_gid_ent_t;
 

@@ -109,6 +109,7 @@ typedef struct rdmat_sess {
 	uint32_t		ts_poll;
 	uint32_t		ts_depth;
 	uint16_t		ts_gid_index;
+	boolean_t		ts_gid_added;
 	uint32_t		ts_nqp;
 	rdmat_qp_t		ts_qp[RDMAT_MAX_QPS];
 } rdmat_sess_t;
