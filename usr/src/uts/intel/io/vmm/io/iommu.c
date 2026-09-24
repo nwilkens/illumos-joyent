@@ -39,6 +39,7 @@
 
 /*
  * Copyright 2022 Oxide Computer Company
+ * Copyright 2026 Edgecast Cloud LLC.
  */
 
 #include <sys/cdefs.h>
@@ -77,7 +78,8 @@ iommu_find_device(dev_info_t *dip, void *arg)
 
 	if (pcie_is_pci_device(dip)) {
 		if (add)
-			iommu_add_device(host_domain, pci_get_rid(dip));
+			(void) iommu_add_device(host_domain,
+			    pci_get_rid(dip));
 		else
 			iommu_remove_device(host_domain, pci_get_rid(dip));
 	}
@@ -210,11 +212,15 @@ iommu_unref(void)
 void *
 iommu_create_domain(vm_paddr_t maxaddr)
 {
-	if (iommu_ref()) {
-		return (ops->create_domain(maxaddr));
-	} else {
+	void *domain;
+
+	if (!iommu_ref())
 		return (NULL);
-	}
+
+	domain = ops->create_domain(maxaddr);
+	if (domain == NULL)
+		iommu_unref();
+	return (domain);
 }
 
 void
@@ -265,12 +271,12 @@ iommu_host_domain(void)
 	return (host_domain);
 }
 
-void
+int
 iommu_add_device(void *domain, uint16_t rid)
 {
 	ASSERT3P(domain, !=, NULL);
 
-	ops->add_device(domain, rid);
+	return (ops->add_device(domain, rid));
 }
 
 void

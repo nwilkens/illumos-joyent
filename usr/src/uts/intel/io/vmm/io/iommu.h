@@ -39,10 +39,15 @@
 
 /*
  * Copyright 2022 Oxide Computer Company
+ * Copyright 2026 Edgecast Cloud LLC.
  */
 
 #ifndef _IO_IOMMU_H_
 #define	_IO_IOMMU_H_
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef int (*iommu_init_func_t)(void);
 typedef void (*iommu_cleanup_func_t)(void);
@@ -54,7 +59,7 @@ typedef uint64_t (*iommu_create_mapping_t)(void *domain, vm_paddr_t gpa,
     vm_paddr_t hpa, uint64_t len);
 typedef uint64_t (*iommu_remove_mapping_t)(void *domain, vm_paddr_t gpa,
     uint64_t len);
-typedef void (*iommu_add_device_t)(void *domain, uint16_t rid);
+typedef int (*iommu_add_device_t)(void *domain, uint16_t rid);
 typedef void (*iommu_remove_device_t)(void *domain, uint16_t rid);
 typedef void (*iommu_invalidate_tlb_t)(void *domain);
 
@@ -81,7 +86,7 @@ void iommu_destroy_domain(void *domain);
 void iommu_create_mapping(void *domain, vm_paddr_t gpa, vm_paddr_t hpa,
     size_t len);
 void iommu_remove_mapping(void *domain, vm_paddr_t gpa, size_t len);
-void iommu_add_device(void *domain, uint16_t rid);
+int iommu_add_device(void *domain, uint16_t rid);
 void iommu_remove_device(void *domain, uint16_t rid);
 void iommu_invalidate_tlb(void *domain);
 
@@ -89,4 +94,8 @@ void iommu_invalidate_tlb(void *domain);
 void *vmm_ptp_alloc(void);
 void vmm_ptp_free(void *);
 
+#ifdef __cplusplus
+}
 #endif
+
+#endif /* _IO_IOMMU_H_ */

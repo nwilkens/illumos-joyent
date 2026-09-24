@@ -41,6 +41,7 @@
 /*
  * Copyright 2019 Joyent, Inc.
  * Copyright 2022 OmniOS Community Edition (OmniOSce) Association.
+ * Copyright 2026 Edgecast Cloud LLC.
  */
 
 #include <sys/cdefs.h>
@@ -1086,11 +1087,18 @@ ppt_assign_device(struct vm *vm, int pptfd)
 		goto done;
 	}
 
+	/* Move the device to the guest's domain before it can do DMA. */
+	iommu_remove_device(iommu_host_domain(), pci_get_bdf(ppt->pptd_dip));
+	err = iommu_add_device(vm_iommu_domain(vm), pci_get_bdf(ppt->pptd_dip));
+	if (err != 0) {
+		(void) iommu_add_device(iommu_host_domain(),
+		    pci_get_bdf(ppt->pptd_dip));
+		goto done;
+	}
+
 	ppt_toggle_bar(ppt, B_TRUE);
 
 	ppt->vm = vm;
-	iommu_remove_device(iommu_host_domain(), pci_get_bdf(ppt->pptd_dip));
-	iommu_add_device(vm_iommu_domain(vm), pci_get_bdf(ppt->pptd_dip));
 	pf_set_passthru(ppt->pptd_dip, B_TRUE);
 
 done:
@@ -1146,7 +1154,8 @@ ppt_do_unassign(struct pptdev *ppt)
 	ppt_teardown_msi(ppt);
 	ppt_teardown_msix(ppt);
 	iommu_remove_device(vm_iommu_domain(vm), pci_get_bdf(ppt->pptd_dip));
-	iommu_add_device(iommu_host_domain(), pci_get_bdf(ppt->pptd_dip));
+	(void) iommu_add_device(iommu_host_domain(),
+	    pci_get_bdf(ppt->pptd_dip));
 	ppt->vm = NULL;
 }
 

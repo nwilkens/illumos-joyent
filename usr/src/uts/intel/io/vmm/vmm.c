@@ -42,6 +42,7 @@
  * Copyright 2018 Joyent, Inc.
  * Copyright 2025 Oxide Computer Company
  * Copyright 2021 OmniOS Community Edition (OmniOSce) Association.
+ * Copyright 2026 Edgecast Cloud LLC.
  */
 
 
@@ -1161,6 +1162,14 @@ vm_iommu_modify(struct vm *vm, bool map)
 	iommu_invalidate_tlb(vm->iommu);
 }
 
+static void
+vm_iommu_destroy(struct vm *vm)
+{
+	vm_iommu_modify(vm, false);
+	iommu_destroy_domain(vm->iommu);
+	vm->iommu = NULL;
+}
+
 int
 vm_unassign_pptdev(struct vm *vm, int pptfd)
 {
@@ -1171,7 +1180,7 @@ vm_unassign_pptdev(struct vm *vm, int pptfd)
 		return (error);
 
 	if (ppt_assigned_devices(vm) == 0)
-		vm_iommu_modify(vm, false);
+		vm_iommu_destroy(vm);
 
 	return (0);
 }
@@ -1194,6 +1203,9 @@ vm_assign_pptdev(struct vm *vm, int pptfd)
 	}
 
 	error = ppt_assign_device(vm, pptfd);
+	if (error != 0 && ppt_assigned_devices(vm) == 0)
+		vm_iommu_destroy(vm);
+
 	return (error);
 }
 

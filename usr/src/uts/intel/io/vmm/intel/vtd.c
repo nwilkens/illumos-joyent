@@ -40,6 +40,7 @@
 /*
  * Copyright 2018 Joyent, Inc.
  * Copyright 2022 Oxide Computer Company
+ * Copyright 2026 Edgecast Cloud LLC.
  */
 
 #include <sys/cdefs.h>
@@ -592,7 +593,7 @@ vtd_disable(void)
 	}
 }
 
-static void
+static int
 vtd_add_device(void *arg, uint16_t rid)
 {
 	int idx;
@@ -633,6 +634,7 @@ vtd_add_device(void *arg, uint16_t rid)
 	 * 'Not Present' entries are not cached in either the Context Cache
 	 * or in the IOTLB, so there is no need to invalidate either of them.
 	 */
+	return (0);
 }
 
 static void
