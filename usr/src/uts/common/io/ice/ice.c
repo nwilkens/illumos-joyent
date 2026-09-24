@@ -741,8 +741,8 @@ ice_intr_adjust_locked(ice_t *ice, ddi_cb_action_t action, int count)
 			h[i] = NULL;
 			ice->ice_intr_count = i;
 		}
-	} else if (ddi_intr_alloc(ice->ice_dip, &h[old], DDI_INTR_TYPE_MSIX,
-	    old, target - old, &actual, DDI_INTR_ALLOC_NORMAL) != DDI_SUCCESS) {
+	} else if (ddi_intr_alloc(ice->ice_dip, h, DDI_INTR_TYPE_MSIX, old,
+	    target - old, &actual, DDI_INTR_ALLOC_NORMAL) != DDI_SUCCESS) {
 		ret = DDI_FAILURE;
 	} else {
 		ice->ice_intr_count = old + actual;

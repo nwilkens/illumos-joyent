@@ -137,6 +137,7 @@ typedef struct ice {
 } ice_t;
 
 static int ncpus = 40, max_ncpus = 40, boot_max_ncpus = -1;
+static ice_t dev;
 
 /* IRM and the DDI: which MSI-X entries are allocated, and handler state. */
 static struct {
@@ -242,13 +243,18 @@ ddi_intr_get_navail(dev_info_t *dip, int type, int *n)
 	return (DDI_SUCCESS);
 }
 
-/* MSI-X entries are handed out contiguously from inum. */
+/*
+ * MSI-X entries are handed out contiguously from inum, and, as in the DDI,
+ * each handle is stored at its entry's index in the array passed.
+ */
 static int
 ddi_intr_alloc(dev_info_t *dip, ddi_intr_handle_t *h, int type, int inum,
     int count, int *actual, int behavior)
 {
 	int navail, i;
 
+	assert(h == dev.ice_intr_handles);
+	assert(inum + count <= (int)(dev.ice_intr_size / sizeof (*h)));
 	assert(type == DDI_INTR_TYPE_MSIX && inum == m.allocated);
 	assert(behavior == DDI_INTR_ALLOC_NORMAL && count > 0);
 	if (m.fail_alloc)
@@ -263,7 +269,7 @@ ddi_intr_alloc(dev_info_t *dip, ddi_intr_handle_t *h, int type, int inum,
 	for (i = 0; i < *actual; i++) {
 		assert(!m.live[inum + i]);
 		m.live[inum + i] = B_TRUE;
-		h[i] = &tokens[inum + i];
+		h[inum + i] = &tokens[inum + i];
 	}
 	m.allocated += *actual;
 	return (DDI_SUCCESS);
@@ -362,7 +368,6 @@ cv_init(kcondvar_t *cv, void *name, int type, void *arg)
 	*cv = 0;
 }
 
-static ice_t dev;
 
 /*
  * The DDI handler and enable operations, each of which can be made to fail
