@@ -916,11 +916,7 @@ irdma_query_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask,
 	attr->cap.max_inline_data = uk->max_inline_data;
 	attr->cap.max_send_sge = uk->max_sq_frag_cnt;
 	attr->cap.max_recv_sge = uk->max_rq_frag_cnt;
-	attr->qp_access_flags = RDK_ACCESS_LOCAL_WRITE;
-	if (iqp->iqp_roce.wr_rdresp_en)
-		attr->qp_access_flags |= RDK_ACCESS_REMOTE_WRITE;
-	if (iqp->iqp_roce.rd_en)
-		attr->qp_access_flags |= RDK_ACCESS_REMOTE_READ;
+	attr->qp_access_flags = iqp->iqp_access;
 	attr->port_num = 1;
 	attr->path_mtu = rdk_mtu_int_to_enum((int)iqp->iqp_udp.snd_mss);
 	attr->qkey = iqp->iqp_roce.qkey;
@@ -930,7 +926,8 @@ irdma_query_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask,
 	attr->retry_cnt = iqp->iqp_udp.rexmit_thresh;
 	attr->rnr_retry = iqp->iqp_udp.rnr_nak_thresh;
 	attr->max_rd_atomic = (uint8_t)iqp->iqp_roce.ord_size;
-	attr->max_dest_rd_atomic = (uint8_t)iqp->iqp_roce.ird_size;
+	attr->max_dest_rd_atomic = iqp->iqp_ird_zero ? 0 :
+	    (uint8_t)iqp->iqp_roce.ird_size;
 	mutex_exit(&iqp->iqp_lock);
 
 	init->event_handler = rqp->event_handler;
