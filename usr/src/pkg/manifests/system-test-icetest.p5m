@@ -1,0 +1,42 @@
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+
+#
+# Copyright 2026 Edgecast Cloud LLC.
+#
+
+#
+# The default for payload-bearing actions in this package is to appear in the
+# global zone only.  See the include file for greater detail, as well as
+# information about overriding the defaults.
+#
+<include global_zone_only_component>
+set name=pkg.fmri value=pkg:/system/test/icetest@$(PKGVERS)
+set name=pkg.summary value="ice(4D) Test Suite"
+set name=pkg.description value="On-system tests for the Intel E800 ice driver"
+set name=info.classification \
+    value=org.opensolaris.category.2008:Development/System
+set name=variant.arch value=i386
+dir  path=opt/ice-tests
+dir  path=opt/ice-tests/bin
+file path=opt/ice-tests/bin/icetest mode=0555
+dir  path=opt/ice-tests/runfiles
+file path=opt/ice-tests/runfiles/datapath.run mode=0444
+file path=opt/ice-tests/runfiles/default.run mode=0444
+dir  path=opt/ice-tests/tests
+file path=opt/ice-tests/tests/attach mode=0555
+file path=opt/ice-tests/tests/datapath mode=0555
+file path=opt/ice-tests/tests/datapath_accept mode=0555
+file path=opt/ice-tests/tests/diag_ioctl.64 mode=0555
+file path=opt/ice-tests/tests/led mode=0555
+license lic_CDDL license=lic_CDDL
+depend type=require fmri=driver/network/ice
+depend type=require fmri=system/test/testrunner
