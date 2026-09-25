@@ -9,22 +9,78 @@
 # http://www.illumos.org/license/CDDL.
 #
 
-This directory contains files extracted from the Intel FreeBSD ice
-driver. This uses the FreeBSD main branch, git SHA
-310145642312e1c5fb3d8efa8321cf905d0354c4.
+This directory contains the OS-independent "common code" of the Intel ice
+driver, imported from the FreeBSD main branch at git SHA
+310145642312e1c5fb3d8efa8321cf905d0354c4 (sys/dev/ice).
 
-These files are the OS-independent "common code" and are used unmodified.
-All illumos adaptation lives in the ../ice_osdep.h and ../ice_osdep.c
-shim and in the surrounding driver; nothing in this directory is changed.
+OS adaptation lives in ../ice_osdep.h and ../ice_osdep.c and in the rest of
+the driver.  All files in this directory are unmodified from that commit,
+except the local changes listed below.
 
-The following files were imported but are intentionally not compiled (see
-the ICE_INTC_OBJS list in usr/src/uts/common/Makefile.files):
+Files not compiled
+------------------
 
-    ice_dcb.c		DCB/LLDP support; no coupling into the rest of the
-			common code, omitted until needed.
-    ice_vf_mbx.c	SR-IOV virtchnl mailbox; omitted until IOV support
-			is added.
+These files were imported but are not in ICE_INTC_OBJS
+(usr/src/uts/common/Makefile.files):
 
-The following illumos changes have further modified the common code:
+    ice_dcb.c		DCB/LLDP support.  Nothing else in the common code
+			calls it; omitted until DCB is supported.
+    ice_vf_mbx.c	SR-IOV virtchnl mailbox; omitted until SR-IOV is
+			supported.
 
-    (none yet)
+Local changes
+-------------
+
+Each change is marked with an "illumos:" comment next to the code.  All of
+them treat firmware or DDP package data as untrusted: the upstream code uses
+a count or length from the device or the package before it checks that the
+value fits the buffer it indexes.
+
+    ice_common.c
+	ice_discover_dev_caps(), ice_discover_func_caps(): reject a
+	capability count larger than the response buffer holds.
+
+    ice_switch.c
+	ice_get_initial_sw_cfg(): reject a switch configuration element
+	count larger than the response buffer holds.
+
+    ice_ddp_common.c
+	ice_init_pkg_info(): reject a metadata section smaller than
+	struct ice_meta_sect, and print the package name with a bounded
+	length because it has no guaranteed terminator.
+	ice_get_pkg_info(): reject a package count larger than
+	ICE_PKG_CNT, and print firmware package names with a bounded
+	length.
+	ice_chk_pkg_compat(): reject a package count larger than
+	ICE_PKG_CNT.
+
+    ice_sched.c
+	ice_sched_add_node(): refuse a child when the parent's children
+	array (sized by max_children for its layer) is full.
+	ice_sched_init_port(): reject a branch element count outside
+	1..ICE_AQC_TOPO_MAX_LEVEL_NUM.
+	ice_sched_query_res_alloc(): accept only a 5 or 9 layer
+	topology, and require a nonzero child group size for every layer
+	used as a parent, before any scheduler state is published.
+
+usr/src/test/ice-tests/core_counts.py checks that each guard is present,
+core_readme.py checks that this list matches the "illumos:" markers, and
+sched_resources.py runs the scheduler admission code.
+
+Newer upstream definitions that the driver needs are defined in the driver,
+not added here.  For example, ../ice.h defines the E830 TCLAN malicious
+driver detection registers that later FreeBSD and Linux autogen headers
+carry.
+
+Re-import policy
+----------------
+
+1. Copy the files from one FreeBSD commit without changes and record its
+   SHA above.
+2. For each local change listed above, check whether the new upstream code
+   has an equivalent check.  If it does, drop the local change.  If it does
+   not, apply it again with its "illumos:" comment.  Update this list.
+3. Do not add new local changes for features.  Put OS glue in ice_osdep.[ch]
+   or the driver, and put missing register definitions in the driver.
+4. Run python3 -B usr/src/test/ice-tests/run_tests.py and a full module
+   build with smatch before the change is committed.

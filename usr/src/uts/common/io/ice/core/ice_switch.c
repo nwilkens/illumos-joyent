@@ -1096,6 +1096,12 @@ int ice_get_initial_sw_cfg(struct ice_hw *hw)
 		if (status)
 			break;
 
+		/* illumos: the count is firmware data; it must fit the buffer. */
+		if (num_elems > ICE_SW_CFG_MAX_BUF_LEN / sizeof(*rbuf)) {
+			status = ICE_ERR_AQ_ERROR;
+			break;
+		}
+
 		for (i = 0, ele = rbuf; i < num_elems; i++, ele++) {
 			u16 pf_vf_num, swid, vsi_port_num;
 			bool is_vf = false;

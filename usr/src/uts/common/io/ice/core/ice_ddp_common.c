@@ -832,13 +832,21 @@ ice_init_pkg_info(struct ice_hw *hw, struct ice_pkg_hdr *pkg_hdr)
 			return ICE_DDP_PKG_INVALID_FILE;
 		}
 
+		/* illumos: the section must hold the struct read below. */
+		if (LE16_TO_CPU(state.buf->section_entry[state.sect_idx].size) <
+		    sizeof(*meta)) {
+			ice_debug(hw, ICE_DBG_INIT, "ice metadata section too small\n");
+			return ICE_DDP_PKG_INVALID_FILE;
+		}
+
 		hw->pkg_ver = meta->ver;
 		ice_memcpy(hw->pkg_name, meta->name, sizeof(meta->name),
 			   ICE_NONDMA_TO_NONDMA);
 
-		ice_debug(hw, ICE_DBG_PKG, "Pkg: %d.%d.%d.%d, %s\n",
+		/* illumos: the name has no guaranteed terminator. */
+		ice_debug(hw, ICE_DBG_PKG, "Pkg: %d.%d.%d.%d, %.*s\n",
 			  meta->ver.major, meta->ver.minor, meta->ver.update,
-			  meta->ver.draft, meta->name);
+			  meta->ver.draft, (int)sizeof(meta->name), meta->name);
 
 		hw->ice_seg_fmt_ver = seg_hdr->seg_format_ver;
 		ice_memcpy(hw->ice_seg_id, seg_hdr->seg_id,
@@ -881,6 +889,12 @@ enum ice_ddp_state ice_get_pkg_info(struct ice_hw *hw)
 		goto init_pkg_free_alloc;
 	}
 
+	/* illumos: the count is firmware data; it must fit the buffer. */
+	if (LE32_TO_CPU(pkg_info->count) > ICE_PKG_CNT) {
+		state = ICE_DDP_PKG_ERR;
+		goto init_pkg_free_alloc;
+	}
+
 	for (i = 0; i < LE32_TO_CPU(pkg_info->count); i++) {
 #define ICE_PKG_FLAG_COUNT	4
 		char flags[ICE_PKG_FLAG_COUNT + 1] = { 0 };
@@ -904,11 +918,13 @@ enum ice_ddp_state ice_get_pkg_info(struct ice_hw *hw)
 		if (pkg_info->pkg_info[i].is_in_nvm)
 			flags[place++] = 'N';
 
-		ice_debug(hw, ICE_DBG_PKG, "Pkg[%d]: %d.%d.%d.%d,%s,%s\n",
+		/* illumos: the firmware name has no guaranteed terminator. */
+		ice_debug(hw, ICE_DBG_PKG, "Pkg[%d]: %d.%d.%d.%d,%.*s,%s\n",
 			  i, pkg_info->pkg_info[i].ver.major,
 			  pkg_info->pkg_info[i].ver.minor,
 			  pkg_info->pkg_info[i].ver.update,
 			  pkg_info->pkg_info[i].ver.draft,
+			  (int)sizeof(pkg_info->pkg_info[i].name),
 			  pkg_info->pkg_info[i].name, flags);
 	}
 
@@ -1147,6 +1163,12 @@ ice_chk_pkg_compat(struct ice_hw *hw, struct ice_pkg_hdr *ospkg,
 		return ICE_DDP_PKG_ERR;
 
 	if (ice_aq_get_pkg_info_list(hw, pkg, size, NULL)) {
+		state = ICE_DDP_PKG_ERR;
+		goto fw_ddp_compat_free_alloc;
+	}
+
+	/* illumos: the count is firmware data; it must fit the buffer. */
+	if (LE32_TO_CPU(pkg->count) > ICE_PKG_CNT) {
 		state = ICE_DDP_PKG_ERR;
 		goto fw_ddp_compat_free_alloc;
 	}

@@ -3182,6 +3182,10 @@ ice_discover_dev_caps(struct ice_hw *hw, struct ice_hw_dev_caps *dev_caps)
 
 	status = ice_aq_list_caps(hw, cbuf, ICE_AQ_MAX_BUF_LEN, &cap_count,
 				  ice_aqc_opc_list_dev_caps, NULL);
+	/* illumos: the count is firmware data; it must fit the buffer. */
+	if (!status &&
+	    cap_count > ICE_AQ_MAX_BUF_LEN / sizeof(struct ice_aqc_list_caps_elem))
+		status = ICE_ERR_AQ_ERROR;
 	if (!status)
 		ice_parse_dev_caps(hw, dev_caps, cbuf, cap_count);
 	ice_free(hw, cbuf);
@@ -3216,6 +3220,10 @@ ice_discover_func_caps(struct ice_hw *hw, struct ice_hw_func_caps *func_caps)
 
 	status = ice_aq_list_caps(hw, cbuf, ICE_AQ_MAX_BUF_LEN, &cap_count,
 				  ice_aqc_opc_list_func_caps, NULL);
+	/* illumos: the count is firmware data; it must fit the buffer. */
+	if (!status &&
+	    cap_count > ICE_AQ_MAX_BUF_LEN / sizeof(struct ice_aqc_list_caps_elem))
+		status = ICE_ERR_AQ_ERROR;
 	if (!status)
 		ice_parse_func_caps(hw, func_caps, cbuf, cap_count);
 	ice_free(hw, cbuf);
