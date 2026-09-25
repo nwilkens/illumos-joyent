@@ -22,8 +22,10 @@ Only the code the E810 (GEN2) control plane and later the kernel verbs need
 is imported.  The Linux OS layer (main.c, hw.c, utils.c, verbs.c, cm.c,
 icrdma_if.c, osdep.h), the GEN1 and GEN3 hardware files (i40iw_*, ig3rdma_*),
 the virtual channel (virtchnl.c) and the trace files are not.  Linux osdep.h
-is to be replaced by an osdep.h written for illumos.  GEN1 and GEN3 paths stay
-in the files and are not to be reached: the driver will run only IRDMA_GEN_2.
+is replaced by ../osdep.h, written for illumos; the functions the shared code
+expects from the OS layer are in ../irdma_ctl.c and ../irdma_osdep.c.  GEN1
+and GEN3 paths stay in the files and are never reached: the driver runs only
+IRDMA_GEN_2, and i40iw_init_hw() and ig3rdma_init_hw() are empty.
 
 Files and their blob IDs at that commit (git rev-parse <commit>:<path>)
 -----------------------------------------------------------------------
@@ -50,11 +52,46 @@ Files and their blob IDs at that commit (git rev-parse <commit>:<path>)
     user.h         ab57f689827a024fbbde40b3487809baa60a8b8f
     virtchnl.h     aa955a9125bdd96086a6f239e0e919bb425c52ea
 
-The files are unmodified.
+The files are unmodified except for the local changes below.
+
+Local changes
+-------------
+
+Each change is marked with an "illumos:" comment.  Each treats data the
+device or firmware writes as untrusted where the upstream code does not.
+
+    ctrl.c
+	irdma_sc_ccq_get_cqe_info(): take the CQP from the device structure
+	instead of the pointer in the completion entry, and reject an entry
+	that names another; reject a WQE index at or above the SQ size before
+	it indexes the scratch array and the SQ.
+	irdma_sc_parse_fpm_query_buf(): return the result of
+	irdma_osdep_fpm_query_check(), which bounds the FPM counts, sizes,
+	block sizes and SD count before irdma_cfg_fpm_val() computes with
+	them in the same function.
+	irdma_sc_cfg_iw_fpm(): after parsing the commit buffer, return the
+	result of irdma_osdep_fpm_commit_check(), which requires every
+	committed object to lie inside the SD table before it is allocated
+	and indexed.
+	irdma_sc_process_ceq(): stop after one pass over the CEQ, so that
+	entries with no registered CQ cannot keep the caller in the loop.
+
+The checks themselves are in ../irdma_osdep.c.  Other untrusted values are
+handled outside core/ without changes here: CEQ entries resolve only to CQs
+registered on the CEQ (the driver passes reg_cq), and AEQ completion
+contexts are never dereferenced.
+
+usr/src/test/irdma-tests checks that each marker is present and that this
+list matches them.
 
 Re-import policy
 ----------------
 
 1. Copy the files from one Linux commit without changes and record the
    commit and blob IDs above.  Check each license line first.
-2. Put OS glue in ../osdep.h and the driver, not here.
+2. For each local change, check whether upstream now has an equivalent
+   check; drop the change if so, otherwise apply it again with its
+   "illumos:" comment.  Update this list.
+3. Put OS glue in ../osdep.h and the driver, not here.
+4. Run python3 -B usr/src/test/irdma-tests/run_tests.py and a full module
+   build with smatch before the change is committed.
