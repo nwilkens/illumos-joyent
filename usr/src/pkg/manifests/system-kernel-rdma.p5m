@@ -1,0 +1,27 @@
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+
+#
+# Copyright 2026 Edgecast Cloud LLC.
+#
+
+set name=pkg.fmri value=pkg:/system/kernel/rdma@$(PKGVERS)
+set name=pkg.summary value="RDMA Kernel Verbs"
+set name=pkg.description value="Kernel RDMA verbs framework (rdmak)"
+set name=info.classification value=org.opensolaris.category.2008:System/Core
+set name=variant.arch value=i386
+dir  path=kernel group=sys
+dir  path=kernel/misc group=sys
+dir  path=kernel/misc/$(ARCH64) group=sys
+file path=kernel/misc/$(ARCH64)/rdmak group=sys mode=0755
+license lic_CDDL license=lic_CDDL
+license usr/src/uts/common/io/rdma/THIRDPARTYLICENSE \
+    license=usr/src/uts/common/io/rdma/THIRDPARTYLICENSE

@@ -31,7 +31,11 @@ root with Python 3.9+ and a C99 compiler.
   code; ice calls the child with no lock held; the reset worker offlines and
   onlines the child with `ice_rebuild_lock` dropped; the quarantine is freed
   only after a reset.
-- `cstyle.py`: `cstyle -pP` over the driver and the tests.
+- `rdk_verbs.py`: runs the rdmak QP state table against missing, extra and
+  out-of-range attributes, states and types, and the DMA page walk against
+  offsets, gaps, a full page list and a cookie that wraps the address
+  space.
+- `cstyle.py`: `cstyle -pP` over the driver, rdmak and the tests.
 
 ## On hardware
 
