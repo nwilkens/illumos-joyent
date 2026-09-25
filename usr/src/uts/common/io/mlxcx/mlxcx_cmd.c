@@ -13,7 +13,7 @@
  * Copyright 2020, The University of Queensland
  * Copyright (c) 2018, Joyent, Inc.
  * Copyright 2020 RackTop Systems, Inc.
- * Copyright 2023 MNX Cloud, Inc.
+ * Copyright 2026 MNX Cloud, Inc.
  */
 
 /*
@@ -566,6 +566,15 @@ mlxcx_cmd_queue_init(mlxcx_t *mlxp)
 	if (cmd->mcmd_size > MLXCX_CMD_MAX) {
 		mlxcx_warn(mlxp, "command queue size %u is too "
 		    "large. Maximum is %u", cmd->mcmd_size, MLXCX_CMD_MAX);
+		return (B_FALSE);
+	}
+
+	if ((1U << cmd->mcmd_stride_l2) < sizeof (mlxcx_cmd_ent_t) ||
+	    ((cmd->mcmd_size - 1) << cmd->mcmd_stride_l2) +
+	    sizeof (mlxcx_cmd_ent_t) > MLXCX_CMD_DMA_PAGE_SIZE) {
+		mlxcx_warn(mlxp, "command queue of %u entries with stride %u "
+		    "does not fit in %u bytes", cmd->mcmd_size,
+		    1U << cmd->mcmd_stride_l2, MLXCX_CMD_DMA_PAGE_SIZE);
 		return (B_FALSE);
 	}
 
