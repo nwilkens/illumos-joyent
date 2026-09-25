@@ -122,8 +122,15 @@ typedef struct rdmat_connect {
 	uint8_t		rc_retry;
 	uint8_t		rc_rnr_retry;
 	uint32_t	rc_rqkey;	/* UD */
-	uint32_t	rc_pad;
+	uint32_t	rc_qp_access;	/* RC: 0 for all, or RDMAT_QPACC_* */
 } rdmat_connect_t;
+
+/*
+ * rc_qp_access: RDMAT_QPACC_SET with the RDMAT_ACC_* rights the QP grants,
+ * and RDMAT_QPACC_NO_IRD for no inbound read resources.
+ */
+#define	RDMAT_QPACC_SET		0x100
+#define	RDMAT_QPACC_NO_IRD	0x200
 
 typedef enum rdmat_op {
 	RDMAT_OP_SEND = 1,	/* count sends of size from offset */
@@ -180,6 +187,7 @@ typedef struct rdmat_run {
 
 #define	RDMAT_ACC_REMOTE_WRITE	0x1
 #define	RDMAT_ACC_REMOTE_READ	0x2
+#define	RDMAT_ACC_LOCAL_WRITE	0x4	/* rc_qp_access only */
 
 typedef enum rdmat_bufop {
 	RDMAT_BUF_FILL = 1,

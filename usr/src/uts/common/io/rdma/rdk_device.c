@@ -473,6 +473,7 @@ rdk_add_gid(struct rdk_device *dev, uint32_t port, const rdk_gid_t *gid,
 		    bcmp(&e->rge_attr.gid, gid, sizeof (*gid)) == 0 &&
 		    e->rge_attr.vlan_id == vlan &&
 		    bcmp(e->rge_attr.mac, mac, ETHERADDRL) == 0) {
+			e->rge_owners++;
 			*indexp = e->rge_attr.index;
 			mutex_exit(&p->rdp_lock);
 			mutex_exit(&p->rdp_gid_lock);
@@ -500,6 +501,7 @@ rdk_add_gid(struct rdk_device *dev, uint32_t port, const rdk_gid_t *gid,
 	if (ret == 0) {
 		mutex_enter(&p->rdp_lock);
 		e->rge_refs = 0;
+		e->rge_owners = 1;
 		e->rge_valid = B_TRUE;
 		mutex_exit(&p->rdp_lock);
 		*indexp = e->rge_attr.index;
@@ -525,11 +527,18 @@ rdk_del_gid(struct rdk_device *dev, uint32_t port, uint16_t index)
 		mutex_exit(&p->rdp_gid_lock);
 		return (ENOENT);
 	}
+	if (e->rge_owners > 1) {
+		e->rge_owners--;
+		mutex_exit(&p->rdp_lock);
+		mutex_exit(&p->rdp_gid_lock);
+		return (0);
+	}
 	if (e->rge_refs != 0) {
 		mutex_exit(&p->rdp_lock);
 		mutex_exit(&p->rdp_gid_lock);
 		return (EBUSY);
 	}
+	e->rge_owners = 0;
 	e->rge_valid = B_FALSE;
 	mutex_exit(&p->rdp_lock);
 	dev->rd_ops->del_gid(&e->rge_attr);

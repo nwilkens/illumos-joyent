@@ -279,6 +279,7 @@ irdma_locks_init(irdma_t *irdma)
 	(mutex_init)(&irdma->irdma_qptable_lock, NULL, MUTEX_DRIVER, NULL);
 	(mutex_init)(&irdma->irdma_cqtable_lock, NULL, MUTEX_DRIVER, NULL);
 	(mutex_init)(&irdma->irdma_arp_lock, NULL, MUTEX_DRIVER, NULL);
+	(mutex_init)(&irdma->irdma_arp_cmd_lock, NULL, MUTEX_DRIVER, NULL);
 	(mutex_init)(&irdma->irdma_ceq_lock, NULL, MUTEX_DRIVER, NULL);
 	rw_init(&irdma->irdma_rdk_lock, NULL, RW_DRIVER, NULL);
 	cv_init(&irdma->irdma_req_cv, NULL, CV_DRIVER, NULL);
@@ -297,6 +298,7 @@ irdma_locks_fini(irdma_t *irdma)
 	rw_destroy(&irdma->irdma_rdk_lock);
 	mutex_destroy(&irdma->irdma_ceq_lock);
 	mutex_destroy(&irdma->irdma_arp_lock);
+	mutex_destroy(&irdma->irdma_arp_cmd_lock);
 	mutex_destroy(&irdma->irdma_cqtable_lock);
 	mutex_destroy(&irdma->irdma_qptable_lock);
 	mutex_destroy(&irdma->irdma_rsrc_lock);

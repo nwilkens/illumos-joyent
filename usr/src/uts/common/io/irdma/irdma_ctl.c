@@ -751,11 +751,26 @@ irdma_ceq0_process(irdma_t *irdma)
 	}
 }
 
+/* Whether CEQ 0 holds an entry that has not been processed. */
+static boolean_t
+irdma_ceq_pending(irdma_t *irdma)
+{
+	struct irdma_sc_ceq *ceq = &irdma->irdma_ceq0;
+	u64 temp;
+
+	get_64bit_val(IRDMA_GET_CURRENT_CEQ_ELEM(ceq), 0, &temp);
+	return ((u8)FIELD_GET(IRDMA_CEQE_VALID, temp) == ceq->polarity);
+}
+
+/* Passes the task makes on its own for CEQ entries that beat the enable. */
+#define	IRDMA_CEQ_RECHECKS	4
+
 void
 irdma_intr_task(void *arg)
 {
 	irdma_t *irdma = arg;
 	boolean_t ceq, aeq;
+	uint_t rechecks = 0;
 
 	for (;;) {
 		mutex_enter(&irdma->irdma_intr_lock);
@@ -772,6 +787,16 @@ irdma_intr_task(void *arg)
 		if (ceq && (irdma->irdma_progress & BIT(IRDMA_STEP_CEQ0))) {
 			irdma_ceq0_process(irdma);
 			irdma_vec_enable(irdma, irdma->irdma_ceq_vec);
+			/*
+			 * The enable clears the pending bit, so an entry
+			 * written before it raises no interrupt.
+			 */
+			if (irdma_ceq_pending(irdma) &&
+			    rechecks++ < IRDMA_CEQ_RECHECKS) {
+				mutex_enter(&irdma->irdma_intr_lock);
+				irdma->irdma_ceq_owed = B_TRUE;
+				mutex_exit(&irdma->irdma_intr_lock);
+			}
 		}
 		if (aeq && (irdma->irdma_progress & BIT(IRDMA_STEP_AEQ))) {
 			irdma_aeq_process(irdma);

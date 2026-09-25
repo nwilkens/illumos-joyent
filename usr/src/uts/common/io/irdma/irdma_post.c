@@ -87,6 +87,11 @@ irdma_post_send(struct rdk_qp *rqp, const struct rdk_send_wr *wr,
 	boolean_t flushed;
 	int err = 0;
 
+	/* The device may reset at any time; this only stops new work. */
+	if (!irdma_healthy(iqp->iqp_irdma)) {
+		*bad = wr;
+		return (EIO);
+	}
 	mutex_enter(&iqp->iqp_lock);
 	for (; wr != NULL; wr = wr->next) {
 		bzero(&pi, sizeof (pi));
@@ -194,7 +199,8 @@ irdma_post_send(struct rdk_qp *rqp, const struct rdk_send_wr *wr,
 				break;
 			}
 			pi.op_type = IRDMA_OP_TYPE_INV_STAG;
-			pi.local_fence = pi.read_fence;
+			/* Earlier work may still use the MR. */
+			pi.local_fence = true;
 			pi.op.inv_local_stag.target_stag =
 			    wr->ex.invalidate_rkey;
 			err = irdma_uk_stag_local_invalidate(uk, &pi, false);
@@ -239,6 +245,10 @@ irdma_post_recv(struct rdk_qp *rqp, const struct rdk_recv_wr *wr,
 	boolean_t flushed;
 	int i, err = 0;
 
+	if (!irdma_healthy(iqp->iqp_irdma)) {
+		*bad = wr;
+		return (EIO);
+	}
 	mutex_enter(&iqp->iqp_lock);
 	for (; wr != NULL; wr = wr->next) {
 		if (wr->num_sge < 0 ||

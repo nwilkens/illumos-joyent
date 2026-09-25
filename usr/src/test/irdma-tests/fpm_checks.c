@@ -107,7 +107,12 @@ query(void)
 	return (irdma_osdep_fpm_query_check(&dev, &hmc, &dev.hmc_fpm_misc));
 }
 
-/* A committed layout: every object packed after the one before. */
+static u32 req[IRDMA_HMC_IW_MAX];
+
+/*
+ * A committed layout: every object packed after the one before, with the
+ * counts the driver asked for.
+ */
 static void
 commit_layout(u32 sds)
 {
@@ -117,6 +122,7 @@ commit_layout(u32 sds)
 	for (i = 0; i < IRDMA_HMC_IW_MAX; i++) {
 		obj[i].cnt = obj[i].max_cnt == 0 ? 0 :
 		    (i == IRDMA_HMC_IW_PBLE ? 4096 : obj[i].max_cnt / 2);
+		req[i] = obj[i].cnt;
 		obj[i].base = base;
 		base += (u64)obj[i].cnt * obj[i].size;
 		base = (base + 511) & ~511ULL;
@@ -186,10 +192,11 @@ main(void)
 	/* The committed layout must lie inside the SD table. */
 	good();
 	commit_layout(64);
-	assert(irdma_osdep_fpm_commit_check(&dev, &hmc) == 0);
+	assert(irdma_osdep_fpm_commit_check(&dev, &hmc, req) == 0);
 #define	REJECT_COMMIT(stmt)	do {					\
 	good(); commit_layout(64); stmt;				\
-	assert(irdma_osdep_fpm_commit_check(&dev, &hmc) == -EINVAL);	\
+	assert(irdma_osdep_fpm_commit_check(&dev, &hmc, req) ==		\
+	    -EINVAL);							\
 	cases++;							\
 } while (0)
 	REJECT_COMMIT(hmc.sd_table.sd_cnt = 0);
@@ -203,6 +210,9 @@ main(void)
 	REJECT_COMMIT(obj[IRDMA_HMC_IW_PBLE].cnt = 1000);
 	REJECT_COMMIT(obj[IRDMA_HMC_IW_QP].cnt = 0);
 	REJECT_COMMIT(obj[IRDMA_HMC_IW_TIMER].base = UINT64_MAX - 100);
+	/* More than the driver asked for, though within the query limit. */
+	REJECT_COMMIT(obj[IRDMA_HMC_IW_QP].cnt = req[IRDMA_HMC_IW_QP] + 1);
+	REJECT_COMMIT(obj[IRDMA_HMC_IW_MR].cnt = req[IRDMA_HMC_IW_MR] * 2);
 
 	(void) printf("PASS: FPM checks accept a sane layout and reject %d "
 	    "hostile values\n", cases);

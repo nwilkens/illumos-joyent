@@ -52,6 +52,8 @@ struct rdk_cq_poller {
 	boolean_t	rcp_queued;	/* the task is queued or running */
 	boolean_t	rcp_rerun;	/* an event came while it ran */
 	boolean_t	rcp_dying;
+	kthread_t	*rcp_runner;	/* the thread polling and dispatching */
+	uint64_t	rcp_batches;
 	uint64_t	rcp_no_cqe;	/* completions without an rdk_cqe */
 	struct rdk_wc	rcp_wc[RDK_CQ_BATCH];
 };
@@ -89,6 +91,9 @@ rdk_cq_process(struct rdk_cq *cq, struct rdk_wc *wcs, int budget)
 			want = MIN(want, budget - done);
 		if (want <= 0)
 			break;
+		mutex_enter(&cp->rcp_lock);
+		cp->rcp_runner = curthread;
+		mutex_exit(&cp->rcp_lock);
 		n = rdk_poll_cq(cq, want, wcs);
 		for (i = 0; i < n; i++) {
 			if (wcs[i].wr_cqe != NULL)
@@ -96,6 +101,11 @@ rdk_cq_process(struct rdk_cq *cq, struct rdk_wc *wcs, int budget)
 			else
 				cp->rcp_no_cqe++;
 		}
+		mutex_enter(&cp->rcp_lock);
+		cp->rcp_runner = NULL;
+		cp->rcp_batches++;
+		cv_broadcast(&cp->rcp_cv);
+		mutex_exit(&cp->rcp_lock);
 		if (n > 0)
 			done += n;
 		if (n < want)
@@ -192,16 +202,20 @@ rdk_alloc_cq(struct rdk_device *dev, void *private, int nr_cqe,
 	bzero(&attr, sizeof (attr));
 	attr.cqe = (uint32_t)nr_cqe;
 	attr.comp_vector = (uint32_t)comp_vector;
-	ret = rdk_create_cq(dev, ctx == RDK_POLL_TASKQ ? rdk_cq_event : NULL,
-	    NULL, private, &attr, &cq);
+	ret = rdk_create_cq_poll(dev, ctx == RDK_POLL_TASKQ ? rdk_cq_event :
+	    NULL, NULL, private, &attr, ctx, cp, &cq);
 	if (ret != 0) {
+		/* The provider may have sent an event before it failed. */
+		mutex_enter(&cp->rcp_lock);
+		cp->rcp_dying = B_TRUE;
+		while (cp->rcp_queued)
+			cv_wait(&cp->rcp_cv, &cp->rcp_lock);
+		mutex_exit(&cp->rcp_lock);
 		cv_destroy(&cp->rcp_cv);
 		mutex_destroy(&cp->rcp_lock);
 		kmem_free(cp, sizeof (*cp));
 		return (ret);
 	}
-	cq->poll_ctx = ctx;
-	cq->poller = cp;
 	if (ctx == RDK_POLL_TASKQ)
 		(void) rdk_req_notify_cq(cq, RDK_CQ_NEXT_COMP);
 	*cqp = cq;
@@ -228,6 +242,27 @@ rdk_free_cq(struct rdk_cq *cq)
 	cv_destroy(&cp->rcp_cv);
 	mutex_destroy(&cp->rcp_lock);
 	kmem_free(cp, sizeof (*cp));
+}
+
+/*
+ * Wait until completions polled before the call are dispatched.  After the
+ * provider has destroyed a QP, no later poll returns its completions.
+ */
+void
+rdk_cq_barrier(struct rdk_cq *cq)
+{
+	struct rdk_cq_poller *cp = cq->poller;
+	uint64_t gen;
+
+	if (cp == NULL)
+		return;
+	mutex_enter(&cp->rcp_lock);
+	ASSERT3P(cp->rcp_runner, !=, curthread);
+	gen = cp->rcp_batches;
+	while (cp->rcp_runner != NULL && cp->rcp_runner != curthread &&
+	    cp->rcp_batches == gen)
+		cv_wait(&cp->rcp_cv, &cp->rcp_lock);
+	mutex_exit(&cp->rcp_lock);
 }
 
 /*

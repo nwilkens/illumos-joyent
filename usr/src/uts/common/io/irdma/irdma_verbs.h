@@ -55,9 +55,19 @@ extern "C" {
 #define	IRDMA_REFLUSH		0x4
 #define	IRDMA_FLUSH_WAIT	0x8
 
+typedef enum irdma_arp_state {
+	IRDMA_ARP_FREE = 0,
+	IRDMA_ARP_PENDING,
+	IRDMA_ARP_LIVE,
+	IRDMA_ARP_DYING
+} irdma_arp_state_t;
+
+/* Under irdma_arp_lock. */
 typedef struct irdma_arp_entry {
-	uint32_t	iae_ip[4];
-	uint8_t		iae_mac[ETHERADDRL];
+	uint32_t		iae_ip[4];
+	uint8_t			iae_mac[ETHERADDRL];
+	irdma_arp_state_t	iae_state;
+	uint32_t		iae_refs;
 } irdma_arp_entry_t;
 
 typedef struct irdma_pd {
@@ -88,6 +98,7 @@ typedef struct irdma_cq {
 	struct irdma_dma_mem	icq_shadow;
 	list_t			icq_gen;
 	uint32_t		icq_refs;
+	boolean_t		icq_live;	/* created; under ceq_lock */
 	boolean_t		icq_dying;
 	kcondvar_t		icq_cv;
 	uint64_t		icq_bad_cqes;
@@ -127,6 +138,9 @@ typedef struct irdma_qp {
 	boolean_t		iqp_flush_issued;
 	boolean_t		iqp_sig_all;
 	boolean_t		iqp_destroying;
+	int			iqp_access;	/* RDK_ACCESS_* */
+	boolean_t		iqp_ird_zero;
+	uint32_t		iqp_arp_idx;	/* held; iqp_mod_lock */
 	uint32_t		iqp_max_send_wr;
 	uint32_t		iqp_max_recv_wr;
 	struct irdma_dma_mem	iqp_q2ctx;
@@ -183,6 +197,8 @@ extern int irdma_alloc_rsrc(irdma_t *, ulong_t *, uint32_t, uint32_t *,
 extern void irdma_free_rsrc(irdma_t *, ulong_t *, uint32_t);
 extern int irdma_add_arp(irdma_t *, const uint32_t *, boolean_t,
     const uint8_t *);
+extern void irdma_arp_rele(irdma_t *, uint32_t);
+extern void irdma_verbs_uncertain(irdma_t *, const char *);
 extern boolean_t irdma_hw_ok(irdma_t *);
 extern boolean_t irdma_healthy(irdma_t *);
 extern irdma_cqp_req_t *irdma_vreq(irdma_t *, uint8_t);
@@ -215,7 +231,7 @@ extern void irdma_qp_to_error(irdma_qp_t *);
 extern void irdma_qp_event(irdma_qp_t *, enum irdma_qp_event_type);
 extern void irdma_flush_wqes(irdma_qp_t *, uint32_t);
 extern void irdma_flush_later(irdma_qp_t *);
-extern void irdma_generate_flush_completions(irdma_qp_t *);
+extern boolean_t irdma_generate_flush_completions(irdma_qp_t *);
 
 /*
  * irdma_post.c

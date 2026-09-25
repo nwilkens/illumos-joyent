@@ -26,7 +26,10 @@ def main():
                      r"hmc_fpm_misc\);\n}", ctrl)
     assert re.search(r"irdma_sc_parse_fpm_commit_buf\([\s\S]{0,200}?"
                      r"ret_code = irdma_osdep_fpm_commit_check\(dev, "
-                     r"hmc_info\);", ctrl)
+                     r"hmc_info, req\);", ctrl)
+    # The counts it checks against are taken before the commit.
+    assert re.search(r"req\[i\] = obj_info\[i\]\.cnt;[\s\S]*?"
+                     r"irdma_sc_commit_fpm_val\(dev->cqp", ctrl)
 
 
 if __name__ == "__main__":

@@ -314,7 +314,8 @@ struct rdk_wc;
 /*
  * A consumer that allocates its CQ with rdk_alloc_cq() puts a struct
  * rdk_cqe in each work request instead of a wr_id; done() runs for the
- * completion.
+ * completion.  done() must not destroy the QP or the CQ: completions
+ * polled with it may still name them.
  */
 struct rdk_cqe {
 	void	(*done)(struct rdk_cq *, struct rdk_wc *);
@@ -576,6 +577,7 @@ enum rdk_poll_context {
 
 struct rdk_cq {
 	struct rdk_device	*device;
+	/* Neither handler may destroy the CQ: destroy waits for them. */
 	rdk_comp_handler_t	comp_handler;
 	void			(*event_handler)(struct rdk_event *, void *);
 	void			*cq_context;
@@ -590,12 +592,14 @@ struct rdk_qp {
 	struct rdk_pd		*pd;
 	struct rdk_cq		*send_cq;
 	struct rdk_cq		*recv_cq;
+	/* It must not destroy the QP: destroy waits for it to return. */
 	void			(*event_handler)(struct rdk_event *, void *);
 	void			*qp_context;
 	uint32_t		qp_num;
 	uint32_t		port;
 	enum rdk_qp_type	qp_type;
 	const struct rdk_gid_attr *av_sgid_attr;	/* framework */
+	void			*drain_orphans;		/* framework */
 };
 
 struct rdk_mr {
@@ -722,6 +726,7 @@ extern int rdk_query_port(struct rdk_device *, uint32_t,
     struct rdk_port_attr *);
 extern int rdk_add_gid(struct rdk_device *, uint32_t, const rdk_gid_t *,
     uint16_t, const uint8_t *, uint16_t *);
+/* Each successful rdk_add_gid() needs its own rdk_del_gid(). */
 extern int rdk_del_gid(struct rdk_device *, uint32_t, uint16_t);
 extern int rdk_query_gid(struct rdk_device *, uint32_t, uint16_t,
     rdk_gid_t *);
@@ -753,6 +758,7 @@ extern int rdk_query_qp(struct rdk_qp *, struct rdk_qp_attr *, int,
 extern void rdk_destroy_qp(struct rdk_qp *);
 extern boolean_t rdk_modify_qp_is_ok(enum rdk_qp_state, enum rdk_qp_state,
     enum rdk_qp_type, int);
+/* A QP's drain and its destroy must not run at the same time. */
 extern void rdk_drain_qp(struct rdk_qp *);
 extern void rdk_drain_sq(struct rdk_qp *);
 extern void rdk_drain_rq(struct rdk_qp *);

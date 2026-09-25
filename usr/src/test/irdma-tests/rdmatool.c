@@ -31,9 +31,11 @@
  * addresses travel the same way.  Every data test fills the source with a
  * seeded pattern and checks every byte at the destination in the kernel.
  *
- * Tests: send write read frwr localinv badkey zerokey bounds access ud
- * pingpong bw inflight.  Each prints PASS or FAIL with its numbers; the
- * exit status is 0 only if all pass.
+ * Tests: send write read frwr localinv badkey zerokey bounds access
+ * qpaccess ud pingpong bw inflight, and tcp for a TCP baseline between two
+ * hosts.
+ * Each prints PASS or FAIL with its numbers; the exit status is 0 only if
+ * all pass.
  *
  * Build: gcc -m64 -o rdmatool rdmatool.c -lkstat -lsocket -lnsl
  */
@@ -67,8 +69,19 @@
 #define	K_RESULT	2
 #define	C_FRESH		0x100	/* reopen the server's session */
 #define	C_BYE		0x101
+#define	C_CPU		0x102	/* the server's busy CPU nanoseconds */
+#define	C_TCP		0x103	/* a TCP ping-pong and bulk transfer */
 #define	ST_REM_ACCESS	10	/* RDK_WC_REM_ACCESS_ERR */
 #define	QPS_ERR		6	/* RDK_QPS_ERR */
+
+typedef struct tcpreq {
+	uint64_t	tr_count;	/* ping-pong round trips */
+	uint64_t	tr_bulk;	/* bytes the client then sends */
+	uint32_t	tr_size;	/* ping-pong message size */
+	uint32_t	tr_pad;
+	uint64_t	tr_srv_cpu_ns;	/* out: server busy time in the bulk */
+	uint64_t	tr_srv_ns;	/* out: server time from first byte */
+} tcpreq_t;
 
 typedef struct msg {
 	uint32_t	m_magic;
@@ -97,6 +110,9 @@ static uint32_t o_depth = 64;
 static int o_secs = 5;
 static int failures;
 static uint32_t path_mtu = 1024;
+static char *o_server;
+
+static uint64_t cpu_busy_ns(void);
 
 static void
 fatal(const char *fmt, ...)
@@ -144,6 +160,10 @@ cmd_len(uint32_t cmd)
 	case C_FRESH:
 	case C_BYE:
 		return (0);
+	case C_CPU:
+		return (sizeof (uint64_t));
+	case C_TCP:
+		return (sizeof (tcpreq_t));
 	default:
 		return ((size_t)-1);
 	}
@@ -313,6 +333,9 @@ qp_state(peer_t *p)
 /*
  * Fresh sessions on both sides, set up and connected to each other.
  */
+/* The QP access B's next fresh() connection grants (rc_qp_access). */
+static uint32_t fresh_b_access;
+
 static int
 fresh(peer_t *a, peer_t *b, uint32_t qpt, uint32_t poll)
 {
@@ -358,6 +381,8 @@ fresh(peer_t *a, peer_t *b, uint32_t qpt, uint32_t poll)
 		bcopy(o->p_setup.rs_mac, rc.rc_dmac, sizeof (rc.rc_dmac));
 		rc.rc_retry = 7;
 		rc.rc_rnr_retry = 7;
+		if (p == b)
+			rc.rc_qp_access = fresh_b_access;
 		if ((ret = pio(p, RDMAT_IOC_CONNECT, &rc)) != 0) {
 			(void) fprintf(stderr, "%s: connect: %s\n", p->p_name,
 			    strerror(ret));
@@ -651,6 +676,66 @@ t_reject(peer_t *a, peer_t *b, const char *name)
 	    rr.rr_vendor_err, qp_state(b));
 }
 
+/*
+ * B's QP grants less than B's MR.  The device has one right for inbound
+ * writes and read responses, which LOCAL_WRITE also turns on.
+ */
+static int
+qpacc_case(peer_t *a, peer_t *b, uint32_t acc, uint32_t ok_op,
+    uint32_t bad_op, char *out, size_t outlen)
+{
+	rdmat_run_t rr;
+	uint32_t st;
+	uint64_t ns;
+	int ret;
+
+	fresh_b_access = RDMAT_QPACC_SET | acc;
+	ret = fresh(a, b, RDMAT_QPT_RC, RDMAT_POLL_TASKQ);
+	fresh_b_access = 0;
+	if (ret != 0) {
+		(void) snprintf(out, outlen, "setup with access 0x%x failed",
+		    acc);
+		return (-1);
+	}
+	if (ok_op != 0 && xfer_check(a, b, ok_op, 4096, &ns) != 0) {
+		(void) snprintf(out, outlen, "access 0x%x: the allowed %s "
+		    "failed", acc, ok_op == RDMAT_OP_READ ? "read" : "write");
+		return (-1);
+	}
+	run_init(&rr, bad_op, 4096, 1);
+	rr.rr_raddr = b->p_setup.rs_qp[0].rqi_addr;
+	rr.rr_rlen = 4096;
+	rr.rr_rkey = b->p_setup.rs_qp[0].rqi_rkey;
+	ret = run(a, &rr);
+	st = qp_state(a);
+	if (ret != EIO || rr.rr_status == 0 || st != QPS_ERR) {
+		(void) snprintf(out, outlen, "access 0x%x: %s got ret %s "
+		    "status %u qp state %u", acc, bad_op == RDMAT_OP_READ ?
+		    "read" : "write", strerror(ret), rr.rr_status, st);
+		return (-1);
+	}
+	(void) snprintf(out, outlen, "access 0x%x: %s refused, status %u",
+	    acc, bad_op == RDMAT_OP_READ ? "read" : "write", rr.rr_status);
+	return (0);
+}
+
+static void
+t_qpaccess(peer_t *a, peer_t *b)
+{
+	char r1[96], r2[96], r3[96];
+	int bad = 0;
+
+	bad |= qpacc_case(a, b, RDMAT_ACC_REMOTE_READ, RDMAT_OP_READ,
+	    RDMAT_OP_WRITE, r1, sizeof (r1));
+	bad |= qpacc_case(a, b, RDMAT_ACC_LOCAL_WRITE | RDMAT_ACC_REMOTE_WRITE,
+	    RDMAT_OP_WRITE, RDMAT_OP_READ, r2, sizeof (r2));
+	bad |= qpacc_case(a, b, RDMAT_ACC_LOCAL_WRITE | RDMAT_ACC_REMOTE_WRITE |
+	    RDMAT_ACC_REMOTE_READ | RDMAT_QPACC_NO_IRD, RDMAT_OP_WRITE,
+	    RDMAT_OP_READ, r3, sizeof (r3));
+	result(bad == 0, "qpaccess", "B's QP rights under a full MR: %s; %s; "
+	    "%s, no inbound read resources", r1, r2, r3);
+}
+
 static void
 t_ud(peer_t *a, peer_t *b)
 {
@@ -762,21 +847,67 @@ cpu_busy_ns(void)
 	return (sum);
 }
 
+static uint64_t
+now_ns(void)
+{
+	struct timespec ts;
+
+	(void) clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ((uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec);
+}
+
+/* A host's busy CPU time with the network idle, per wall second. */
+static double
+idle_rate(peer_t *p)
+{
+	uint64_t c0, c1, t0, t1;
+
+	t0 = now_ns();
+	if (p != NULL)
+		(void) rpc(p, C_CPU, &c0, 0, K_RESULT);
+	else
+		c0 = cpu_busy_ns();
+	(void) sleep(3);
+	if (p != NULL)
+		(void) rpc(p, C_CPU, &c1, 0, K_RESULT);
+	else
+		c1 = cpu_busy_ns();
+	t1 = now_ns();
+	return ((double)(c1 - c0) / (double)(t1 - t0));
+}
+
+/* CPU seconds per GB net of the idle rate. */
+static double
+cpu_per_gb(uint64_t busy, double idle, uint64_t wall, uint64_t bytes)
+{
+	double net = (double)busy - idle * (double)wall;
+
+	if (net < 0)
+		net = 0;
+	return (net / 1e9 / ((double)bytes / 1e9));
+}
+
 static void
 t_bw(peer_t *a, peer_t *b)
 {
 	static const uint32_t sizes[] = { 4096, 65536, 1 << 20 };
 	static const uint32_t ops[] = { RDMAT_OP_WRITE, RDMAT_OP_READ };
 	rdmat_run_t rr;
-	uint64_t c0, c1, count;
+	uint64_t c0, c1, r0 = 0, r1 = 0, w0, w1, count;
 	uint_t i, j;
-	double gbps, cpu;
+	double gbps, cpu, idle_a, idle_b = 0;
+	char rcpu[64];
 	int ret;
 
 	if (fresh(a, b, RDMAT_QPT_RC, RDMAT_POLL_TASKQ) != 0) {
 		result(0, "bw", "setup failed");
 		return;
 	}
+	idle_a = idle_rate(NULL);
+	if (b->p_sock >= 0)
+		idle_b = idle_rate(b);
+	(void) printf("  idle CPU: %.2f on A, %.2f on B, subtracted below\n",
+	    idle_a, idle_b);
 	for (j = 0; j < 2; j++) {
 		for (i = 0; i < 3; i++) {
 			uint32_t s = sizes[i];
@@ -794,9 +925,17 @@ t_bw(peer_t *a, peer_t *b)
 			rr.rr_rlen = b->p_setup.rs_qp[0].rqi_len;
 			rr.rr_flags = RDMAT_F_UNSIGNALED;
 			rr.rr_timeout_ms = (uint32_t)o_secs * 20000;
+			if (rr.rr_timeout_ms > RDMAT_MAX_TIMEOUT_MS)
+				rr.rr_timeout_ms = RDMAT_MAX_TIMEOUT_MS;
+			if (b->p_sock >= 0)
+				(void) rpc(b, C_CPU, &r0, 0, K_RESULT);
 			c0 = cpu_busy_ns();
+			w0 = now_ns();
 			ret = run(a, &rr);
+			w1 = now_ns();
 			c1 = cpu_busy_ns();
+			if (b->p_sock >= 0)
+				(void) rpc(b, C_CPU, &r1, 0, K_RESULT);
 			if (ret != 0 || rr.rr_ns == 0) {
 				result(0, "bw", "%s %u: %s status %u done %llu",
 				    j == 0 ? "write" : "read", s, strerror(ret),
@@ -804,11 +943,20 @@ t_bw(peer_t *a, peer_t *b)
 				return;
 			}
 			gbps = (double)rr.rr_bytes * 8 / rr.rr_ns;
-			cpu = (double)(c1 - c0) / 1e9 /
-			    ((double)rr.rr_bytes / 1e9);
+			cpu = cpu_per_gb(c1 - c0, idle_a, w1 - w0,
+			    rr.rr_bytes);
+			rcpu[0] = '\0';
+			if (b->p_sock >= 0) {
+				double bc = cpu_per_gb(r1 - r0, idle_b,
+				    w1 - w0, rr.rr_bytes);
+
+				(void) snprintf(rcpu, sizeof (rcpu),
+				    ", %.3f on B", bc);
+			}
 			result(1, "bw", "%s %7u B x %llu, depth %u: %.2f Gb/s, "
-			    "%.3f CPU-s per GB on A", j == 0 ? "write" : "read",
-			    s, (u_longlong_t)count, rr.rr_depth, gbps, cpu);
+			    "%.3f CPU-s per GB on A%s",
+			    j == 0 ? "write" : "read", s, (u_longlong_t)count,
+			    rr.rr_depth, gbps, cpu, rcpu);
 		}
 	}
 }
@@ -854,12 +1002,176 @@ t_inflight(peer_t *a, peer_t *b)
 	    "flight, then a fresh 1 MB write checked");
 }
 
+static int
+xsock(const char *host, int port)
+{
+	struct sockaddr_in sin;
+	int s, one = 1;
+
+	bzero(&sin, sizeof (sin));
+	sin.sin_family = AF_INET;
+	sin.sin_port = htons((uint16_t)port);
+	if (inet_pton(AF_INET, host, &sin.sin_addr) != 1 ||
+	    (s = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+		return (-1);
+	if (connect(s, (struct sockaddr *)&sin, sizeof (sin)) != 0) {
+		(void) close(s);
+		return (-1);
+	}
+	(void) setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof (one));
+	return (s);
+}
+
+static int
+u64cmp(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return (x < y ? -1 : x > y ? 1 : 0);
+}
+
+/*
+ * The same exchanges over TCP between the same hosts, for comparison: a
+ * 64 byte ping-pong and a bulk transfer, with the CPU both hosts use.
+ */
+static void
+t_tcp(peer_t *a, peer_t *b)
+{
+	const uint64_t n = 20000, bulk = 8ULL << 30;
+	static char data[1 << 20];
+	uint64_t *lat, i, sent, c0, c1, sum = 0;
+	struct timespec t0, t1;
+	double idle_a, idle_b;
+	tcpreq_t tr;
+	char msg[64];
+	int s, ret;
+
+	(void) a;
+	if (b->p_sock < 0) {
+		result(0, "tcp", "needs two hosts");
+		return;
+	}
+	idle_a = idle_rate(NULL);
+	idle_b = idle_rate(b);
+	bzero(&tr, sizeof (tr));
+	tr.tr_count = n;
+	tr.tr_size = sizeof (msg);
+	tr.tr_bulk = bulk;
+	(void) rpc(b, C_TCP, &tr, 1, K_ACK);
+	(void) usleep(200000);
+	if ((s = xsock(o_server, o_port + 1)) < 0) {
+		result(0, "tcp", "connect: %s", strerror(errno));
+		return;
+	}
+	lat = calloc(n, sizeof (uint64_t));
+	bzero(msg, sizeof (msg));
+	for (i = 0; i < n; i++) {
+		(void) clock_gettime(CLOCK_MONOTONIC, &t0);
+		if (xfer(s, msg, sizeof (msg), 1) != 0 ||
+		    xfer(s, msg, sizeof (msg), 0) != 0)
+			break;
+		(void) clock_gettime(CLOCK_MONOTONIC, &t1);
+		lat[i] = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL +
+		    (uint64_t)t1.tv_nsec - (uint64_t)t0.tv_nsec;
+		sum += lat[i];
+	}
+	c0 = cpu_busy_ns();
+	(void) clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (sent = 0; i == n && sent < bulk; sent += sizeof (data)) {
+		if (xfer(s, data, sizeof (data), 1) != 0)
+			break;
+	}
+	/* The server answers once it has every byte. */
+	ret = rpc(b, C_TCP, &tr, 1, K_RESULT);
+	(void) clock_gettime(CLOCK_MONOTONIC, &t1);
+	c1 = cpu_busy_ns();
+	(void) close(s);
+	if (i != n || sent < bulk || ret != 0) {
+		result(0, "tcp", "round trips %llu of %llu, bulk %llu of %llu",
+		    (u_longlong_t)i, (u_longlong_t)n, (u_longlong_t)sent,
+		    (u_longlong_t)bulk);
+		free(lat);
+		return;
+	}
+	qsort(lat, n, sizeof (uint64_t), u64cmp);
+	result(1, "tcp", "64 B round trip over %llu: min %.1f us, p50 %.1f "
+	    "us, avg %.1f us, p99 %.1f us", (u_longlong_t)n, lat[0] / 1e3,
+	    lat[n / 2] / 1e3, sum / 1e3 / n, lat[n * 99 / 100] / 1e3);
+	{
+		double ns = (double)(t1.tv_sec - t0.tv_sec) * 1e9 +
+		    (t1.tv_nsec - t0.tv_nsec);
+
+		result(1, "tcp", "bulk %llu GB in 1 MB writes: %.2f Gb/s, "
+		    "%.3f CPU-s per GB on A, %.3f on B (idle %.2f and %.2f "
+		    "subtracted)", (u_longlong_t)(bulk >> 30),
+		    (double)bulk * 8 / ns,
+		    cpu_per_gb(c1 - c0, idle_a, (uint64_t)ns, bulk),
+		    cpu_per_gb(tr.tr_srv_cpu_ns, idle_b, tr.tr_srv_ns, bulk),
+		    idle_a, idle_b);
+	}
+	free(lat);
+}
+
+/* The server side of t_tcp(), on a second port. */
+static int
+serve_tcp(tcpreq_t *tr)
+{
+	static char data[1 << 20];
+	struct sockaddr_in sin;
+	struct timespec t0, t1;
+	uint64_t i, got, c0;
+	char msg[256];
+	int l, s, one = 1;
+	ssize_t r;
+
+	if (tr->tr_size == 0 || tr->tr_size > sizeof (msg) ||
+	    tr->tr_count > 10000000 || tr->tr_bulk > (1ULL << 40))
+		return (EINVAL);
+	if ((l = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+		return (errno);
+	(void) setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof (one));
+	bzero(&sin, sizeof (sin));
+	sin.sin_family = AF_INET;
+	sin.sin_port = htons((uint16_t)(o_port + 1));
+	sin.sin_addr.s_addr = o_ip;
+	if (bind(l, (struct sockaddr *)&sin, sizeof (sin)) != 0 ||
+	    listen(l, 1) != 0 || (s = accept(l, NULL, NULL)) < 0) {
+		(void) close(l);
+		return (EIO);
+	}
+	(void) close(l);
+	(void) setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof (one));
+	for (i = 0; i < tr->tr_count; i++) {
+		if (xfer(s, msg, tr->tr_size, 0) != 0 ||
+		    xfer(s, msg, tr->tr_size, 1) != 0) {
+			(void) close(s);
+			return (EIO);
+		}
+	}
+	c0 = 0;
+	for (got = 0; got < tr->tr_bulk; got += (uint64_t)r) {
+		r = read(s, data, sizeof (data));
+		if (r <= 0)
+			break;
+		if (got == 0) {
+			c0 = cpu_busy_ns();
+			(void) clock_gettime(CLOCK_MONOTONIC, &t0);
+		}
+	}
+	(void) clock_gettime(CLOCK_MONOTONIC, &t1);
+	tr->tr_srv_cpu_ns = cpu_busy_ns() - c0;
+	tr->tr_srv_ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL +
+	    (uint64_t)t1.tv_nsec - (uint64_t)t0.tv_nsec;
+	(void) close(s);
+	return (got == tr->tr_bulk ? 0 : EIO);
+}
+
 static void
 run_tests(peer_t *a, peer_t *b, int argc, char **argv)
 {
 	static const char *all[] = { "send", "write", "read", "frwr",
-	    "localinv", "badkey", "zerokey", "bounds", "access", "ud",
-	    "pingpong", "bw", "inflight", NULL };
+	    "localinv", "badkey", "zerokey", "bounds", "access", "qpaccess",
+	    "ud", "pingpong", "bw", "inflight", NULL };
 	const char **list = (const char **)argv;
 	int i, n = argc;
 
@@ -885,6 +1197,8 @@ run_tests(peer_t *a, peer_t *b, int argc, char **argv)
 		    strcmp(t, "zerokey") == 0 || strcmp(t, "bounds") == 0 ||
 		    strcmp(t, "access") == 0)
 			t_reject(a, b, t);
+		else if (strcmp(t, "qpaccess") == 0)
+			t_qpaccess(a, b);
 		else if (strcmp(t, "ud") == 0)
 			t_ud(a, b);
 		else if (strcmp(t, "pingpong") == 0)
@@ -893,6 +1207,8 @@ run_tests(peer_t *a, peer_t *b, int argc, char **argv)
 			t_bw(a, b);
 		else if (strcmp(t, "inflight") == 0)
 			t_inflight(a, b);
+		else if (strcmp(t, "tcp") == 0)
+			t_tcp(a, b);
 		else
 			fatal("unknown test %s", t);
 	}
@@ -941,6 +1257,8 @@ serve(int s)
 		rdmat_buf_t d;
 		rdmat_query_t e;
 		rdmat_devices_t f;
+		tcpreq_t g;
+		uint64_t h;
 	} u;
 	int fd = open_session();
 	msg_t m;
@@ -955,7 +1273,8 @@ serve(int s)
 			break;
 		if (m.m_cmd == C_BYE)
 			break;
-		if (m.m_cmd == RDMAT_IOC_RUN && m.m_err != 0) {
+		if ((m.m_cmd == RDMAT_IOC_RUN || m.m_cmd == C_TCP) &&
+		    m.m_err != 0) {
 			msg_t ack = { MAGIC, K_ACK, 0, 0 };
 
 			if (xfer(s, &ack, sizeof (ack), 1) != 0)
@@ -965,6 +1284,11 @@ serve(int s)
 			(void) close(fd);
 			fd = open_session();
 			m.m_err = 0;
+		} else if (m.m_cmd == C_CPU) {
+			u.h = cpu_busy_ns();
+			m.m_err = 0;
+		} else if (m.m_cmd == C_TCP) {
+			m.m_err = serve_tcp(&u.g);
 		} else {
 			if (m.m_cmd == RDMAT_IOC_SETUP) {
 				(void) strlcpy(u.a.rs_dev, o_dev,
@@ -1117,6 +1441,7 @@ main(int argc, char **argv)
 
 		if (argc < 2)
 			usage();
+		o_server = argv[1];
 		b.p_sock = connect_to(argv[1]);
 		bzero(&d, sizeof (d));
 		if (rpc(&b, RDMAT_IOC_DEVICES, &d, 0, K_RESULT) != 0 ||

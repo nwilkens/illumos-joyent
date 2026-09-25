@@ -334,6 +334,7 @@ rdmat_setup(rdmat_sess_t *ts, rdmat_setup_t *rs)
 	if ((ret = rdk_add_gid(dev, 1, &gid, RDK_VLAN_NONE, pa.mac,
 	    &ts->ts_gid_index)) != 0)
 		goto fail;
+	ts->ts_gid_added = B_TRUE;
 	if ((ret = rdk_alloc_pd(dev, 0, &ts->ts_pd)) != 0)
 		goto fail;
 	for (i = 0; i < rs->rs_nqp; i++) {
@@ -430,11 +431,16 @@ rdmat_connect(rdmat_sess_t *ts, rdmat_connect_t *rc)
 	rdmat_qp_t *tq;
 	struct rdk_qp_attr a;
 	struct rdk_ah_attr ah;
+	uint32_t qacc = rc->rc_qp_access;
 	int ret, acc;
 
 	if ((tq = rdmat_qp(ts, rc->rc_qp)) == NULL || tq->tq_connected ||
 	    rc->rc_rqpn > 0xffffff || rc->rc_retry > 7 ||
 	    rc->rc_rnr_retry > 7 ||
+	    (qacc != 0 && ((qacc & RDMAT_QPACC_SET) == 0 ||
+	    (qacc & ~(RDMAT_QPACC_SET | RDMAT_QPACC_NO_IRD |
+	    RDMAT_ACC_LOCAL_WRITE | RDMAT_ACC_REMOTE_WRITE |
+	    RDMAT_ACC_REMOTE_READ)) != 0)) ||
 	    (rc->rc_path_mtu != 256 && rc->rc_path_mtu != 512 &&
 	    rc->rc_path_mtu != 1024 && rc->rc_path_mtu != 2048 &&
 	    rc->rc_path_mtu != 4096))
@@ -456,6 +462,15 @@ rdmat_connect(rdmat_sess_t *ts, rdmat_connect_t *rc)
 	if (ts->ts_qpt == RDMAT_QPT_RC) {
 		a.qp_access_flags = RDK_ACCESS_LOCAL_WRITE |
 		    RDK_ACCESS_REMOTE_WRITE | RDK_ACCESS_REMOTE_READ;
+		if (qacc != 0) {
+			a.qp_access_flags =
+			    ((qacc & RDMAT_ACC_LOCAL_WRITE) != 0 ?
+			    RDK_ACCESS_LOCAL_WRITE : 0) |
+			    ((qacc & RDMAT_ACC_REMOTE_WRITE) != 0 ?
+			    RDK_ACCESS_REMOTE_WRITE : 0) |
+			    ((qacc & RDMAT_ACC_REMOTE_READ) != 0 ?
+			    RDK_ACCESS_REMOTE_READ : 0);
+		}
 		ret = rdmat_modify(tq, &a, RDK_QP_STATE | RDK_QP_PKEY_INDEX |
 		    RDK_QP_PORT | RDK_QP_ACCESS_FLAGS);
 	} else {
@@ -473,7 +488,8 @@ rdmat_connect(rdmat_sess_t *ts, rdmat_connect_t *rc)
 		a.path_mtu = rdk_mtu_int_to_enum((int)rc->rc_path_mtu);
 		a.dest_qp_num = rc->rc_rqpn;
 		a.rq_psn = rc->rc_rpsn & 0xffffff;
-		a.max_dest_rd_atomic = 16;
+		a.max_dest_rd_atomic =
+		    (qacc & RDMAT_QPACC_NO_IRD) != 0 ? 0 : 16;
 		a.min_rnr_timer = 12;
 		ret = rdmat_modify(tq, &a, RDK_QP_STATE | RDK_QP_AV |
 		    RDK_QP_PATH_MTU | RDK_QP_DEST_QPN | RDK_QP_RQ_PSN |
@@ -534,7 +550,7 @@ rdmat_sge(rdmat_sess_t *ts, rdmat_qp_t *tq, uint64_t off, uint32_t len,
 {
 	uint64_t c;
 
-	if (off > tq->tq_len || len > tq->tq_len - off)
+	if (off >= tq->tq_len || len > tq->tq_len - off)
 		return (EINVAL);
 	if (dma_lkey || tq->tq_lmr == NULL) {
 		c = off / RDMAT_CHUNK;
@@ -766,6 +782,13 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 		return (EINVAL);
 	if (rr->rr_depth == 0)
 		rr->rr_depth = 1;
+	/* The remote window is walked in rr_size steps. */
+	if ((rr->rr_op == RDMAT_OP_WRITE || rr->rr_op == RDMAT_OP_READ) &&
+	    rr->rr_size == 0)
+		return (EINVAL);
+	if ((rr->rr_op == RDMAT_OP_PING || rr->rr_op == RDMAT_OP_PONG) &&
+	    rr->rr_count == 0)
+		return (EINVAL);
 
 	/* The run's footprint in the local buffer. */
 	len = (uint64_t)rr->rr_size;
@@ -774,7 +797,7 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 	if (rr->rr_op == RDMAT_OP_POST_RECV || rr->rr_op == RDMAT_OP_PING ||
 	    rr->rr_op == RDMAT_OP_PONG)
 		len *= ts->ts_depth;
-	if (rr->rr_offset > tq->tq_len || len > tq->tq_len - rr->rr_offset)
+	if (rr->rr_offset >= tq->tq_len || len > tq->tq_len - rr->rr_offset)
 		return (EINVAL);
 	if (ts->ts_qpt == RDMAT_QPT_UD && rr->rr_op != RDMAT_OP_SEND &&
 	    rr->rr_op != RDMAT_OP_POST_RECV &&
@@ -971,5 +994,9 @@ rdmat_teardown(rdmat_sess_t *ts, boolean_t removing)
 	if (ts->ts_pd != NULL) {
 		rdk_dealloc_pd(ts->ts_pd);
 		ts->ts_pd = NULL;
+	}
+	if (ts->ts_gid_added) {
+		(void) rdk_del_gid(ts->ts_dev, 1, ts->ts_gid_index);
+		ts->ts_gid_added = B_FALSE;
 	}
 }

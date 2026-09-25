@@ -28,6 +28,7 @@ extern "C" {
 typedef struct rdk_gid_ent {
 	struct rdk_gid_attr	rge_attr;
 	boolean_t		rge_valid;
+	uint32_t		rge_owners;	/* rdp_gid_lock */
 	uint32_t		rge_refs;	/* rdp_lock */
 } rdk_gid_ent_t;
 
@@ -66,8 +67,14 @@ extern void rdk_obj_rele(struct rdk_device *);
 extern boolean_t rdk_port_valid(struct rdk_device *, uint32_t);
 extern int rdk_resolve_ah_attr(struct rdk_device *, struct rdk_ah_attr *);
 
+extern int rdk_create_cq_poll(struct rdk_device *, rdk_comp_handler_t,
+    void (*)(struct rdk_event *, void *), void *,
+    const struct rdk_cq_init_attr *, enum rdk_poll_context,
+    struct rdk_cq_poller *, struct rdk_cq **);
+
 extern int rdk_cq_init(void);
 extern void rdk_cq_fini(void);
+extern void rdk_cq_barrier(struct rdk_cq *);
 
 #ifdef __cplusplus
 }

@@ -5181,10 +5181,15 @@ static int irdma_sc_cfg_iw_fpm(struct irdma_sc_dev *dev, u8 hmc_fn_id)
 	struct irdma_dma_mem commit_fpm_mem;
 	int ret_code = 0;
 	u8 wait_type;
+	/* illumos: the counts asked for, which the firmware may not exceed. */
+	u32 req[IRDMA_HMC_IW_MAX];
+	u32 i;
 
 	hmc_info = dev->hmc_info;
 	obj_info = hmc_info->hmc_obj;
 	buf = dev->fpm_commit_buf;
+	for (i = 0; i < IRDMA_HMC_IW_MAX; i++)
+		req[i] = obj_info[i].cnt;
 
 	set_64bit_val(buf, 0, (u64)obj_info[IRDMA_HMC_IW_QP].cnt);
 	set_64bit_val(buf, 8, (u64)obj_info[IRDMA_HMC_IW_CQ].cnt);
@@ -5232,7 +5237,7 @@ static int irdma_sc_cfg_iw_fpm(struct irdma_sc_dev *dev, u8 hmc_fn_id)
 					      hmc_info->hmc_obj,
 					      &hmc_info->sd_table.sd_cnt);
 		/* illumos: check the committed layout before it is allocated. */
-		ret_code = irdma_osdep_fpm_commit_check(dev, hmc_info);
+		ret_code = irdma_osdep_fpm_commit_check(dev, hmc_info, req);
 	}
 	print_hex_dump_debug("HMC: COMMIT FPM BUFFER", DUMP_PREFIX_OFFSET, 16,
 			     8, commit_fpm_mem.va, IRDMA_COMMIT_FPM_BUF_SIZE,

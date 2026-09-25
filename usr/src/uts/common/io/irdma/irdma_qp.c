@@ -174,11 +174,14 @@ static void
 irdma_qp_flush_task(void *arg)
 {
 	irdma_qp_t *iqp = arg;
+	boolean_t later;
 
-	irdma_generate_flush_completions(iqp);
+	later = irdma_generate_flush_completions(iqp);
 	mutex_enter(&iqp->iqp_lock);
 	iqp->iqp_flush_queued = B_FALSE;
 	mutex_exit(&iqp->iqp_lock);
+	if (later)
+		irdma_flush_later(iqp);
 	irdma_qp_work_done(iqp);
 }
 
@@ -196,10 +199,10 @@ irdma_set_cpi(struct irdma_cq_poll_info *cpi, irdma_qp_t *iqp)
 
 /*
  * Complete, with a flush error, the work requests the device did not
- * flush.  Waits for the device's own entries by rescheduling while the CQ
- * is not empty.
+ * flush.  Returns whether to try again later: the device's own entries are
+ * still in a CQ, or memory ran out.
  */
-void
+boolean_t
 irdma_generate_flush_completions(irdma_qp_t *iqp)
 {
 	struct irdma_qp_uk *qp = &iqp->iqp_sc.qp_uk;
@@ -207,7 +210,7 @@ irdma_generate_flush_completions(irdma_qp_t *iqp)
 	irdma_cq_t *cqs[2] = { iqp->iqp_scq, iqp->iqp_rcq };
 	boolean_t made[2] = { B_FALSE, B_FALSE };
 	boolean_t later = B_FALSE;
-	irdma_cmpl_gen_t *g;
+	irdma_cmpl_gen_t *g = NULL;
 	uint32_t idx, n;
 	uint_t i;
 	u64 qword;
@@ -224,6 +227,12 @@ irdma_generate_flush_completions(irdma_qp_t *iqp)
 		mutex_enter(&iqp->iqp_lock);
 		for (n = 0; i == 0 && IRDMA_RING_MORE_WORK(*sq) &&
 		    n < sq->size; n++) {
+			if (g == NULL)
+				g = kmem_zalloc(sizeof (*g), KM_NOSLEEP);
+			if (g == NULL) {
+				later = B_TRUE;
+				break;
+			}
 			idx = sq->tail;
 			get_64bit_val(qp->sq_base[idx].elem, 24, &qword);
 			IRDMA_RING_SET_TAIL(*sq, idx +
@@ -231,41 +240,44 @@ irdma_generate_flush_completions(irdma_qp_t *iqp)
 			if (FIELD_GET(IRDMAQPSQ_OPCODE, qword) ==
 			    IRDMAQP_OP_NOP)
 				continue;
-			g = kmem_zalloc(sizeof (*g), KM_NOSLEEP);
-			if (g == NULL)
-				break;
 			irdma_set_cpi(&g->icg_cpi, iqp);
 			g->icg_cpi.wr_id = qp->sq_wrtrk_array[idx].wrid;
 			g->icg_cpi.op_type = (u8)FIELD_GET(IRDMAQPSQ_OPCODE,
 			    qword);
 			g->icg_cpi.q_type = IRDMA_CQE_QTYPE_SQ;
 			list_insert_tail(&icq->icq_gen, g);
+			g = NULL;
 			made[i] = B_TRUE;
 		}
 		for (n = 0; i == 1 && IRDMA_RING_MORE_WORK(*rq) &&
 		    n < rq->size; n++) {
-			idx = rq->tail;
-			g = kmem_zalloc(sizeof (*g), KM_NOSLEEP);
 			if (g == NULL)
+				g = kmem_zalloc(sizeof (*g), KM_NOSLEEP);
+			if (g == NULL) {
+				later = B_TRUE;
 				break;
+			}
+			idx = rq->tail;
 			irdma_set_cpi(&g->icg_cpi, iqp);
 			g->icg_cpi.wr_id = qp->rq_wrid_array[idx];
 			g->icg_cpi.op_type = IRDMA_OP_TYPE_REC;
 			g->icg_cpi.q_type = IRDMA_CQE_QTYPE_RQ;
 			IRDMA_RING_SET_TAIL(*rq, idx + 1);
 			list_insert_tail(&icq->icq_gen, g);
+			g = NULL;
 			made[i] = B_TRUE;
 		}
 		mutex_exit(&iqp->iqp_lock);
 		mutex_exit(&icq->icq_lock);
 	}
+	if (g != NULL)
+		kmem_free(g, sizeof (*g));
 
 	for (i = 0; i < 2; i++) {
 		if (made[i])
 			irdma_comp_handler(cqs[i]);
 	}
-	if (later)
-		irdma_flush_later(iqp);
+	return (later);
 }
 
 /* A CQP QP_MODIFY with info; the caller holds iqp_mod_lock. */
@@ -331,6 +343,8 @@ irdma_flush_wqes(irdma_qp_t *iqp, uint32_t mask)
 	ret = irdma_cqp_exec(irdma, req, &cqe);
 	atomic_inc_64(&irdma->irdma_flushes);
 
+	if (ret != 0)
+		irdma_verbs_uncertain(irdma, "failed to flush a QP");
 	mutex_enter(&iqp->iqp_lock);
 	iqp->iqp_flush_issued = B_TRUE;
 	if (ret != 0) {
@@ -364,8 +378,8 @@ irdma_roce_ctx(irdma_qp_t *iqp)
 	udp->src_port = 0xc000;
 	udp->dst_port = IRDMA_ROCE_UDP_DPORT;
 	bcopy(irdma->irdma_info.iri_mac, roce->mac_addr, ETHERADDRL);
-	roce->rd_en = true;
-	roce->wr_rdresp_en = true;
+	/* An RC QP gets remote access only from RDK_QP_ACCESS_FLAGS. */
+	roce->rd_en = roce->wr_rdresp_en = iqp->iqp_rdk.qp_type != RDK_QPT_RC;
 	roce->dcqcn_en = false;
 	roce->rtomin = 5;
 	roce->ack_credits = IRDMA_ROCE_ACKCREDS_DEFAULT;
@@ -583,7 +597,7 @@ irdma_create_qp(struct rdk_qp *rqp, struct rdk_qp_init_attr *init)
 	req->icr_cmd.in.u.qp_create.qp = &iqp->iqp_sc;
 	req->icr_cmd.in.u.qp_create.scratch = irdma_req_scratch(irdma, req);
 	if ((ret = irdma_cqp_exec(irdma, req, NULL)) != 0) {
-		irdma_taint(irdma);
+		irdma_verbs_uncertain(irdma, "failed to create a QP");
 		goto fail_qos;
 	}
 
@@ -680,8 +694,12 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 	struct irdma_roce_offload_info *roce = &iqp->iqp_roce;
 	struct irdma_udp_offload_info *udp = &iqp->iqp_udp;
 	struct irdma_modify_qp_info info;
+	struct irdma_udp_offload_info udp_old;
+	struct irdma_roce_offload_info roce_old;
 	boolean_t issue = B_FALSE, flush = B_FALSE;
-	uint32_t dest_qp;
+	uint32_t dest_qp, new_arp = 0, old_arp;
+	int access_old;
+	boolean_t ird_zero_old;
 	int ret = 0;
 
 	if ((mask & ~RDK_QP_ATTR_STANDARD_BITS) != 0)
@@ -705,11 +723,18 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 		return (EINVAL);
 
 	mutex_enter(&iqp->iqp_mod_lock);
+	mutex_enter(&iqp->iqp_lock);
+	udp_old = *udp;
+	roce_old = *roce;
+	access_old = iqp->iqp_access;
+	ird_zero_old = iqp->iqp_ird_zero;
+	mutex_exit(&iqp->iqp_lock);
 	dest_qp = (mask & RDK_QP_DEST_QPN) != 0 ? attr->dest_qp_num :
 	    roce->dest_qp;
 	if ((mask & RDK_QP_AV) != 0) {
 		if ((ret = irdma_qp_av(iqp, attr, dest_qp)) != 0)
 			goto out;
+		new_arp = udp->arp_idx;
 	}
 
 	bzero(&info, sizeof (info));
@@ -755,9 +780,7 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 			info.next_iwarp_state = IRDMA_QP_STATE_RTS;
 			issue = B_TRUE;
 			break;
-		case RDK_QPS_SQE:
 		case RDK_QPS_ERR:
-		case RDK_QPS_RESET:
 			if (iqp->iqp_hw_state == IRDMA_QP_STATE_ERROR) {
 				iqp->iqp_state = attr->qp_state;
 				mutex_exit(&iqp->iqp_lock);
@@ -766,6 +789,12 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 			info.next_iwarp_state = IRDMA_QP_STATE_ERROR;
 			issue = B_TRUE;
 			break;
+		case RDK_QPS_RESET:
+			/* The device cannot take a created QP back to reset. */
+			if (iqp->iqp_hw_state != IRDMA_QP_STATE_INVALID)
+				ret = ENOTSUP;
+			break;
+		case RDK_QPS_SQE:
 		case RDK_QPS_SQD:
 		default:
 			ret = ENOTSUP;
@@ -775,6 +804,13 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 			mutex_exit(&iqp->iqp_lock);
 			goto out;
 		}
+	}
+	/* The device reads these only when the QP changes state. */
+	if (!issue && iqp->iqp_hw_state > IRDMA_QP_STATE_IDLE &&
+	    (mask & (RDK_QP_ACCESS_FLAGS | RDK_QP_MAX_DEST_RD_ATOMIC)) != 0) {
+		mutex_exit(&iqp->iqp_lock);
+		ret = ENOTSUP;
+		goto out;
 	}
 
 	if ((mask & RDK_QP_DEST_QPN) != 0)
@@ -799,15 +835,18 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 		udp->rexmit_thresh = attr->retry_cnt;
 	if ((mask & RDK_QP_MAX_QP_RD_ATOMIC) != 0 && attr->max_rd_atomic != 0)
 		roce->ord_size = attr->max_rd_atomic;
-	if ((mask & RDK_QP_MAX_DEST_RD_ATOMIC) != 0 &&
-	    attr->max_dest_rd_atomic != 0)
-		roce->ird_size = attr->max_dest_rd_atomic;
-	if ((mask & RDK_QP_ACCESS_FLAGS) != 0) {
-		if ((attr->qp_access_flags & (RDK_ACCESS_LOCAL_WRITE |
-		    RDK_ACCESS_REMOTE_WRITE)) != 0)
-			roce->wr_rdresp_en = true;
-		if ((attr->qp_access_flags & RDK_ACCESS_REMOTE_READ) != 0)
-			roce->rd_en = true;
+	if ((mask & RDK_QP_MAX_DEST_RD_ATOMIC) != 0) {
+		iqp->iqp_ird_zero = attr->max_dest_rd_atomic == 0;
+		if (attr->max_dest_rd_atomic != 0)
+			roce->ird_size = attr->max_dest_rd_atomic;
+	}
+	if ((mask & RDK_QP_ACCESS_FLAGS) != 0)
+		iqp->iqp_access = attr->qp_access_flags;
+	if (iqp->iqp_rdk.qp_type == RDK_QPT_RC) {
+		roce->wr_rdresp_en = (iqp->iqp_access &
+		    (RDK_ACCESS_LOCAL_WRITE | RDK_ACCESS_REMOTE_WRITE)) != 0;
+		roce->rd_en = (iqp->iqp_access & RDK_ACCESS_REMOTE_READ) != 0 &&
+		    !iqp->iqp_ird_zero;
 	}
 	roce->pd_id = iqp->iqp_pd->ipd_sc.pd_id;
 	ctx->send_cq_num = iqp->iqp_scq->icq_num;
@@ -822,12 +861,13 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 
 	ctx->rem_endpoint_idx = udp->arp_idx;
 	if ((ret = irdma_hw_modify_qp(iqp, &info)) != 0) {
+		/* The device may have applied it, with its ARP index. */
+		irdma_verbs_uncertain(irdma, "failed to modify a QP");
 		/* An error transition still stops posting and flushes. */
 		if (info.next_iwarp_state != IRDMA_QP_STATE_ERROR) {
 			ret = EIO;
 			goto out;
 		}
-		irdma_taint(irdma);
 		ret = 0;
 	}
 	mutex_enter(&iqp->iqp_lock);
@@ -841,6 +881,22 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 		irdma_flush_wqes(iqp, IRDMA_FLUSH_SQ | IRDMA_FLUSH_RQ |
 		    IRDMA_FLUSH_WAIT);
 out:
+	if (ret != 0) {
+		/* A failed modify leaves the QP as it was. */
+		mutex_enter(&iqp->iqp_lock);
+		*udp = udp_old;
+		*roce = roce_old;
+		iqp->iqp_access = access_old;
+		iqp->iqp_ird_zero = ird_zero_old;
+		mutex_exit(&iqp->iqp_lock);
+		if (new_arp != 0)
+			irdma_arp_rele(irdma, new_arp);
+	} else if (new_arp != 0) {
+		old_arp = iqp->iqp_arp_idx;
+		iqp->iqp_arp_idx = new_arp;
+		if (old_arp != 0)
+			irdma_arp_rele(irdma, old_arp);
+	}
 	mutex_exit(&iqp->iqp_mod_lock);
 	return (ret);
 }
@@ -860,11 +916,7 @@ irdma_query_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask,
 	attr->cap.max_inline_data = uk->max_inline_data;
 	attr->cap.max_send_sge = uk->max_sq_frag_cnt;
 	attr->cap.max_recv_sge = uk->max_rq_frag_cnt;
-	attr->qp_access_flags = RDK_ACCESS_LOCAL_WRITE;
-	if (iqp->iqp_roce.wr_rdresp_en)
-		attr->qp_access_flags |= RDK_ACCESS_REMOTE_WRITE;
-	if (iqp->iqp_roce.rd_en)
-		attr->qp_access_flags |= RDK_ACCESS_REMOTE_READ;
+	attr->qp_access_flags = iqp->iqp_access;
 	attr->port_num = 1;
 	attr->path_mtu = rdk_mtu_int_to_enum((int)iqp->iqp_udp.snd_mss);
 	attr->qkey = iqp->iqp_roce.qkey;
@@ -874,7 +926,8 @@ irdma_query_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask,
 	attr->retry_cnt = iqp->iqp_udp.rexmit_thresh;
 	attr->rnr_retry = iqp->iqp_udp.rnr_nak_thresh;
 	attr->max_rd_atomic = (uint8_t)iqp->iqp_roce.ord_size;
-	attr->max_dest_rd_atomic = (uint8_t)iqp->iqp_roce.ird_size;
+	attr->max_dest_rd_atomic = iqp->iqp_ird_zero ? 0 :
+	    (uint8_t)iqp->iqp_roce.ird_size;
 	mutex_exit(&iqp->iqp_lock);
 
 	init->event_handler = rqp->event_handler;
@@ -935,8 +988,10 @@ irdma_destroy_qp(struct rdk_qp *rqp)
 		req->icr_cmd.in.u.qp_destroy.scratch =
 		    irdma_req_scratch(irdma, req);
 		if (irdma_cqp_exec(irdma, req, NULL) != 0)
-			irdma_taint(irdma);
+			irdma_verbs_uncertain(irdma, "failed to destroy a QP");
 	}
+	irdma_arp_rele(irdma, iqp->iqp_arp_idx);
+	iqp->iqp_arp_idx = 0;
 	mutex_exit(&iqp->iqp_mod_lock);
 
 	mutex_enter(&irdma->irdma_qptable_lock);
