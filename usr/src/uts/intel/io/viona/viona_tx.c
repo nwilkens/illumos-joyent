@@ -458,25 +458,31 @@ viona_tx_offloads(viona_vring_t *ring, const struct virtio_net_mrgrxhdr *hdr,
 		    MEOI_L3INFO_SET | MEOI_L4INFO_SET;
 
 		/*
-		 * The LSO paths below read the IP addresses and write the TCP
-		 * checksum through raw pointers into the first mblk, so the
-		 * whole parsed header must reside there: the header copy is
-		 * sized for a typical maximum and a chain of IPv6 extension
-		 * headers can push the transport header into a second mblk.
-		 * The guest's checksum location must also be the TCP checksum
-		 * field the parse found, not merely somewhere inside the copy.
+		 * The LSO paths below read the IP header and write the TCP
+		 * checksum through raw pointers into the first mblk, so both
+		 * must reside there: the header copy is sized for a typical
+		 * maximum and a chain of IPv6 extension headers can push the
+		 * transport header into a second mblk.  The guest's checksum
+		 * start and offset must name the TCP header and its checksum
+		 * field exactly, because providers consume the start as the
+		 * TCP header location.  Each segment the provider produces
+		 * must also fit the link, so LSO is not a blanket exemption
+		 * from the MTU bound applied in viona_tx().
 		 */
-		const uint32_t full_hdr_sz = meoi->meoi_l2hlen +
-		    meoi->meoi_l3hlen + meoi->meoi_l4hlen;
-		const uint32_t tcp_csum_off = meoi->meoi_l2hlen +
-		    meoi->meoi_l3hlen + TCP_CHECKSUM_OFFSET;
+		const uint32_t l4_off = meoi->meoi_l2hlen + meoi->meoi_l3hlen;
+		const uint32_t tcp_csum_end = l4_off + TCP_CHECKSUM_OFFSET +
+		    sizeof (uint16_t);
+		const uint32_t seg_max = sizeof (struct ether_vlan_header) +
+		    link->l_mtu;
 
 		if ((link->l_features & dev_feature) == 0 ||
 		    (meoi->meoi_flags & all_valid) != all_valid ||
 		    meoi->meoi_l4proto != IPPROTO_TCP ||
-		    full_hdr_sz > MBLKL(mp) ||
-		    (uint32_t)hdr->vrh_csum_start + hdr->vrh_csum_offset !=
-		    tcp_csum_off) {
+		    tcp_csum_end > MBLKL(mp) ||
+		    hdr->vrh_csum_start != l4_off ||
+		    hdr->vrh_csum_offset != TCP_CHECKSUM_OFFSET ||
+		    gso_size == 0 ||
+		    l4_off + meoi->meoi_l4hlen + gso_size > seg_max) {
 			VIONA_PROBE3(tx_gso_fail, viona_link_t *, link,
 			    mblk_t *, mp, uint8_t, gso_type);
 			VIONA_RING_STAT_INCR(ring, tx_gso_fail);
