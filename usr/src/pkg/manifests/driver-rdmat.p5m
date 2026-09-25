@@ -1,0 +1,30 @@
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+
+#
+# Copyright 2026 Edgecast Cloud LLC.
+#
+
+<include global_zone_only_component>
+set name=pkg.fmri value=pkg:/driver/rdmat@$(PKGVERS)
+set name=pkg.summary value="RDMA verbs test client"
+set name=pkg.description value="rdmak test client driver for RDMA acceptance tests"
+set name=info.classification \
+    value=org.opensolaris.category.2008:Development/System
+set name=variant.arch value=i386
+dir  path=kernel group=sys
+dir  path=kernel/drv group=sys
+dir  path=kernel/drv/$(ARCH64) group=sys
+file path=kernel/drv/$(ARCH64)/rdmat group=sys mode=0755
+file path=kernel/drv/rdmat.conf group=sys
+driver name=rdmat perms="* 0600 root sys"
+license lic_CDDL license=lic_CDDL
+depend fmri=system/kernel/rdma type=require
