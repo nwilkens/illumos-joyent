@@ -457,8 +457,26 @@ viona_tx_offloads(viona_vring_t *ring, const struct virtio_net_mrgrxhdr *hdr,
 		const mac_ether_offload_flags_t all_valid = MEOI_L2INFO_SET |
 		    MEOI_L3INFO_SET | MEOI_L4INFO_SET;
 
+		/*
+		 * The LSO paths below read the IP addresses and write the TCP
+		 * checksum through raw pointers into the first mblk, so the
+		 * whole parsed header must reside there: the header copy is
+		 * sized for a typical maximum and a chain of IPv6 extension
+		 * headers can push the transport header into a second mblk.
+		 * The guest's checksum location must also be the TCP checksum
+		 * field the parse found, not merely somewhere inside the copy.
+		 */
+		const uint32_t full_hdr_sz = meoi->meoi_l2hlen +
+		    meoi->meoi_l3hlen + meoi->meoi_l4hlen;
+		const uint32_t tcp_csum_off = meoi->meoi_l2hlen +
+		    meoi->meoi_l3hlen + TCP_CHECKSUM_OFFSET;
+
 		if ((link->l_features & dev_feature) == 0 ||
-		    (meoi->meoi_flags & all_valid) != all_valid) {
+		    (meoi->meoi_flags & all_valid) != all_valid ||
+		    meoi->meoi_l4proto != IPPROTO_TCP ||
+		    full_hdr_sz > MBLKL(mp) ||
+		    (uint32_t)hdr->vrh_csum_start + hdr->vrh_csum_offset !=
+		    tcp_csum_off) {
 			VIONA_PROBE3(tx_gso_fail, viona_link_t *, link,
 			    mblk_t *, mp, uint8_t, gso_type);
 			VIONA_RING_STAT_INCR(ring, tx_gso_fail);
