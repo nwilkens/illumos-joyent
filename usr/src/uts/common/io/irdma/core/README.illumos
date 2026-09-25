@@ -76,10 +76,21 @@ device or firmware writes as untrusted where the upstream code does not.
 	irdma_sc_process_ceq(): stop after one pass over the CEQ, so that
 	entries with no registered CQ cannot keep the caller in the loop.
 
+    uk.c
+	irdma_uk_cq_poll_cmpl(): take the QP from irdma_osdep_cqe_qp(), which
+	accepts the pointer and number in the CQE only if they name a live QP
+	on this CQ, instead of dereferencing the pointer; drop entries that
+	claim an SRQ; complete a send or receive only if its WQE index lies
+	between the ring's tail and head; bound the walk over a flushed send
+	queue by the ring size and treat a zero quanta count as one.
+	irdma_uk_clean_cq(): stop after one pass over the CQ.
+
 The checks themselves are in ../irdma_osdep.c.  Other untrusted values are
 handled outside core/ without changes here: CEQ entries resolve only to CQs
-registered on the CEQ (the driver passes reg_cq), and AEQ completion
-contexts are never dereferenced.
+registered on the CEQ (the driver passes reg_cq), AEQ completion contexts
+are never dereferenced and AEQ QP and CQ numbers index bounded tables, and a
+receive completion's length is checked against what was posted
+(../irdma_cq.c).
 
 usr/src/test/irdma-tests checks that each marker is present and that this
 list matches them.

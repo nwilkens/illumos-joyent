@@ -432,6 +432,18 @@ extern int irdma_osdep_fpm_query_check(struct irdma_sc_dev *,
 extern int irdma_osdep_fpm_commit_check(struct irdma_sc_dev *,
     struct irdma_hmc_info *);
 
+/*
+ * illumos: the QP a CQE names, if it is live on the CQ (irdma_cq.c), and
+ * whether index i of a ring lies between its tail and head.
+ */
+struct irdma_cq_uk;
+struct irdma_qp_uk;
+extern struct irdma_qp_uk *irdma_osdep_cqe_qp(struct irdma_cq_uk *, u64,
+    u32);
+#define	IRDMA_OSDEP_RING_HOLDS(r, i)					\
+	((i) < (r).size && (((i) + (r).size - (r).tail) % (r).size) <	\
+	(((r).head + (r).size - (r).tail) % (r).size))
+
 #ifdef __cplusplus
 }
 #endif

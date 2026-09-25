@@ -224,11 +224,13 @@ dma_alloc_coherent(struct device *od, size_t size, dma_addr_t *pa, gfp_t flags)
 	return (dma->ird_va);
 }
 
-void
-dma_free_coherent(struct device *od, size_t size, void *va, dma_addr_t pa)
+static void
+irdma_dma_free(struct device *od, size_t size, void *va, dma_addr_t pa,
+    boolean_t consumer)
 {
 	irdma_t *irdma = od->od_irdma;
 	irdma_osbuf_t *b;
+	boolean_t quiesced;
 
 	if (va == NULL)
 		return;
@@ -246,16 +248,33 @@ dma_free_coherent(struct device *od, size_t size, void *va, dma_addr_t pa)
 	}
 	list_remove(&od->od_bufs, b);
 	od->od_nbufs--;
-	if ((irdma->irdma_flags & IRDMA_F_DEFER) != 0) {
+	if (!consumer && (irdma->irdma_flags & IRDMA_F_DEFER) != 0) {
 		list_insert_tail(&od->od_deferred, b);
 		mutex_exit(&od->od_lock);
 		return;
 	}
 	mutex_exit(&od->od_lock);
 
-	irdma->irdma_ops->iro_dma_free(irdma->irdma_peer, b->iob_dma,
-	    irdma_quiesced(irdma));
+	/*
+	 * The device reaches a consumer buffer only through an MR or QP that
+	 * the consumer destroyed first, so a pending control command does not
+	 * matter for it, only a device that failed to confirm the destroy.
+	 */
+	quiesced = consumer ? irdma_healthy(irdma) : irdma_quiesced(irdma);
+	irdma->irdma_ops->iro_dma_free(irdma->irdma_peer, b->iob_dma, quiesced);
 	kmem_free(b, sizeof (*b));
+}
+
+void
+dma_free_coherent(struct device *od, size_t size, void *va, dma_addr_t pa)
+{
+	irdma_dma_free(od, size, va, pa, B_FALSE);
+}
+
+void
+irdma_osdep_free_consumer(irdma_t *irdma, void *va, uint64_t pa, size_t size)
+{
+	irdma_dma_free(&irdma->irdma_osdev, size, va, pa, B_TRUE);
 }
 
 /* Streaming DMA serves only the iWARP exception queues, not supported. */

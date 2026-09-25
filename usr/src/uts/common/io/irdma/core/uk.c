@@ -1227,10 +1227,17 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 	info->error = (bool)FIELD_GET(IRDMA_CQ_ERROR, qword3);
 	info->ipv4 = (bool)FIELD_GET(IRDMACQ_IPV4, qword3);
 	get_64bit_val(cqe, 8, &comp_ctx);
-	if (is_srq)
-		get_64bit_val(cqe, 40, (u64 *)&qp);
-	else
-		qp = (struct irdma_qp_uk *)(unsigned long)comp_ctx;
+	get_64bit_val(cqe, 16, &qword2);
+	/*
+	 * illumos: the QP pointer and number come from the device; use the QP
+	 * only if the driver finds it live on this CQ.  There is no SRQ.
+	 */
+	qp = irdma_osdep_cqe_qp(cq, comp_ctx,
+				(u32)FIELD_GET(IRDMACQ_QPID, qword2));
+	if (!qp || is_srq) {
+		ret_code = -EFAULT;
+		goto exit;
+	}
 	if (info->error) {
 		info->major_err = FIELD_GET(IRDMA_CQ_MAJERR, qword3);
 		info->minor_err = FIELD_GET(IRDMA_CQ_MINERR, qword3);
@@ -1274,11 +1281,8 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 	info->qp_id = (u32)FIELD_GET(IRDMACQ_QPID, qword2);
 	info->ud_src_qpn = (u32)FIELD_GET(IRDMACQ_UDSRCQPN, qword2);
 
-	get_64bit_val(cqe, 8, &comp_ctx);
-
 	info->solicited_event = (bool)FIELD_GET(IRDMACQ_SOEVENT, qword3);
-	qp = (struct irdma_qp_uk *)(unsigned long)comp_ctx;
-	if (!qp || qp->destroy_pending) {
+	if (qp->destroy_pending) {
 		ret_code = -EFAULT;
 		goto exit;
 	}
@@ -1305,6 +1309,13 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 		u32 array_idx;
 
 		array_idx = wqe_idx / qp->rq_wqe_size_multiplier;
+		/* illumos: only an outstanding receive can complete. */
+		if (info->comp_status != IRDMA_COMPL_STATUS_FLUSHED &&
+		    info->comp_status != IRDMA_COMPL_STATUS_UNKNOWN &&
+		    !IRDMA_OSDEP_RING_HOLDS(qp->rq_ring, array_idx)) {
+			ret_code = -EFAULT;
+			goto exit;
+		}
 
 		if (info->comp_status == IRDMA_COMPL_STATUS_FLUSHED ||
 		    info->comp_status == IRDMA_COMPL_STATUS_UNKNOWN) {
@@ -1352,13 +1363,21 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 			}
 		}
 		if (info->comp_status != IRDMA_COMPL_STATUS_FLUSHED) {
+			/* illumos: only an outstanding send can complete. */
+			if (!IRDMA_OSDEP_RING_HOLDS(qp->sq_ring, wqe_idx)) {
+				ret_code = -EFAULT;
+				goto exit;
+			}
 			info->wr_id = qp->sq_wrtrk_array[wqe_idx].wrid;
 			if (!info->comp_status)
 				info->bytes_xfered = qp->sq_wrtrk_array[wqe_idx].wr_len;
 			info->op_type = (u8)FIELD_GET(IRDMACQ_OP, qword3);
 			IRDMA_RING_SET_TAIL(qp->sq_ring,
-					    wqe_idx + qp->sq_wrtrk_array[wqe_idx].quanta);
+					    wqe_idx + max_t(u16, 1, qp->sq_wrtrk_array[wqe_idx].quanta));
 		} else {
+			u32 walked = 0;
+
+
 			if (!IRDMA_RING_MORE_WORK(qp->sq_ring)) {
 				ret_code = -ENOENT;
 				goto exit;
@@ -1369,6 +1388,12 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 				u64 wqe_qword;
 				u32 tail;
 
+				/* illumos: walk at most the posted work. */
+				if (!IRDMA_RING_MORE_WORK(qp->sq_ring) ||
+				    walked++ >= qp->sq_ring.size) {
+					ret_code = -ENOENT;
+					goto exit;
+				}
 				tail = qp->sq_ring.tail;
 				sw_wqe = qp->sq_base[tail].elem;
 				get_64bit_val(sw_wqe, 24,
@@ -1376,7 +1401,7 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 				info->op_type = (u8)FIELD_GET(IRDMAQPSQ_OPCODE,
 							      wqe_qword);
 				IRDMA_RING_SET_TAIL(qp->sq_ring,
-						    tail + qp->sq_wrtrk_array[tail].quanta);
+						    tail + max_t(u16, 1, qp->sq_wrtrk_array[tail].quanta));
 				if (info->op_type != IRDMAQP_OP_NOP) {
 					info->wr_id = qp->sq_wrtrk_array[tail].wrid;
 					info->bytes_xfered = qp->sq_wrtrk_array[tail].wr_len;
@@ -1771,12 +1796,15 @@ void irdma_uk_clean_cq(void *q, struct irdma_cq_uk *cq)
 {
 	__le64 *cqe;
 	u64 qword3, comp_ctx;
-	u32 cq_head;
+	u32 cq_head, seen = 0;
 	u8 polarity, temp;
 
 	cq_head = cq->cq_ring.head;
 	temp = cq->polarity;
 	do {
+		/* illumos: the device can keep every entry valid. */
+		if (seen++ >= cq->cq_ring.size)
+			break;
 		if (cq->avoid_mem_cflct)
 			cqe = ((struct irdma_extended_cqe *)(cq->cq_base))[cq_head].buf;
 		else

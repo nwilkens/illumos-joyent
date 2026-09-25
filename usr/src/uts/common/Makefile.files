@@ -2120,7 +2120,8 @@ ICE_INTC_OBJS =	ice_common.o ice_controlq.o ice_sched.o ice_switch.o \
 #
 #	irdma: the E800 series RDMA function, and the Linux shared code it runs
 #
-IRDMA_OBJS =	irdma.o irdma_ctl.o irdma_osdep.o
+IRDMA_OBJS =	irdma.o irdma_ctl.o irdma_osdep.o irdma_verbs.o irdma_cq.o \
+		irdma_qp.o irdma_post.o irdma_mr.o irdma_aeq.o
 IRDMA_CORE_OBJS = ctrl.o hmc.o pble.o uk.o puda.o uda.o ws.o icrdma_hw.o
 
 #

@@ -64,6 +64,16 @@ def main():
     assert (IRDMA / "linux/etherdevice.h").exists()
     lic = (CORE / "THIRDPARTYLICENSE").read_text(encoding="utf-8")
     assert "Linux-OpenIB" in lic and "Intel Corporation" in lic
+    # Every OS-layer file under the OpenIB license is in the parent record.
+    top = (IRDMA / "README.illumos").read_text(encoding="utf-8")
+    derived = sorted(p.name for p in IRDMA.glob("*.[ch]") if "Linux-OpenIB"
+                     in p.read_text(encoding="utf-8").splitlines()[0])
+    for name in derived:
+        assert re.search(rf"^    {re.escape(name)}\s", top, re.MULTILINE), name
+    for src in re.findall(r"^    (\S+\.[ch])\s+([0-9a-f]{40})$", top,
+                          re.MULTILINE):
+        assert src[0] in ("verbs.c", "verbs.h", "utils.c", "hw.c",
+                          "main.h"), src
     print(f"PASS: {len(files)} imported files match their blob IDs or list "
           f"their local changes ({edited} edited)")
 

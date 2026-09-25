@@ -8,6 +8,7 @@ import sys
 
 TESTS = (
     "core_provenance.py",
+    "cqe_checks.py",
     "cqp_requests.py",
     "cstyle.py",
     "fpm_checks.py",

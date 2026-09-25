@@ -35,7 +35,7 @@
  * guards only the owed-work flags.
  */
 
-#include "irdma_impl.h"
+#include "irdma_verbs.h"
 #include "puda.h"
 #include "virtchnl.h"
 
@@ -55,7 +55,7 @@ static const char *irdma_step_names[IRDMA_STEP_MAX] = {
 	"pble", "ws", "pefltr"
 };
 
-static boolean_t
+boolean_t
 irdma_hw_ok(irdma_t *irdma)
 {
 	return ((irdma->irdma_flags & IRDMA_F_CQP_DEAD) == 0 &&
@@ -95,7 +95,7 @@ irdma_obj_mem(irdma_t *irdma, struct irdma_dma_mem *m, u32 size, u32 mask)
  * CQP requests.
  */
 
-static u64
+u64
 irdma_req_scratch(irdma_t *irdma, irdma_cqp_req_t *req)
 {
 	uint_t idx = (uint_t)(req - irdma->irdma_reqs);
@@ -122,7 +122,7 @@ irdma_req_lookup(irdma_t *irdma, u64 scratch)
 	return (req);
 }
 
-static irdma_cqp_req_t *
+irdma_cqp_req_t *
 irdma_req_alloc(irdma_t *irdma)
 {
 	irdma_cqp_req_t *req = NULL;
@@ -257,7 +257,7 @@ irdma_ccq_poll(irdma_t *irdma)
  * Submit the command in req and, with wait, wait for its completion.  The
  * request is freed or abandoned on return.
  */
-static int
+int
 irdma_cqp_exec(irdma_t *irdma, irdma_cqp_req_t *req,
     struct irdma_ccq_cqe_info *out)
 {
@@ -722,39 +722,33 @@ irdma_vec_disable(irdma_t *irdma, uint_t vec)
 	dev->irq_ops->irdma_dis_irq(dev, irdma_hw_vec(irdma, vec));
 }
 
+/*
+ * CEQ 0 carries the CCQ and every verbs CQ.  A CQ is held under
+ * irdma_ceq_lock, which CQ destroy takes to leave the CEQ, and its handler
+ * runs with no lock held.
+ */
 static void
 irdma_ceq0_process(irdma_t *irdma)
 {
 	struct irdma_sc_dev *dev = &irdma->irdma_sc;
 	struct irdma_sc_cq *cq;
-	uint32_t n = 0;
+	irdma_cq_t *icq;
+	uint32_t n;
 
-	/* Only CQs registered on CEQ 0 come back from the core. */
-	while (n++ < irdma->irdma_ceq0.elem_cnt &&
-	    (cq = irdma_sc_process_ceq(dev, &irdma->irdma_ceq0)) != NULL) {
+	for (n = 0; n < irdma->irdma_ceq0.elem_cnt; n++) {
+		icq = NULL;
+		mutex_enter(&irdma->irdma_ceq_lock);
+		cq = irdma_sc_process_ceq(dev, &irdma->irdma_ceq0);
+		if (cq != NULL && cq != &irdma->irdma_ccq)
+			icq = irdma_cq_ceq_hold(irdma, cq);
+		mutex_exit(&irdma->irdma_ceq_lock);
+		if (cq == NULL)
+			break;
 		if (cq == &irdma->irdma_ccq)
 			irdma_ccq_poll(irdma);
+		else if (icq != NULL)
+			irdma_cq_ceq_dispatch(icq);
 	}
-}
-
-static void
-irdma_aeq_process(irdma_t *irdma)
-{
-	struct irdma_aeqe_info info;
-	uint32_t n = 0;
-
-	while (n < irdma->irdma_aeq.elem_cnt) {
-		bzero(&info, sizeof (info));
-		if (irdma_sc_get_next_aeqe(&irdma->irdma_aeq, &info) != 0)
-			break;
-		n++;
-		irdma->irdma_aeqes++;
-		/* No QP or CQ exists yet, so every event is unexpected. */
-		irdma_error(irdma, "async event 0x%x source 0x%x id %u",
-		    info.ae_id, info.ae_src, info.qp_cq_id);
-	}
-	if (n != 0)
-		irdma_sc_repost_aeq_entries(&irdma->irdma_sc, n);
 }
 
 void

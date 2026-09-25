@@ -1,0 +1,53 @@
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+
+The verbs files of this driver are adapted from the Linux irdma OS layer of
+v6.18-rc2-10-g552c50713f27, commit 552c50713f273b494ac6c77052032a49bc9255e2,
+under the Linux-OpenIB license that each source offers
+("SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB"); see
+core/THIRDPARTYLICENSE.  Their logic follows the sources below, rewritten
+for rdmak and illumos: kernel QPs only, no user verbs, no iWARP, no SRQ, and
+checks on everything the device writes.  core/README.illumos covers the
+imported shared code.
+
+Sources (drivers/infiniband/hw/irdma, blob IDs at that commit):
+
+    verbs.c   76ce6137f2ba3255c0b1685ac91601d4a410b611
+    verbs.h   ed21c1b56e8ec63ee3a46d26580eaa10e671da09
+    utils.c   8b94d87b01923e2815f702f5d41f851b7010f971
+    hw.c      7bad0e38786a21c8a389fad33cf0e95aa5c79505
+    main.h    886b30da188aed18ec09c8b8886c2e499bd3fb84
+
+Derived files and what they follow:
+
+    irdma_verbs.h  verbs.h (the object structures), main.h (constants)
+    irdma_verbs.c  verbs.c irdma_query_device(), irdma_query_port(),
+                   irdma_alloc_pd(), irdma_create_ah(); utils.c
+                   irdma_arp_table(), irdma_add_arp(); hw.c
+                   irdma_manage_arp_cache(), irdma_initialize_hw_rsrc()
+    irdma_cq.c     verbs.c irdma_create_cq(), irdma_destroy_cq(),
+                   irdma_process_cqe(), __irdma_poll_cq(),
+                   irdma_req_notify_cq(); utils.c irdma_cq_empty()
+    irdma_qp.c     verbs.c irdma_create_qp(), irdma_setup_kmode_qp(),
+                   irdma_roce_fill_and_set_qpctx_info(),
+                   irdma_modify_qp_roce(), irdma_query_qp(),
+                   irdma_destroy_qp(); utils.c irdma_hw_modify_qp(),
+                   irdma_generate_flush_completions(); hw.c
+                   irdma_flush_wqes(), irdma_hw_flush_wqes()
+    irdma_post.c   verbs.c irdma_post_send(), irdma_post_recv(),
+                   irdma_get_mr_access()
+    irdma_mr.c     verbs.c irdma_create_stag(), irdma_hw_alloc_stag(),
+                   irdma_alloc_mr(), irdma_set_page(), irdma_map_mr_sg(),
+                   irdma_hwdereg_mr(), irdma_dereg_mr()
+    irdma_aeq.c    hw.c irdma_process_aeq(), irdma_set_flush_fields()
+
+The other files here (irdma.c, irdma_ctl.c, irdma_osdep.c, irdma_impl.h,
+irdma_ioctl.h, osdep.h) are written for illumos under the CDDL.

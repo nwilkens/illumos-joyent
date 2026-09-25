@@ -20,6 +20,10 @@ root with Python 3.9+ and a C99 compiler.
 - `fpm_checks.py`: runs the FPM query and commit checks against 28 hostile
   firmware values (zero block sizes the core divides by, counts that make
   its loops spin, sizes and bases that overflow or leave the SD table).
+- `cqe_checks.py`: runs the core's CQE poll, with its local changes,
+  against a forged QP pointer, a QP number that does not match, an SRQ
+  entry, send and receive WQE indexes outside the posted work, a flush over
+  a queue of NOPs and a CQ whose entries all stay valid.
 - `cqp_requests.py`: runs the CQP request matching against stale, reused,
   forged and abandoned completions, and checks the core's CCQ reader
   bounds the WQE index and ignores the CQP pointer in the entry.
@@ -28,7 +32,8 @@ root with Python 3.9+ and a C99 compiler.
   add, and a failed removal that owes a reset.
 - `lock_order.py`: static checks of the interrupt priority and the peer lock
   order: the interrupt handler takes only its own lock and calls no core
-  code; ice calls the child with no lock held; the reset worker offlines and
+  code; consumer completion handlers run from the interrupt task with no
+  driver lock held, and the AEQ task never waits on a control command; ice calls the child with no lock held; the reset worker offlines and
   onlines the child with `ice_rebuild_lock` dropped; the quarantine is freed
   only after a reset.
 - `rdk_verbs.py`: runs the rdmak QP state table against missing, extra and
