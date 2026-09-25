@@ -54,6 +54,7 @@ typedef int (*ddi_cb_func_t)(dev_info_t *, ddi_cb_action_t, void *, void *,
 #define	DDI_CB_INTR_REMOVE	1
 #define	DDI_CB_OTHER		2
 #define	DDI_DEV_T_ANY		0
+#define	DDI_PROP_DONTPASS	1
 #define	DDI_SERVICE_LOST	2
 #define	MUTEX_DRIVER		0
 #define	CV_DRIVER		0
@@ -95,6 +96,7 @@ struct dev_info {
 
 struct ice_hw_common_caps {
 	uint32_t num_rxq, num_txq, num_msix_vectors, rss_table_entry_width;
+	boolean_t iwarp;
 };
 
 struct ice_hw {
@@ -126,6 +128,8 @@ typedef struct ice {
 	ddi_cb_handle_t ice_intr_cb;
 	boolean_t ice_irm_busy, ice_attaching, ice_detaching;
 	uint16_t ice_nqueues;
+	uint_t ice_intr_rdma;
+	boolean_t ice_safe_mode;
 	uint32_t ice_state;
 	ice_attach_state_t ice_attach_progress;
 	uint_t ice_num_rxr, ice_num_txr;
@@ -138,6 +142,9 @@ typedef struct ice {
 
 static int ncpus = 40, max_ncpus = 40, boot_max_ncpus = -1;
 static ice_t dev;
+
+/* The rdma_enable and rdma_vectors properties; 0 leaves RDMA off. */
+static uint_t rdma_want;
 
 /* IRM and the DDI: which MSI-X entries are allocated, and handler state. */
 static struct {
@@ -185,6 +192,10 @@ ddi_prop_get_int(int dev, dev_info_t *dip, int flags, const char *name,
 	(void) dev;
 	(void) dip;
 	(void) flags;
+	if (strcmp(name, "rdma_enable") == 0)
+		return (rdma_want != 0);
+	if (strcmp(name, "rdma_vectors") == 0)
+		return (rdma_want != 0 ? (int)rdma_want : def);
 	assert(strcmp(name, "num_queues") == 0);
 	return (def);
 }
@@ -582,16 +593,23 @@ reset(int nintrs)
 	dev.ice_hw.func_caps.common_cap.num_txq = 256;
 	dev.ice_hw.func_caps.common_cap.num_msix_vectors = 2048;
 	dev.ice_hw.func_caps.common_cap.rss_table_entry_width = 8;
+	dev.ice_hw.func_caps.common_cap.iwarp = B_TRUE;
 }
 
-/* An attached instance with NRINGS queue pairs and its handlers enabled. */
+/*
+ * An attached instance with NRINGS queue pairs and its handlers enabled.  A
+ * child holds handlers on the RDMA block, if there is one.
+ */
 static void
 attached(int nintrs)
 {
 	uint_t i;
+	int v;
 
 	reset(nintrs);
 	assert(ice_alloc_intrs(&dev));
+	for (v = ICE_RDMA_FIRST_VECTOR; ICE_INTR_IS_RDMA(&dev, v); v++)
+		m.handler[v] = m.enabled[v] = B_TRUE;
 	dev.ice_num_rxr = dev.ice_num_txr = dev.ice_nqueues;
 	dev.ice_rx_limit_per_intr = 256;
 	dev.ice_rxr = rxr;
@@ -625,8 +643,9 @@ callback(int action, int count)
 static void
 check_map(void)
 {
-	uint_t i, share = (NRINGS + dev.ice_intr_count - 2) /
-	    (dev.ice_intr_count - 1);
+	int first = (int)ICE_INTR_LAN_FIRST(&dev);
+	int lan = dev.ice_intr_count - first;
+	uint_t i, share = (NRINGS + lan - 1) / lan;
 	int v;
 
 	assert(m.allocated == dev.ice_intr_count && !l.mac_cleared);
@@ -634,11 +653,16 @@ check_map(void)
 	for (v = 0; v < 64; v++) {
 		boolean_t in = v < dev.ice_intr_count;
 
-		assert(m.live[v] == in && m.handler[v] == in &&
-		    m.enabled[v] == in);
+		assert(m.live[v] == in);
+		/* The RDMA block's handlers are the child's business. */
+		if (ICE_INTR_IS_RDMA(&dev, v)) {
+			assert(m.handler[v] && m.enabled[v]);
+			continue;
+		}
+		assert(m.handler[v] == in && m.enabled[v] == in);
 	}
 	for (i = 0; i < dev.ice_num_rxr; i++) {
-		assert(rxr[i].irxr_vec >= 1 &&
+		assert((int)rxr[i].irxr_vec >= first &&
 		    (int)rxr[i].irxr_vec < dev.ice_intr_count);
 		assert(txr[i].itxr_vec == rxr[i].irxr_vec);
 		assert(rxr[i].irxr_intr_limit == MAX(16, 256 / share));
@@ -646,7 +670,7 @@ check_map(void)
 		assert(l.mac_rx[i] == dev.ice_intr_handles[rxr[i].irxr_vec]);
 		assert(l.mac_tx[i] == dev.ice_intr_handles[txr[i].itxr_vec]);
 	}
-	for (v = 1; v < dev.ice_intr_count; v++) {
+	for (v = first; v < dev.ice_intr_count; v++) {
 		for (i = 0; i < dev.ice_num_rxr; i++)
 			rxr[i].irxr_serviced = txr[i].itxr_serviced = 0;
 		assert(ice_intr_queue(&dev, (uint_t)v) == DDI_INTR_CLAIMED);
@@ -781,6 +805,95 @@ irm(void)
 	finish();
 }
 
+/*
+ * The RDMA block stays below the LAN vectors through every reclaim and
+ * offer, and a reclaim that would reach it is refused.
+ */
+static void
+irm_rdma(void)
+{
+	uint_t i;
+	int v;
+
+	rdma_want = 2;
+	attached(1024);
+	assert(dev.ice_intr_rdma == 2);
+	assert(dev.ice_intr_count == 19 && dev.ice_nqueues == NRINGS);
+	for (i = 0; i < NRINGS; i++) {
+		assert(rxr[i].irxr_vec == 3 + i);
+		l.mac_rx[i] = dev.ice_intr_handles[rxr[i].irxr_vec];
+		l.mac_tx[i] = dev.ice_intr_handles[txr[i].itxr_vec];
+	}
+	check_map();
+	/* ice registers no handler there and does not route it. */
+	assert(ice_intr_msix((char *)&dev, (char *)1) == DDI_INTR_CLAIMED);
+
+	dev.ice_state = ICE_STATE_STARTED;
+	assert(callback(DDI_CB_INTR_REMOVE, 9) == DDI_SUCCESS);
+	assert(dev.ice_intr_count == 10 && dev.ice_intr_rdma == 2);
+	assert(rxr[0].irxr_vec == 3 && rxr[7].irxr_vec == 3);
+	check_map();
+	for (v = 1; v <= 2; v++)
+		assert(dev.ice_intr_handles[v] == &tokens[v]);
+
+	/* The OICR, the block and one LAN vector always stay. */
+	assert(callback(DDI_CB_INTR_REMOVE, 7) == DDI_FAILURE);
+	assert(dev.ice_intr_count == 10);
+	assert(callback(DDI_CB_INTR_REMOVE, 6) == DDI_SUCCESS);
+	assert(dev.ice_intr_count == 4);
+	for (i = 0; i < NRINGS; i++)
+		assert(rxr[i].irxr_vec == 3);
+	check_map();
+
+	assert(callback(DDI_CB_INTR_ADD, INT32_MAX) == DDI_SUCCESS);
+	assert(dev.ice_intr_count == 19);
+	for (i = 0; i < NRINGS; i++)
+		assert(rxr[i].irxr_vec == 3 + i);
+	check_map();
+	dev.ice_state = 0;
+	finish();
+
+	/* A grant too short for the block and a LAN vector drops RDMA. */
+	reset(1024);
+	m.grant = 3;
+	assert(ice_alloc_intrs(&dev));
+	assert(dev.ice_intr_rdma == 0 && m.notes == 2);
+	assert(dev.ice_intr_count == 3 && dev.ice_nqueues == 2);
+	ice_free_intrs(&dev);
+
+	/* One that covers both keeps it, however few queues are left. */
+	reset(1024);
+	m.grant = 4;
+	assert(ice_alloc_intrs(&dev));
+	assert(dev.ice_intr_rdma == 2 && m.notes == 1);
+	assert(dev.ice_intr_count == 4 && dev.ice_nqueues == 1);
+	assert(m.nreq == 19);
+	ice_free_intrs(&dev);
+	assert(dev.ice_intr_rdma == 0);
+
+	/* No capability, safe mode, or too few firmware vectors: no RDMA. */
+	reset(1024);
+	dev.ice_hw.func_caps.common_cap.iwarp = B_FALSE;
+	assert(ice_alloc_intrs(&dev) && dev.ice_intr_rdma == 0);
+	assert(dev.ice_intr_count == 17 && m.notes == 2);
+	ice_free_intrs(&dev);
+	reset(1024);
+	dev.ice_safe_mode = B_TRUE;
+	assert(ice_alloc_intrs(&dev) && dev.ice_intr_rdma == 0);
+	ice_free_intrs(&dev);
+	reset(1024);
+	dev.ice_hw.func_caps.common_cap.num_msix_vectors = 3;
+	assert(ice_alloc_intrs(&dev) && dev.ice_intr_rdma == 0);
+	ice_free_intrs(&dev);
+	/* An out-of-range rdma_vectors falls back to the default. */
+	rdma_want = 99;
+	reset(1024);
+	assert(ice_alloc_intrs(&dev) && dev.ice_intr_rdma == 2);
+	assert(m.errors == 1);
+	ice_free_intrs(&dev);
+	rdma_want = 0;
+}
+
 /* Tear an instance down whatever state a failure left its vectors in. */
 static void
 finish(void)
@@ -861,6 +974,7 @@ main(void)
 	assert(ice_alloc_intrs(&dev));
 	assert(m.registered && dev.ice_intr_count == 17);
 	assert(dev.ice_nqueues == 16 && m.allocated == 17 && m.notes == 1);
+	assert(dev.ice_intr_rdma == 0);
 	ice_free_intrs(&dev);
 	assert(m.allocated == 0 && m.unregisters == 1 && !m.registered);
 	assert(dev.ice_intr_cb == NULL && dev.ice_intr_handles == NULL);
@@ -906,6 +1020,7 @@ main(void)
 
 	irm();
 	irm_failures();
+	irm_rdma();
 
 	(void) puts("PASS: MSI-X sizing registers for interrupt resource "
 	    "management, and reclaims and offers keep every ring on a live "

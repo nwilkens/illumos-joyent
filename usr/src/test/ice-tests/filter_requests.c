@@ -166,6 +166,14 @@ ice_rss_setup(ice_t *ice)
 	return (setup_failure == SETUP_RSS ? -1 : ICE_SUCCESS);
 }
 
+/* The RDMA peer replays its VSI state last and cannot fail the rebuild. */
+static void
+ice_rdma_vsi_replay(ice_t *ice)
+{
+	CHECK(MUTEX_HELD(&ice->ice_rebuild_lock));
+	CHECK(replay_prepares == replay_finishes + 1);
+}
+
 #include "ice_vsi_filter_bodies.h"
 
 static void

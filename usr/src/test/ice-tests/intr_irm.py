@@ -21,8 +21,13 @@ def main():
     header = DRIVER / "ice.h"
     types = [extract(header.read_text(), pattern, header) for pattern in (
         r"^typedef enum ice_state \{[\s\S]*?^} ice_state_t;",
-        r"^typedef enum ice_attach_state \{[\s\S]*?^} ice_attach_state_t;")]
-    parts = bodies(args.source, ("ice_prop_get_num_queues", "ice_queue_limit",
+        r"^typedef enum ice_attach_state \{[\s\S]*?^} ice_attach_state_t;",
+        r"^#define\tICE_RDMA_FIRST_VECTOR\t[\s\S]*?"
+        r"\(uint_t\)\(v\) < ICE_INTR_LAN_FIRST\(ice\)\)$")]
+    parts = [extract(source, rf"^#define\tICE_RDMA_{n}_VECTORS\t.*$",
+                     args.source) for n in ("DEF", "MAX")]
+    parts += bodies(args.source, ("ice_rdma_vectors",
+                                  "ice_prop_get_num_queues", "ice_queue_limit",
                                  "ice_intr_cb", "ice_intr_cb_fini",
                                  "ice_free_intrs", "ice_alloc_intrs",
                                  "ice_rem_intr_handlers",

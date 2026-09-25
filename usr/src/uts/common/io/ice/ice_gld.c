@@ -703,6 +703,7 @@ ice_m_setprop(void *arg, const char *pr_name, mac_prop_id_t pr_num,
 			return (ret);
 		ice->ice_mtu = mtu;
 		ice_update_mtu(ice);
+		ice_rdma_mtu_notify(ice);
 		return (0);
 	}
 	default:

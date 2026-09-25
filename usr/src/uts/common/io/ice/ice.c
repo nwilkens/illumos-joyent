@@ -42,6 +42,8 @@
  * ice_stats.c		Hardware counters and kstats.
  * ice_ddp.c		The DDP package load and safe mode.
  * ice_ioctl.c		Firmware logging and debug dump ioctls.
+ * ice_rdma.c		The RDMA child node, its events and resets.
+ * ice_rdma_ops.c	The operations the RDMA child calls (ice_rdma.h).
  *
  * ---------------
  * Device families
@@ -105,6 +107,11 @@
  *	ice_loopback_lock, then ice_lse_lock	the link state cache.
  *	ice_stat_lock	the counter baselines (ice_stats.c).
  *	ice_fwlog_lock	the firmware log ring (ice_ioctl.c).
+ *
+ * The RDMA peer's ir_lock sits between ice_rebuild_lock and ice_lse_lock.
+ * Its ir_cfg_lock, which covers the child's online and offline, is taken with
+ * no other ice lock held, because the child calls back into ice as it
+ * detaches.
  *
  * The common code's control queue, scheduler and switch locks are adaptive
  * and innermost.  No interrupt-priority lock (ice_lock, ice_lse_lock, a ring
@@ -172,12 +179,13 @@
  *
  * The queue pair count is the lowest of the CPU count, the queues and vectors
  * firmware gives this PF, the vectors the platform grants less the OICR
- * vector, and the num_queues property.  That property defaults to 16 and is
- * clamped to 1 through MAX_RINGS_PER_GROUP - 1.  The count need not be a
- * power of two: the VSI TC map rounds up, while the rings and the RSS table
- * use the exact count.  Interrupt resource management can later take vectors
- * back or offer them again (ice_intr_adjust()); the ring count MAC sees stays
- * fixed, so the rings share the queue vectors that are left.
+ * vector and any RDMA block, and the num_queues property.  That property
+ * defaults to 16 and is clamped to 1 through MAX_RINGS_PER_GROUP - 1.  The
+ * count need not be a power of two: the VSI TC map rounds up, while the rings
+ * and the RSS table use the exact count.  Interrupt resource management can
+ * later take vectors back or offer them again (ice_intr_adjust()); the ring
+ * count MAC sees stays fixed, so the rings share the queue vectors that are
+ * left.
  *
  * Each tx ring has its own copy-buffer pools, sized for the copied packets
  * it can have in flight rather than for its descriptors, within a cap per
@@ -189,6 +197,19 @@
  * (safe mode), which also leaves one queue pair.  For LSO the MSS comes from
  * mac_lso_get() and must be at least 88 bytes; the header is copied into one
  * descriptor so that each segment uses at most eight.
+ *
+ * ----
+ * RDMA
+ * ----
+ *
+ * With the rdma_enable property set, firmware reporting the capability and
+ * the DDP package loaded, the RDMA function attaches as the child irdma@0
+ * (ice_rdma.c, ice_rdma.h).  It gets a fixed block of MSI-X vectors right
+ * after vector 0, so the LAN vectors follow it and interrupt resource
+ * management takes LAN vectors only.  A grant too small for the block and one
+ * LAN vector leaves RDMA off.  The reset worker takes the child offline before
+ * the reset and attaches it again after the rebuild.  DMA memory the child
+ * frees while the device may still write to it is freed only after a reset.
  *
  * -----------------
  * Diagnostic ioctls
@@ -265,7 +286,7 @@ static struct dev_ops ice_dev_ops = {
 	.devo_detach = ice_detach,
 	.devo_reset = nodev,
 	.devo_cb_ops = &ice_cb_ops,
-	.devo_bus_ops = NULL,
+	.devo_bus_ops = &ice_bus_ops,
 	.devo_power = NULL,
 	.devo_quiesce = ddi_quiesce_not_supported
 };
@@ -694,7 +715,8 @@ ice_datapath_pause(ice_t *ice)
 /*
  * Change the vector count by count and spread the rings over what is left.
  * The rings MAC sees cannot change, so a removal makes rings share vectors;
- * vector 0 stays with the other causes.  Returns the DDI status for IRM.
+ * vector 0 stays with the other causes and the RDMA block below the LAN
+ * vectors is never taken.  Returns the DDI status for IRM.
  */
 static int
 ice_intr_adjust_locked(ice_t *ice, ddi_cb_action_t action, int count)
@@ -703,7 +725,8 @@ ice_intr_adjust_locked(ice_t *ice, ddi_cb_action_t action, int count)
 	    ICE_STATE_RESET_PENDING | ICE_STATE_RESET_FAILED;
 	ddi_intr_handle_t *h = ice->ice_intr_handles;
 	int cap = (int)(ice->ice_intr_size / sizeof (ddi_intr_handle_t));
-	int use = 1 + (int)MAX(ice->ice_num_rxr, ice->ice_num_txr);
+	int rdma = (int)ice->ice_intr_rdma;
+	int use = 1 + rdma + (int)MAX(ice->ice_num_rxr, ice->ice_num_txr);
 	int old = ice->ice_intr_count, target, actual = 0, i;
 	boolean_t paused = B_FALSE;
 	int ret = DDI_SUCCESS;
@@ -712,7 +735,7 @@ ice_intr_adjust_locked(ice_t *ice, ddi_cb_action_t action, int count)
 	ASSERT(MUTEX_HELD(&ice->ice_rebuild_lock));
 
 	if (action == DDI_CB_INTR_REMOVE) {
-		if (count > old - ICE_INTR_MSIX_MIN)
+		if (count > old - ICE_INTR_MSIX_MIN - rdma)
 			return (DDI_FAILURE);
 		target = old - count;
 	} else {
@@ -786,8 +809,8 @@ ice_intr_adjust_locked(ice_t *ice, ddi_cb_action_t action, int count)
 	}
 
 	dev_err(ice->ice_dip, CE_NOTE, "!MSI-X vectors: %d -> %d for %u "
-	    "queue pairs", old, ice->ice_intr_count,
-	    MAX(ice->ice_num_rxr, ice->ice_num_txr));
+	    "queue pairs, rdma=%d", old, ice->ice_intr_count,
+	    MAX(ice->ice_num_rxr, ice->ice_num_txr), rdma);
 	return (ret);
 
 dead:
@@ -839,6 +862,8 @@ ice_intr_adjust(ice_t *ice, ddi_cb_action_t action, int count)
 static void
 ice_unconfigure(ice_t *ice)
 {
+	boolean_t reset_ok = B_FALSE;
+
 	/*
 	 * Delete the kstats first: their update callbacks read hardware
 	 * registers, so they must stop before the register mapping is torn
@@ -944,11 +969,15 @@ ice_unconfigure(ice_t *ice)
 		/*
 		 * Best-effort cleanup for a later attach.  Packet DMA was
 		 * already stopped before any resource release; this reset is
-		 * not part of that isolation proof.
+		 * not part of that isolation proof.  It is the barrier for the
+		 * RDMA buffers the child left in quarantine.
 		 */
-		if (ice_reset(&ice->ice_hw, ICE_RESET_PFR) != ICE_SUCCESS)
+		reset_ok = ice_reset(&ice->ice_hw, ICE_RESET_PFR) ==
+		    ICE_SUCCESS;
+		if (!reset_ok)
 			ice_error(ice, "cleanup PF reset failed");
 	}
+	ice_rdma_fini(ice, reset_ok);
 
 	if (ice->ice_attach_progress & ICE_ATTACH_REGS_MAP) {
 		ddi_regs_map_free(&ice->ice_osdep.ios_reg_handle);
@@ -1100,6 +1129,7 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	if (!ice_alloc_intrs(ice))
 		goto fail;
 	ice->ice_attach_progress |= ICE_ATTACH_ALLOC_INTR;
+	ice_rdma_attach(ice);
 
 	if (!ice_add_intr_handlers(ice))
 		goto fail;
@@ -1261,6 +1291,7 @@ ice_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 
 	ice_oicr_resync(ice);
 	ice_admin_periodic_start(ice);
+	ice_rdma_start(ice);
 
 	atomic_or_32(&ice->ice_state, ICE_STATE_ATTACHED);
 	return (DDI_SUCCESS);
@@ -1352,6 +1383,10 @@ ice_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	if (ice == NULL)
 		return (DDI_FAILURE);
 
+	/* The child calls into ice while it detaches. */
+	if (!ice_rdma_detach(ice))
+		return (DDI_FAILURE);
+
 	/*
 	 * Leave an active datapath alone, and an interrupt adjustment that
 	 * is changing MAC's ring handles.  The same lock makes the detaching
@@ -1361,6 +1396,7 @@ ice_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	mutex_enter(&ice->ice_rebuild_lock);
 	if ((ice->ice_state & ICE_STATE_STARTED) != 0 || ice->ice_irm_busy) {
 		mutex_exit(&ice->ice_rebuild_lock);
+		ice_rdma_detach_undo(ice);
 		return (DDI_FAILURE);
 	}
 	ice->ice_detaching = B_TRUE;
@@ -1393,6 +1429,7 @@ fail:
 	ice->ice_detaching = B_FALSE;
 	ice_reset_redispatch(ice);
 	mutex_exit(&ice->ice_rebuild_lock);
+	ice_rdma_detach_undo(ice);
 	return (DDI_FAILURE);
 }
 
@@ -1594,6 +1631,7 @@ ice_rebuild(ice_t *ice, uint32_t requests)
 	ice_rx_reclaim(ice);
 	if ((ice->ice_state & ICE_STATE_STARTED) == 0)
 		ice_tx_lso_free(ice);
+	ice_rdma_reset_barrier(ice);
 
 	/*
 	 * Every step below rides the admin queue, which soft-fails with
@@ -1794,8 +1832,10 @@ reset_failed:
 void
 ice_reset_task(void *arg)
 {
+	const uint32_t owed = ICE_STATE_RESET_PENDING | ICE_STATE_PFR_REQ;
 	ice_t *ice = arg;
-	uint32_t requests;
+	uint32_t requests = 0;
+	boolean_t rdma = B_FALSE, ok = B_FALSE;
 
 	/* The queued/running ownership flag stays set while this lock waits. */
 	mutex_enter(&ice->ice_rebuild_lock);
@@ -1808,11 +1848,26 @@ ice_reset_task(void *arg)
 	    (ice->ice_state & ICE_STATE_RESET_FAILED) != 0)
 		goto done;
 
+	/*
+	 * The RDMA child goes offline before the reset, with no lifecycle
+	 * lock held: its detach calls back into ice.
+	 */
+	if (ice->ice_rdma != NULL && (ice->ice_state & owed) != 0) {
+		rdma = B_TRUE;
+		mutex_exit(&ice->ice_rebuild_lock);
+		ice_rdma_reset_prepare(ice);
+		mutex_enter(&ice->ice_rebuild_lock);
+		if (ice->ice_attaching || ice->ice_detaching ||
+		    (ice->ice_state & ICE_STATE_RESET_FAILED) != 0)
+			goto done;
+	}
+
 	requests = ice_reset_take_requests(ice);
 	if (requests != 0) {
 		ice_prepare_for_reset(ice);
 		ice_rebuild(ice, requests);
 	}
+	ok = (ice->ice_state & ICE_STATE_RESET_FAILED) == 0;
 
 done:
 	mutex_enter(&ice->ice_lock);
@@ -1821,6 +1876,9 @@ done:
 	if (!ice->ice_attaching && !ice->ice_detaching)
 		ice_reset_redispatch(ice);
 	mutex_exit(&ice->ice_rebuild_lock);
+
+	if (rdma)
+		ice_rdma_reset_done(ice, ok);
 }
 
 #ifdef DEBUG

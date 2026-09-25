@@ -56,6 +56,8 @@ static struct {
 	unsigned int disables, resets, reclaims, unregisters, redispatches;
 	unsigned int starts, clears;
 	boolean_t consume_fault, pending_fault, inject_after_ok_get;
+	boolean_t rdma_busy;
+	unsigned int rdma_detaches, rdma_undos;
 } fixture;
 
 static void
@@ -270,6 +272,22 @@ ice_led_fini(ice_t *p)
 	assert(p->ice_detaching);
 }
 
+/* The RDMA child detaches first, with no ice lock held. */
+static boolean_t
+ice_rdma_detach(ice_t *p)
+{
+	assert(!MUTEX_HELD(&p->ice_rebuild_lock) && !p->ice_detaching);
+	fixture.rdma_detaches++;
+	return (!fixture.rdma_busy);
+}
+
+static void
+ice_rdma_detach_undo(ice_t *p)
+{
+	assert(!MUTEX_HELD(&p->ice_rebuild_lock) && !p->ice_detaching);
+	fixture.rdma_undos++;
+}
+
 static void ice_unconfigure(ice_t *p)
 {
 	assert(fixture.quiet && fixture.drained);
@@ -296,6 +314,8 @@ failed(void)
 	assert(!device.ice_detaching && !fixture.freed);
 	assert(device.ice_attach_progress & ICE_ATTACH_MAC);
 	assert(!MUTEX_HELD(&device.ice_rebuild_lock));
+	/* A failure after the child left brings it back once. */
+	assert(fixture.rdma_undos == fixture.rdma_detaches);
 }
 
 int
@@ -417,6 +437,14 @@ main(void)
 	assert(fixture.resets == 1 && fixture.reclaims == 0);
 	failed();
 
-	(void) puts("detach quiescence: PASS (15 scenarios)");
+	/* A child that will not detach leaves everything untouched. */
+	init();
+	fixture.rdma_busy = B_TRUE;
+	assert(ice_detach(NULL, DDI_DETACH) == DDI_FAILURE);
+	assert(fixture.rdma_detaches == 1 && fixture.rdma_undos == 0);
+	assert(fixture.disables == 0 && fixture.unregisters == 0);
+	assert(!device.ice_detaching && !fixture.freed);
+
+	(void) puts("detach quiescence: PASS (16 scenarios)");
 	return (0);
 }

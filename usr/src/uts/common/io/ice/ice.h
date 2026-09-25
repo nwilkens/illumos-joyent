@@ -58,6 +58,18 @@ extern "C" {
 CTASSERT(ICE_INTR_MSIX_MIN == 2);
 
 /*
+ * With RDMA enabled, vectors 1 through ice_intr_rdma belong to the RDMA
+ * child and the LAN queue vectors follow them.
+ */
+#define	ICE_RDMA_FIRST_VECTOR	1
+#define	ICE_INTR_LAN_FIRST(ice)	(ICE_RDMA_FIRST_VECTOR + (ice)->ice_intr_rdma)
+#define	ICE_INTR_LAN_COUNT(ice)	\
+	((uint32_t)(ice)->ice_intr_count - ICE_INTR_LAN_FIRST(ice))
+#define	ICE_INTR_IS_RDMA(ice, v)	\
+	((uint_t)(v) >= ICE_RDMA_FIRST_VECTOR &&	\
+	(uint_t)(v) < ICE_INTR_LAN_FIRST(ice))
+
+/*
  * Ceiling and default of the num_queues property; ice_queue_limit() applies
  * the CPU, firmware and vector limits.  MAC keeps one SRS per rx ring plus
  * one for software classification in an array of MAX_RINGS_PER_GROUP
@@ -640,6 +652,7 @@ typedef struct ice {
 	ddi_cb_handle_t		ice_intr_cb;	/* IRM registration */
 	boolean_t		ice_irm_busy;	/* ice_rebuild_lock */
 	uint16_t		ice_nqueues;
+	uint_t			ice_intr_rdma;	/* fixed after attach */
 
 	/* OICR deferred async work; thread context, serialized via ice_lock. */
 	ddi_taskq_t		*ice_oicr_taskq;
@@ -751,7 +764,11 @@ typedef struct ice {
 	uint32_t		ice_fwlog_dropped;
 
 	mac_handle_t		ice_mac_hdl;	/* set by mac_register() */
+
+	struct ice_rdma		*ice_rdma;	/* NULL unless enabled */
 } ice_t;
+
+typedef struct ice_rdma ice_rdma_t;
 
 /*
  * ice.c
@@ -968,6 +985,26 @@ extern int ice_vsi_loopback_set(ice_t *, boolean_t);
 extern void ice_link_loopback_update(ice_t *, uint32_t);
 extern void ice_loopback_replay(ice_t *);
 extern void ice_loopback_fini(ice_t *);
+
+/*
+ * ice_rdma.c: the RDMA peer interface.  The reset hooks run in the reset
+ * worker with no ice lock held; ice_rdma_vsi_replay() needs
+ * ice_rebuild_lock.
+ */
+extern struct bus_ops ice_bus_ops;
+extern void ice_rdma_attach(ice_t *);
+extern void ice_rdma_start(ice_t *);
+extern void ice_rdma_online_task(void *);
+extern boolean_t ice_rdma_detach(ice_t *);
+extern void ice_rdma_detach_undo(ice_t *);
+extern void ice_rdma_fini(ice_t *, boolean_t);
+extern void ice_rdma_reset_prepare(ice_t *);
+extern void ice_rdma_reset_barrier(ice_t *);
+extern void ice_rdma_reset_done(ice_t *, boolean_t);
+extern void ice_rdma_vsi_replay(ice_t *);
+extern void ice_rdma_link_notify(ice_t *);
+extern void ice_rdma_mtu_notify(ice_t *);
+extern void ice_rdma_crit_notify(ice_t *, uint32_t);
 
 #ifdef __cplusplus
 }
