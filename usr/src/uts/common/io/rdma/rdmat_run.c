@@ -41,6 +41,8 @@
 #define	RDMAT_SLICE_US		(100 * 1000)
 /* Empty polls a DIRECT wait spins before it sleeps one tick. */
 #define	RDMAT_SPIN		2048
+/* Completions a busy poll handles at once. */
+#define	RDMAT_SPIN_BUDGET	64
 
 static uint8_t
 rdmat_pattern(uint64_t seed, uint64_t off)
@@ -160,6 +162,64 @@ rdmat_reset_counts(rdmat_qp_t *tq, uint32_t expect_len)
 	mutex_exit(&tq->tq_lock);
 }
 
+/* Arm the CQs a RDMAT_F_ADAPT wait busy polled and give them back. */
+void
+rdmat_spin_end(rdmat_qp_t *tq)
+{
+	if (tq->tq_spoll)
+		rdk_cq_poll_end(tq->tq_scq);
+	if (tq->tq_rpoll)
+		rdk_cq_poll_end(tq->tq_rcq);
+	tq->tq_spoll = tq->tq_rpoll = B_FALSE;
+}
+
+/*
+ * Busy poll for up to tq_spin_ns, keeping the CQs between calls while the
+ * waits succeed.  Returns -1 once the time is up, with the CQs armed.
+ */
+static int
+rdmat_wait_spin(rdmat_qp_t *tq, uint64_t *ctr, uint64_t want,
+    hrtime_t deadline)
+{
+	rdmat_sess_t *ts = tq->tq_sess;
+	hrtime_t end = gethrtime() + tq->tq_spin_ns;
+	uint_t spins = 0;
+	int ret;
+
+	if (!tq->tq_spoll && !tq->tq_rpoll) {
+		tq->tq_spoll = rdk_cq_poll_begin(tq->tq_scq);
+		if (tq->tq_rcq != tq->tq_scq)
+			tq->tq_rpoll = rdk_cq_poll_begin(tq->tq_rcq);
+	}
+	for (;;) {
+		if (tq->tq_spoll)
+			(void) rdk_cq_poll(tq->tq_scq, RDMAT_SPIN_BUDGET);
+		if (tq->tq_rpoll)
+			(void) rdk_cq_poll(tq->tq_rcq, RDMAT_SPIN_BUDGET);
+		mutex_enter(&tq->tq_lock);
+		if (tq->tq_errors != 0)
+			ret = EIO;
+		else if (*ctr >= want)
+			ret = 0;
+		else if (ts->ts_dying)
+			ret = ENXIO;
+		else if (gethrtime() >= deadline)
+			ret = ETIMEDOUT;
+		else
+			ret = -1;
+		mutex_exit(&tq->tq_lock);
+		if (ret >= 0)
+			return (ret);
+		if (gethrtime() >= end)
+			break;
+		if ((++spins & (RDMAT_SPIN - 1)) == 0 &&
+		    ISSIG(curthread, JUSTLOOKING))
+			return (EINTR);
+	}
+	rdmat_spin_end(tq);
+	return (-1);
+}
+
 /*
  * Wait until *ctr reaches want.  Returns EIO once a completion failed,
  * EINTR on a signal, ETIMEDOUT past the deadline and ENXIO when the
@@ -173,6 +233,9 @@ rdmat_wait(rdmat_qp_t *tq, uint64_t *ctr, uint64_t want, hrtime_t deadline)
 	uint_t spins = 0;
 	int ret = 0;
 
+	if (tq->tq_spin_ns != 0 &&
+	    (ret = rdmat_wait_spin(tq, ctr, want, deadline)) >= 0)
+		return (ret);
 	for (;;) {
 		if (direct) {
 			(void) rdk_process_cq_direct(tq->tq_scq, -1);
@@ -282,6 +345,11 @@ rdmat_qp_create(rdmat_sess_t *ts, rdmat_qp_t *tq, uint64_t len)
 	if ((ret = rdk_alloc_cq(dev, tq, (int)ts->ts_depth + 8,
 	    (int)ts->ts_comp_vector, pc, &tq->tq_rcq)) != 0)
 		return (ret);
+	if ((ts->ts_mod_count != 0 || ts->ts_mod_us != 0) &&
+	    ((ret = rdk_modify_cq(tq->tq_scq, ts->ts_mod_count,
+	    ts->ts_mod_us)) != 0 || (ret = rdk_modify_cq(tq->tq_rcq,
+	    ts->ts_mod_count, ts->ts_mod_us)) != 0))
+		return (ret);
 
 	bzero(&init, sizeof (init));
 	init.event_handler = rdmat_qp_event;
@@ -332,6 +400,8 @@ rdmat_setup(rdmat_sess_t *ts, rdmat_setup_t *rs)
 	    rs->rs_depth + 4 > (uint32_t)dev->rd_attr.max_qp_wr ||
 	    rs->rs_inline > dev->rd_attr.max_inline_data ||
 	    rs->rs_comp_vector >= dev->rd_num_comp_vectors ||
+	    ((rs->rs_mod_count != 0 || rs->rs_mod_us != 0) &&
+	    rs->rs_poll != RDMAT_POLL_TASKQ) ||
 	    rs->rs_buf_len / PAGESIZE > dev->rd_attr.max_fast_reg_page_list_len)
 		return (EINVAL);
 	if ((ret = rdk_query_port(dev, 1, &pa)) != 0)
@@ -342,6 +412,8 @@ rdmat_setup(rdmat_sess_t *ts, rdmat_setup_t *rs)
 	ts->ts_depth = rs->rs_depth;
 	ts->ts_inline = rs->rs_inline;
 	ts->ts_comp_vector = rs->rs_comp_vector;
+	ts->ts_mod_count = rs->rs_mod_count;
+	ts->ts_mod_us = rs->rs_mod_us;
 	ts->ts_setup = B_TRUE;
 
 	rdk_gid_from_ipv4(&gid, rs->rs_ipv4);
@@ -573,11 +645,15 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 	if (timeout > RDMAT_MAX_TIMEOUT_MS || rr->rr_count > RDMAT_MAX_COUNT ||
 	    rr->rr_depth > ts->ts_depth || rr->rr_batch > RDMAT_MAX_BATCH ||
 	    rr->rr_signal > RDMAT_MAX_DEPTH || rr->rr_run_ms > timeout ||
+	    rr->rr_spin_us > RDMAT_MAX_SPIN_US ||
 	    (rr->rr_flags & ~(RDMAT_F_UNSIGNALED | RDMAT_F_DMA_LKEY |
-	    RDMAT_F_INLINE | RDMAT_F_BUSY | RDMAT_F_LAT)) != 0)
+	    RDMAT_F_INLINE | RDMAT_F_BUSY | RDMAT_F_LAT | RDMAT_F_ADAPT)) != 0)
 		return (EINVAL);
 	if ((rr->rr_flags & RDMAT_F_BUSY) != 0 &&
 	    ts->ts_poll != RDMAT_POLL_DIRECT)
+		return (EINVAL);
+	if ((rr->rr_flags & RDMAT_F_ADAPT) != 0 &&
+	    ts->ts_poll != RDMAT_POLL_TASKQ)
 		return (EINVAL);
 	if (rr->rr_depth == 0)
 		rr->rr_depth = 1;
@@ -613,6 +689,8 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 		    op == RDMAT_OP_RECV_STREAM ? rr->rr_size +
 		    (ts->ts_qpt == RDMAT_QPT_UD ? RDMAT_GRH_LEN : 0) : 0);
 	tq->tq_busy = (rr->rr_flags & RDMAT_F_BUSY) != 0;
+	tq->tq_spin_ns = (rr->rr_flags & RDMAT_F_ADAPT) != 0 ?
+	    USEC2NSEC(MAX(rr->rr_spin_us, 1)) : 0;
 	tq->tq_posted = tq->tq_post_calls = 0;
 	start = gethrtime();
 	deadline = start + MSEC2NSEC(timeout);
@@ -677,6 +755,8 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 	}
 
 	tq->tq_busy = B_FALSE;
+	rdmat_spin_end(tq);
+	tq->tq_spin_ns = 0;
 	mutex_enter(&tq->tq_lock);
 	rr->rr_done = tq->tq_send_done + tq->tq_recv_done + tq->tq_reg_done;
 	rr->rr_bytes = op == RDMAT_OP_WAIT_RECV ||

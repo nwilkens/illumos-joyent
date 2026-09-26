@@ -105,6 +105,9 @@ typedef struct rdmat_qp {
 
 	/* The ioctl thread's, for the run in progress. */
 	boolean_t		tq_busy;	/* RDMAT_F_BUSY */
+	hrtime_t		tq_spin_ns;	/* RDMAT_F_ADAPT */
+	boolean_t		tq_spoll;	/* busy polling tq_scq */
+	boolean_t		tq_rpoll;
 	uint64_t		tq_posted;
 	uint64_t		tq_post_calls;
 	rdmat_swr_t		tq_swr[RDMAT_MAX_BATCH];
@@ -133,6 +136,8 @@ typedef struct rdmat_sess {
 	uint32_t		ts_depth;
 	uint32_t		ts_inline;
 	uint32_t		ts_comp_vector;
+	uint16_t		ts_mod_count;
+	uint16_t		ts_mod_us;
 	uint16_t		ts_gid_index;
 	boolean_t		ts_gid_added;
 	uint32_t		ts_nqp;
@@ -147,6 +152,7 @@ extern int rdmat_buf(rdmat_sess_t *, rdmat_buf_t *);
 extern int rdmat_query(rdmat_sess_t *, rdmat_query_t *);
 extern void rdmat_teardown(rdmat_sess_t *, boolean_t);
 extern int rdmat_wait(rdmat_qp_t *, uint64_t *, uint64_t, hrtime_t);
+extern void rdmat_spin_end(rdmat_qp_t *);
 
 /* rdmat_bench.c: the data path runs */
 extern int rdmat_post_recvs(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,

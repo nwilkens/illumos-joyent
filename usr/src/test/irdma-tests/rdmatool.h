@@ -83,6 +83,8 @@ extern char *o_server;
 extern uint32_t fresh_b_access;
 extern uint32_t fresh_inline;
 extern uint32_t fresh_vector;
+extern uint16_t fresh_mod_count;
+extern uint16_t fresh_mod_us;
 extern rdmat_devinfo_t local_dev;
 
 extern void fatal(const char *, ...);

@@ -318,6 +318,9 @@ uint32_t fresh_b_access;
 /* The inline size and completion vector of the next fresh() QPs. */
 uint32_t fresh_inline;
 uint32_t fresh_vector;
+/* The CQ moderation of the next fresh() sessions. */
+uint16_t fresh_mod_count;
+uint16_t fresh_mod_us;
 
 int
 fresh(peer_t *a, peer_t *b, uint32_t qpt, uint32_t poll)
@@ -347,6 +350,8 @@ fresh(peer_t *a, peer_t *b, uint32_t qpt, uint32_t poll)
 		p->p_setup.rs_depth = o_depth;
 		p->p_setup.rs_inline = fresh_inline;
 		p->p_setup.rs_comp_vector = fresh_vector;
+		p->p_setup.rs_mod_count = fresh_mod_count;
+		p->p_setup.rs_mod_us = fresh_mod_us;
 		/* The server supplies its own device and address. */
 		if ((ret = pio(p, RDMAT_IOC_SETUP, &p->p_setup)) != 0) {
 			(void) fprintf(stderr, "%s: setup: %s\n", p->p_name,

@@ -32,7 +32,11 @@
  *	signal=0	signal every n'th request; 0 is every depth/2
  *	inline=0	1: sends and writes carry their data in the WQE
  *	mode=intr	intr: the posting thread sleeps until a completion
- *			interrupt; poll: it polls the CQ and never sleeps
+ *			interrupt; poll: it polls the CQ and never sleeps;
+ *			adapt: it polls up to spin microseconds, then sleeps
+ *	spin=50		adapt: microseconds of polling per wait
+ *	modc=0		CQ moderation count (intr and adapt)
+ *	modus=0		CQ moderation time in microseconds
  *	secs=5		length of a bandwidth run
  *	iters=20000	round trips of a latency run
  *	verify=1	check every byte of the destination after a run
@@ -76,6 +80,9 @@
 enum {
 	T_WRITE_BW, T_READ_BW, T_SEND_BW, T_WRITE_LAT, T_READ_LAT, T_SEND_LAT
 };
+enum { M_INTR, M_POLL, M_ADAPT };
+static const char *const mnames[] = { "intr", "poll", "adapt" };
+
 static const char *const tnames[] = {
 	"write_bw", "read_bw", "send_bw", "write_lat", "read_lat", "send_lat",
 	NULL
@@ -94,7 +101,10 @@ typedef struct bconf {
 	uint32_t	c_batch;
 	uint32_t	c_signal;
 	uint32_t	c_inline;
-	uint32_t	c_poll;		/* 1: poll */
+	uint32_t	c_poll;		/* M_* */
+	uint32_t	c_spin;
+	uint32_t	c_modc;
+	uint32_t	c_modus;
 	uint32_t	c_secs;
 	uint32_t	c_iters;
 	uint32_t	c_verify;
@@ -138,11 +148,13 @@ blist_parse(blist_t *l, const char *v, const char *key)
 			fatal("%s: at most %d values", key, B_MAXLIST);
 		if (strcmp(key, "mode") == 0) {
 			if (strcmp(tok, "poll") == 0)
-				l->bl_v[l->bl_n++] = 1;
+				l->bl_v[l->bl_n++] = M_POLL;
 			else if (strcmp(tok, "intr") == 0)
-				l->bl_v[l->bl_n++] = 0;
+				l->bl_v[l->bl_n++] = M_INTR;
+			else if (strcmp(tok, "adapt") == 0)
+				l->bl_v[l->bl_n++] = M_ADAPT;
 			else
-				fatal("mode is poll or intr");
+				fatal("mode is poll, intr or adapt");
 		} else {
 			l->bl_v[l->bl_n++] = (uint32_t)strtoul(tok, NULL, 0);
 		}
@@ -254,8 +266,10 @@ side_init(bside_t *s, peer_t *p, uint32_t op, const bconf_t *c,
 	s->s_rr.rr_depth = c->c_depth;
 	s->s_rr.rr_batch = c->c_batch;
 	s->s_rr.rr_signal = c->c_signal;
-	s->s_rr.rr_flags = (c->c_poll ? RDMAT_F_BUSY : 0) |
+	s->s_rr.rr_flags = (c->c_poll == M_POLL ? RDMAT_F_BUSY : 0) |
+	    (c->c_poll == M_ADAPT ? RDMAT_F_ADAPT : 0) |
 	    (c->c_inline ? RDMAT_F_INLINE : 0);
+	s->s_rr.rr_spin_us = c->c_poll == M_ADAPT ? c->c_spin : 0;
 	s->s_rr.rr_timeout_ms = RDMAT_MAX_TIMEOUT_MS;
 	s->s_used = 1;
 }
@@ -416,9 +430,13 @@ report(const bconf_t *c, uint64_t wall, const host_stats_t *a0,
 
 	(void) printf("BENCH test=%s where=%s mode=%s size=%u qps=%u "
 	    "depth=%u batch=%u signal=%u inline=%u vecs=%u", tnames[c->c_test],
-	    remote ? "hosts" : "loop", c->c_poll ? "poll" : "intr",
+	    remote ? "hosts" : "loop", mnames[c->c_poll],
 	    c->c_size, c->c_qps, c->c_depth, c->c_batch, c->c_signal,
 	    c->c_inline, vec_fixed >= 0 ? 1 : MIN(ncomp, c->c_qps));
+	if (c->c_poll == M_ADAPT)
+		(void) printf(" spin=%u", c->c_spin);
+	if (c->c_modc != 0 || c->c_modus != 0)
+		(void) printf(" modc=%u modus=%u", c->c_modc, c->c_modus);
 	if (err != 0) {
 		(void) printf(" result=FAIL error=%s\n", strerror(err));
 		(void) fflush(stdout);
@@ -516,8 +534,11 @@ bench_one(const bconf_t *c)
 	fresh_inline = c->c_inline ? c->c_size : 0;
 	for (i = 0; i < c->c_qps; i++) {
 		fresh_vector = vec_fixed >= 0 ? (uint32_t)vec_fixed : i % ncomp;
+		fresh_mod_count = c->c_poll == M_POLL ? 0 : (uint16_t)c->c_modc;
+		fresh_mod_us = c->c_poll == M_POLL ? 0 : (uint16_t)c->c_modus;
 		if ((ret = fresh(&pairs[i].bp_a, &pairs[i].bp_b, RDMAT_QPT_RC,
-		    c->c_poll ? RDMAT_POLL_DIRECT : RDMAT_POLL_TASKQ)) != 0 ||
+		    c->c_poll == M_POLL ? RDMAT_POLL_DIRECT :
+		    RDMAT_POLL_TASKQ)) != 0 ||
 		    prepare(c, &pairs[i]) != 0) {
 			(void) printf("BENCH test=%s qps=%u size=%u "
 			    "result=FAIL error=setup:%s\n", tnames[c->c_test],
@@ -568,17 +589,18 @@ usage_bench(void)
 	(void) fprintf(stderr, "usage: rdmatool -i ip bench {loop | host} "
 	    "{write_bw|read_bw|send_bw|write_lat|read_lat|send_lat}\n"
 	    "\t[size=] [qps=] [depth=] [batch=] [signal=] [inline=]\n"
-	    "\t[mode=poll,intr] [secs=] [iters=] [verify=]\n");
+	    "\t[mode=poll,intr,adapt] [spin=] [modc=] [modus=] [secs=] "
+	    "[iters=] [verify=] [vec=]\n");
 	exit(2);
 }
 
 int
 bench_main(peer_t *a, peer_t *b, int argc, char **argv)
 {
-	blist_t size, qps, depth, batch, signal, inl, mode;
+	blist_t size, qps, depth, batch, signal, inl, mode, spin, modc, modus;
 	bconf_t c;
 	uint32_t secs = (uint32_t)o_secs, iters = 20000, verify = 1, maxqp;
-	uint_t im, iq, is, id, ib, ig, ii;
+	uint_t im, iq, is, id, ib, ig, ii, ip, ic, iu;
 	int i, test = -1;
 
 	(void) a;
@@ -600,6 +622,9 @@ bench_main(peer_t *a, peer_t *b, int argc, char **argv)
 	blist_parse(&signal, "0", "signal");
 	blist_parse(&inl, "0", "inline");
 	blist_parse(&mode, "intr", "mode");
+	blist_parse(&spin, "50", "spin");
+	blist_parse(&modc, "0", "modc");
+	blist_parse(&modus, "0", "modus");
 	for (i = 2; i < argc; i++) {
 		char *eq = strchr(argv[i], '=');
 		const char *v;
@@ -622,6 +647,12 @@ bench_main(peer_t *a, peer_t *b, int argc, char **argv)
 			blist_parse(&inl, v, "inline");
 		else if (strcmp(argv[i], "mode") == 0)
 			blist_parse(&mode, v, "mode");
+		else if (strcmp(argv[i], "spin") == 0)
+			blist_parse(&spin, v, "spin");
+		else if (strcmp(argv[i], "modc") == 0)
+			blist_parse(&modc, v, "modc");
+		else if (strcmp(argv[i], "modus") == 0)
+			blist_parse(&modus, v, "modus");
 		else if (strcmp(argv[i], "secs") == 0)
 			secs = (uint32_t)strtoul(v, NULL, 0);
 		else if (strcmp(argv[i], "iters") == 0)
@@ -683,8 +714,14 @@ bench_main(peer_t *a, peer_t *b, int argc, char **argv)
 	for (id = 0; id < depth.bl_n; id++)
 	for (ib = 0; ib < batch.bl_n; ib++)
 	for (ig = 0; ig < signal.bl_n; ig++)
-	for (ii = 0; ii < inl.bl_n; ii++) {
+	for (ii = 0; ii < inl.bl_n; ii++)
+	for (ip = 0; ip < spin.bl_n; ip++)
+	for (ic = 0; ic < modc.bl_n; ic++)
+	for (iu = 0; iu < modus.bl_n; iu++) {
 		bzero(&c, sizeof (c));
+		c.c_spin = spin.bl_v[ip];
+		c.c_modc = modc.bl_v[ic];
+		c.c_modus = modus.bl_v[iu];
 		c.c_test = test;
 		c.c_poll = mode.bl_v[im];
 		c.c_qps = qps.bl_v[iq];

@@ -54,6 +54,7 @@ extern "C" {
 #define	RDMAT_MAX_BATCH		32
 #define	RDMAT_MAX_COUNT		(1U << 28)
 #define	RDMAT_MAX_TIMEOUT_MS	120000
+#define	RDMAT_MAX_SPIN_US	100000
 /* The GRH a UD receive gets in front of the payload. */
 #define	RDMAT_GRH_LEN		40
 
@@ -109,7 +110,8 @@ typedef struct rdmat_setup {
 	uint32_t	rs_depth;	/* send and receive queue depth */
 	uint32_t	rs_inline;	/* inline bytes the QPs take */
 	uint32_t	rs_comp_vector;	/* of the CQs */
-	uint32_t	rs_pad;
+	uint16_t	rs_mod_count;	/* rdk_modify_cq(), RDMAT_POLL_TASKQ */
+	uint16_t	rs_mod_us;
 	/* Out */
 	uint8_t		rs_gid[16];
 	uint8_t		rs_mac[6];
@@ -157,12 +159,15 @@ typedef enum rdmat_op {
  * rr_flags.  RDMAT_F_UNSIGNALED with rr_signal 0 signals every rr_depth'th
  * request and the last.  RDMAT_F_BUSY waits by polling without sleeping
  * (RDMAT_POLL_DIRECT only).  RDMAT_F_LAT times each READ or WRITE alone.
+ * RDMAT_F_ADAPT (RDMAT_POLL_TASKQ only) busy polls the CQs for up to
+ * rr_spin_us per wait before it arms them and sleeps.
  */
 #define	RDMAT_F_UNSIGNALED	0x01
 #define	RDMAT_F_DMA_LKEY	0x02	/* use the local DMA lkey, not the MR */
 #define	RDMAT_F_INLINE		0x04
 #define	RDMAT_F_BUSY		0x08
 #define	RDMAT_F_LAT		0x10
+#define	RDMAT_F_ADAPT		0x20	/* poll rr_spin_us, then sleep */
 
 typedef struct rdmat_run {
 	/* In */
@@ -202,7 +207,7 @@ typedef struct rdmat_run {
 	uint32_t	rr_batch;	/* requests per post call; 0 is 1 */
 	uint32_t	rr_signal;	/* signal every rr_signal'th request */
 	uint32_t	rr_run_ms;	/* stop posting after this long */
-	uint32_t	rr_pad2;
+	uint32_t	rr_spin_us;	/* RDMAT_F_ADAPT */
 	/* Out */
 	uint64_t	rr_lat_p999;
 	uint64_t	rr_posted;	/* requests posted */
