@@ -185,17 +185,6 @@ t4_ofld_listen(t4_ofld_t *of, const t4_rdma_listen_t *l)
 	}
 	op = &of->of_port[l->trl_port];
 
-	mutex_enter(&of->of_tids.td_lock);
-	e = t4_tid_owned(of, T4_TID_STID, l->trl_stid, gen);
-	if (e == NULL || (e->te_flags & (TEF_LISTEN | TEF_UNLISTEN)) != 0 ||
-	    ((e->te_flags & TEF_V6) != 0) != v6) {
-		mutex_exit(&of->of_tids.td_lock);
-		return (EINVAL);
-	}
-	e->te_flags |= TEF_LISTEN | TEF_OPEN;
-	e->te_port = l->trl_port;
-	mutex_exit(&of->of_tids.td_lock);
-
 	bzero(&req, sizeof (req));
 	if (v6) {
 		len = sizeof (req.v6);
@@ -221,14 +210,19 @@ t4_ofld_listen(t4_ofld_t *of, const t4_rdma_listen_t *l)
 		    F_SYN_RSS_ENABLE |
 		    V_SYN_RSS_QUEUE(of->of_rxq.iq.tsi_abs_id));
 	}
-	if ((rc = t4_ofld_wr_send(of, &op->op_ctrlq, &req,
-	    roundup(len, 16))) != 0) {
-		mutex_enter(&of->of_tids.td_lock);
-		if ((e = t4_tid_owned(of, T4_TID_STID, l->trl_stid, gen)) !=
-		    NULL)
-			e->te_flags &= ~(TEF_LISTEN | TEF_OPEN);
-		mutex_exit(&of->of_tids.td_lock);
+
+	/* Sent under td_lock so that a concurrent free sees the request. */
+	mutex_enter(&of->of_tids.td_lock);
+	e = t4_tid_owned(of, T4_TID_STID, l->trl_stid, gen);
+	if (e == NULL || (e->te_flags & TEF_STID_BUSY) != 0 ||
+	    ((e->te_flags & TEF_V6) != 0) != v6) {
+		rc = EINVAL;
+	} else if ((rc = t4_ofld_wr_send(of, &op->op_ctrlq, &req,
+	    roundup(len, 16))) == 0) {
+		e->te_flags |= TEF_LISTEN | TEF_OPEN;
+		e->te_port = l->trl_port;
 	}
+	mutex_exit(&of->of_tids.td_lock);
 	return (rc);
 }
 
@@ -338,17 +332,6 @@ t4_ofld_act_open(t4_ofld_t *of, const t4_rdma_act_open_t *a)
 		return (EINVAL);
 	op = &of->of_port[a->trao_port];
 
-	mutex_enter(&of->of_tids.td_lock);
-	e = t4_tid_owned(of, T4_TID_ATID, a->trao_atid, gen);
-	if (e == NULL || (e->te_flags & TEF_OPEN) != 0) {
-		mutex_exit(&of->of_tids.td_lock);
-		return (EINVAL);
-	}
-	e->te_flags |= TEF_OPEN;
-	e->te_port = a->trao_port;
-	e->te_rxq = of->of_rxq.iq.tsi_abs_id;
-	mutex_exit(&of->of_tids.td_lock);
-
 	opt0 = t4_ofld_opt0(op, &a->trao_opts, a->trao_l2t);
 	opt2 = t4_ofld_opt2(op, &a->trao_opts);
 	params = V_FILTER_TUPLE(t4_ofld_ntuple(of, op->op_pi, vlan));
@@ -383,14 +366,18 @@ t4_ofld_act_open(t4_ofld_t *of, const t4_rdma_act_open_t *a)
 		r4->params = BE_64(params);
 	}
 
-	if ((rc = t4_ofld_wr_send(of, &op->op_ctrlq, &req,
-	    roundup(len, 16))) != 0) {
-		mutex_enter(&of->of_tids.td_lock);
-		if ((e = t4_tid_owned(of, T4_TID_ATID, a->trao_atid, gen)) !=
-		    NULL)
-			e->te_flags &= ~TEF_OPEN;
-		mutex_exit(&of->of_tids.td_lock);
+	/* Sent under td_lock so that a concurrent free sees the request. */
+	mutex_enter(&of->of_tids.td_lock);
+	e = t4_tid_owned(of, T4_TID_ATID, a->trao_atid, gen);
+	if (e == NULL || (e->te_flags & TEF_OPEN) != 0) {
+		rc = EINVAL;
+	} else if ((rc = t4_ofld_wr_send(of, &op->op_ctrlq, &req,
+	    roundup(len, 16))) == 0) {
+		e->te_flags |= TEF_OPEN;
+		e->te_port = a->trao_port;
+		e->te_rxq = of->of_rxq.iq.tsi_abs_id;
 	}
+	mutex_exit(&of->of_tids.td_lock);
 	return (rc);
 }
 
