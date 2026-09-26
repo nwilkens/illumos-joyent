@@ -214,6 +214,10 @@ def main():
     place = body(numa, "irdma_numa_place")
     assert place.index("mutex_exit(&cpu_lock);") < \
         place.index("set_intr_affinity(")
+    # Threads bind only when asked; bound, they lost to the interrupt.
+    assert '"numa_place", IRDMA_NUMA_INTR);' in place
+    assert place.index("(place & IRDMA_NUMA_THREAD) == 0") < \
+        place.index("iv->iv_cpu = cpu;")
     for name in ("irdma_numa_read_ns", "irdma_numa_nearest",
                  "irdma_numa_cpus"):
         assert "ASSERT(MUTEX_HELD(&cpu_lock));" in body(numa, name), name

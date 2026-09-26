@@ -17,8 +17,11 @@
  * Placement of the RDMA vectors near the device.  illumos keeps no
  * locality for devices, so the driver takes the lgroup whose CPUs read a
  * device register in the least time, if it is clearly the least; the
- * numa_lgrp property can name one instead.  Each vector's interrupt and
- * thread go to a CPU of that lgroup, one core per vector while cores last.
+ * numa_lgrp property can name one instead.  Each vector's interrupt goes to
+ * a CPU of that lgroup, one core per vector while cores last.  The vector
+ * threads stay unbound unless numa_place asks, since a thread bound to its
+ * interrupt's CPU waits behind each interrupt and cut multi-QP throughput
+ * by two thirds.
  */
 
 #include "irdma_verbs.h"
@@ -31,6 +34,10 @@
 
 #define	IRDMA_NUMA_READS	32
 #define	IRDMA_NUMA_LGRPS	8
+
+/* numa_place: what follows the chosen CPUs. */
+#define	IRDMA_NUMA_INTR		0x1
+#define	IRDMA_NUMA_THREAD	0x2
 
 /* The least time of a register read from cp; the caller holds cpu_lock. */
 static hrtime_t
@@ -142,8 +149,8 @@ irdma_numa_cpus(lgrp_id_t lg, processorid_t *cpus, uint_t max)
 }
 
 /*
- * Choose the vectors' CPUs, move their interrupts and ask their threads to
- * follow.  Nothing changes when no lgroup is known.
+ * Choose the vectors' CPUs and move there what numa_place names.  Nothing
+ * changes when no lgroup is known.
  */
 void
 irdma_numa_place(irdma_t *irdma)
@@ -153,9 +160,13 @@ irdma_numa_place(irdma_t *irdma)
 	char msg[128];
 	lgrp_id_t lg;
 	uint_t n = 0, i;
-	int prop;
+	int prop, place;
 
 	msg[0] = '\0';
+	place = ddi_prop_get_int(DDI_DEV_T_ANY, irdma->irdma_dip,
+	    DDI_PROP_DONTPASS, "numa_place", IRDMA_NUMA_INTR);
+	if ((place & (IRDMA_NUMA_INTR | IRDMA_NUMA_THREAD)) == 0)
+		return;
 	prop = ddi_prop_get_int(DDI_DEV_T_ANY, irdma->irdma_dip,
 	    DDI_PROP_DONTPASS, "numa_lgrp", -1);
 	mutex_enter(&cpu_lock);
@@ -176,9 +187,12 @@ irdma_numa_place(irdma_t *irdma)
 		irdma_vec_t *iv = &irdma->irdma_vecs[i];
 		processorid_t cpu = cpus[i % n];
 
-		if (set_intr_affinity(in->irin_handles[i], cpu) != DDI_SUCCESS)
+		if ((place & IRDMA_NUMA_INTR) != 0 &&
+		    set_intr_affinity(in->irin_handles[i], cpu) != DDI_SUCCESS)
 			irdma_error(irdma, "failed to move RDMA vector %u to "
 			    "CPU %d", i, cpu);
+		if ((place & IRDMA_NUMA_THREAD) == 0)
+			continue;
 		mutex_enter(&iv->iv_lock);
 		iv->iv_cpu = cpu;
 		cv_signal(&iv->iv_cv);
