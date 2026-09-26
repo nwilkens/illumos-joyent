@@ -106,6 +106,14 @@ def main():
     # The only re-entry before the read leaves the loop body at once.
     for m in re.finditer(r"mutex_enter\(&iv->iv_lock\);", seg):
         assert seg[m.end():].lstrip().startswith("continue;")
+    # The check counts as busy, so irdma_vec_barrier() waits for it before
+    # teardown frees the CEQ.
+    pre = idle[:idle.index("irdma_vec_pending(iv, ic)")]
+    assert pre.rindex("iv->iv_busy = B_TRUE;") > \
+        pre.rindex("iv->iv_ceq != ic)")
+    post = idle[idle.index("irdma_vec_pending(iv, ic)"):]
+    assert post.index("iv->iv_busy = B_FALSE;") < \
+        post.index("iv->iv_owed = B_TRUE;")
     # Only a CEQ entry uses up a CQ's arm.
     assert re.search(r"if \(event\) \{\n\t\tmutex_enter\(&icq->icq_lock\);"
                      r"\n\t\ticq->icq_armed = B_FALSE;", dispatch)
@@ -153,7 +161,7 @@ def main():
         unconf.index("ice_reset(&ice->ice_hw, ICE_RESET_PFR)")
 
     # Register access takes no lock; the map changes only under its writer
-    # lock with the generation odd.
+    # lock with the generation odd and the writer not preemptible.
     osd = (IRDMA / "irdma_osdep.c").read_text(encoding="utf-8")
     for name in ("readl", "writel", "irdma_regs_find"):
         assert "mutex_enter" not in body(osd, name), name
@@ -161,9 +169,13 @@ def main():
     for name in ("irdma_osdep_regs_add", "irdma_osdep_regs_dbs",
                  "irdma_osdep_regs_remove"):
         text = body(osd, name)
-        assert text.count("irdma_regs_change();") == 2, name
-        first = text.index("irdma_regs_change();")
+        assert text.count("irdma_regs_begin();") == 1, name
+        first = text.index("irdma_regs_begin();")
+        assert first < text.index("irdma_regs_end();"), name
         assert text.rindex("mutex_enter(&irdma_regs_lock);", 0, first) >= 0
+    begin, end = body(osd, "irdma_regs_begin"), body(osd, "irdma_regs_end")
+    assert begin.index("kpreempt_disable();") < begin.index("irdma_regs_gen++")
+    assert end.index("irdma_regs_gen++") < end.index("kpreempt_enable();")
     find = body(osd, "irdma_regs_find")
     assert "& 1) != 0" in find and "while (gen != irdma_regs_gen)" in find
     # The post path does not ask ice, whose lock every QP would share.
@@ -199,6 +211,12 @@ def main():
     call = fire.index("resched(cq);")
     assert fire.rindex("mutex_exit(&cp->rcp_lock);", 0, call) > \
         fire.rindex("mutex_enter(&cp->rcp_lock);", 0, call)
+    # No delay replaces rcp_mod_tid, which rdk_free_cq() waits on, until
+    # the hand-back is over.
+    assert fire.rindex("cp->rcp_mod_pending = B_FALSE;") > \
+        fire.rindex("&cp->rcp_ent);")
+    delay = body(rdk, "rdk_cq_mod_delay")
+    assert "cp->rcp_mod_pending ||" in delay
     # Busy polling runs only on a poller it holds.
     begin = body(rdk, "rdk_cq_poll_begin")
     assert "cp->rcp_queued = cp->rcp_busy = B_TRUE;" in begin
