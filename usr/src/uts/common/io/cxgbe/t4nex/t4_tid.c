@@ -42,6 +42,7 @@
 typedef struct t4_hwtid_dir {
 	uint32_t	hd_nchunks;
 	t4_tid_ent_t	**hd_chunk;
+	uint16_t	*hd_used;	/* entries not free, per chunk */
 } t4_hwtid_dir_t;
 
 static int
@@ -84,6 +85,8 @@ t4_tids_init(t4_ofld_t *of)
 	dir->hd_nchunks = howmany(of->of_ntids, T4_TID_CHUNK);
 	dir->hd_chunk = kmem_zalloc(dir->hd_nchunks * sizeof (t4_tid_ent_t *),
 	    KM_SLEEP);
+	dir->hd_used = kmem_zalloc(dir->hd_nchunks * sizeof (uint16_t),
+	    KM_SLEEP);
 	for (uint32_t i = 0; i < dir->hd_nchunks; i++) {
 		dir->hd_chunk[i] = kmem_zalloc(T4_TID_CHUNK *
 		    sizeof (t4_tid_ent_t), KM_SLEEP);
@@ -117,6 +120,7 @@ t4_tids_fini(t4_ofld_t *of)
 		}
 		kmem_free(dir->hd_chunk,
 		    dir->hd_nchunks * sizeof (t4_tid_ent_t *));
+		kmem_free(dir->hd_used, dir->hd_nchunks * sizeof (uint16_t));
 		kmem_free(dir, sizeof (*dir));
 		cv_destroy(&td->td_cv);
 		mutex_destroy(&td->td_lock);
@@ -169,11 +173,40 @@ t4_tid_ent(t4_ofld_t *of, t4_tid_kind_t kind, uint32_t id)
 	return (t4_tid_lookup(of, kind, id));
 }
 
-/* The hwtid entry for *idp, or NULL past the end.  td_lock is held. */
+/*
+ * The first hwtid entry at or after *idp in a chunk with an entry in use, or
+ * NULL.  The caller holds td_lock.
+ */
 t4_tid_ent_t *
 t4_hwtid_next(t4_ofld_t *of, uint32_t *idp)
 {
-	return (t4_tid_lookup(of, T4_TID_HW, *idp));
+	t4_tid_tab_t *tt = &of->of_tids.td_hw;
+	t4_hwtid_dir_t *dir = (t4_hwtid_dir_t *)tt->tt_ent;
+	uint32_t idx;
+
+	ASSERT(MUTEX_HELD(&of->of_tids.td_lock));
+	if (dir == NULL || *idp < tt->tt_base)
+		return (NULL);
+	for (idx = *idp - tt->tt_base; idx < tt->tt_n; ) {
+		const uint32_t c = idx >> T4_TID_CHUNK_SHIFT;
+
+		if (dir->hd_used[c] == 0) {
+			idx = (idx | (T4_TID_CHUNK - 1)) + 1;
+			continue;
+		}
+		*idp = tt->tt_base + idx;
+		return (&dir->hd_chunk[c][idx & (T4_TID_CHUNK - 1)]);
+	}
+	return (NULL);
+}
+
+static void
+t4_hwtid_used(t4_ofld_t *of, uint32_t id, int delta)
+{
+	t4_tid_tab_t *tt = &of->of_tids.td_hw;
+	t4_hwtid_dir_t *dir = (t4_hwtid_dir_t *)tt->tt_ent;
+
+	dir->hd_used[(id - tt->tt_base) >> T4_TID_CHUNK_SHIFT] += delta;
 }
 
 int
@@ -284,6 +317,8 @@ t4_tid_free_locked(t4_ofld_t *of, t4_tid_kind_t kind, uint32_t id)
 	}
 	ASSERT3U(tt->tt_inuse, >=, n);
 	tt->tt_inuse -= n;
+	if (kind == T4_TID_HW)
+		t4_hwtid_used(of, id, -1);
 
 	if (kind == T4_TID_ATID) {
 		const uint32_t idx = id - tt->tt_base;
@@ -376,10 +411,12 @@ t4_hwtid_claim(t4_ofld_t *of, uint32_t tid, t4_tid_state_t state,
 	    td->td_embryos >= T4_OFLD_MAX_EMBRYOS) {
 		rc = EAGAIN;
 	} else {
-		if (e->te_state == TTS_FREE)
+		if (e->te_state == TTS_FREE) {
 			td->td_hw.tt_inuse++;
-		else if ((e->te_flags & TEF_EMBRYO) != 0)
+			t4_hwtid_used(of, tid, 1);
+		} else if ((e->te_flags & TEF_EMBRYO) != 0) {
 			td->td_embryos--;
+		}
 		if ((flags & TEF_EMBRYO) != 0)
 			td->td_embryos++;
 		e->te_state = state;

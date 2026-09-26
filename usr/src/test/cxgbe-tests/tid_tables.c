@@ -172,7 +172,7 @@ test_hwtid_claim(void)
 	CHECK(e->te_seq == seq + 1 && e->te_owner == 9 && e->te_flags == 0);
 	CHECK(of->of_tids.td_hw.tt_inuse == 1);
 
-	/* The walk visits every ID once and ends at the last. */
+	/* The walk skips chunks with nothing in use. */
 	CHECK(t4_hwtid_claim(of, 1499, TTS_ORPHAN, 0, 0, 7, 0, NULL) == 0);
 	mutex_enter(&of->of_tids.td_lock);
 	uint_t n = 0;
@@ -185,6 +185,8 @@ test_hwtid_claim(void)
 	CHECK(n == 2);
 	t4_tid_free_locked(of, T4_TID_HW, 600);
 	t4_tid_free_locked(of, T4_TID_HW, 1499);
+	id = 500;
+	CHECK(t4_hwtid_next(of, &id) == NULL);
 	mutex_exit(&of->of_tids.td_lock);
 	CHECK(of->of_tids.td_hw.tt_inuse == 0);
 	teardown(of);
