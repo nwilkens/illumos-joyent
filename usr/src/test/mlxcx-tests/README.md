@@ -49,3 +49,4 @@ device writes to each of them, so freeing one it holds fails the test.
 | `cmdq_uar.py` | ALLOC_UAR refuses UAR 0, a page past the BAR0 size that attach now keeps, and an index whose offset wraps 32 bits. |
 | `teardown_order.py` | Source check: detach stops interrupts, then drains the page and async taskqs, before it destroys their mutexes, the ports, the EQs, the page list or the command queue. |
 | `cmdq_hca_cap.py` | QUERY_HCA_CAP returns failure for a bad status, a bad delivery status and a timeout. |
+| `no_device_panic.py` | Source check: no VERIFY, ASSERT or `mlxcx_panic()` in the command, EQ and page paths uses a value read from a register, a command entry or output, an event entry or a returned page. Taint is tracked within each function only. |

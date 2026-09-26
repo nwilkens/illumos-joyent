@@ -20,6 +20,7 @@ TESTS = (
     "cmdq_uar.py",
     "teardown_order.py",
     "cmdq_hca_cap.py",
+    "no_device_panic.py",
 )
 
 
