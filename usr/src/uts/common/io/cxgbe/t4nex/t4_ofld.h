@@ -297,6 +297,11 @@ typedef struct t4_ofld_kstats {
 	kstat_named_t	ok_syn_refused;
 	kstat_named_t	ok_dma_bytes;
 	kstat_named_t	ok_quar_bytes;
+	/* The chip's IPv4 TCP MIB: every offloaded connection. */
+	kstat_named_t	ok_tcp_out_rsts;
+	kstat_named_t	ok_tcp_in_segs;
+	kstat_named_t	ok_tcp_out_segs;
+	kstat_named_t	ok_tcp_retrans_segs;
 } t4_ofld_kstats_t;
 
 struct t4_rdma_peer {

@@ -332,6 +332,7 @@ t4_ofld_kstat_update(kstat_t *ksp, int rw)
 	t4_ofld_t *of = ksp->ks_private;
 	t4_ofld_kstats_t *k = &of->of_kstats;
 	t4_ofld_stats_t *s = &of->of_stats;
+	struct tp_tcp_stats v4;
 
 	if (rw == KSTAT_WRITE)
 		return (EACCES);
@@ -382,6 +383,11 @@ t4_ofld_kstat_update(kstat_t *ksp, int rw)
 	k->ok_dma_bytes.value.ui64 = of->of_dma_bytes;
 	k->ok_quar_bytes.value.ui64 = of->of_quar_bytes;
 
+	t4_tp_get_tcp_stats(of->of_sc, &v4, NULL, B_TRUE);
+	k->ok_tcp_out_rsts.value.ui64 = v4.tcp_out_rsts;
+	k->ok_tcp_in_segs.value.ui64 = v4.tcp_in_segs;
+	k->ok_tcp_out_segs.value.ui64 = v4.tcp_out_segs;
+	k->ok_tcp_retrans_segs.value.ui64 = v4.tcp_retrans_segs;
 	mutex_exit(&of->of_dma_lock);
 	return (0);
 }
@@ -440,6 +446,10 @@ t4_ofld_kstat_init(t4_ofld_t *of)
 	OK_U64(ok_syn_refused, "syn_refused");
 	OK_U64(ok_dma_bytes, "dma_bytes");
 	OK_U64(ok_quar_bytes, "quarantine_bytes");
+	OK_U64(ok_tcp_out_rsts, "tcp_out_rsts");
+	OK_U64(ok_tcp_in_segs, "tcp_in_segs");
+	OK_U64(ok_tcp_out_segs, "tcp_out_segs");
+	OK_U64(ok_tcp_retrans_segs, "tcp_retrans_segs");
 
 	kstat_install(ksp);
 	of->of_ksp = ksp;
