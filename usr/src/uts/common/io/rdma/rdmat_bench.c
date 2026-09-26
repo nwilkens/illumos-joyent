@@ -173,8 +173,13 @@ rdmat_swr(rdmat_sess_t *ts, rdmat_qp_t *tq, const rdmat_run_t *rr,
 		return (EINVAL);
 	}
 	if ((rr->rr_flags & RDMAT_F_INLINE) != 0 &&
-	    wr->opcode != RDK_WR_RDMA_READ)
+	    wr->opcode != RDK_WR_RDMA_READ) {
+		/* The provider copies inline data from a kernel address. */
+		if ((off % RDMAT_CHUNK) + rr->rr_size > RDMAT_CHUNK)
+			return (EINVAL);
+		sw->sw_sge.addr = (uint64_t)(uintptr_t)rdmat_byte(tq, off);
 		wr->send_flags |= RDK_SEND_INLINE;
+	}
 	if (ts->ts_qpt == RDMAT_QPT_UD) {
 		sw->sw_ud.ah = tq->tq_ah;
 		sw->sw_ud.remote_qpn = tq->tq_rqpn;

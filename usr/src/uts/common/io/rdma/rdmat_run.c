@@ -659,6 +659,9 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 		rr->rr_depth = 1;
 	if (rr->rr_batch == 0)
 		rr->rr_batch = 1;
+	/* A batch the queue cannot hold is never posted. */
+	if (rr->rr_batch > rr->rr_depth)
+		return (EINVAL);
 	/* The remote window is walked in rr_size steps. */
 	if (rw && rr->rr_size == 0)
 		return (EINVAL);
