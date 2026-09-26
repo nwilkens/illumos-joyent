@@ -3,8 +3,8 @@
 
 The atid free list must hand a freed ID out last, IPv6 servers must take an
 aligned stid pair whose odd half is not an ID, and a chip-assigned TID must be
-range checked, claimable only when free or on its way to release, held only
-by its owner from its own queue, and walkable chunk by chunk.  Unanswered
+range checked, claimable without allocation only when free or on its way to
+release, held only by its owner from its own queue, and walkable.  Unanswered
 SYNs are capped.
 """
 

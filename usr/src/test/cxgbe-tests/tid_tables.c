@@ -138,10 +138,13 @@ test_hwtid_claim(void)
 	CHECK(t4_hwtid_claim(of, 1500, TTS_OWNED, 5, 0, 7, 0, &c) == ERANGE);
 	CHECK(t4_hwtid_claim(of, UINT32_MAX, TTS_OWNED, 5, 0, 7, 0, &c) ==
 	    ERANGE);
-	stub_nosleep_fail = 1;
-	CHECK(t4_hwtid_claim(of, 600, TTS_OWNED, 5, 0, 7, 0, &c) == ENOMEM);
+	/* Every entry exists from the start: a claim never allocates. */
+	stub_nosleep_fail = 1000;
+	CHECK(t4_hwtid_claim(of, 1499, TTS_OWNED, 5, 0, 7, 0, &c) == 0);
+	free_id(of, T4_TID_HW, 1499);
 	CHECK(t4_hwtid_claim(of, 600, TTS_OWNED, 5, 1, 7, TEF_EMBRYO, &c) ==
 	    0);
+	stub_nosleep_fail = 0;
 	CHECK(t4_hwtid_claim(of, 600, TTS_OWNED, 5, 1, 7, 0, &c) == EEXIST);
 	CHECK(of->of_tids.td_hw.tt_inuse == 1);
 
@@ -149,7 +152,8 @@ test_hwtid_claim(void)
 	CHECK(t4_tid_hold(of, T4_TID_HW, 600, 5, 8, &ctx) == EXDEV);
 	CHECK(t4_tid_hold(of, T4_TID_HW, 600, 6, 7, &ctx) == ESTALE);
 	CHECK(t4_tid_hold(of, T4_TID_HW, 601, 5, 7, &ctx) == ESTALE);
-	CHECK(t4_tid_hold(of, T4_TID_HW, 1499, 5, 7, &ctx) == ERANGE);
+	CHECK(t4_tid_hold(of, T4_TID_HW, 1499, 5, 7, &ctx) == ESTALE);
+	CHECK(t4_tid_hold(of, T4_TID_HW, 1500, 5, 7, &ctx) == ERANGE);
 	CHECK(t4_tid_hold(of, T4_TID_HW, 600, 5, 7, &ctx) == 0 && ctx == &c);
 
 	/* A release on its way: new holds fail, and the chip may reuse it. */
@@ -168,7 +172,7 @@ test_hwtid_claim(void)
 	CHECK(e->te_seq == seq + 1 && e->te_owner == 9 && e->te_flags == 0);
 	CHECK(of->of_tids.td_hw.tt_inuse == 1);
 
-	/* Walking the table visits only chunks that exist. */
+	/* The walk visits every ID once and ends at the last. */
 	CHECK(t4_hwtid_claim(of, 1499, TTS_ORPHAN, 0, 0, 7, 0, NULL) == 0);
 	mutex_enter(&of->of_tids.td_lock);
 	uint_t n = 0;

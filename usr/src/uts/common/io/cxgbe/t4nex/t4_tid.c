@@ -32,7 +32,10 @@
 
 #include "t4_ofld.h"
 
-/* hwtid entries are allocated in chunks as the chip hands out TIDs. */
+/*
+ * hwtid entries live in chunks, all allocated at start so that a CPL never
+ * finds a TID the table cannot track.
+ */
 #define	T4_TID_CHUNK_SHIFT	8
 #define	T4_TID_CHUNK		(1U << T4_TID_CHUNK_SHIFT)
 
@@ -81,6 +84,10 @@ t4_tids_init(t4_ofld_t *of)
 	dir->hd_nchunks = howmany(of->of_ntids, T4_TID_CHUNK);
 	dir->hd_chunk = kmem_zalloc(dir->hd_nchunks * sizeof (t4_tid_ent_t *),
 	    KM_SLEEP);
+	for (uint32_t i = 0; i < dir->hd_nchunks; i++) {
+		dir->hd_chunk[i] = kmem_zalloc(T4_TID_CHUNK *
+		    sizeof (t4_tid_ent_t), KM_SLEEP);
+	}
 	td->td_hw.tt_n = of->of_ntids;
 	td->td_hw.tt_base = of->of_tid_base;
 	td->td_hw.tt_ent = (t4_tid_ent_t *)dir;
@@ -131,12 +138,11 @@ t4_tid_tab(t4_ofld_t *of, t4_tid_kind_t kind)
 }
 
 /*
- * The entry for a hardware ID, or NULL if the ID is outside the table.  For a
- * hwtid whose chunk does not exist yet, create it when create is set.  The
+ * The entry for a hardware ID, or NULL if the ID is outside the table.  The
  * caller holds td_lock.
  */
 static t4_tid_ent_t *
-t4_tid_lookup(t4_ofld_t *of, t4_tid_kind_t kind, uint32_t id, boolean_t create)
+t4_tid_lookup(t4_ofld_t *of, t4_tid_kind_t kind, uint32_t id)
 {
 	t4_tid_tab_t *tt = t4_tid_tab(of, kind);
 	t4_hwtid_dir_t *dir;
@@ -154,48 +160,20 @@ t4_tid_lookup(t4_ofld_t *of, t4_tid_kind_t kind, uint32_t id, boolean_t create)
 
 	dir = (t4_hwtid_dir_t *)tt->tt_ent;
 	c = idx >> T4_TID_CHUNK_SHIFT;
-	if (dir->hd_chunk[c] == NULL) {
-		if (!create)
-			return (NULL);
-		dir->hd_chunk[c] = kmem_zalloc(T4_TID_CHUNK *
-		    sizeof (t4_tid_ent_t), KM_NOSLEEP);
-		if (dir->hd_chunk[c] == NULL)
-			return (NULL);
-	}
 	return (&dir->hd_chunk[c][idx & (T4_TID_CHUNK - 1)]);
 }
 
 t4_tid_ent_t *
 t4_tid_ent(t4_ofld_t *of, t4_tid_kind_t kind, uint32_t id)
 {
-	return (t4_tid_lookup(of, kind, id, B_FALSE));
+	return (t4_tid_lookup(of, kind, id));
 }
 
-/*
- * The first hwtid entry at or after *idp that has storage, or NULL.  The
- * caller holds td_lock.
- */
+/* The hwtid entry for *idp, or NULL past the end.  td_lock is held. */
 t4_tid_ent_t *
 t4_hwtid_next(t4_ofld_t *of, uint32_t *idp)
 {
-	t4_tid_tab_t *tt = &of->of_tids.td_hw;
-	t4_hwtid_dir_t *dir = (t4_hwtid_dir_t *)tt->tt_ent;
-	uint32_t idx;
-
-	ASSERT(MUTEX_HELD(&of->of_tids.td_lock));
-	if (dir == NULL || *idp < tt->tt_base)
-		return (NULL);
-	for (idx = *idp - tt->tt_base; idx < tt->tt_n; ) {
-		t4_tid_ent_t *c = dir->hd_chunk[idx >> T4_TID_CHUNK_SHIFT];
-
-		if (c == NULL) {
-			idx = (idx | (T4_TID_CHUNK - 1)) + 1;
-			continue;
-		}
-		*idp = tt->tt_base + idx;
-		return (&c[idx & (T4_TID_CHUNK - 1)]);
-	}
-	return (NULL);
+	return (t4_tid_lookup(of, T4_TID_HW, *idp));
 }
 
 int
@@ -285,7 +263,7 @@ void
 t4_tid_free_locked(t4_ofld_t *of, t4_tid_kind_t kind, uint32_t id)
 {
 	t4_tid_tab_t *tt = t4_tid_tab(of, kind);
-	t4_tid_ent_t *e = t4_tid_lookup(of, kind, id, B_FALSE);
+	t4_tid_ent_t *e = t4_tid_lookup(of, kind, id);
 	uint32_t n = 1;
 
 	ASSERT(MUTEX_HELD(&of->of_tids.td_lock));
@@ -328,7 +306,7 @@ t4_tid_ent_t *
 t4_tid_owned(t4_ofld_t *of, t4_tid_kind_t kind, uint32_t id, uint32_t owner)
 {
 	t4_tid_tab_t *tt = t4_tid_tab(of, kind);
-	t4_tid_ent_t *e = t4_tid_lookup(of, kind, id, B_FALSE);
+	t4_tid_ent_t *e = t4_tid_lookup(of, kind, id);
 
 	ASSERT(MUTEX_HELD(&of->of_tids.td_lock));
 	if (e == NULL || e->te_state != TTS_OWNED || e->te_owner != owner)
@@ -354,7 +332,7 @@ t4_tid_hold(t4_ofld_t *of, t4_tid_kind_t kind, uint32_t id, uint32_t owner,
 	int rc = 0;
 
 	mutex_enter(&td->td_lock);
-	if ((e = t4_tid_lookup(of, kind, id, B_FALSE)) == NULL) {
+	if ((e = t4_tid_lookup(of, kind, id)) == NULL) {
 		rc = ERANGE;
 	} else if (e->te_state != TTS_OWNED || e->te_owner != owner ||
 	    (e->te_flags & TEF_RELEASING) != 0 ||
@@ -388,11 +366,8 @@ t4_hwtid_claim(t4_ofld_t *of, uint32_t tid, t4_tid_state_t state,
 	int rc = 0;
 
 	mutex_enter(&td->td_lock);
-	if (tid < td->td_hw.tt_base ||
-	    tid - td->td_hw.tt_base >= td->td_hw.tt_n) {
+	if ((e = t4_tid_lookup(of, T4_TID_HW, tid)) == NULL) {
 		rc = ERANGE;
-	} else if ((e = t4_tid_lookup(of, T4_TID_HW, tid, B_TRUE)) == NULL) {
-		rc = ENOMEM;
 	} else if (e->te_state != TTS_FREE &&
 	    (e->te_flags & TEF_RELEASING) == 0) {
 		rc = EEXIST;
@@ -426,7 +401,7 @@ t4_tid_rele(t4_ofld_t *of, t4_tid_kind_t kind, uint32_t id)
 	t4_tid_ent_t *e;
 
 	mutex_enter(&td->td_lock);
-	e = t4_tid_lookup(of, kind, id, B_FALSE);
+	e = t4_tid_lookup(of, kind, id);
 	VERIFY(e != NULL && e->te_refs > 0);
 	if (--e->te_refs == 0)
 		cv_broadcast(&td->td_cv);
