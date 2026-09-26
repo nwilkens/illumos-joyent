@@ -885,8 +885,9 @@ static boolean_t mlxcx_cmd_reclaim(mlxcx_cmd_queue_t *, uint_t);
  */
 /*
  * The token is taken with the slot, from a rolling counter, so a caller can
- * never block on tokens while it holds nothing. Tokens only need to differ
- * from the last command posted to the same slot.
+ * never block on tokens while it holds nothing. A token must differ from the
+ * one last posted to the same slot, so that an old entry cannot pass for the
+ * new command.
  */
 static boolean_t
 mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq, mlxcx_cmd_t *cmd,
@@ -942,7 +943,9 @@ mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq, mlxcx_cmd_t *cmd,
 
 	do {
 		cmd->mlcmd_token = ++cmdq->mcmd_next_token;
-	} while (cmd->mlcmd_token == 0);
+	} while (cmd->mlcmd_token == 0 ||
+	    cmd->mlcmd_token == cmdq->mcmd_last_token[slot]);
+	cmdq->mcmd_last_token[slot] = cmd->mlcmd_token;
 
 	mutex_exit(&cmdq->mcmd_lock);
 

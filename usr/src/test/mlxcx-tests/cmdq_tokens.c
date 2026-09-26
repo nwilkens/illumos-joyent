@@ -81,11 +81,31 @@ fresh_tokens(void)
 	}
 }
 
+/*
+ * The page slot sees one command, then 254 ordinary ones elsewhere; a
+ * single rolling counter would give the next page command the same token.
+ */
+static void
+page_gap(void)
+{
+	model_attach(B_TRUE);
+	for (uint_t round = 0; round < 3; round++) {
+		if (!page_command())
+			stub_fail("page command failed");
+		for (uint_t i = 0; i < 254; i++) {
+			if (!mlxcx_cmd_enable_hca(model_mlxp))
+				stub_fail("command %u failed", i);
+		}
+	}
+	if (!page_command())
+		stub_fail("page command failed");
+}
+
 static const char *const names[] = {
-	"waiting-callers", "fresh-tokens", NULL
+	"waiting-callers", "fresh-tokens", "page-gap", NULL
 };
 static void (*const funcs[])(void) = {
-	waiting_callers, fresh_tokens
+	waiting_callers, fresh_tokens, page_gap
 };
 
 int

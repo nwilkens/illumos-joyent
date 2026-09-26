@@ -4,7 +4,7 @@
 import cmdq
 
 
-NAMES = ("waiting-callers", "fresh-tokens")
+NAMES = ("waiting-callers", "fresh-tokens", "page-gap")
 
 if __name__ == "__main__":
     cmdq.run(__doc__, "cmdq_tokens.c", NAMES)
