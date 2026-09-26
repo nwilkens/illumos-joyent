@@ -381,7 +381,7 @@ t4_tid_hold(t4_ofld_t *of, t4_tid_kind_t kind, uint32_t id, uint32_t owner,
  */
 int
 t4_hwtid_claim(t4_ofld_t *of, uint32_t tid, t4_tid_state_t state,
-    uint32_t owner, uint8_t port, uint16_t rxq, uint8_t flags, void *ctx)
+    uint32_t owner, uint8_t port, uint16_t rxq, uint16_t flags, void *ctx)
 {
 	t4_tids_t *td = &of->of_tids;
 	t4_tid_ent_t *e;

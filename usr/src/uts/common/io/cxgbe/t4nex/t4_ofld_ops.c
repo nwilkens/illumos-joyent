@@ -272,10 +272,7 @@ t4_ofld_stid_free(t4_ofld_t *of, uint32_t stid)
 		} else {
 			/* Its close reply frees a live server. */
 			e->te_state = TTS_ORPHAN;
-			if ((e->te_flags & TEF_UNLISTEN) == 0 &&
-			    t4_ofld_send_unlisten(of, e->te_port, stid,
-			    (e->te_flags & TEF_V6) != 0) == 0)
-				e->te_flags |= TEF_UNLISTEN;
+			t4_ofld_orphan_unlisten_locked(of, e, stid);
 		}
 	}
 	mutex_exit(&of->of_tids.td_lock);

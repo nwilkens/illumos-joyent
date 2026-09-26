@@ -104,12 +104,13 @@ typedef enum t4_tid_state {
 #define	TEF_UNLISTEN	0x20	/* stid: CLOSE_LISTSRV_REQ sent */
 #define	TEF_OPEN	0x40	/* atid: ACT_OPEN_REQ sent */
 #define	TEF_RELEASING	0x80	/* hwtid: TID_RELEASE on its way */
+#define	TEF_RELPEND	0x100	/* hwtid: TID_RELEASE not yet sent */
 
 #define	T4_TID_NIL	UINT32_MAX
 
 typedef struct t4_tid_ent {
 	uint8_t		te_state;
-	uint8_t		te_flags;
+	uint16_t	te_flags;
 	uint8_t		te_port;
 	uint16_t	te_rxq;		/* absolute ID its CPLs arrive on */
 	uint16_t	te_refs;
@@ -228,6 +229,7 @@ typedef struct t4_ofld_stats {
 	uint64_t	os_fl_badlen;
 	uint64_t	os_orphan_release;
 	uint64_t	os_orphan_abort;
+	uint64_t	os_orphan_retry;
 	uint64_t	os_wr_sent;
 	uint64_t	os_wr_full;
 	uint64_t	os_wr_badcookie;
@@ -264,6 +266,7 @@ typedef struct t4_ofld_kstats {
 	kstat_named_t	ok_fl_badlen;
 	kstat_named_t	ok_orphan_release;
 	kstat_named_t	ok_orphan_abort;
+	kstat_named_t	ok_orphan_retry;
 	kstat_named_t	ok_wr_sent;
 	kstat_named_t	ok_wr_full;
 	kstat_named_t	ok_wr_badcookie;
@@ -324,6 +327,8 @@ typedef struct t4_ofld {
 	boolean_t		of_ev_queued;
 
 	t4_tids_t		of_tids;
+	timeout_id_t		of_retry_tid;	/* td_lock */
+	boolean_t		of_retry_stop;	/* td_lock */
 	t4_l2t_t		of_l2t;
 	t4_clip_t		of_clip;
 
@@ -378,6 +383,9 @@ extern void t4_ofld_cpl_dispatch(t4_ofld_t *, t4_rdma_queue_t, uint8_t,
     mblk_t *);
 extern void t4_ofld_cq_notify(t4_ofld_t *, const uint32_t *, uint_t);
 extern void t4_ofld_orphan_sweep(t4_ofld_t *, uint32_t);
+extern void t4_ofld_retry_stop(t4_ofld_t *);
+extern void t4_ofld_orphan_unlisten_locked(t4_ofld_t *, t4_tid_ent_t *,
+    uint32_t);
 extern int t4_ofld_waiter_get(t4_ofld_t *, uint64_t *);
 extern int t4_ofld_waiter_wait(t4_ofld_t *, uint64_t);
 extern void t4_ofld_waiter_put(t4_ofld_t *, uint64_t);
@@ -404,7 +412,7 @@ extern int t4_tid_hold(t4_ofld_t *, t4_tid_kind_t, uint32_t, uint32_t,
 extern void t4_tid_rele(t4_ofld_t *, t4_tid_kind_t, uint32_t);
 extern void t4_tid_wait_idle(t4_ofld_t *, t4_tid_ent_t *);
 extern int t4_hwtid_claim(t4_ofld_t *, uint32_t, t4_tid_state_t, uint32_t,
-    uint8_t, uint16_t, uint8_t, void *);
+    uint8_t, uint16_t, uint16_t, void *);
 extern t4_tid_ent_t *t4_tid_owned(t4_ofld_t *, t4_tid_kind_t, uint32_t,
     uint32_t);
 

@@ -350,6 +350,7 @@ t4_ofld_kstat_update(kstat_t *ksp, int rw)
 	k->ok_fl_badlen.value.ui64 = s->os_fl_badlen;
 	k->ok_orphan_release.value.ui64 = s->os_orphan_release;
 	k->ok_orphan_abort.value.ui64 = s->os_orphan_abort;
+	k->ok_orphan_retry.value.ui64 = s->os_orphan_retry;
 	k->ok_wr_sent.value.ui64 = s->os_wr_sent;
 	k->ok_wr_full.value.ui64 = s->os_wr_full;
 	k->ok_wr_badcookie.value.ui64 = s->os_wr_badcookie;
@@ -409,6 +410,7 @@ t4_ofld_kstat_init(t4_ofld_t *of)
 	OK_U64(ok_fl_badlen, "fl_badlen");
 	OK_U64(ok_orphan_release, "orphan_release");
 	OK_U64(ok_orphan_abort, "orphan_abort");
+	OK_U64(ok_orphan_retry, "orphan_retry");
 	OK_U64(ok_wr_sent, "wr_sent");
 	OK_U64(ok_wr_full, "wr_full");
 	OK_U64(ok_wr_badcookie, "wr_badcookie");
@@ -607,6 +609,7 @@ t4_ofld_fini(struct adapter *sc)
 	VERIFY3P(of->of_cdip, ==, NULL);
 	VERIFY3P(of->of_client, ==, NULL);
 
+	t4_ofld_retry_stop(of);
 	if (of->of_tq != NULL) {
 		ddi_taskq_destroy(of->of_tq);
 		of->of_tq = NULL;
