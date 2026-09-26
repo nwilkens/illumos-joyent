@@ -50,12 +50,15 @@ stub_sleep_hook(clock_t deadline)
 static int fail_cq_at = -1;
 static int fail_sq_at = -1;
 static boolean_t sq_timeout;
+static boolean_t fail_tis;
 static int ncq;
 
 static boolean_t
 mlxcx_cmd_create_tis(mlxcx_t *mlxp, mlxcx_tis_t *tis)
 {
 	(void) mlxp;
+	if (fail_tis)
+		return (B_FALSE);
 	tis->mltis_state |= MLXCX_TIS_CREATED;
 	return (B_TRUE);
 }
@@ -245,11 +248,20 @@ sq_fails_mid(void)
 	}
 }
 
+static void
+tis_fails(void)
+{
+	setup(3);
+	fail_tis = B_TRUE;
+	fail_and_teardown();
+}
+
 static const char *const names[] = {
-	"sq-fails", "sq-times-out", "cq-fails-mid", "sq-fails-mid", NULL
+	"sq-fails", "sq-times-out", "cq-fails-mid", "sq-fails-mid",
+	"tis-fails", NULL
 };
 static void (*const funcs[])(void) = {
-	sq_fails, sq_times_out, cq_fails_mid, sq_fails_mid
+	sq_fails, sq_times_out, cq_fails_mid, sq_fails_mid, tis_fails
 };
 
 int

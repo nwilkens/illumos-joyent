@@ -1,17 +1,37 @@
 #!/usr/bin/env python3
-"""A TX group whose ring setup failed part way tears down cleanly."""
+"""A ring group whose ring setup failed part way tears down cleanly."""
+
+import re
 
 from c_test import (TESTDIR, CTestFailure, define, function, mlxcx_types,
                     optional_function, run_c, scenarios, source_parser,
                     typedef)
 
 
-NAMES = ("sq-fails", "sq-times-out")
+NAMES = ("sq-fails", "sq-times-out", "cq-fails-mid", "sq-fails-mid",
+         "tis-fails", "rx-ring-fails")
+
+
+def rx_check(src):
+    """RX setup goes on without a failed ring, so it must undo it at once."""
+    body = function(src / "mlxcx_ring.c", "mlxcx_rx_group_setup")
+    match = re.search(r"if \(!mlxcx_rq_setup\([^)]*\)\) \{(.*?)\n\t\t\}",
+                      body, re.S)
+    if match is None or "mlxcx_wq_teardown(mlxp, rq)" not in match.group(1):
+        raise SystemExit("FAIL: a failed RX ring stays on mlx_wqs inside "
+                         "mlg_wqs, which group teardown frees")
+    print("ok rx-ring-fails")
 
 
 def main():
     args = source_parser(__doc__).parse_args()
     src = args.source_dir
+    chosen = [name for (name,) in scenarios(args, NAMES)]
+    if "rx-ring-fails" in chosen:
+        rx_check(src)
+        chosen.remove("rx-ring-fails")
+    if not chosen:
+        return
     header = src / "mlxcx.h"
     types = [typedef(header, name) for name in (
         "mlxcx_eventq_state_t", "mlxcx_completionq_state_t",
@@ -33,7 +53,7 @@ def main():
             "mlxcx_types.h": mlxcx_types(src),
             "mlxcx_group_types.h": "\n".join(types),
             "mlxcx_groups_body.h": "\n".join(body),
-        }, src, cases=scenarios(args, NAMES))
+        }, src, cases=tuple((name,) for name in chosen))
     except CTestFailure as error:
         raise SystemExit(f"FAIL groups.c: {error}") from None
 

@@ -824,6 +824,12 @@ mlxcx_rx_group_setup(mlxcx_t *mlxp, mlxcx_ring_group_t *g)
 
 		rq = &g->mlg_wqs[i];
 		if (!mlxcx_rq_setup(mlxp, cq, rq)) {
+			/*
+			 * The group goes on without this ring, so undo it now
+			 * rather than leave it on mlx_wqs inside mlg_wqs.
+			 */
+			mlxcx_wq_teardown(mlxp, rq);
+			mlxcx_cq_teardown(mlxp, cq);
 			g->mlg_nwqs = i;
 			break;
 		}
@@ -1341,7 +1347,7 @@ mlxcx_tx_group_setup(mlxcx_t *mlxp, mlxcx_ring_group_t *g)
 	mlxcx_event_queue_t *eq;
 	mlxcx_completion_queue_t *cq;
 	mlxcx_work_queue_t *sq;
-	uint_t i;
+	uint_t i, nwqs;
 
 	ASSERT3S(g->mlg_state, ==, 0);
 
@@ -1354,9 +1360,11 @@ mlxcx_tx_group_setup(mlxcx_t *mlxp, mlxcx_ring_group_t *g)
 	g->mlg_type = MLXCX_GROUP_TX;
 	g->mlg_port = &mlxp->mlx_ports[0];
 
-	g->mlg_nwqs = mlxp->mlx_props.mldp_tx_nrings_per_group;
-	g->mlg_wqs_size = g->mlg_nwqs * sizeof (mlxcx_work_queue_t);
+	nwqs = mlxp->mlx_props.mldp_tx_nrings_per_group;
+	g->mlg_wqs_size = nwqs * sizeof (mlxcx_work_queue_t);
 	g->mlg_wqs = kmem_zalloc(g->mlg_wqs_size, KM_SLEEP);
+	/* Teardown undoes the first mlg_nwqs rings, so count them as we go. */
+	g->mlg_nwqs = 0;
 	g->mlg_state |= MLXCX_GROUP_WQS;
 
 	g->mlg_tis.mltis_tdom = &mlxp->mlx_tdom;
@@ -1368,7 +1376,7 @@ mlxcx_tx_group_setup(mlxcx_t *mlxp, mlxcx_ring_group_t *g)
 
 	g->mlg_state |= MLXCX_GROUP_TIRTIS;
 
-	for (i = 0; i < g->mlg_nwqs; ++i) {
+	for (i = 0; i < nwqs; ++i) {
 		eq = NULL;
 		while (eq == NULL) {
 			eq = &mlxp->mlx_eqs[mlxp->mlx_next_eq++];
@@ -1381,13 +1389,17 @@ mlxcx_tx_group_setup(mlxcx_t *mlxp, mlxcx_ring_group_t *g)
 			}
 		}
 
+		/* A CQ that failed setup is freed by mlxcx_teardown_cqs(). */
 		if (!mlxcx_cq_setup(mlxp, eq, &cq,
-		    mlxp->mlx_props.mldp_cq_size_shift))
+		    mlxp->mlx_props.mldp_cq_size_shift)) {
+			mutex_exit(&g->mlg_mtx);
 			return (B_FALSE);
+		}
 
 		cq->mlcq_stats = &g->mlg_port->mlp_stats;
 
 		sq = &g->mlg_wqs[i];
+		g->mlg_nwqs = i + 1;
 		if (!mlxcx_sq_setup(mlxp, g->mlg_port, cq, &g->mlg_tis, sq)) {
 			mutex_exit(&g->mlg_mtx);
 			return (B_FALSE);
