@@ -1110,6 +1110,23 @@ mlxcx_teardown(mlxcx_t *mlxp)
 		mlxcx_intr_disable(mlxp);
 	}
 
+	/*
+	 * With interrupts off nothing can queue more async work. Let the work
+	 * already queued finish while the ports and page state it uses still
+	 * exist, then destroy what it used.
+	 */
+	if (mlxp->mlx_attach & MLXCX_ATTACH_ASYNC_TQ) {
+		taskq_destroy(mlxp->mlx_pages_tq);
+		mlxp->mlx_pages_tq = NULL;
+		taskq_destroy(mlxp->mlx_async_tq);
+		mlxp->mlx_async_tq = NULL;
+		for (i = 0; i <= MLXCX_FUNC_ID_MAX; i++) {
+			mlxp->mlx_npages_req[i].mla_mlx = NULL;
+			mutex_destroy(&mlxp->mlx_npages_req[i].mla_mtx);
+		}
+		mlxp->mlx_attach &= ~MLXCX_ATTACH_ASYNC_TQ;
+	}
+
 	if (mlxp->mlx_attach & MLXCX_ATTACH_SENSORS) {
 		mlxcx_teardown_sensors(mlxp);
 		mlxp->mlx_attach &= ~MLXCX_ATTACH_SENSORS;
@@ -1181,18 +1198,6 @@ mlxcx_teardown(mlxcx_t *mlxp)
 	if (mlxp->mlx_attach & MLXCX_ATTACH_PAGE_LIST) {
 		mlxcx_teardown_pages(mlxp);
 		mlxp->mlx_attach &= ~MLXCX_ATTACH_PAGE_LIST;
-	}
-
-	if (mlxp->mlx_attach & MLXCX_ATTACH_ASYNC_TQ) {
-		for (i = 0; i <= MLXCX_FUNC_ID_MAX; i++) {
-			mlxp->mlx_npages_req[i].mla_mlx = NULL;
-			mutex_destroy(&mlxp->mlx_npages_req[i].mla_mtx);
-		}
-		taskq_destroy(mlxp->mlx_pages_tq);
-		mlxp->mlx_pages_tq = NULL;
-		taskq_destroy(mlxp->mlx_async_tq);
-		mlxp->mlx_async_tq = NULL;
-		mlxp->mlx_attach &= ~MLXCX_ATTACH_ASYNC_TQ;
 	}
 
 	if (mlxp->mlx_attach & MLXCX_ATTACH_ENABLE_HCA) {

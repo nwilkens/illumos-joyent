@@ -47,3 +47,4 @@ device writes to each of them, so freeing one it holds fails the test.
 | `pages_request.py` | A page request of INT32_MIN, a runtime or boot request that would pass the page limit, a failed allocation and a refused gift are all handled with the page lock balanced. |
 | `pages_give_timeout.py` | Pages from a MANAGE_PAGES(GIVE) that timed out stay tracked as given, so teardown reclaims them instead of freeing memory the device holds. |
 | `cmdq_uar.py` | ALLOC_UAR refuses UAR 0, a page past the BAR0 size that attach now keeps, and an index whose offset wraps 32 bits. |
+| `teardown_order.py` | Source check: detach stops interrupts, then drains the page and async taskqs, before it destroys their mutexes, the ports, the EQs, the page list or the command queue. |
