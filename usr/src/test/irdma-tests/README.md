@@ -62,7 +62,7 @@ enabled for the LAN.
 `rdma_verbs.sh` runs the verbs tests on hardware with irdma, rdmak and
 rdmat installed; `rdmatool.c` drives rdmat:
 
-    gcc -m64 -o rdmatool rdmatool.c rdmabench.c -lkstat -lsocket -lnsl
+    gcc -m64 -pthread -o rdmatool rdmatool.c rdmabench.c -lkstat -lsocket -lnsl
     rdma_verbs.sh -i <local_ip> [-p <peer_ip>] [-s <server_ip>] [tests]
 
 On one host it runs the rdmatool suite between two sessions (SEND/RECV,

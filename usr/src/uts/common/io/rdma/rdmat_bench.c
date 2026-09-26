@@ -38,6 +38,9 @@
 
 #include "rdmat_impl.h"
 
+/* How long a timed receive stream waits for a straggler. */
+#define	RDMAT_IDLE_MS	500
+
 /*
  * The local SGE for [off, off + len) of the buffer.  With the DMA lkey the
  * range must lie in one chunk.
@@ -273,14 +276,19 @@ out:
 
 /*
  * Receive rr_count messages, keeping up to rr_depth receives posted and
- * posting again in chains of at least rr_batch.
+ * posting again in chains of at least rr_batch.  With rr_run_ms the stream
+ * also ends once that has passed and no message came for RDMAT_IDLE_MS.
  */
 int
 rdmat_recv_stream(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
     hrtime_t deadline)
 {
 	uint64_t count = rr->rr_count, posted = 0, seen, room, want;
+	hrtime_t stop = 0, wd;
 	int ret;
+
+	if (rr->rr_run_ms != 0)
+		stop = gethrtime() + MSEC2NSEC(rr->rr_run_ms);
 
 	if ((ret = rdmat_post_recvs(ts, tq, rr,
 	    (uint32_t)MIN(count, rr->rr_depth), &posted)) != 0)
@@ -298,8 +306,16 @@ rdmat_recv_stream(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
 				goto out;
 			continue;
 		}
-		if ((ret = rdmat_wait(tq, &tq->tq_recv_done, seen + 1,
-		    deadline)) != 0)
+		wd = deadline;
+		if (stop != 0 && gethrtime() >= stop)
+			wd = MIN(deadline, gethrtime() +
+			    MSEC2NSEC(RDMAT_IDLE_MS));
+		ret = rdmat_wait(tq, &tq->tq_recv_done, seen + 1, wd);
+		if (ret == ETIMEDOUT && wd < deadline) {
+			ret = 0;
+			break;
+		}
+		if (ret != 0)
 			goto out;
 	}
 out:

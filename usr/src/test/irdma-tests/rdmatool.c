@@ -39,7 +39,8 @@
  * Each prints PASS or FAIL with its numbers; the exit status is 0 only if
  * all pass.
  *
- * Build: gcc -m64 -o rdmatool rdmatool.c rdmabench.c -lkstat -lsocket -lnsl
+ * Build: gcc -m64 -pthread -o rdmatool rdmatool.c rdmabench.c \
+ *	-lkstat -lsocket -lnsl
  */
 
 #include <sys/types.h>

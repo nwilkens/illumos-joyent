@@ -38,7 +38,10 @@
  *	verify=1	check every byte of the destination after a run
  *
  * Each run prints one "BENCH key=value ..." line.  Bandwidth is the bytes
- * of every completed request over the wall time of the slowest QP.
+ * of every completed request over the time of the slowest QP, from its
+ * first post to its last completion.  A send_bw receiver waits up to half
+ * a second after the senders stop.
+ * Build with -pthread, so errno is per thread.
  *
  * CPU is in CPU seconds per GiB moved (and microseconds per operation), two
  * ways for each host.  host: the user, kernel and interrupt time of every
@@ -263,7 +266,7 @@ set_remote(rdmat_run_t *rr, const peer_t *target, uint64_t rlen)
 
 /* Fill in the runs and the data each side starts with. */
 static int
-prepare(const bconf_t *c, bpair_t *bp, uint32_t sendcount)
+prepare(const bconf_t *c, bpair_t *bp)
 {
 	uint64_t rlen = window(c);
 	bside_t *sa = &bp->bp_sa, *sb = &bp->bp_sb;
@@ -288,8 +291,10 @@ prepare(const bconf_t *c, bpair_t *bp, uint32_t sendcount)
 		}
 		break;
 	case T_SEND_BW:
-		side_init(sa, a, RDMAT_OP_SEND, c, sendcount);
-		side_init(sb, b, RDMAT_OP_RECV_STREAM, c, sendcount);
+		/* The receiver ends once the sends stop coming. */
+		side_init(sa, a, RDMAT_OP_SEND, c, RDMAT_MAX_COUNT);
+		side_init(sb, b, RDMAT_OP_RECV_STREAM, c, RDMAT_MAX_COUNT);
+		sa->s_rr.rr_run_ms = sb->s_rr.rr_run_ms = c->c_secs * 1000;
 		sb->s_rr.rr_flags &= ~RDMAT_F_INLINE;
 		if (c->c_verify && (buf(a, RDMAT_BUF_FILL, 0, c->c_size,
 		    bp->bp_seed, 0, NULL) != 0 || buf(b, RDMAT_BUF_ZERO, 0,
@@ -364,6 +369,7 @@ report(const bconf_t *c, uint64_t wall, const host_stats_t *a0,
 {
 	double bytes = 0, ops = 0, qmin = 1e30, qmax = 0, gbps;
 	double busy, attr, intr;
+	uint64_t span = 0;
 	char vecs[256];
 	int64_t bad = -1, b;
 	uint32_t i, v;
@@ -394,6 +400,7 @@ report(const bconf_t *c, uint64_t wall, const host_stats_t *a0,
 			    ra->rr_ns : 0;
 			qmin = q < qmin ? q : qmin;
 			qmax = q > qmax ? q : qmax;
+			span = ra->rr_ns > span ? ra->rr_ns : span;
 		} else {
 			ops += (double)c->c_iters;
 			bytes += (double)c->c_iters * c->c_size;
@@ -401,7 +408,7 @@ report(const bconf_t *c, uint64_t wall, const host_stats_t *a0,
 		if (c->c_verify && (b = check(c, bp)) != -1 && bad == -1)
 			bad = b;
 	}
-	gbps = wall > 0 ? bytes * 8 / (double)wall : 0;
+	gbps = span > 0 ? bytes * 8 / (double)span : 0;
 
 	(void) printf("BENCH test=%s where=%s mode=%s size=%u qps=%u "
 	    "depth=%u batch=%u signal=%u inline=%u", tnames[c->c_test],
@@ -415,7 +422,8 @@ report(const bconf_t *c, uint64_t wall, const host_stats_t *a0,
 	}
 	if (c->c_test <= T_SEND_BW) {
 		(void) printf(" gbps=%.3f mops=%.4f qp_gbps_min=%.3f "
-		    "qp_gbps_max=%.3f", gbps, ops / (double)wall * 1e3,
+		    "qp_gbps_max=%.3f", gbps, span > 0 ? ops / (double)span *
+		    1e3 : 0,
 		    qmin, qmax);
 	} else {
 		rdmat_run_t *ra = &pairs[0].bp_sa.s_rr;
@@ -482,7 +490,7 @@ static void
 bench_one(const bconf_t *c)
 {
 	host_stats_t a0, a1, b0, b1;
-	uint32_t i, sendcount = 0;
+	uint32_t i;
 	uint64_t t0, t1;
 	int ret;
 
@@ -502,26 +510,10 @@ bench_one(const bconf_t *c)
 		return;
 	}
 	fresh_inline = c->c_inline ? c->c_size : 0;
-	if (c->c_test == T_SEND_BW) {
-		/*
-		 * Sends are counted, not timed: about secs at the link speed,
-		 * or at what the PCIe link carries in loopback.
-		 */
-		uint64_t bps = local_dev.rdi_speed != 0 ? local_dev.rdi_speed :
-		    10000000000ULL;
-		uint64_t n;
-
-		if (!remote && bps < 32000000000ULL)
-			bps = 32000000000ULL;
-		n = bps / 8 / c->c_size * c->c_secs;
-
-		sendcount = (uint32_t)(n < 1000 ? 1000 : n > RDMAT_MAX_COUNT ?
-		    RDMAT_MAX_COUNT : n);
-	}
 	for (i = 0; i < c->c_qps; i++) {
 		if ((ret = fresh(&pairs[i].bp_a, &pairs[i].bp_b, RDMAT_QPT_RC,
 		    c->c_poll ? RDMAT_POLL_DIRECT : RDMAT_POLL_TASKQ)) != 0 ||
-		    prepare(c, &pairs[i], sendcount) != 0) {
+		    prepare(c, &pairs[i]) != 0) {
 			(void) printf("BENCH test=%s qps=%u size=%u "
 			    "result=FAIL error=setup:%s\n", tnames[c->c_test],
 			    c->c_qps, c->c_size, strerror(ret));
