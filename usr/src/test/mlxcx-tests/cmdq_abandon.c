@@ -87,8 +87,6 @@ late_write(void)
 	if (stub_dma_live != base)
 		stub_fail("%" PRId64 " mailboxes not freed after hardware "
 		    "returned the slot", stub_dma_live - base);
-	if (stub_ids_used(model_mlx.mlx_cmd.mcmd_tokens) != 0)
-		stub_fail("token of a returned slot not freed");
 }
 
 /* The next command must not reuse a slot hardware still owns. */

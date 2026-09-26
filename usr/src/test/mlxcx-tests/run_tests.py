@@ -13,6 +13,7 @@ TESTS = (
     "cmdq_abandon.py",
     "cmdq_deadline.py",
     "cmdq_pageslot.py",
+    "cmdq_tokens.py",
     "cmdq_return_pages.py",
     "pages_return.py",
     "pages_request.py",

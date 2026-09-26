@@ -347,7 +347,7 @@ typedef struct mlxcx_cmd_queue {
 	uint64_t		mcmd_stray;
 	uint64_t		mcmd_timeouts;
 
-	id_space_t		*mcmd_tokens;
+	uint8_t			mcmd_next_token;
 } mlxcx_cmd_queue_t;
 
 typedef struct mlxcd_cmd_mbox {

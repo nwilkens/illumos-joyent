@@ -544,11 +544,6 @@ mlxcx_cmd_queue_fini(mlxcx_t *mlxp)
 			nowned++;
 	}
 
-	if (cmd->mcmd_tokens != NULL) {
-		id_space_destroy(cmd->mcmd_tokens);
-		cmd->mcmd_tokens = NULL;
-	}
-
 	cv_destroy(&cmd->mcmd_cv);
 	mutex_destroy(&cmd->mcmd_lock);
 
@@ -570,7 +565,6 @@ mlxcx_cmd_queue_init(mlxcx_t *mlxp)
 {
 	uint32_t tmp, cmd_low, cmd_high, i;
 	mlxcx_cmd_queue_t *cmd = &mlxp->mlx_cmd;
-	char buf[32];
 	const ddi_dma_cookie_t *ck;
 
 	ddi_device_acc_attr_t acc;
@@ -623,13 +617,6 @@ mlxcx_cmd_queue_init(mlxcx_t *mlxp)
 	cv_init(&cmd->mcmd_cv, NULL, CV_DRIVER, NULL);
 	list_create(&cmd->mcmd_reap, sizeof (mlxcx_cmd_abandon_t),
 	    offsetof(mlxcx_cmd_abandon_t, mca_node));
-
-	(void) snprintf(buf, sizeof (buf), "mlxcx_tokens_%d", mlxp->mlx_inst);
-	if ((cmd->mcmd_tokens = id_space_create(buf, 1, UINT8_MAX)) == NULL) {
-		mlxcx_warn(mlxp, "failed to allocate token id space");
-		mlxcx_cmd_queue_fini(mlxp);
-		return (B_FALSE);
-	}
 
 	mlxcx_dma_acc_attr(mlxp, &acc);
 	mlxcx_dma_page_attr(mlxp, &attr);
@@ -749,9 +736,6 @@ mlxcx_cmd_fini(mlxcx_t *mlxp, mlxcx_cmd_t *cmd)
 {
 	mlxcx_cmd_mbox_list_free(&cmd->mlcmd_mbox_out);
 	mlxcx_cmd_mbox_list_free(&cmd->mlcmd_mbox_in);
-	/* A timed out command gave its token to the abandoned slot. */
-	if (cmd->mlcmd_token != 0)
-		id_free(mlxp->mlx_cmd.mcmd_tokens, cmd->mlcmd_token);
 	cv_destroy(&cmd->mlcmd_cv);
 	mutex_destroy(&cmd->mlcmd_lock);
 }
@@ -761,7 +745,6 @@ mlxcx_cmd_abandon_free(mlxcx_t *mlxp, mlxcx_cmd_abandon_t *mca)
 {
 	mlxcx_cmd_mbox_list_free(&mca->mca_mbox_out);
 	mlxcx_cmd_mbox_list_free(&mca->mca_mbox_in);
-	id_free(mlxp->mlx_cmd.mcmd_tokens, mca->mca_token);
 	kmem_free(mca, sizeof (*mca));
 }
 
@@ -772,7 +755,6 @@ mlxcx_cmd_init(mlxcx_t *mlxp, mlxcx_cmd_t *cmd)
 	mutex_init(&cmd->mlcmd_lock, NULL, MUTEX_DRIVER,
 	    DDI_INTR_PRI(mlxp->mlx_async_intr_pri));
 	cv_init(&cmd->mlcmd_cv, NULL, CV_DRIVER, NULL);
-	cmd->mlcmd_token = id_alloc(mlxp->mlx_cmd.mcmd_tokens);
 	cmd->mlcmd_poll = mlxp->mlx_cmd.mcmd_polled;
 	list_create(&cmd->mlcmd_mbox_in, sizeof (mlxcx_cmd_mbox_t),
 	    offsetof(mlxcx_cmd_mbox_t, mlbox_node));
@@ -901,8 +883,13 @@ static boolean_t mlxcx_cmd_reclaim(mlxcx_cmd_queue_t *, uint_t);
  * Firmware may need pages before it can finish other commands, so page
  * commands have a slot of their own and never wait behind a full queue.
  */
+/*
+ * The token is taken with the slot, from a rolling counter, so a caller can
+ * never block on tokens while it holds nothing. Tokens only need to differ
+ * from the last command posted to the same slot.
+ */
 static boolean_t
-mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq, mlxcx_cmd_op_t op,
+mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq, mlxcx_cmd_t *cmd,
     uint_t *slotp)
 {
 	uint_t slot;
@@ -910,7 +897,7 @@ mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq, mlxcx_cmd_op_t op,
 	clock_t deadline = ddi_get_lbolt() + drv_usectohz(mlxcx_cmd_timeout);
 	clock_t stuck = 0;
 
-	usable = (op == MLXCX_OP_MANAGE_PAGES) ? page : (page - 1);
+	usable = (cmd->mlcmd_op == MLXCX_OP_MANAGE_PAGES) ? page : (page - 1);
 
 	mutex_enter(&cmdq->mcmd_lock);
 	for (;;) {
@@ -952,6 +939,10 @@ mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq, mlxcx_cmd_op_t op,
 
 	ASSERT3P(cmdq->mcmd_active[slot], ==, NULL);
 	ASSERT3P(cmdq->mcmd_abandoned[slot], ==, NULL);
+
+	do {
+		cmd->mlcmd_token = ++cmdq->mcmd_next_token;
+	} while (cmd->mlcmd_token == 0);
 
 	mutex_exit(&cmdq->mcmd_lock);
 
@@ -1054,7 +1045,6 @@ mlxcx_cmd_abandon(mlxcx_cmd_queue_t *cmdq, mlxcx_cmd_t *cmd, uint_t slot,
 	    offsetof(mlxcx_cmd_mbox_t, mlbox_node));
 	list_move_tail(&mca->mca_mbox_in, &cmd->mlcmd_mbox_in);
 	list_move_tail(&mca->mca_mbox_out, &cmd->mlcmd_mbox_out);
-	cmd->mlcmd_token = 0;
 
 	cmdq->mcmd_active[slot] = NULL;
 	cmdq->mcmd_abandoned[slot] = mca;
@@ -1099,7 +1089,7 @@ mlxcx_cmd_post(mlxcx_t *mlxp, mlxcx_cmd_t *cmd)
 
 	ASSERT3S(cmd->mlcmd_op, !=, 0);
 
-	if (!mlxcx_cmd_reserve_slot(cmdq, cmd->mlcmd_op, &slot)) {
+	if (!mlxcx_cmd_reserve_slot(cmdq, cmd, &slot)) {
 		mlxcx_warn(mlxp, "timed out waiting for a slot for command "
 		    "%s (0x%x)", mlxcx_cmd_opcode_string(cmd->mlcmd_op),
 		    cmd->mlcmd_op);
