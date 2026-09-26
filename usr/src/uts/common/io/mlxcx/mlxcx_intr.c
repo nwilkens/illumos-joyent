@@ -504,40 +504,15 @@ cleanup_npages:
 static void
 mlxcx_take_pages_once(mlxcx_t *mlxp, size_t npages)
 {
-	uint_t i;
 	int32_t ret;
 	uint64_t *pas;
-	mlxcx_dev_page_t *mdp, probe;
 
+	npages = MIN(npages, MLXCX_MANAGE_PAGES_MAX_PAGES);
 	pas = kmem_alloc(sizeof (*pas) * npages, KM_SLEEP);
 
-	if (!mlxcx_cmd_return_pages(mlxp, npages, pas, &ret)) {
-		kmem_free(pas, sizeof (*pas) * npages);
-		return;
-	}
-
 	mutex_enter(&mlxp->mlx_pagemtx);
-
-	ASSERT0(avl_is_empty(&mlxp->mlx_pages));
-
-	for (i = 0; i < ret; i++) {
-		bzero(&probe, sizeof (probe));
-		probe.mxdp_pa = pas[i];
-
-		mdp = avl_find(&mlxp->mlx_pages, &probe, NULL);
-
-		if (mdp != NULL) {
-			avl_remove(&mlxp->mlx_pages, mdp);
-			mlxp->mlx_npages--;
-			mlxcx_dma_free(&mdp->mxdp_dma);
-			kmem_free(mdp, sizeof (mlxcx_dev_page_t));
-		} else {
-			mlxcx_warn(mlxp, "hardware returned a page "
-			    "with PA 0x%" PRIx64 " but we have no "
-			    "record of giving out such a page", pas[i]);
-		}
-	}
-
+	if (mlxcx_cmd_return_pages(mlxp, npages, pas, &ret))
+		(void) mlxcx_pages_returned(mlxp, pas, ret);
 	mutex_exit(&mlxp->mlx_pagemtx);
 
 	kmem_free(pas, sizeof (*pas) * npages);

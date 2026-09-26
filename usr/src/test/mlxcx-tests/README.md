@@ -29,6 +29,10 @@ stray completion events. A sleep that no scripted event can end fails the
 test. The model fails the test if the driver rings a doorbell for a slot
 the device still owns, or if the device would write to freed memory.
 
+`pages_test.h` runs the page request, give, take and teardown code against
+a model of the page commands that tracks which pages the device holds; the
+device writes to each of them, so freeing one it holds fails the test.
+
 ## Checks
 
 | Script | What it proves |
@@ -38,3 +42,5 @@ the device still owns, or if the device would write to freed memory.
 | `cmdq_abandon.py` | A timed-out command keeps its slot, token and mailboxes until hardware returns the entry with the right token; detach leaks them if it never does. |
 | `cmdq_deadline.py` | In event mode a command gives up at its deadline when firmware never answers or no slot comes free, and recovers when the completion event is lost. |
 | `cmdq_pageslot.py` | MANAGE_PAGES has the last slot to itself and completes behind a full queue; other commands never take it; a one-slot queue is refused; page requests do not share the link-state taskq. |
+| `cmdq_return_pages.py` | RETURN_PAGES refuses a returned count above the request, including one with the sign bit set, and a request above the page limit. |
+| `pages_return.py` | Unknown and repeated returned PAs are counted and skipped in both the request and teardown paths; teardown stops when hardware returns nothing we know; a reclaim request with no pages given does not assert. |

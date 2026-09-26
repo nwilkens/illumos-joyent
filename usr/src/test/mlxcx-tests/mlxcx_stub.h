@@ -161,7 +161,7 @@ kmem_alloc(size_t size, int flag)
 	(void) flag;
 	if (size > stub_kmem_max_request)
 		stub_fail("kmem_alloc(%zu) would sleep forever", size);
-	if ((h = malloc(sizeof (*h) + size + 16)) == NULL)
+	if ((h = malloc(sizeof (*h) + size)) == NULL)
 		stub_fail("host out of memory");
 	h->sh_magic = STUB_MAGIC;
 	h->sh_size = size;
@@ -566,6 +566,7 @@ ddi_ffs(long mask)
 
 /* DDI odds and ends. */
 #define	DDI_SUCCESS		0
+#define	DDI_INTR_CLAIMED	1
 #define	DDI_FAILURE		(-1)
 #define	DDI_SLEEP		0
 #define	DDI_NOSLEEP		1

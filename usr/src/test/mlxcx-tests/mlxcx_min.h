@@ -22,6 +22,19 @@
 #ifndef _MLXCX_MIN_H
 #define	_MLXCX_MIN_H
 
+/* Just enough of an event queue and a port for the async interrupt path. */
+typedef struct mlxcx_event_queue {
+	kmutex_t		mleq_mtx;
+	kcondvar_t		mleq_cv;
+	uint_t			mleq_state;
+	uint_t			mleq_intr_index;
+} mlxcx_event_queue_t;
+
+struct mlxcx_port {
+	kmutex_t		mlp_mtx;
+	mlxcx_async_param_t	mlx_port_event;
+};
+
 struct mlxcx {
 	dev_info_t		*mlx_dip;
 	int			mlx_inst;
@@ -46,6 +59,8 @@ struct mlxcx {
 	mlxcx_async_param_t	mlx_npages_req[MLXCX_FUNC_ID_MAX + 1];
 	taskq_t			*mlx_async_tq;
 	taskq_t			*mlx_pages_tq;
+	uint_t			mlx_nports;
+	mlxcx_port_t		*mlx_ports;
 };
 
 #ifdef DEBUG

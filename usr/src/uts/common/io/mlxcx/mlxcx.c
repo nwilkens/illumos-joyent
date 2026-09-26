@@ -818,6 +818,45 @@ mlxcx_teardown_bufs(mlxcx_t *mlxp)
 	kmem_cache_destroy(mlxp->mlx_bufs_cache);
 }
 
+/*
+ * Free the pages that hardware says it has given back, and return how many we
+ * freed. A PA we never gave, or that we already took back, is counted and
+ * skipped. The caller must hold mlx_pagemtx.
+ */
+int32_t
+mlxcx_pages_returned(mlxcx_t *mlxp, const uint64_t *pas, int32_t npas)
+{
+	mlxcx_dev_page_t *mdp, probe;
+	int32_t i, nfreed = 0, nunknown = 0;
+
+	ASSERT(mutex_owned(&mlxp->mlx_pagemtx));
+
+	for (i = 0; i < npas; i++) {
+		bzero(&probe, sizeof (probe));
+		probe.mxdp_pa = pas[i];
+
+		mdp = avl_find(&mlxp->mlx_pages, &probe, NULL);
+		if (mdp == NULL) {
+			nunknown++;
+			continue;
+		}
+
+		avl_remove(&mlxp->mlx_pages, mdp);
+		mlxp->mlx_npages--;
+		mlxcx_dma_free(&mdp->mxdp_dma);
+		kmem_free(mdp, sizeof (mlxcx_dev_page_t));
+		nfreed++;
+	}
+
+	if (nunknown != 0) {
+		mlxp->mlx_pages_unknown += nunknown;
+		mlxcx_warn(mlxp, "hardware returned %d pages that we have no "
+		    "record of giving out", nunknown);
+	}
+
+	return (nfreed);
+}
+
 static void
 mlxcx_teardown_pages(mlxcx_t *mlxp)
 {
@@ -841,29 +880,10 @@ mlxcx_teardown_pages(mlxcx_t *mlxp)
 			goto out;
 		}
 
-		for (int32_t i = 0; i < ret; i++) {
-			mlxcx_dev_page_t *mdp, probe;
-			bzero(&probe, sizeof (probe));
-			probe.mxdp_pa = pas[i];
-
-			mdp = avl_find(&mlxp->mlx_pages, &probe, NULL);
-
-			if (mdp != NULL) {
-				avl_remove(&mlxp->mlx_pages, mdp);
-				mlxp->mlx_npages--;
-				mlxcx_dma_free(&mdp->mxdp_dma);
-				kmem_free(mdp, sizeof (mlxcx_dev_page_t));
-			} else {
-				mlxcx_panic(mlxp, "hardware returned a page "
-				    "with PA 0x%" PRIx64 " but we have no "
-				    "record of giving out such a page", pas[i]);
-			}
-		}
-
 		/*
-		 * If no pages were returned, note that fact.
+		 * If no pages we know of were returned, note that fact.
 		 */
-		if (ret == 0) {
+		if (mlxcx_pages_returned(mlxp, pas, ret) == 0) {
 			nzeros++;
 			if (nzeros > mlxcx_reclaim_tries) {
 				mlxcx_warn(mlxp, "hardware refused to return "

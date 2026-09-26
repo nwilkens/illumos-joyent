@@ -1210,6 +1210,8 @@ struct mlxcx {
 	kmutex_t		mlx_pagemtx;
 	uint_t			mlx_npages;
 	avl_tree_t		mlx_pages;
+	/* Returned PAs that we did not give out. */
+	uint64_t		mlx_pages_unknown;
 
 	mlxcx_async_param_t	mlx_npages_req[MLXCX_FUNC_ID_MAX + 1];
 
@@ -1316,6 +1318,7 @@ extern void mlxcx_dma_qdbell_attr(mlxcx_t *, ddi_dma_attr_t *);
 extern void mlxcx_dma_buf_attr(mlxcx_t *, ddi_dma_attr_t *);
 
 extern boolean_t mlxcx_give_pages(mlxcx_t *, int32_t, int32_t *);
+extern int32_t mlxcx_pages_returned(mlxcx_t *, const uint64_t *, int32_t);
 
 static inline const ddi_dma_cookie_t *
 mlxcx_dma_cookie_iter(const mlxcx_dma_buffer_t *db,

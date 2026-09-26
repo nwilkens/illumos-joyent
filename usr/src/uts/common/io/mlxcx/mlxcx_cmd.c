@@ -1526,9 +1526,9 @@ mlxcx_cmd_return_pages(mlxcx_t *mlxp, int32_t nreq, uint64_t *pas,
 	mlxcx_cmd_manage_pages_out_t *out;
 	size_t insize, outsize;
 	boolean_t ret;
-	uint32_t i;
+	uint32_t i, n;
 
-	if (nreq <= 0) {
+	if (nreq <= 0 || nreq > MLXCX_MANAGE_PAGES_MAX_PAGES) {
 		mlxcx_warn(mlxp, "passed invalid number of pages (%d) "
 		    "to return pages", nreq);
 		return (B_FALSE);
@@ -1536,7 +1536,7 @@ mlxcx_cmd_return_pages(mlxcx_t *mlxp, int32_t nreq, uint64_t *pas,
 
 	insize = offsetof(mlxcx_cmd_manage_pages_in_t, mlxi_manage_pages_pas);
 	outsize = offsetof(mlxcx_cmd_manage_pages_out_t,
-	    mlxo_manage_pages_pas) + nreq * sizeof (uint64_t);
+	    mlxo_manage_pages_pas) + (size_t)nreq * sizeof (uint64_t);
 
 	bzero(&in, sizeof (in));
 	out = kmem_alloc(outsize, KM_SLEEP);
@@ -1552,11 +1552,19 @@ mlxcx_cmd_return_pages(mlxcx_t *mlxp, int32_t nreq, uint64_t *pas,
 
 		ret = mlxcx_cmd_evaluate(mlxp, &cmd);
 		if (ret) {
-			*nret = from_be32(out->mlxo_manage_pages_npages);
-			for (i = 0; i < *nret; i++) {
+			n = from_be32(out->mlxo_manage_pages_npages);
+			if (n > (uint32_t)nreq) {
+				mlxcx_warn(mlxp, "hardware returned %u pages "
+				    "when asked for at most %d", n, nreq);
+				ret = B_FALSE;
+			}
+		}
+		if (ret) {
+			for (i = 0; i < n; i++) {
 				pas[i] =
 				    from_be64(out->mlxo_manage_pages_pas[i]);
 			}
+			*nret = (int32_t)n;
 		}
 	}
 
