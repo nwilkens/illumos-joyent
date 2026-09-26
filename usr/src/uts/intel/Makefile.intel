@@ -404,6 +404,7 @@ DRV_KMODS	+= amd8111s
 DRV_KMODS	+= ice
 DRV_KMODS	+= irdma
 DRV_KMODS	+= rdmat
+DRV_KMODS	+= iwcxgbe
 DRV_KMODS	+= igb
 DRV_KMODS	+= igc
 DRV_KMODS	+= ipmi
