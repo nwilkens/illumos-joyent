@@ -1133,9 +1133,9 @@ iwc_iw_connect(struct rdk_device *rdev, struct rdk_iw_cm_id *cmid,
 	ep->ep_qp = qp;
 	ep->ep_ird = MIN(p->ird, max);
 	ep->ep_ord = MIN(p->ord, max);
-	/* The ready-to-receive read needs one inbound read. */
-	if (ep->ep_ird == 0)
-		ep->ep_ird = 1;
+	/* The ready-to-receive read is our first outbound read. */
+	if (ep->ep_ord == 0)
+		ep->ep_ord = 1;
 	ep->ep_attr.ma_initiator = B_TRUE;
 	ep->ep_attr.ma_version = 2;
 	ep->ep_attr.ma_enhanced = B_TRUE;
