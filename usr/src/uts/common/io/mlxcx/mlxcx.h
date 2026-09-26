@@ -13,7 +13,7 @@
  * Copyright 2023 The University of Queensland
  * Copyright (c) 2018, Joyent, Inc.
  * Copyright 2023 RackTop Systems, Inc.
- * Copyright 2023 MNX Cloud, Inc.
+ * Copyright 2026 MNX Cloud, Inc.
  */
 
 /*
@@ -326,6 +326,9 @@ typedef struct mlxcx_cmd_queue {
 	uint32_t		mcmd_mask;
 
 	mlxcx_cmd_t		*mcmd_active[MLXCX_CMD_MAX];
+
+	/* Completions that named no command we are waiting for. */
+	uint64_t		mcmd_stray;
 
 	ddi_taskq_t		*mcmd_taskq;
 	id_space_t		*mcmd_tokens;

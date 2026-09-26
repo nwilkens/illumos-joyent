@@ -34,3 +34,4 @@ the device still owns, or if the device would write to freed memory.
 | Script | What it proves |
 | --- | --- |
 | `cmdq_geometry.py` | Attach refuses a queue size and stride that do not fit the 4 KiB queue page. |
+| `cmdq_completion.py` | A completion event for an idle, out-of-range, still-owned, wrong-token or already finished slot is counted and ignored. |

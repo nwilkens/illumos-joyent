@@ -878,21 +878,44 @@ mlxcx_cmd_release_slot(mlxcx_cmd_queue_t *cmdq, uint_t slot)
 	mutex_exit(&cmdq->mcmd_lock);
 }
 
-static void
-mlxcx_cmd_done(mlxcx_cmd_t *cmd, uint_t slot)
+static mlxcx_cmd_ent_t *
+mlxcx_cmd_entry(mlxcx_cmd_queue_t *cmdq, uint_t slot)
 {
-	mlxcx_t *mlxp = cmd->mlcmd_mlxp;
-	mlxcx_cmd_queue_t *cmdq = &mlxp->mlx_cmd;
-	mlxcx_cmd_ent_t *ent;
+	return ((mlxcx_cmd_ent_t *)(cmdq->mcmd_dma.mxdb_va +
+	    (slot << cmdq->mcmd_stride_l2)));
+}
 
-	/*
-	 * Command is done. Save relevant data. Once we broadcast on the CV and
-	 * drop the lock, we must not touch it again.
-	 */
+/*
+ * Check that hardware has handed the entry for this slot back to us and that
+ * it still carries the token of the command we posted there.
+ */
+static boolean_t
+mlxcx_cmd_returned(mlxcx_cmd_queue_t *cmdq, uint_t slot, uint8_t token)
+{
+	mlxcx_cmd_ent_t *ent = mlxcx_cmd_entry(cmdq, slot);
+
+	ASSERT(mutex_owned(&cmdq->mcmd_lock));
+
 	MLXCX_DMA_SYNC(cmdq->mcmd_dma, DDI_DMA_SYNC_FORKERNEL);
+	if ((ent->mce_status & MLXCX_CMD_HW_OWNED) != 0)
+		return (B_FALSE);
+	membar_consumer();
 
-	ent = (mlxcx_cmd_ent_t *)(cmdq->mcmd_dma.mxdb_va +
-	    (slot << cmdq->mcmd_stride_l2));
+	return (ent->mce_token == token);
+}
+
+/*
+ * Called with mcmd_lock held, once mlxcx_cmd_returned() has accepted the
+ * entry. Once we broadcast on the command CV and drop its lock, we must not
+ * touch the command again.
+ */
+static void
+mlxcx_cmd_done(mlxcx_cmd_queue_t *cmdq, mlxcx_cmd_t *cmd, uint_t slot)
+{
+	mlxcx_cmd_ent_t *ent = mlxcx_cmd_entry(cmdq, slot);
+
+	ASSERT(mutex_owned(&cmdq->mcmd_lock));
+	ASSERT3P(cmdq->mcmd_active[slot], ==, cmd);
 
 	mutex_enter(&cmd->mlcmd_lock);
 	cmd->mlcmd_status = MLXCX_CMD_STATUS(ent->mce_status);
@@ -904,7 +927,8 @@ mlxcx_cmd_done(mlxcx_cmd_t *cmd, uint_t slot)
 	mutex_exit(&cmd->mlcmd_lock);
 
 	cmdq->mcmd_active[slot] = NULL;
-	mlxcx_cmd_release_slot(cmdq, slot);
+	cmdq->mcmd_mask |= 1U << slot;
+	cv_broadcast(&cmdq->mcmd_cv);
 }
 
 static void
@@ -919,10 +943,7 @@ mlxcx_cmd_taskq(void *arg)
 	ASSERT3S(cmd->mlcmd_op, !=, 0);
 
 	slot = mlxcx_cmd_reserve_slot(cmdq);
-	ent = (mlxcx_cmd_ent_t *)(cmdq->mcmd_dma.mxdb_va +
-	    (slot << cmdq->mcmd_stride_l2));
-
-	cmdq->mcmd_active[slot] = cmd;
+	ent = mlxcx_cmd_entry(cmdq, slot);
 
 	/*
 	 * Command queue is currently ours as we set busy.
@@ -938,6 +959,10 @@ mlxcx_cmd_taskq(void *arg)
 	mlxcx_cmd_prep_output(ent, cmd);
 	MLXCX_DMA_SYNC(cmdq->mcmd_dma, DDI_DMA_SYNC_FORDEV);
 
+	mutex_enter(&cmdq->mcmd_lock);
+	cmdq->mcmd_active[slot] = cmd;
+	mutex_exit(&cmdq->mcmd_lock);
+
 	mlxcx_put32(mlxp, MLXCX_ISS_CMD_DOORBELL, 1 << slot);
 
 	if (!cmd->mlcmd_poll)
@@ -945,32 +970,30 @@ mlxcx_cmd_taskq(void *arg)
 
 	for (poll = 0; poll < mlxcx_cmd_tries; poll++) {
 		delay(drv_usectohz(mlxcx_cmd_delay));
-		MLXCX_DMA_SYNC(cmdq->mcmd_dma, DDI_DMA_SYNC_FORKERNEL);
-		if ((ent->mce_status & MLXCX_CMD_HW_OWNED) == 0)
-			break;
+		mutex_enter(&cmdq->mcmd_lock);
+		if (cmdq->mcmd_active[slot] == cmd &&
+		    mlxcx_cmd_returned(cmdq, slot, cmd->mlcmd_token)) {
+			mlxcx_cmd_done(cmdq, cmd, slot);
+			mutex_exit(&cmdq->mcmd_lock);
+			return;
+		}
+		mutex_exit(&cmdq->mcmd_lock);
 	}
 
 	/*
-	 * Command is done (or timed out). Save relevant data. Once we broadcast
-	 * on the CV and drop the lock, we must not touch the cmd again.
+	 * The command timed out. Once we broadcast on the CV and drop the
+	 * lock, we must not touch the cmd again.
 	 */
+	mutex_enter(&cmd->mlcmd_lock);
+	cmd->mlcmd_status = MLXCX_CMD_R_TIMEOUT;
+	cmd->mlcmd_state = MLXCX_CMD_S_ERROR;
+	cv_broadcast(&cmd->mlcmd_cv);
+	mutex_exit(&cmd->mlcmd_lock);
 
-	if (poll == mlxcx_cmd_tries) {
-		mutex_enter(&cmd->mlcmd_lock);
-		cmd->mlcmd_status = MLXCX_CMD_R_TIMEOUT;
-		cmd->mlcmd_state = MLXCX_CMD_S_ERROR;
-		cv_broadcast(&cmd->mlcmd_cv);
-		mutex_exit(&cmd->mlcmd_lock);
+	mlxcx_fm_ereport(mlxp, DDI_FM_DEVICE_NO_RESPONSE);
 
-		mlxcx_fm_ereport(mlxp, DDI_FM_DEVICE_NO_RESPONSE);
-
-		cmdq->mcmd_active[slot] = NULL;
-		mlxcx_cmd_release_slot(cmdq, slot);
-
-		return;
-	}
-
-	mlxcx_cmd_done(cmd, slot);
+	cmdq->mcmd_active[slot] = NULL;
+	mlxcx_cmd_release_slot(cmdq, slot);
 }
 
 void
@@ -985,15 +1008,27 @@ mlxcx_cmd_completion(mlxcx_t *mlxp, mlxcx_eventq_ent_t *ent)
 	DTRACE_PROBE2(cmd_event, mlxcx_t *, mlxp,
 	    mlxcx_evdata_cmd_completion_t *, eqe_cmd);
 
+	mutex_enter(&cmdq->mcmd_lock);
 	while ((slot = ddi_ffs(comp_vec)) != 0) {
 		comp_vec &= ~(1U << --slot);
 
-		cmd = cmdq->mcmd_active[slot];
+		if (slot >= cmdq->mcmd_size ||
+		    (cmd = cmdq->mcmd_active[slot]) == NULL) {
+			cmdq->mcmd_stray++;
+			continue;
+		}
+
 		if (cmd->mlcmd_poll)
 			continue;
 
-		mlxcx_cmd_done(cmd, slot);
+		if (!mlxcx_cmd_returned(cmdq, slot, cmd->mlcmd_token)) {
+			cmdq->mcmd_stray++;
+			continue;
+		}
+
+		mlxcx_cmd_done(cmdq, cmd, slot);
 	}
+	mutex_exit(&cmdq->mcmd_lock);
 }
 
 static boolean_t
