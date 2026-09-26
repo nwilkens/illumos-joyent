@@ -38,6 +38,7 @@
 #include <sys/disp.h>
 #include <sys/cpuvar.h>
 #include <sys/taskq_impl.h>
+#include <sys/callo.h>
 
 #include "rdk_impl.h"
 
@@ -52,8 +53,9 @@
 taskq_t *rdk_cq_taskq;
 
 /*
- * rcp_queued is set while the poller runs or is handed back; rcp_deferred
- * while it is handed back, and rcp_in_tq while that is to rdk_cq_taskq,
+ * rcp_queued is set while the poller runs, is busy polled or is handed
+ * back; rcp_deferred while it is handed back (to the provider, to a delayed
+ * poll or to rdk_cq_taskq), and rcp_in_tq while that is to rdk_cq_taskq,
  * which then owns rcp_ent.
  */
 struct rdk_cq_poller {
@@ -69,6 +71,12 @@ struct rdk_cq_poller {
 	uint64_t	rcp_batches;
 	uint64_t	rcp_no_cqe;	/* completions without an rdk_cqe */
 	uint64_t	rcp_resched;
+	boolean_t	rcp_busy;	/* rdk_cq_poll_begin() has it */
+	uint16_t	rcp_mod_count;
+	uint16_t	rcp_mod_us;
+	boolean_t	rcp_mod_pending;	/* a delayed poll is set */
+	boolean_t	rcp_mod_done;	/* the next run arms */
+	callout_id_t	rcp_mod_tid;
 	struct rdk_wc	rcp_wc[RDK_CQ_BATCH];
 };
 
@@ -150,9 +158,59 @@ rdk_cq_defer(struct rdk_cq *cq)
 		    &cp->rcp_ent);
 }
 
+/* A moderation delay is over; hand the poller back to its vector. */
+static void
+rdk_cq_mod_fire(void *arg)
+{
+	struct rdk_cq *cq = arg;
+	struct rdk_cq_poller *cp = cq->poller;
+	void (*resched)(struct rdk_cq *) = cq->device->rd_ops->cq_resched;
+
+	mutex_enter(&cp->rcp_lock);
+	cp->rcp_mod_pending = B_FALSE;
+	if (cp->rcp_dying || !cp->rcp_deferred || cp->rcp_in_tq) {
+		mutex_exit(&cp->rcp_lock);
+		return;
+	}
+	cp->rcp_in_tq = resched == NULL;
+	mutex_exit(&cp->rcp_lock);
+	if (resched != NULL)
+		resched(cq);
+	else
+		taskq_dispatch_ent(rdk_cq_taskq, rdk_cq_task, cq, 0,
+		    &cp->rcp_ent);
+}
+
+/*
+ * Whether to poll again after the moderation delay instead of arming; the
+ * caller holds rcp_lock.
+ */
+static boolean_t
+rdk_cq_mod_delay(struct rdk_cq *cq, int total, boolean_t may_delay)
+{
+	struct rdk_cq_poller *cp = cq->poller;
+	hrtime_t us;
+
+	ASSERT(MUTEX_HELD(&cp->rcp_lock));
+	if (!may_delay || cp->rcp_mod_us == 0 || total >= cp->rcp_mod_count ||
+	    cp->rcp_mod_done || cp->rcp_mod_pending || cp->rcp_dying) {
+		cp->rcp_mod_done = B_FALSE;
+		return (B_FALSE);
+	}
+	us = cp->rcp_mod_us;
+	cp->rcp_deferred = B_TRUE;
+	cp->rcp_in_tq = B_FALSE;
+	cp->rcp_mod_pending = B_TRUE;
+	cp->rcp_mod_done = B_TRUE;
+	cp->rcp_mod_tid = timeout_generic(CALLOUT_NORMAL, rdk_cq_mod_fire, cq,
+	    USEC2NSEC(us), MAX(USEC2NSEC(us) / 4, 1000), 0);
+	cv_broadcast(&cp->rcp_cv);
+	return (B_TRUE);
+}
+
 /* The caller has set rcp_queued. */
 static void
-rdk_cq_run(struct rdk_cq *cq)
+rdk_cq_run(struct rdk_cq *cq, boolean_t may_delay)
 {
 	struct rdk_cq_poller *cp = cq->poller;
 	int total = 0, passes = 0;
@@ -173,6 +231,12 @@ rdk_cq_run(struct rdk_cq *cq)
 			rdk_cq_defer(cq);
 			return;
 		}
+		mutex_enter(&cp->rcp_lock);
+		if (rdk_cq_mod_delay(cq, total, may_delay)) {
+			mutex_exit(&cp->rcp_lock);
+			return;
+		}
+		mutex_exit(&cp->rcp_lock);
 		if (rdk_req_notify_cq(cq, RDK_CQ_NEXT_COMP |
 		    RDK_CQ_REPORT_MISSED_EVENTS) > 0)
 			continue;
@@ -198,7 +262,7 @@ rdk_cq_task(void *arg)
 	mutex_enter(&cp->rcp_lock);
 	cp->rcp_deferred = cp->rcp_in_tq = B_FALSE;
 	mutex_exit(&cp->rcp_lock);
-	rdk_cq_run(cq);
+	rdk_cq_run(cq, B_TRUE);
 }
 
 /*
@@ -225,7 +289,7 @@ rdk_cq_event(struct rdk_cq *cq, void *ctx)
 	cp->rcp_queued = B_TRUE;
 	cp->rcp_deferred = B_FALSE;
 	mutex_exit(&cp->rcp_lock);
-	rdk_cq_run(cq);
+	rdk_cq_run(cq, B_TRUE);
 }
 
 /*
@@ -289,6 +353,7 @@ void
 rdk_free_cq(struct rdk_cq *cq)
 {
 	struct rdk_cq_poller *cp = cq->poller;
+	callout_id_t tid;
 
 	if (cq->usecnt != 0) {
 		/* rdk_destroy_cq() leaks it too; keep the poller with it. */
@@ -297,6 +362,12 @@ rdk_free_cq(struct rdk_cq *cq)
 	}
 	mutex_enter(&cp->rcp_lock);
 	cp->rcp_dying = B_TRUE;
+	tid = cp->rcp_mod_tid;
+	mutex_exit(&cp->rcp_lock);
+	/* This waits for a delayed poll that has started. */
+	if (tid != 0)
+		(void) untimeout_generic(tid, 0);
+	mutex_enter(&cp->rcp_lock);
 	rdk_cq_wait_idle(cp);
 	mutex_exit(&cp->rcp_lock);
 
@@ -339,4 +410,66 @@ rdk_process_cq_direct(struct rdk_cq *cq, int budget)
 
 	VERIFY3U(cq->poll_ctx, ==, RDK_POLL_DIRECT);
 	return (rdk_cq_process(cq, wcs, budget));
+}
+
+/*
+ * Moderation; see rdk.h.  A provider that cannot hold its interrupts
+ * leaves only the delayed poll.
+ */
+int
+rdk_modify_cq(struct rdk_cq *cq, uint16_t count, uint16_t usec)
+{
+	struct rdk_cq_poller *cp = cq->poller;
+	int (*modify)(struct rdk_cq *, uint16_t, uint16_t) =
+	    cq->device->rd_ops->modify_cq;
+	int ret;
+
+	if (cp == NULL || cq->poll_ctx != RDK_POLL_TASKQ ||
+	    usec > RDK_CQ_MOD_MAX_US || (count > 1 && usec == 0))
+		return (EINVAL);
+	if (modify != NULL && (ret = modify(cq, count, usec)) != 0 &&
+	    ret != ENOTSUP)
+		return (ret);
+	mutex_enter(&cp->rcp_lock);
+	cp->rcp_mod_count = count;
+	cp->rcp_mod_us = usec;
+	mutex_exit(&cp->rcp_lock);
+	return (0);
+}
+
+boolean_t
+rdk_cq_poll_begin(struct rdk_cq *cq)
+{
+	struct rdk_cq_poller *cp = cq->poller;
+
+	VERIFY3U(cq->poll_ctx, ==, RDK_POLL_TASKQ);
+	mutex_enter(&cp->rcp_lock);
+	if (cp->rcp_dying || cp->rcp_queued) {
+		mutex_exit(&cp->rcp_lock);
+		return (B_FALSE);
+	}
+	cp->rcp_queued = cp->rcp_busy = B_TRUE;
+	mutex_exit(&cp->rcp_lock);
+	return (B_TRUE);
+}
+
+int
+rdk_cq_poll(struct rdk_cq *cq, int budget)
+{
+	struct rdk_cq_poller *cp = cq->poller;
+
+	ASSERT(cp->rcp_busy);
+	return (rdk_cq_process(cq, cp->rcp_wc, budget));
+}
+
+void
+rdk_cq_poll_end(struct rdk_cq *cq)
+{
+	struct rdk_cq_poller *cp = cq->poller;
+
+	mutex_enter(&cp->rcp_lock);
+	ASSERT(cp->rcp_busy);
+	cp->rcp_busy = B_FALSE;
+	mutex_exit(&cp->rcp_lock);
+	rdk_cq_run(cq, B_FALSE);
 }

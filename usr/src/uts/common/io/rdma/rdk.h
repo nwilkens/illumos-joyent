@@ -684,6 +684,8 @@ struct rdk_device_ops {
 	 * of its completion vector.
 	 */
 	void	(*cq_resched)(struct rdk_cq *);
+	/* Optional: hold the CQ's events up to usec; see rdk_modify_cq(). */
+	int	(*modify_cq)(struct rdk_cq *, uint16_t, uint16_t);
 
 	size_t	size_pd;
 	size_t	size_cq;
@@ -798,6 +800,27 @@ extern int rdk_alloc_cq(struct rdk_device *, void *, int, int,
     enum rdk_poll_context, struct rdk_cq **);
 extern void rdk_free_cq(struct rdk_cq *);
 extern int rdk_process_cq_direct(struct rdk_cq *, int);
+
+/*
+ * Moderation of a RDK_POLL_TASKQ CQ, with count and usec: a poller run that
+ * finds fewer than count completions polls again usec later instead of
+ * arming the CQ, so completions in that time raise no interrupt and wait
+ * at most usec.  A provider with modify_cq() may also hold the interrupt
+ * itself for up to usec.  0 and 0 turn moderation off.
+ */
+#define	RDK_CQ_MOD_MAX_US	1000
+extern int rdk_modify_cq(struct rdk_cq *, uint16_t, uint16_t);
+
+/*
+ * Busy polling of a RDK_POLL_TASKQ CQ.  rdk_cq_poll_begin() takes the
+ * poller from the provider's thread, or returns B_FALSE if that thread has
+ * it; rdk_cq_poll() handles up to budget completions; rdk_cq_poll_end()
+ * arms the CQ and gives the poller back.  In between, the CQ raises at most
+ * the one interrupt it was armed for.
+ */
+extern boolean_t rdk_cq_poll_begin(struct rdk_cq *);
+extern int rdk_cq_poll(struct rdk_cq *, int);
+extern void rdk_cq_poll_end(struct rdk_cq *);
 
 /*
  * The data path goes straight to the provider.
