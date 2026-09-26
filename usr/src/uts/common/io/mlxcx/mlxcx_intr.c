@@ -430,75 +430,23 @@ mlxcx_update_link_state(mlxcx_t *mlxp, mlxcx_port_t *port)
 	mutex_exit(&port->mlp_mtx);
 }
 
-CTASSERT(MLXCX_MANAGE_PAGES_MAX_PAGES < UINT_MAX);
+CTASSERT(MLXCX_MANAGE_PAGES_MAX_PAGES < INT32_MAX);
 
 static void
 mlxcx_give_pages_once(mlxcx_t *mlxp, size_t npages)
 {
-	ddi_device_acc_attr_t acc;
-	ddi_dma_attr_t attr;
-	mlxcx_dev_page_t *mdp;
-	mlxcx_dev_page_t **pages;
-	size_t i;
-	const ddi_dma_cookie_t *ck;
+	int32_t given;
 
 	/*
 	 * If this isn't enough, the HCA will ask for more
 	 */
 	npages = MIN(npages, MLXCX_MANAGE_PAGES_MAX_PAGES);
 
-	pages = kmem_zalloc(sizeof (*pages) * npages, KM_SLEEP);
-
-	for (i = 0; i < npages; i++) {
-		mdp = kmem_zalloc(sizeof (mlxcx_dev_page_t), KM_SLEEP);
-		mlxcx_dma_acc_attr(mlxp, &acc);
-		mlxcx_dma_page_attr(mlxp, &attr);
-		if (!mlxcx_dma_alloc(mlxp, &mdp->mxdp_dma, &attr, &acc,
-		    B_TRUE, MLXCX_HW_PAGE_SIZE, B_TRUE)) {
-			mlxcx_warn(mlxp, "failed to allocate 4k page %u/%lu", i,
-			    npages);
-			kmem_free(mdp, sizeof (mlxcx_dev_page_t));
-			goto cleanup_npages;
-		}
-		ck = mlxcx_dma_cookie_one(&mdp->mxdp_dma);
-		mdp->mxdp_pa = ck->dmac_laddress;
-		pages[i] = mdp;
+	if (!mlxcx_give_pages(mlxp, (int32_t)npages, &given)) {
+		/* Tell the hardware we had an allocation failure. */
+		(void) mlxcx_cmd_give_pages(mlxp,
+		    MLXCX_MANAGE_PAGES_OPMOD_ALLOC_FAIL, 0, NULL);
 	}
-
-	mutex_enter(&mlxp->mlx_pagemtx);
-
-	if (!mlxcx_cmd_give_pages(mlxp,
-	    MLXCX_MANAGE_PAGES_OPMOD_GIVE_PAGES, npages, pages)) {
-		mlxcx_warn(mlxp, "!hardware refused our gift of %lu "
-		    "pages!", npages);
-		mutex_exit(&mlxp->mlx_pagemtx);
-		goto cleanup_npages;
-	}
-
-	for (i = 0; i < npages; i++) {
-		avl_add(&mlxp->mlx_pages, pages[i]);
-	}
-	mlxp->mlx_npages += npages;
-	mutex_exit(&mlxp->mlx_pagemtx);
-
-	kmem_free(pages, sizeof (*pages) * npages);
-
-	return;
-
-cleanup_npages:
-	for (i = 0; i < npages; i++) {
-		if ((mdp = pages[i]) == NULL)
-			break;
-
-		mlxcx_dma_free(&mdp->mxdp_dma);
-		kmem_free(mdp, sizeof (mlxcx_dev_page_t));
-	}
-	/* Tell the hardware we had an allocation failure. */
-	(void) mlxcx_cmd_give_pages(mlxp, MLXCX_MANAGE_PAGES_OPMOD_ALLOC_FAIL,
-	    0, NULL);
-	mutex_exit(&mlxp->mlx_pagemtx);
-
-	kmem_free(pages, sizeof (*pages) * npages);
 }
 
 static void
@@ -550,7 +498,8 @@ mlxcx_pages_task(void *arg)
 	if (npages > 0) {
 		mlxcx_give_pages_once(mlxp, npages);
 	} else if (npages < 0) {
-		mlxcx_take_pages_once(mlxp, -1 * npages);
+		/* INT32_MIN has no int32_t negation. */
+		mlxcx_take_pages_once(mlxp, (size_t)(-(int64_t)npages));
 	}
 }
 

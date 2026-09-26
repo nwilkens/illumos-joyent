@@ -1212,6 +1212,9 @@ struct mlxcx {
 	avl_tree_t		mlx_pages;
 	/* Returned PAs that we did not give out. */
 	uint64_t		mlx_pages_unknown;
+	/* The most pages we give, and requests refused for passing it. */
+	uint_t			mlx_npages_max;
+	uint64_t		mlx_pages_refused;
 
 	mlxcx_async_param_t	mlx_npages_req[MLXCX_FUNC_ID_MAX + 1];
 

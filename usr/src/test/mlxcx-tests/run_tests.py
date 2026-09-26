@@ -15,6 +15,7 @@ TESTS = (
     "cmdq_pageslot.py",
     "cmdq_return_pages.py",
     "pages_return.py",
+    "pages_request.py",
 )
 
 

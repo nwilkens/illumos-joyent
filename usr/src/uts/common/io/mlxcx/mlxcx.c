@@ -444,6 +444,7 @@
 #include <sys/time.h>
 #include <sys/pci.h>
 #include <sys/mac_provider.h>
+#include <sys/systm.h>
 
 #include <mlxcx.h>
 
@@ -461,6 +462,12 @@ CTASSERT((1 << MLXCX_RX_HASH_FT_SIZE_SHIFT) >= MLXCX_TIRS_PER_GROUP);
  */
 clock_t mlxcx_reclaim_delay = 1000 * 50; /* 50 ms in us */
 uint_t mlxcx_reclaim_tries = 100; /* Wait at most 5000ms */
+
+/*
+ * The most 4k pages we give to the device, at boot and at runtime together.
+ * Attach also holds it to a quarter of physical memory.
+ */
+uint_t mlxcx_max_fw_pages = 1024 * 1024; /* 4 GiB */
 
 static void *mlxcx_softstate;
 
@@ -1326,6 +1333,10 @@ mlxcx_check_issi(mlxcx_t *mlxp)
 	return (B_TRUE);
 }
 
+/*
+ * Give the device up to MLXCX_MANAGE_PAGES_MAX_PAGES pages. We hold
+ * mlx_pagemtx throughout so that the limit check and the page count agree.
+ */
 boolean_t
 mlxcx_give_pages(mlxcx_t *mlxp, int32_t npages, int32_t *ngiven)
 {
@@ -1346,6 +1357,17 @@ mlxcx_give_pages(mlxcx_t *mlxp, int32_t npages, int32_t *ngiven)
 	}
 
 	npages = MIN(npages, MLXCX_MANAGE_PAGES_MAX_PAGES);
+
+	mutex_enter(&mlxp->mlx_pagemtx);
+	if (mlxp->mlx_npages > mlxp->mlx_npages_max ||
+	    (uint_t)npages > mlxp->mlx_npages_max - mlxp->mlx_npages) {
+		mlxp->mlx_pages_refused++;
+		mlxcx_warn(mlxp, "hardware asked for %d more pages, which "
+		    "would pass the limit of %u", npages,
+		    mlxp->mlx_npages_max);
+		mutex_exit(&mlxp->mlx_pagemtx);
+		return (B_FALSE);
+	}
 
 	pages = kmem_alloc(sizeof (*pages) * npages, KM_SLEEP);
 
@@ -1387,7 +1409,6 @@ mlxcx_give_pages(mlxcx_t *mlxp, int32_t npages, int32_t *ngiven)
 		goto cleanup_npages;
 	}
 
-	mutex_enter(&mlxp->mlx_pagemtx);
 	for (i = 0; i < npages; i++) {
 		avl_add(&mlxp->mlx_pages, pages[i]);
 	}
@@ -1402,6 +1423,7 @@ mlxcx_give_pages(mlxcx_t *mlxp, int32_t npages, int32_t *ngiven)
 	return (B_TRUE);
 
 cleanup_npages:
+	mutex_exit(&mlxp->mlx_pagemtx);
 	kmem_free(pages, sizeof (*pages) * npages);
 	while ((mdp = list_remove_head(&plist)) != NULL) {
 		mlxcx_dma_free(&mdp->mxdp_dma);
@@ -2834,6 +2856,8 @@ mlxcx_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	    DDI_INTR_PRI(mlxp->mlx_intr_pri));
 	avl_create(&mlxp->mlx_pages, mlxcx_page_compare,
 	    sizeof (mlxcx_dev_page_t), offsetof(mlxcx_dev_page_t, mxdp_tree));
+	mlxp->mlx_npages_max = (uint_t)MIN(mlxcx_max_fw_pages,
+	    ptob((uint64_t)physmem) / MLXCX_HW_PAGE_SIZE / 4);
 	mlxp->mlx_attach |= MLXCX_ATTACH_PAGE_LIST;
 
 	/*

@@ -54,6 +54,7 @@ struct mlxcx {
 	uint_t			mlx_npages;
 	uint_t			mlx_npages_max;
 	uint64_t		mlx_pages_unknown;
+	uint64_t		mlx_pages_refused;
 	uint64_t		mlx_pages_bad_req;
 	avl_tree_t		mlx_pages;
 	mlxcx_async_param_t	mlx_npages_req[MLXCX_FUNC_ID_MAX + 1];
@@ -112,7 +113,7 @@ mlxcx_fm_ereport(mlxcx_t *mlxp, const char *detail)
 }
 
 /* DMA buffers with fake bus addresses. */
-#define	STUB_DMA_MAX		8192
+#define	STUB_DMA_MAX		16384
 #define	STUB_DMA_BASE		0x100000000ULL
 #define	STUB_DMA_STRIDE		0x10000ULL
 
