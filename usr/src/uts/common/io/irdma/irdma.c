@@ -49,6 +49,7 @@
 #include <sys/policy.h>
 #include <sys/zone.h>
 #include <sys/varargs.h>
+#include <sys/cpuvar.h>
 
 #include "irdma_verbs.h"
 
@@ -160,6 +161,7 @@ irdma_kstat_update(kstat_t *ksp, int rw)
 	irdma_t *irdma = ksp->ks_private;
 	irdma_kstats_t *k = &irdma->irdma_kstats;
 	struct irdma_hmc_info *hmc = irdma->irdma_sc.hmc_info;
+	int i;
 
 	if (rw == KSTAT_WRITE)
 		return (EACCES);
@@ -187,6 +189,14 @@ irdma_kstat_update(kstat_t *ksp, int rw)
 	k->ik_bad_cqes.value.ui64 = irdma->irdma_bad_cqes;
 	k->ik_qp_errors.value.ui64 = irdma->irdma_qp_errors;
 	k->ik_flushes.value.ui64 = irdma->irdma_flushes;
+	k->ik_sq_doorbells.value.ui64 = 0;
+	k->ik_cq_arms.value.ui64 = 0;
+	for (i = 0; irdma->irdma_dbstats != NULL && i < max_ncpus; i++) {
+		k->ik_sq_doorbells.value.ui64 +=
+		    irdma->irdma_dbstats[i].ids_sq_doorbells;
+		k->ik_cq_arms.value.ui64 +=
+		    irdma->irdma_dbstats[i].ids_cq_arms;
+	}
 	if (hmc != NULL && hmc->hmc_obj != NULL) {
 		k->ik_hmc_sds.value.ui32 = hmc->sd_table.sd_cnt;
 		k->ik_qp_cnt.value.ui32 = hmc->hmc_obj[IRDMA_HMC_IW_QP].cnt;
@@ -245,6 +255,9 @@ irdma_kstat_init(irdma_t *irdma)
 	kstat_named_init(&k->ik_bad_cqes, "bad_cqes", KSTAT_DATA_UINT64);
 	kstat_named_init(&k->ik_qp_errors, "qp_errors", KSTAT_DATA_UINT64);
 	kstat_named_init(&k->ik_flushes, "flushes", KSTAT_DATA_UINT64);
+	kstat_named_init(&k->ik_sq_doorbells, "sq_doorbells",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&k->ik_cq_arms, "cq_arms", KSTAT_DATA_UINT64);
 
 	kstat_install(ksp);
 	irdma->irdma_kstat = ksp;
@@ -373,6 +386,8 @@ irdma_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	irdma->irdma_ops = hdr->irp_ops;
 	irdma->irdma_link = LINK_STATE_UNKNOWN;
 	irdma_locks_init(irdma);
+	irdma->irdma_dbstats = kmem_zalloc(sizeof (irdma_dbstat_t) *
+	    max_ncpus, KM_SLEEP);
 
 	irdma->irdma_qp_limit = irdma_prop(irdma, "qp_limit",
 	    IRDMA_DEF_QP_LIMIT, IRDMA_MIN_QP_LIMIT, IRDMA_MAX_QP_LIMIT);
@@ -470,6 +485,7 @@ fail:
 		    "handler is still registered");
 		return (DDI_FAILURE);
 	}
+	kmem_free(irdma->irdma_dbstats, sizeof (irdma_dbstat_t) * max_ncpus);
 	irdma_locks_fini(irdma);
 	ddi_soft_state_free(irdma_state, instance);
 	return (DDI_FAILURE);
@@ -509,6 +525,7 @@ irdma_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 		return (DDI_FAILURE);
 
 	irdma_unsetup(irdma);
+	kmem_free(irdma->irdma_dbstats, sizeof (irdma_dbstat_t) * max_ncpus);
 	irdma_locks_fini(irdma);
 	ddi_soft_state_free(irdma_state, instance);
 	return (DDI_SUCCESS);

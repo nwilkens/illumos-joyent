@@ -104,6 +104,13 @@ struct irdma_qp;
 struct irdma_cq;
 struct irdma_arp_entry;
 
+/* Doorbell counts, one per CPU, padded to a cache line. */
+typedef struct irdma_dbstat {
+	uint64_t	ids_sq_doorbells;
+	uint64_t	ids_cq_arms;
+	uint64_t	ids_pad[6];
+} irdma_dbstat_t;
+
 typedef struct irdma_kstats {
 	kstat_named_t	ik_progress;
 	kstat_named_t	ik_flags;
@@ -133,6 +140,8 @@ typedef struct irdma_kstats {
 	kstat_named_t	ik_bad_cqes;
 	kstat_named_t	ik_qp_errors;
 	kstat_named_t	ik_flushes;
+	kstat_named_t	ik_sq_doorbells;
+	kstat_named_t	ik_cq_arms;
 } irdma_kstats_t;
 
 typedef struct irdma {
@@ -217,6 +226,7 @@ typedef struct irdma {
 
 	kstat_t			*irdma_kstat;
 	irdma_kstats_t		irdma_kstats;
+	irdma_dbstat_t		*irdma_dbstats;	/* max_ncpus */
 	uint64_t		irdma_cqp_submitted;
 	uint64_t		irdma_cqp_completed;
 	uint64_t		irdma_cqp_timeouts;
@@ -319,6 +329,7 @@ extern void irdma_osdep_regs_fini(void);
 extern void irdma_osdep_init(irdma_t *);
 extern void irdma_osdep_fini(irdma_t *);
 extern boolean_t irdma_osdep_regs_add(caddr_t, size_t, ddi_acc_handle_t);
+extern void irdma_osdep_regs_dbs(caddr_t, caddr_t, caddr_t, irdma_dbstat_t *);
 extern void irdma_osdep_regs_remove(caddr_t);
 extern boolean_t irdma_quiesced(irdma_t *);
 extern void irdma_taint(irdma_t *);

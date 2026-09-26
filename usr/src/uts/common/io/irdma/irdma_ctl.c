@@ -875,6 +875,9 @@ irdma_step_dev(irdma_t *irdma)
 		irdma_error(irdma, "device init failed: %d", ret);
 		goto fail;
 	}
+	irdma_osdep_regs_dbs(irdma->irdma_info.iri_bar0,
+	    (caddr_t)dev->wqe_alloc_db, (caddr_t)dev->cq_arm_db,
+	    irdma->irdma_dbstats);
 	return (0);
 
 nomem:

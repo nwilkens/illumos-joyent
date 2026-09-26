@@ -20,6 +20,7 @@
 
 #include <sys/varargs.h>
 #include <sys/rwlock.h>
+#include <sys/cpuvar.h>
 
 #include "irdma_impl.h"
 
@@ -339,6 +340,9 @@ typedef struct irdma_regmap {
 	caddr_t			irm_base;
 	size_t			irm_len;
 	ddi_acc_handle_t	irm_handle;
+	caddr_t			irm_sqdb;
+	caddr_t			irm_cqarm;
+	irdma_dbstat_t		*irm_stats;
 } irdma_regmap_t;
 
 static krwlock_t irdma_regs_lock;
@@ -374,6 +378,24 @@ irdma_osdep_regs_add(caddr_t base, size_t len, ddi_acc_handle_t h)
 	return (i < IRDMA_REGS_MAX);
 }
 
+/* Count writes to the send queue doorbell and the CQ arm register. */
+void
+irdma_osdep_regs_dbs(caddr_t base, caddr_t sqdb, caddr_t cqarm,
+    irdma_dbstat_t *stats)
+{
+	uint_t i;
+
+	rw_enter(&irdma_regs_lock, RW_WRITER);
+	for (i = 0; i < IRDMA_REGS_MAX; i++) {
+		if (irdma_regs[i].irm_base == base) {
+			irdma_regs[i].irm_sqdb = sqdb;
+			irdma_regs[i].irm_cqarm = cqarm;
+			irdma_regs[i].irm_stats = stats;
+		}
+	}
+	rw_exit(&irdma_regs_lock);
+}
+
 void
 irdma_osdep_regs_remove(caddr_t base)
 {
@@ -388,7 +410,7 @@ irdma_osdep_regs_remove(caddr_t base)
 }
 
 /* The caller holds irdma_regs_lock. */
-static ddi_acc_handle_t
+static irdma_regmap_t *
 irdma_regs_find(const volatile void *addr)
 {
 	uintptr_t a = (uintptr_t)addr;
@@ -401,22 +423,39 @@ irdma_regs_find(const volatile void *addr)
 
 		if (base != 0 && a >= base &&
 		    a - base <= irdma_regs[i].irm_len - sizeof (uint32_t))
-			return (irdma_regs[i].irm_handle);
+			return (&irdma_regs[i]);
 	}
 	return (NULL);
+}
+
+static void
+irdma_regs_count(const irdma_regmap_t *rm, const volatile void *addr)
+{
+	irdma_dbstat_t *st;
+
+	if (rm->irm_stats == NULL ||
+	    (addr != rm->irm_sqdb && addr != rm->irm_cqarm))
+		return;
+	kpreempt_disable();
+	st = &rm->irm_stats[CPU->cpu_seqid];
+	if (addr == rm->irm_sqdb)
+		st->ids_sq_doorbells++;
+	else
+		st->ids_cq_arms++;
+	kpreempt_enable();
 }
 
 u32
 readl(const volatile void *addr)
 {
-	ddi_acc_handle_t h;
+	irdma_regmap_t *rm;
 	u32 v = UINT32_MAX;
 
 	rw_enter(&irdma_regs_lock, RW_READER);
-	if ((h = irdma_regs_find(addr)) != NULL)
-		v = ddi_get32(h, (uint32_t *)(uintptr_t)addr);
+	if ((rm = irdma_regs_find(addr)) != NULL)
+		v = ddi_get32(rm->irm_handle, (uint32_t *)(uintptr_t)addr);
 	rw_exit(&irdma_regs_lock);
-	if (h == NULL)
+	if (rm == NULL)
 		cmn_err(CE_WARN, "!irdma: read of an unmapped address %p",
 		    (void *)addr);
 	return (v);
@@ -425,13 +464,15 @@ readl(const volatile void *addr)
 void
 writel(u32 v, volatile void *addr)
 {
-	ddi_acc_handle_t h;
+	irdma_regmap_t *rm;
 
 	rw_enter(&irdma_regs_lock, RW_READER);
-	if ((h = irdma_regs_find(addr)) != NULL)
-		ddi_put32(h, (uint32_t *)(uintptr_t)addr, v);
+	if ((rm = irdma_regs_find(addr)) != NULL) {
+		ddi_put32(rm->irm_handle, (uint32_t *)(uintptr_t)addr, v);
+		irdma_regs_count(rm, addr);
+	}
 	rw_exit(&irdma_regs_lock);
-	if (h == NULL)
+	if (rm == NULL)
 		cmn_err(CE_WARN, "!irdma: write of an unmapped address %p",
 		    (void *)addr);
 }
