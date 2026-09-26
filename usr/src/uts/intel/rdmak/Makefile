@@ -22,6 +22,7 @@ ROOTMODULE	= $(ROOT_MISC_DIR)/$(MODULE)
 include $(UTSBASE)/intel/Makefile.intel
 
 CPPFLAGS	+= -I$(UTSBASE)/common/io/rdma
+LDFLAGS		+= -N fs/sockfs -N drv/ip -N misc/neti -N misc/hook
 
 ALL_TARGET	= $(BINARY)
 INSTALL_TARGET	= $(BINARY) $(ROOTMODULE)

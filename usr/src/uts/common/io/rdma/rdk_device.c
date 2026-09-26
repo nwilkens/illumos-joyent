@@ -38,6 +38,7 @@
 #include <netinet/in.h>
 
 #include "rdk_impl.h"
+#include "rdk_cm_impl.h"
 
 /* How long unregister waits between warnings about a leaked object. */
 #define	RDK_UNREG_WARN_SEC	10
@@ -672,7 +673,12 @@ _init(void)
 	    offsetof(struct rdk_client, rc_node));
 	if ((ret = rdk_cq_init()) != 0)
 		goto fail;
+	if ((ret = rdk_cm_init()) != 0) {
+		rdk_cq_fini();
+		goto fail;
+	}
 	if ((ret = mod_install(&rdk_modlinkage)) != 0) {
+		(void) rdk_cm_fini();
 		rdk_cq_fini();
 		goto fail;
 	}
@@ -697,14 +703,19 @@ _fini(void)
 	int ret;
 
 	mutex_enter(&rdk_reg_lock);
-	if (!list_is_empty(&rdk_devices) || !list_is_empty(&rdk_clients)) {
+	if (!list_is_empty(&rdk_devices) || list_head(&rdk_clients) !=
+	    list_tail(&rdk_clients)) {
 		mutex_exit(&rdk_reg_lock);
 		return (EBUSY);
 	}
 	mutex_exit(&rdk_reg_lock);
 
-	if ((ret = mod_remove(&rdk_modlinkage)) != 0)
+	if ((ret = rdk_cm_fini()) != 0)
 		return (ret);
+	if ((ret = mod_remove(&rdk_modlinkage)) != 0) {
+		VERIFY0(rdk_cm_init());
+		return (ret);
+	}
 	rdk_cq_fini();
 	list_destroy(&rdk_clients);
 	list_destroy(&rdk_devices);

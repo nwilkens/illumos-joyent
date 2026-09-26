@@ -42,6 +42,8 @@
 #include <sys/list.h>
 #include <sys/ksynch.h>
 #include <sys/taskq.h>
+#include <sys/cred.h>
+#include <netinet/in.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -863,6 +865,261 @@ rdk_inc_rkey(uint32_t rkey)
 
 	return (((rkey + 1) & mask) | (rkey & ~mask));
 }
+
+/*
+ * The connection manager (rdk_cm.c).  One API for every transport; iWARP is
+ * the first backend and a RoCE backend over the IB CM follows.  Only IPv4
+ * with specific local and peer addresses is supported for now.
+ *
+ * An rdk_cm_id names one endpoint: a listener, an active connection or a
+ * connection a listener received.  Its handler runs in a framework taskq
+ * thread, one event at a time per ID and in order, and may block and call
+ * any rdk_cm operation on the ID except rdk_cm_destroy_id().  A handler that
+ * returns nonzero has the framework destroy the ID after it returns.
+ *
+ * An ID runs at most one operation at a time, and each one it starts ends
+ * in exactly one event:
+ *
+ *	resolve_addr	ADDR_RESOLVED or ADDR_ERROR
+ *	resolve_route	ROUTE_RESOLVED or ROUTE_ERROR
+ *	connect		ESTABLISHED, REJECTED, UNREACHABLE or CONNECT_ERROR
+ *			(CONNECT_RESPONSE instead of ESTABLISHED when the
+ *			consumer drives the QP itself, RoCE only)
+ *	accept		ESTABLISHED or CONNECT_ERROR
+ *
+ * An ID that saw ESTABLISHED later sees exactly one DISCONNECTED, and after
+ * it exactly one TIMEWAIT_EXIT, once the transport has let go of the QP.
+ * DEVICE_REMOVAL ends all of these: no event follows it, and the consumer
+ * must destroy the ID.  ADDR_CHANGE is advice and may come at any time
+ * before DEVICE_REMOVAL.  An operation that returns an error delivers no
+ * event.  rdk_cm_cancel() ends the pending operation with its error event
+ * and ECANCELED, and returns EALREADY when the operation already ended.
+ * rdk_cm_destroy_id() ends everything silently: no event is delivered once
+ * it returns, and a connection it ends is aborted.
+ *
+ * A CONNECT_REQUEST arrives on a new ID with the listener's handler and
+ * context.  The handler must call rdk_cm_accept() or rdk_cm_reject() on it
+ * before returning; otherwise the framework rejects the request and
+ * destroys the new ID, as it does when the handler returns nonzero.  The
+ * listener is held for the call and cannot be destroyed from it.
+ *
+ * The consumer may destroy its QP at any time; destroying the QP of a live
+ * connection aborts the connection.  The framework passes the QP to the
+ * transport at connect and accept and does not use it afterwards.
+ *
+ * Private data is copied on entry and on delivery; an event's pointers are
+ * valid only during the handler call.  Timeouts are in milliseconds; 0
+ * picks the default and the maximum is RDK_CM_TIMEOUT_MAX_MS.
+ */
+typedef struct rdk_cm_id rdk_cm_id_t;
+typedef struct rdk_cm_acl rdk_cm_acl_t;
+
+enum rdk_cm_event_type {
+	RDK_CM_EVENT_ADDR_RESOLVED,
+	RDK_CM_EVENT_ADDR_ERROR,
+	RDK_CM_EVENT_ROUTE_RESOLVED,
+	RDK_CM_EVENT_ROUTE_ERROR,
+	RDK_CM_EVENT_CONNECT_REQUEST,
+	RDK_CM_EVENT_CONNECT_RESPONSE,
+	RDK_CM_EVENT_CONNECT_ERROR,
+	RDK_CM_EVENT_UNREACHABLE,
+	RDK_CM_EVENT_REJECTED,
+	RDK_CM_EVENT_ESTABLISHED,
+	RDK_CM_EVENT_DISCONNECTED,
+	RDK_CM_EVENT_DEVICE_REMOVAL,
+	RDK_CM_EVENT_ADDR_CHANGE = 14,
+	RDK_CM_EVENT_TIMEWAIT_EXIT
+};
+
+enum rdk_port_space {
+	RDK_PS_TCP = 0x0106
+};
+
+/* The messages private data rides in; each transport has its own limits. */
+enum rdk_cm_msg {
+	RDK_CM_MSG_REQ,
+	RDK_CM_MSG_REP,
+	RDK_CM_MSG_REJ
+};
+
+/* The most private data any transport carries in one message. */
+#define	RDK_CM_PDATA_MAX	512
+#define	RDK_CM_TIMEOUT_MAX_MS	120000
+#define	RDK_CM_BACKLOG_MAX	1024
+#define	RDK_CM_ACL_MAX		1024
+
+struct rdk_cm_conn_param {
+	const void	*private_data;
+	uint16_t	private_data_len;
+	uint8_t		responder_resources;	/* inbound RDMA reads */
+	uint8_t		initiator_depth;	/* outbound RDMA reads */
+	uint8_t		retry_count;		/* RoCE */
+	uint8_t		rnr_retry_count;	/* RoCE */
+	struct rdk_qp	*qp;
+	uint32_t	timeout_ms;		/* connect */
+};
+
+struct rdk_cm_event {
+	enum rdk_cm_event_type	event;
+	int			status;		/* errno, 0 on success */
+	uint32_t		reject_reason;	/* REJECTED, transport code */
+	rdk_cm_id_t		*listen_id;	/* CONNECT_REQUEST */
+	struct rdk_cm_conn_param param;
+};
+
+typedef int (*rdk_cm_handler_t)(rdk_cm_id_t *, void *,
+    const struct rdk_cm_event *);
+
+/* What a transport needs to reach the peer; valid after ROUTE_RESOLVED. */
+struct rdk_cm_route {
+	struct sockaddr_in	rcr_src;
+	struct sockaddr_in	rcr_dst;
+	uint32_t		rcr_port;	/* device port */
+	uint8_t			rcr_smac[ETHERADDRL];
+	uint8_t			rcr_dmac[ETHERADDRL];	/* next hop */
+	uint16_t		rcr_vlan;	/* RDK_VLAN_NONE */
+	uint32_t		rcr_mtu;	/* IP MTU of the path */
+	uint8_t			rcr_tos;
+};
+
+/*
+ * The global zone only: create_id fails with EPERM for any other.  The ID
+ * holds the credential; its port reservations are made in the netstack of
+ * the credential's zone.
+ */
+extern int rdk_cm_create_id(cred_t *, rdk_cm_handler_t, void *,
+    enum rdk_port_space, enum rdk_qp_type, rdk_cm_id_t **);
+/* Waits for a running handler; EDEADLK from the ID's own handler. */
+extern int rdk_cm_destroy_id(rdk_cm_id_t *);
+extern void rdk_cm_set_context(rdk_cm_id_t *, void *);
+
+/*
+ * Reserve a specific unicast local address and port in the host TCP port
+ * space, exclusively, before any hardware is told of it.  Port 0 picks an
+ * ephemeral port.  The reservation lasts until the ID and every connection
+ * it carried are gone, plus the TCP TIME_WAIT interval.
+ */
+extern int rdk_cm_bind_addr(rdk_cm_id_t *, const struct sockaddr *);
+extern int rdk_cm_resolve_addr(rdk_cm_id_t *, const struct sockaddr *,
+    const struct sockaddr *, uint32_t);
+extern int rdk_cm_resolve_route(rdk_cm_id_t *, uint32_t);
+
+/*
+ * A listener takes requests only from the peers of its allow-list, and has
+ * at most backlog of them (from the SYN to the handler's decision) at once.
+ * The ACL is immutable; listen takes a reference.
+ */
+extern int rdk_cm_acl_create(const struct sockaddr_in *, uint32_t,
+    rdk_cm_acl_t **);
+extern void rdk_cm_acl_rele(rdk_cm_acl_t *);
+extern int rdk_cm_listen(rdk_cm_id_t *, int, rdk_cm_acl_t *);
+
+extern int rdk_cm_connect(rdk_cm_id_t *, const struct rdk_cm_conn_param *);
+extern int rdk_cm_accept(rdk_cm_id_t *, const struct rdk_cm_conn_param *);
+extern int rdk_cm_reject(rdk_cm_id_t *, const void *, uint16_t);
+extern int rdk_cm_disconnect(rdk_cm_id_t *);
+extern int rdk_cm_cancel(rdk_cm_id_t *);
+
+/* Valid once the ID is bound to a device; NULL before. */
+extern struct rdk_device *rdk_cm_device(rdk_cm_id_t *, uint32_t *);
+extern int rdk_cm_route(rdk_cm_id_t *, struct rdk_cm_route *);
+extern uint16_t rdk_cm_pdata_max(rdk_cm_id_t *, enum rdk_cm_msg);
+extern const char *rdk_cm_event_msg(enum rdk_cm_event_type);
+
+/*
+ * The iWARP provider interface.  A provider attaches its CM operations to a
+ * device before rdk_register_device() and detaches them after
+ * rdk_unregister_device(); detach returns once no operation runs and no
+ * event can arrive.  The framework owns each struct rdk_iw_cm_id and has
+ * reserved iw_laddr in the host TCP port space before the provider sees it.
+ *
+ * A successful iw_connect or iw_accept gives the provider a reference it
+ * gives back by delivering exactly one final event: CONNECT_REPLY with a
+ * nonzero status, or CLOSE.  iw_disconnect with abrupt set is valid in
+ * every state before the final event and leads to it.  The provider
+ * touches the ID no more after the final event.  iw_reject and a failed
+ * iw_connect or iw_accept take no reference.  iw_destroy_listen returns
+ * once no CONNECT_REQUEST for the listener can be delivered.
+ *
+ * The operations run in thread context without framework locks.
+ * rdk_iw_cm_event() takes thread context and copies the event.  For a
+ * CONNECT_REQUEST it returns 0 when the framework took ev_child and
+ * ev_admit; otherwise the provider still owns both and rejects the child.
+ */
+struct rdk_iw_cm_id {
+	struct sockaddr_in	iw_laddr;
+	struct sockaddr_in	iw_raddr;
+	uint32_t		iw_port;	/* device port */
+	uint8_t			iw_nh_mac[ETHERADDRL];	/* active open */
+	uint16_t		iw_vlan;	/* RDK_VLAN_NONE */
+	uint32_t		iw_mtu;		/* IP MTU of the path */
+	uint8_t			iw_tos;
+	void			*iw_provider;
+	void			*iw_priv;	/* framework */
+};
+
+enum rdk_iw_event_type {
+	RDK_IW_EVENT_CONNECT_REQUEST = 1,
+	RDK_IW_EVENT_CONNECT_REPLY,
+	RDK_IW_EVENT_ESTABLISHED,
+	RDK_IW_EVENT_DISCONNECT,
+	RDK_IW_EVENT_CLOSE
+};
+
+struct rdk_iw_cm_event {
+	enum rdk_iw_event_type	ev_type;
+	int			ev_status;	/* errno */
+	const void		*ev_pdata;
+	uint16_t		ev_pdata_len;
+	uint32_t		ev_ird;
+	uint32_t		ev_ord;
+	/* CONNECT_REQUEST */
+	struct sockaddr_in	ev_laddr;
+	struct sockaddr_in	ev_raddr;
+	uint32_t		ev_port;
+	void			*ev_child;
+	void			*ev_admit;
+};
+
+struct rdk_iw_conn_param {
+	struct rdk_qp	*qp;
+	const void	*pdata;
+	uint16_t	pdata_len;
+	uint32_t	ird;
+	uint32_t	ord;
+};
+
+struct rdk_iw_cm_ops {
+	uint32_t	iw_version;		/* RDK_ABI_VERSION */
+	uint16_t	iw_max_pdata;		/* REQ, REP and REJ */
+	int	(*iw_connect)(struct rdk_device *, struct rdk_iw_cm_id *,
+	    const struct rdk_iw_conn_param *);
+	int	(*iw_accept)(struct rdk_device *, struct rdk_iw_cm_id *,
+	    const struct rdk_iw_conn_param *);
+	int	(*iw_reject)(struct rdk_device *, struct rdk_iw_cm_id *,
+	    const void *, uint16_t);
+	int	(*iw_create_listen)(struct rdk_device *, struct rdk_iw_cm_id *);
+	void	(*iw_destroy_listen)(struct rdk_device *,
+	    struct rdk_iw_cm_id *);
+	int	(*iw_disconnect)(struct rdk_device *, struct rdk_iw_cm_id *,
+	    boolean_t);
+};
+
+extern int rdk_iw_cm_attach(struct rdk_device *, const struct rdk_iw_cm_ops *);
+extern void rdk_iw_cm_detach(struct rdk_device *);
+extern int rdk_iw_cm_event(struct rdk_iw_cm_id *,
+    const struct rdk_iw_cm_event *);
+
+/*
+ * A listener's admission check, before the provider answers a SYN: the
+ * peer is on the allow-list and the backlog has room.  On success the
+ * provider holds an admission it passes as ev_admit with the
+ * CONNECT_REQUEST, or gives back with rdk_iw_cm_unadmit() if the
+ * connection dies first.  Any context that can take an adaptive mutex.
+ */
+extern int rdk_iw_cm_admit(struct rdk_iw_cm_id *, const struct sockaddr_in *,
+    void **);
+extern void rdk_iw_cm_unadmit(void *);
 
 #ifdef __cplusplus
 }
