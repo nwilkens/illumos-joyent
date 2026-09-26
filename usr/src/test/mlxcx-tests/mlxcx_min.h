@@ -22,10 +22,24 @@
 #ifndef _MLXCX_MIN_H
 #define	_MLXCX_MIN_H
 
-/* Just enough of an event queue and a port for the async interrupt path. */
+/*
+ * Just enough of an event queue, a port and the ring structures for the paths
+ * under test. Enum-typed fields are uint_t and pointers to types we do not
+ * model are void *.
+ */
+typedef struct { int mlpd_unused; } mlxcx_pd_t;
+typedef struct { int mltd_unused; } mlxcx_tdom_t;
+
+typedef struct {
+	uint_t			mltis_state;
+	void			*mltis_tdom;
+	uint_t			mltis_num;
+} mlxcx_tis_t;
+
 typedef struct mlxcx_event_queue {
 	kmutex_t		mleq_mtx;
 	kcondvar_t		mleq_cv;
+	uint_t			mleq_type;
 	uint_t			mleq_state;
 	uint_t			mleq_intr_index;
 	mlxcx_dma_buffer_t	mleq_dma;
@@ -38,11 +52,20 @@ typedef struct mlxcx_completion_queue mlxcx_completion_queue_t;
 typedef struct mlxcx_work_queue {
 	kmutex_t		mlwq_mtx;
 	list_node_t		mlwq_entry;
+	mlxcx_t			*mlwq_mlx;
 	uint_t			mlwq_type;
 	uint_t			mlwq_num;
 	mlxcx_completion_queue_t *mlwq_cq;
 	void			*mlwq_bufs;
 	void			*mlwq_foreign_bufs;
+	void			*mlwq_pd;
+	void			*mlwq_uar;
+	void			*mlwq_tis;
+	void			*mlwq_group;
+	uint_t			mlwq_inline_mode;
+	uint_t			mlwq_nents;
+	uint_t			mlwq_bufhwm;
+	uint_t			mlwq_buflwm;
 	uint_t			mlwq_state;
 	mlxcx_dma_buffer_t	mlwq_dma;
 	mlxcx_dma_buffer_t	mlwq_doorbell_dma;
@@ -52,7 +75,11 @@ typedef struct mlxcx_work_queue {
 
 struct mlxcx_completion_queue {
 	kmutex_t		mlcq_mtx;
+	kmutex_t		mlcq_bufbmtx;
+	list_t			mlcq_buffers;
+	list_t			mlcq_buffers_b;
 	mlxcx_work_queue_t	*mlcq_wq;
+	void			*mlcq_stats;
 	uint_t			mlcq_state;
 	mlxcx_dma_buffer_t	mlcq_dma;
 	mlxcx_dma_buffer_t	mlcq_doorbell_dma;
@@ -63,6 +90,9 @@ struct mlxcx_completion_queue {
 struct mlxcx_port {
 	kmutex_t		mlp_mtx;
 	mlxcx_async_param_t	mlx_port_event;
+	uint_t			mlp_wqe_min_inline;
+	uint_t			mlp_mtu;
+	uint64_t		mlp_stats;
 };
 
 struct mlxcx {
@@ -94,7 +124,22 @@ struct mlxcx {
 	mlxcx_port_t		*mlx_ports;
 	kmutex_t		mlx_quarantine_mtx;
 	list_t			mlx_quarantine;
+	list_t			mlx_quarantine_bufs;
 	list_t			mlx_wqs;
+	list_t			mlx_cqs;
+	mlxcx_event_queue_t	*mlx_eqs;
+	uint_t			mlx_next_eq;
+	int			mlx_intr_count;
+	int			mlx_intr_cq0;
+	mlxcx_pd_t		mlx_pd;
+	mlxcx_tdom_t		mlx_tdom;
+	void			*mlx_bufs_cache;
+	list_t			mlx_buf_shards;
+	struct {
+		uint_t		mldp_tx_nrings_per_group;
+		uint_t		mldp_cq_size_shift;
+		size_t		mldp_rx_p50_loan_min_size;
+	} mlx_props;
 };
 
 #ifdef DEBUG

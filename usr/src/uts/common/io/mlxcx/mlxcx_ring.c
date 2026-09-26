@@ -252,8 +252,10 @@ mlxcx_wq_teardown(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 
 	mutex_enter(&mlcq->mlcq_mtx);
 	mutex_enter(&mlwq->mlwq_mtx);
-	ASSERT3P(mlcq->mlcq_wq, ==, mlwq);
-	mlcq->mlcq_wq = NULL;
+	/* A work queue whose CREATE failed was never linked to its CQ. */
+	if (mlcq->mlcq_wq == mlwq)
+		mlcq->mlcq_wq = NULL;
+	ASSERT3P(mlcq->mlcq_wq, ==, NULL);
 	mutex_exit(&mlwq->mlwq_mtx);
 	mutex_exit(&mlcq->mlcq_mtx);
 
