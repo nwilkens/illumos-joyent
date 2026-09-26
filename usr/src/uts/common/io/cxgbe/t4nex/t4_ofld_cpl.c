@@ -754,7 +754,8 @@ t4_ofld_cpl_fw(t4_ofld_t *of, t4_rdma_queue_t q, uint8_t opcode,
 		return;
 	}
 	case FW6_TYPE_CQE:
-		if (opcode != CPL_FW6_MSG || q != T4_RDMA_Q_CIQ) {
+		/* Asynchronous QP errors come on the connection queue. */
+		if (opcode != CPL_FW6_MSG) {
 			T4_OFLD_STAT(of, os_cpl_wrongq);
 			break;
 		}

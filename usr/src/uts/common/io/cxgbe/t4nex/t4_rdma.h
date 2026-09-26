@@ -72,8 +72,9 @@ typedef struct t4_rdma_event {
 } t4_rdma_event_t;
 
 /*
- * The queue a CPL arrived on.  RX carries connection CPLs and their payload;
- * CIQ carries the firmware's RDMA completion queue messages.
+ * The queue a CPL arrived on.  RX carries connection CPLs and their payload
+ * and the firmware's asynchronous QP errors; CIQ carries RDMA completion
+ * queue notifications.
  */
 typedef enum t4_rdma_queue {
 	T4_RDMA_Q_RX = 1,
