@@ -129,6 +129,7 @@ typedef struct t4_rdma_vres {
 	uint32_t	trv_ofldq_wr_cred;	/* per connection, 16B units */
 	boolean_t	trv_write_w_imm;
 	boolean_t	trv_write_cmpl;
+	boolean_t	trv_memwrite_dsgl;	/* FR_NSMR may take a DSGL */
 } t4_rdma_vres_t;
 
 typedef struct t4_rdma_port {

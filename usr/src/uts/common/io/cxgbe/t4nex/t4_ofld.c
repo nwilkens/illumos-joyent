@@ -259,6 +259,9 @@ t4_ofld_params(struct adapter *sc, t4_ofld_t *of)
 	p[0] = FW_PARAM_DEV(RI_WRITE_CMPL_WR);
 	if (t4_ofld_query(sc, 1, p, v) == 0 && v[0] != 0)
 		vr->trv_write_cmpl = B_TRUE;
+	p[0] = FW_PARAM_DEV(ULPTX_MEMWRITE_DSGL);
+	if (t4_ofld_query(sc, 1, p, v) == 0 && v[0] != 0)
+		vr->trv_memwrite_dsgl = B_TRUE;
 
 	return (0);
 }
