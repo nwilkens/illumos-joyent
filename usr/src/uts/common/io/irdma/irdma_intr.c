@@ -38,6 +38,7 @@
 
 #include <sys/ddi_intr.h>
 #include <sys/disp.h>
+#include <sys/cpuvar.h>
 
 /* Passes a vector makes on its own for entries it finds after the enable. */
 #define	IRDMA_CEQ_RECHECKS	4
@@ -318,7 +319,7 @@ irdma_vec_idle(irdma_vec_t *iv)
 	uint32_t ctl;
 
 	ASSERT(MUTEX_HELD(&iv->iv_lock));
-	while (!iv->iv_exit && !iv->iv_resched &&
+	while (!iv->iv_exit && !iv->iv_resched && iv->iv_cpu == iv->iv_bound &&
 	    (iv->iv_off || !iv->iv_owed)) {
 		ic = iv->iv_ceq;
 		if (iv->iv_off || gethrtime() - iv->iv_last >
@@ -346,6 +347,23 @@ irdma_vec_idle(irdma_vec_t *iv)
 	}
 }
 
+/* Run the calling vector thread on cpu, or anywhere for -1. */
+static void
+irdma_vec_bind(irdma_vec_t *iv, processorid_t cpu)
+{
+	cpu_t *cp;
+
+	mutex_enter(&cpu_lock);
+	if (iv->iv_bound != -1)
+		thread_affinity_clear(curthread);
+	if (cpu != -1 && (cp = cpu_get(cpu)) != NULL && cpu_is_online(cp))
+		thread_affinity_set(curthread, cpu);
+	else
+		cpu = -1;
+	mutex_exit(&cpu_lock);
+	iv->iv_bound = cpu;
+}
+
 /*
  * The vector's context.  Work for CQs that asked to be called again runs
  * even when the vector is off, so their handlers see them go away.
@@ -363,6 +381,15 @@ irdma_vec_thread(void *arg)
 		irdma_vec_idle(iv);
 		if (iv->iv_exit)
 			break;
+		if (iv->iv_cpu != iv->iv_bound) {
+			processorid_t cpu = iv->iv_cpu;
+
+			mutex_exit(&iv->iv_lock);
+			irdma_vec_bind(iv, cpu);
+			mutex_enter(&iv->iv_lock);
+			iv->iv_cpu = iv->iv_bound;
+			continue;
+		}
 		owed = iv->iv_owed && !iv->iv_off;
 		resched = iv->iv_resched;
 		iv->iv_owed = iv->iv_resched = B_FALSE;
@@ -381,6 +408,8 @@ irdma_vec_thread(void *arg)
 		cv_broadcast(&iv->iv_cv);
 	}
 	mutex_exit(&iv->iv_lock);
+	if (iv->iv_bound != -1)
+		irdma_vec_bind(iv, -1);
 	thread_exit();
 }
 
@@ -450,6 +479,7 @@ irdma_vecs_init(irdma_t *irdma)
 		iv->iv_irdma = irdma;
 		iv->iv_idx = i;
 		iv->iv_ctl = i == 0;
+		iv->iv_cpu = iv->iv_bound = -1;
 		(mutex_init)(&iv->iv_lock, NULL, MUTEX_DRIVER,
 		    DDI_INTR_PRI(irdma->irdma_intr.irin_pri));
 		cv_init(&iv->iv_cv, NULL, CV_DRIVER, NULL);

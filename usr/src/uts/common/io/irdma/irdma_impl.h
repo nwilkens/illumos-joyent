@@ -18,6 +18,7 @@
 
 #include <sys/list.h>
 #include <sys/kstat.h>
+#include <sys/lgrp.h>
 #include <sys/ddifm.h>
 #include <sys/fm/protocol.h>
 #include <sys/fm/io/ddi.h>
@@ -131,6 +132,8 @@ typedef struct irdma_vec {
 	uint64_t		iv_rescues;	/* see irdma_vec_idle() */
 	uint64_t		iv_rescues_on;
 	struct irdma_ceq	*iv_ceq;
+	processorid_t		iv_cpu;		/* irdma_numa_place() */
+	processorid_t		iv_bound;	/* the thread's own */
 	kt_did_t		iv_did;
 } irdma_vec_t;
 
@@ -193,6 +196,7 @@ typedef struct irdma_kstats {
 	kstat_named_t	ik_ceq_busy_ns;
 	kstat_named_t	ik_ceq_rescues;
 	kstat_named_t	ik_ceq_rescues_on;
+	kstat_named_t	ik_numa_lgrp;
 	kstat_named_t	ik_ceqn_intrs[IRDMA_MAX_VECTORS];
 } irdma_kstats_t;
 
@@ -219,6 +223,7 @@ typedef struct irdma {
 	irdma_ceq_t		*irdma_ceqs;	/* CEQ 1 and on */
 	uint32_t		irdma_nceqs;
 	uint32_t		irdma_ceqs_alloc;
+	lgrp_id_t		irdma_numa_lgrp;
 
 	struct device		irdma_osdev;
 	struct ib_device	irdma_ibdev;
@@ -385,6 +390,11 @@ extern int irdma_step_ceqs(irdma_t *);
 extern void irdma_unstep_ceqs(irdma_t *);
 extern void irdma_ceq_kick(irdma_ceq_t *);
 extern void irdma_ceq_set_itr(irdma_ceq_t *);
+
+/*
+ * irdma_numa.c
+ */
+extern void irdma_numa_place(irdma_t *);
 
 /*
  * irdma_osdep.c

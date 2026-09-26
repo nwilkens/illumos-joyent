@@ -187,6 +187,7 @@ irdma_kstat_update(kstat_t *ksp, int rw)
 		k->ik_ceq_rescues_on.value.ui64 += iv->iv_rescues_on;
 	}
 	k->ik_comp_vectors.value.ui32 = irdma->irdma_nceqs;
+	k->ik_numa_lgrp.value.i32 = (int32_t)irdma->irdma_numa_lgrp;
 	for (i = 0; i < (int)irdma->irdma_nceqs; i++) {
 		k->ik_ceqn_intrs[i].value.ui64 =
 		    irdma->irdma_ceqs[i].ic_vec->iv_intrs;
@@ -284,6 +285,7 @@ irdma_kstat_init(irdma_t *irdma)
 	kstat_named_init(&k->ik_ceq_rescues, "ceq_rescues", KSTAT_DATA_UINT64);
 	kstat_named_init(&k->ik_ceq_rescues_on, "ceq_rescues_enabled",
 	    KSTAT_DATA_UINT64);
+	kstat_named_init(&k->ik_numa_lgrp, "numa_lgrp", KSTAT_DATA_INT32);
 	for (i = 0; i < irdma->irdma_nceqs; i++) {
 		char name[KSTAT_STRLEN];
 
@@ -415,6 +417,7 @@ irdma_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	irdma->irdma_peer = (ice_rdma_peer_t *)hdr;
 	irdma->irdma_ops = hdr->irp_ops;
 	irdma->irdma_link = LINK_STATE_UNKNOWN;
+	irdma->irdma_numa_lgrp = LGRP_NONE;
 	irdma_locks_init(irdma);
 	irdma->irdma_dbstats = kmem_zalloc(sizeof (irdma_dbstat_t) *
 	    max_ncpus, KM_SLEEP);
@@ -475,6 +478,8 @@ irdma_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	mutex_exit(&irdma->irdma_cfg_lock);
 	if (ret != 0)
 		goto fail;
+
+	irdma_numa_place(irdma);
 
 	if (ddi_create_minor_node(dip, IRDMA_MODULE_NAME, S_IFCHR, instance,
 	    DDI_PSEUDO, 0) != DDI_SUCCESS) {

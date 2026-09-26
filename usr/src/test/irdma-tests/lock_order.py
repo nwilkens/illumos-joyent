@@ -207,6 +207,25 @@ def main():
     itr = body(intr, "irdma_ceq_set_itr")
     assert "us = MIN(us, icq->icq_hold_us);" in itr
 
+    # Vector placement: CPUs are chosen under cpu_lock, interrupts move
+    # with it dropped (set_intr_affinity() takes it), and a vector thread
+    # binds only itself, under cpu_lock and without iv_lock.
+    numa = (IRDMA / "irdma_numa.c").read_text(encoding="utf-8")
+    place = body(numa, "irdma_numa_place")
+    assert place.index("mutex_exit(&cpu_lock);") < \
+        place.index("set_intr_affinity(")
+    for name in ("irdma_numa_read_ns", "irdma_numa_nearest",
+                 "irdma_numa_cpus"):
+        assert "ASSERT(MUTEX_HELD(&cpu_lock));" in body(numa, name), name
+    bind = body(intr, "irdma_vec_bind")
+    assert bind.index("mutex_enter(&cpu_lock);") < \
+        bind.index("thread_affinity_set(curthread, cpu);") < \
+        bind.index("mutex_exit(&cpu_lock);")
+    thr = body(intr, "irdma_vec_thread")
+    call = thr.index("irdma_vec_bind(iv, cpu);")
+    assert thr.rindex("mutex_exit(&iv->iv_lock);", 0, call) > \
+        thr.rindex("mutex_enter(&iv->iv_lock);", 0, call)
+
     # The ice theory statement records the peer locks.
     assert "ir_cfg_lock" in ice and "ir_lock" in ice
     print("PASS: interrupt priority and peer lock ordering")
