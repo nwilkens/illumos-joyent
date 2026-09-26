@@ -1480,12 +1480,13 @@ t4_alloc_iq(struct port_info *pi, const t4_iq_params_t *tip, t4_sge_iq_t *iq,
 	return (0);
 }
 
-void
-t4_free_iq(struct port_info *pi, t4_sge_iq_t *iq)
+int
+t4_free_iq_dev(t4_sge_iq_t *iq)
 {
 	struct adapter *sc = iq->tsi_adapter;
 	struct sge_fl *fl = iq->tsi_fl;
 	t4_sge_eq_t *eq = fl != NULL ? &fl->eq : NULL;
+	int rc = 0;
 
 	/*
 	 * The onus is placed on the caller to ensure that no further activity
@@ -1501,7 +1502,7 @@ t4_free_iq(struct port_info *pi, t4_sge_iq_t *iq)
 		ASSERT(fl == NULL || (eq->tse_flags & EQ_ALLOC_DEV));
 
 		const uint16_t eq_cntxid = fl ? eq->tse_cntxt_id : 0xffff;
-		int rc = -t4_iq_free(sc, sc->mbox, sc->pf, 0,
+		rc = -t4_iq_free(sc, sc->mbox, sc->pf, 0,
 		    FW_IQ_TYPE_FL_INT_CAP, iq->tsi_cntxt_id, eq_cntxid, 0xffff);
 		if (rc != 0) {
 			cxgb_printf(sc->dip, CE_WARN,
@@ -1521,6 +1522,16 @@ t4_free_iq(struct port_info *pi, t4_sge_iq_t *iq)
 			eq->tse_flags &= ~EQ_ALLOC_DEV;
 		}
 	}
+	return (rc);
+}
+
+void
+t4_free_iq(struct port_info *pi, t4_sge_iq_t *iq)
+{
+	struct sge_fl *fl = iq->tsi_fl;
+	t4_sge_eq_t *eq = fl != NULL ? &fl->eq : NULL;
+
+	(void) t4_free_iq_dev(iq);
 	if (iq->tsi_flags & IQ_ALLOC_HOST) {
 		(void) free_desc_ring(&iq->tsi_desc_dhdl, &iq->tsi_desc_ahdl);
 		iq->tsi_desc = NULL;
@@ -1831,10 +1842,10 @@ t4_eq_alloc_eth(struct port_info *pi, t4_sge_eq_t *eq)
 	return (0);
 }
 
-void
-t4_free_eq(struct port_info *pi, t4_sge_eq_t *eq)
+int
+t4_free_eq_dev(struct adapter *sc, t4_sge_eq_t *eq)
 {
-	struct adapter *sc = pi->adapter;
+	int rc = 0;
 
 	if ((eq->tse_flags & EQ_ALLOC_DEV) != 0 && eq->tse_type != TEQT_FL) {
 		t4_sge_eq_t **slot = t4_eqmap_slot(sc, eq->tse_cntxt_id);
@@ -1843,8 +1854,6 @@ t4_free_eq(struct port_info *pi, t4_sge_eq_t *eq)
 	}
 
 	if (eq->tse_flags & EQ_ALLOC_DEV) {
-		int rc;
-
 		switch (eq->tse_type) {
 		case TEQT_CTRL:
 			rc = -t4_ctrl_eq_free(sc, sc->mbox, sc->pf, 0,
@@ -1869,7 +1878,13 @@ t4_free_eq(struct port_info *pi, t4_sge_eq_t *eq)
 		}
 		eq->tse_flags &= ~EQ_ALLOC_DEV;
 	}
+	return (rc);
+}
 
+void
+t4_free_eq(struct port_info *pi, t4_sge_eq_t *eq)
+{
+	(void) t4_free_eq_dev(pi->adapter, eq);
 	if (eq->tse_flags & EQ_ALLOC_HOST) {
 		(void) free_desc_ring(&eq->tse_ring_dhdl, &eq->tse_ring_ahdl);
 		eq->tse_ring = NULL;

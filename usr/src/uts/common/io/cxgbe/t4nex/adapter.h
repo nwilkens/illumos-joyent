@@ -954,9 +954,11 @@ typedef struct t4_iq_params {
 int t4_alloc_iq(struct port_info *, const t4_iq_params_t *, t4_sge_iq_t *,
     struct sge_fl *);
 void t4_free_iq(struct port_info *, t4_sge_iq_t *);
+int t4_free_iq_dev(t4_sge_iq_t *);
 int t4_alloc_eq_base(struct port_info *, t4_sge_eq_t *);
 void t4_alloc_eq_post(struct port_info *, t4_sge_eq_t *);
 void t4_free_eq(struct port_info *, t4_sge_eq_t *);
+int t4_free_eq_dev(struct adapter *, t4_sge_eq_t *);
 void t4_eq_ring_db(struct adapter *, t4_sge_eq_t *);
 t4_sge_eq_t **t4_eqmap_ent(struct adapter *, uint_t);
 bool t4_iq_next_rsp(const t4_sge_iq_t *, struct rsp_ctrl *);

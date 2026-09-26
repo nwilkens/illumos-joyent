@@ -216,14 +216,13 @@ t4_ofld_iqs_init(t4_ofld_t *of)
 	return (0);
 }
 
+/* Keep the starving list from reaching a free list about to go. */
 static void
-t4_ofld_iqs_fini(t4_ofld_t *of)
+t4_ofld_fl_doom(t4_ofld_t *of)
 {
-	struct port_info *pi = of->of_port[0].op_pi;
 	struct adapter *sc = of->of_sc;
 	struct sge_fl *fl = &of->of_rxq.fl;
 
-	/* Keep the starving list from reaching a free list about to go. */
 	if ((fl->eq.tse_flags & EQ_ALLOC_HOST) != 0) {
 		mutex_enter(&sc->sfl_lock);
 		FL_LOCK(fl);
@@ -235,11 +234,47 @@ t4_ofld_iqs_fini(t4_ofld_t *of)
 		FL_UNLOCK(fl);
 		mutex_exit(&sc->sfl_lock);
 	}
+}
+
+static void
+t4_ofld_iqs_fini(t4_ofld_t *of)
+{
+	struct port_info *pi = of->of_port[0].op_pi;
+
 	if ((of->of_ciq.tsi_flags & IQ_ALLOC_HOST) != 0)
 		t4_free_iq(pi, &of->of_ciq);
 	if ((of->of_rxq.iq.tsi_flags & IQ_ALLOC_HOST) != 0)
 		t4_free_iq(pi, &of->of_rxq.iq);
 	bzero(&of->of_rxq, sizeof (of->of_rxq));
+}
+
+/*
+ * Free the queues in the firmware first.  If the firmware keeps any of them,
+ * the chip can still write to the host memory of all of them, so that memory
+ * is leaked on purpose.
+ */
+static boolean_t
+t4_ofld_queues_free_dev(t4_ofld_t *of)
+{
+	boolean_t ok = B_TRUE;
+
+	for (uint_t i = 0; i < of->of_nports; i++) {
+		t4_ofld_port_t *op = &of->of_port[i];
+
+		if (t4_free_eq_dev(of->of_sc, &op->op_ctrlq) != 0)
+			ok = B_FALSE;
+		if (t4_free_eq_dev(of->of_sc, &op->op_txq) != 0)
+			ok = B_FALSE;
+	}
+	if (t4_free_iq_dev(&of->of_ciq) != 0)
+		ok = B_FALSE;
+	if (t4_free_iq_dev(&of->of_rxq.iq) != 0)
+		ok = B_FALSE;
+	if (!ok) {
+		cxgb_printf(of->of_sc->dip, CE_WARN, "offload queues not "
+		    "freed by the firmware; their host memory is leaked");
+	}
+	return (ok);
 }
 
 int
@@ -272,6 +307,9 @@ t4_ofld_queues_fini(t4_ofld_t *of)
 
 	t4_ofld_iq_disable(&of->of_rxq.iq);
 	t4_ofld_iq_disable(&of->of_ciq);
+	t4_ofld_fl_doom(of);
+	if (!t4_ofld_queues_free_dev(of))
+		return;
 	for (uint_t i = 0; i < of->of_nports; i++) {
 		t4_ofld_port_t *op = &of->of_port[i];
 
