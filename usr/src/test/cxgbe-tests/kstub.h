@@ -59,10 +59,10 @@ typedef struct kthread kthread_t;
 } while (0)
 #define	ASSERT(x)		CHECK(x)
 #define	VERIFY(x)		CHECK(x)
-#define	ASSERT3U(a, op, b)	CHECK((a) op (b))
-#define	VERIFY3U(a, op, b)	CHECK((a) op (b))
-#define	ASSERT3P(a, op, b)	CHECK((a) op (b))
-#define	VERIFY3P(a, op, b)	CHECK((a) op (b))
+#define	ASSERT3U(a, op, b)	CHECK(a op b)
+#define	VERIFY3U(a, op, b)	CHECK(a op b)
+#define	ASSERT3P(a, op, b)	CHECK(a op b)
+#define	VERIFY3P(a, op, b)	CHECK(a op b)
 
 static int stub_in_intr;
 static int stub_nosleep_fail;

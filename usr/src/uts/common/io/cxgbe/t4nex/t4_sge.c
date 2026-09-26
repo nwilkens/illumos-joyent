@@ -3675,7 +3675,8 @@ t4_handle_fw_msg(t4_sge_iq_t *iq, const struct rss_header *rss)
 	case FW_TYPE_RSSCPL:	/* also synonym for FW6_TYPE_RSSCPL */
 		rss2 = (const struct rss_header *)&cpl->data[0];
 		/* One level only: each level moves 16 bytes into the entry. */
-		if (rss2->opcode == CPL_FW4_MSG || rss2->opcode == CPL_FW6_MSG) {
+		if (rss2->opcode == CPL_FW4_MSG ||
+		    rss2->opcode == CPL_FW6_MSG) {
 			iq->tsi_stats.sis_bad_cpl++;
 			return (0);
 		}

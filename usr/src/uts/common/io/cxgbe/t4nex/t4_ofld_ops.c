@@ -270,7 +270,7 @@ t4_ofld_stid_free(t4_ofld_t *of, uint32_t stid)
 		if ((e->te_flags & TEF_LISTEN) == 0) {
 			t4_tid_free_locked(of, T4_TID_STID, stid);
 		} else {
-			/* The server is live; the reply to its close frees it. */
+			/* Its close reply frees a live server. */
 			e->te_state = TTS_ORPHAN;
 			if ((e->te_flags & TEF_UNLISTEN) == 0 &&
 			    t4_ofld_send_unlisten(of, e->te_port, stid,

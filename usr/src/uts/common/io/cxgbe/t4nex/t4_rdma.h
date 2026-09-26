@@ -121,7 +121,7 @@ typedef struct t4_rdma_vres {
 	t4_rdma_range_t	trv_srq;	/* entries */
 	uint32_t	trv_max_ordird_qp;
 	uint32_t	trv_max_ird_adapter;
-	uint32_t	trv_ofldq_wr_cred;	/* per connection, 16 byte units */
+	uint32_t	trv_ofldq_wr_cred;	/* per connection, 16B units */
 	boolean_t	trv_write_w_imm;
 	boolean_t	trv_write_cmpl;
 } t4_rdma_vres_t;
@@ -145,8 +145,8 @@ typedef struct t4_rdma_info {
 	t4_rdma_port_t		tri_port[T4_RDMA_MAX_PORTS];
 	t4_rdma_vres_t		tri_vres;
 	uint16_t		tri_mtus[T4_RDMA_NMTUS];
-	uint16_t		tri_rxq_id;	/* absolute ID, connection queue */
-	uint16_t		tri_ciq_id;	/* absolute ID, CQ event queue */
+	uint16_t		tri_rxq_id;	/* abs ID, connection queue */
+	uint16_t		tri_ciq_id;	/* abs ID, CQ event queue */
 	uint16_t		tri_ciq_cntxt;	/* context ID, CQ event queue */
 	/* BAR2 user doorbell region, for the queues the child creates. */
 	caddr_t			tri_bar2;

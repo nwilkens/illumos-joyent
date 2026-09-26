@@ -328,7 +328,8 @@ t4_ot_handle(t4_ot_t *ot, const t4_ot_msg_t *om, mblk_t *mp)
 		break;
 	}
 	case CPL_CLOSE_LISTSRV_RPL: {
-		const struct cpl_close_listsvr_rpl *r = (const void *)mp->b_rptr;
+		const struct cpl_close_listsvr_rpl *r =
+		    (const void *)mp->b_rptr;
 
 		if (ot->ot_want_op == om->om_opcode &&
 		    ot->ot_want_id == om->om_ltid) {

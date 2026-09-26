@@ -20,8 +20,8 @@
 _Static_assert(offsetof(t4_ofld_test_t, tot_conn) == 72, "conn offset");
 _Static_assert(sizeof (t4_ofld_test_conn_t) == 32, "conn size");
 _Static_assert(offsetof(t4_ofld_test_conn_t, totc_rx_bytes) == 16, "rx");
-_Static_assert(sizeof (t4_ofld_test_t) == 72 + 32 * T4_OFLD_TEST_NCONN,
-    "size");
+#define	TOT_SIZE	(72 + 32 * T4_OFLD_TEST_NCONN)
+_Static_assert(sizeof (t4_ofld_test_t) == TOT_SIZE, "size");
 
 int
 main(void)

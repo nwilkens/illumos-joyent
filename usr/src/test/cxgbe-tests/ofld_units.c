@@ -65,7 +65,8 @@ test_waiters(void)
 
 	for (uint_t i = 0; i < T4_OFLD_NWAITERS; i++) {
 		CHECK(t4_ofld_waiter_get(of, &c[i]) == 0);
-		CHECK((c[i] & T4_OFLD_COOKIE_PARENT) != 0 && (c[i] & 0xff) == i);
+		CHECK((c[i] & T4_OFLD_COOKIE_PARENT) != 0);
+		CHECK((c[i] & 0xff) == i);
 	}
 	CHECK(t4_ofld_waiter_get(of, &extra) == EAGAIN);
 
