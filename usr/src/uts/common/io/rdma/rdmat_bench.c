@@ -550,7 +550,9 @@ rdmat_one_lat(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
  * The cost of memory registration, per cycle.  RDMAT_OP_MR_ALLOC allocates
  * and frees an MR for rr_size bytes, which takes two control commands.
  * RDMAT_OP_FRWR binds one MR over the first rr_size bytes of the buffer
- * with REG_MR and unbinds it with LOCAL_INV, on the send queue.
+ * with REG_MR and unbinds it with LOCAL_INV, on the send queue.  A run
+ * that fails with a request posted but not complete leaves the MR in
+ * tq_bmr, for teardown to free after the QP.
  */
 int
 rdmat_mr_cost(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
@@ -563,10 +565,12 @@ rdmat_mr_cost(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
 	struct rdk_reg_wr reg;
 	struct rdk_send_wr inv;
 	struct rdk_mr *mr = NULL, *m;
-	uint64_t *lat, n, i, sum = 0, off;
+	uint64_t *lat, n, i, sum = 0, off, posted = 0;
 	hrtime_t t0;
-	int ret = 0;
+	int ret = 0, r;
 
+	if (tq->tq_bmr != NULL)
+		return (EBUSY);
 	lat = rdmat_lat_alloc(rr, &n);
 	if (frwr) {
 		if ((ret = rdk_alloc_mr(ts->ts_pd, RDK_MR_TYPE_MEM_REG, pages,
@@ -581,6 +585,14 @@ rdmat_mr_cost(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
 	}
 	for (i = 0; i < rr->rr_count; i++) {
 		t0 = gethrtime();
+		if (ts->ts_dying) {
+			ret = ENXIO;
+			break;
+		}
+		if (t0 >= deadline) {
+			ret = ETIMEDOUT;
+			break;
+		}
 		if (!frwr) {
 			if ((ret = rdk_alloc_mr(ts->ts_pd, RDK_MR_TYPE_MEM_REG,
 			    pages, &m)) != 0 || (ret = rdk_dereg_mr(m)) != 0)
@@ -607,10 +619,15 @@ rdmat_mr_cost(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
 			inv.send_flags = RDK_SEND_SIGNALED;
 			inv.ex.invalidate_rkey = mr->rkey;
 			if ((ret = rdk_post_send(tq->tq_qp, &reg.wr,
-			    NULL)) != 0 || (ret = rdmat_wait(tq,
-			    &tq->tq_reg_done, 2 * i + 1, deadline)) != 0 ||
-			    (ret = rdk_post_send(tq->tq_qp, &inv, NULL)) != 0 ||
-			    (ret = rdmat_wait(tq, &tq->tq_reg_done, 2 * i + 2,
+			    NULL)) != 0)
+				break;
+			posted++;
+			if ((ret = rdmat_wait(tq, &tq->tq_reg_done, posted,
+			    deadline)) != 0 ||
+			    (ret = rdk_post_send(tq->tq_qp, &inv, NULL)) != 0)
+				break;
+			posted++;
+			if ((ret = rdmat_wait(tq, &tq->tq_reg_done, posted,
 			    deadline)) != 0)
 				break;
 		}
@@ -621,9 +638,18 @@ rdmat_mr_cost(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
 	}
 	if (ret == 0)
 		rdmat_lat_stats(rr, lat, n, sum);
+	tq->tq_posted = tq->tq_post_calls = posted;
+	mutex_enter(&tq->tq_lock);
+	tq->tq_last_ns = gethrtime();
+	mutex_exit(&tq->tq_lock);
 out:
-	if (mr != NULL)
-		(void) rdk_dereg_mr(mr);
+	if (mr != NULL && ret != 0 &&
+	    rdmat_count(tq, &tq->tq_reg_done) < posted) {
+		tq->tq_bmr = mr;
+		mr = NULL;
+	}
+	if (mr != NULL && (r = rdk_dereg_mr(mr)) != 0 && ret == 0)
+		ret = r;
 	if (ck != NULL)
 		kmem_free(ck, sizeof (*ck) * nc);
 	rdmat_lat_free(lat, n);

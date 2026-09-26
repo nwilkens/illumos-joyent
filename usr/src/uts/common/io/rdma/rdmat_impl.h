@@ -72,6 +72,7 @@ typedef struct rdmat_qp {
 	ddi_dma_cookie_t	*tq_cookies;
 	struct rdk_mr		*tq_lmr;	/* local write */
 	struct rdk_mr		*tq_rmr;	/* what the peer may reach */
+	struct rdk_mr		*tq_bmr;	/* see rdmat_mr_cost() */
 	boolean_t		tq_lmr_bound;
 	boolean_t		tq_rmr_bound;
 	uint32_t		tq_rkey_next;	/* rkey of the next REG */

@@ -889,6 +889,10 @@ rdmat_teardown(rdmat_sess_t *ts, boolean_t removing)
 			(void) rdk_dereg_mr(tq->tq_rmr);
 			tq->tq_rmr = NULL;
 		}
+		if (tq->tq_bmr != NULL) {
+			(void) rdk_dereg_mr(tq->tq_bmr);
+			tq->tq_bmr = NULL;
+		}
 		if (tq->tq_scq != NULL) {
 			rdk_free_cq(tq->tq_scq);
 			tq->tq_scq = NULL;
