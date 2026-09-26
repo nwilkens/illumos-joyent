@@ -92,6 +92,7 @@ t4_ofld_init_tp_wr(void *wr, size_t len, uint32_t tid)
 {
 	struct work_request_hdr *w = wr;
 
+	ASSERT3U(len - sizeof (*w), <=, M_FW_WR_IMMDLEN);
 	w->wr_hi = BE_32(V_FW_WR_OP(FW_TP_WR) |
 	    V_FW_WR_IMMDLEN(len - sizeof (*w)));
 	w->wr_mid = BE_32(V_FW_WR_LEN16(howmany(len, 16)) |

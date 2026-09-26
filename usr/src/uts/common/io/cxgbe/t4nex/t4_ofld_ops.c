@@ -591,6 +591,8 @@ t4_ofld_rx_credits(t4_ofld_t *of, uint32_t tid, uint32_t credits)
 	return (rc);
 }
 
+CTASSERT(T4_OFLD_TX_IMM_MAX <= M_FW_WR_IMMDLEN);
+
 int
 t4_ofld_tx_data(t4_ofld_t *of, uint32_t tid, const void *buf, size_t len)
 {

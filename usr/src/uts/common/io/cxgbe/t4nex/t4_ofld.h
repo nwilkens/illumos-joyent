@@ -76,8 +76,8 @@ extern "C" {
 #define	T4_OFLD_NWAITERS	16
 #define	T4_OFLD_WR_TIMEOUT_US	(2 * MICROSEC)
 
-/* The largest immediate payload of one FW_OFLD_TX_DATA_WR. */
-#define	T4_OFLD_TX_IMM_MAX	256
+/* The largest immediate payload of one FW_OFLD_TX_DATA_WR (IMMDLEN). */
+#define	T4_OFLD_TX_IMM_MAX	255
 
 /* Child DMA memory bounds. */
 #define	T4_OFLD_DMA_MAX_ALIGN	(2 * 1024 * 1024)
