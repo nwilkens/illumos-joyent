@@ -19,7 +19,6 @@
  */
 
 #include <sys/varargs.h>
-#include <sys/rwlock.h>
 #include <sys/cpuvar.h>
 
 #include "irdma_impl.h"
@@ -331,8 +330,13 @@ irdma_unmap_vm_page_list(struct irdma_hw *hw, dma_addr_t *pg_dma, u32 pg_cnt)
 
 /*
  * Registers.  The core code keeps plain addresses into BAR0, so readl() and
- * writel() find the access handle of the mapping that holds the address.  An
- * address outside every mapping is refused.
+ * writel() find the mapping of the RDMA function that holds the address,
+ * and with it the access handle; an address outside every mapping is
+ * refused.  A function's slot is filled at attach before its first register
+ * access and emptied at detach after its control plane is stopped, so the
+ * handle a lookup finds stays valid while the function uses it.  Lookups
+ * take no lock: slots change only between two increments of irdma_regs_gen,
+ * and a lookup that sees it odd or changed looks again.
  */
 #define	IRDMA_REGS_MAX		16
 
@@ -345,19 +349,29 @@ typedef struct irdma_regmap {
 	irdma_dbstat_t		*irm_stats;
 } irdma_regmap_t;
 
-static krwlock_t irdma_regs_lock;
+static kmutex_t irdma_regs_lock;	/* writers */
+static volatile uint64_t irdma_regs_gen;
 static irdma_regmap_t irdma_regs[IRDMA_REGS_MAX];
 
 void
 irdma_osdep_regs_init(void)
 {
-	rw_init(&irdma_regs_lock, NULL, RW_DRIVER, NULL);
+	mutex_init(&irdma_regs_lock, NULL, MUTEX_DRIVER, NULL);
 }
 
 void
 irdma_osdep_regs_fini(void)
 {
-	rw_destroy(&irdma_regs_lock);
+	mutex_destroy(&irdma_regs_lock);
+}
+
+static void
+irdma_regs_change(void)
+{
+	ASSERT(MUTEX_HELD(&irdma_regs_lock));
+	membar_producer();
+	irdma_regs_gen++;
+	membar_producer();
 }
 
 boolean_t
@@ -365,16 +379,18 @@ irdma_osdep_regs_add(caddr_t base, size_t len, ddi_acc_handle_t h)
 {
 	uint_t i;
 
-	rw_enter(&irdma_regs_lock, RW_WRITER);
+	mutex_enter(&irdma_regs_lock);
 	for (i = 0; i < IRDMA_REGS_MAX; i++) {
 		if (irdma_regs[i].irm_base == NULL) {
+			irdma_regs_change();
 			irdma_regs[i].irm_base = base;
 			irdma_regs[i].irm_len = len;
 			irdma_regs[i].irm_handle = h;
+			irdma_regs_change();
 			break;
 		}
 	}
-	rw_exit(&irdma_regs_lock);
+	mutex_exit(&irdma_regs_lock);
 	return (i < IRDMA_REGS_MAX);
 }
 
@@ -385,15 +401,17 @@ irdma_osdep_regs_dbs(caddr_t base, caddr_t sqdb, caddr_t cqarm,
 {
 	uint_t i;
 
-	rw_enter(&irdma_regs_lock, RW_WRITER);
+	mutex_enter(&irdma_regs_lock);
 	for (i = 0; i < IRDMA_REGS_MAX; i++) {
 		if (irdma_regs[i].irm_base == base) {
+			irdma_regs_change();
 			irdma_regs[i].irm_sqdb = sqdb;
 			irdma_regs[i].irm_cqarm = cqarm;
 			irdma_regs[i].irm_stats = stats;
+			irdma_regs_change();
 		}
 	}
-	rw_exit(&irdma_regs_lock);
+	mutex_exit(&irdma_regs_lock);
 }
 
 void
@@ -401,31 +419,45 @@ irdma_osdep_regs_remove(caddr_t base)
 {
 	uint_t i;
 
-	rw_enter(&irdma_regs_lock, RW_WRITER);
+	mutex_enter(&irdma_regs_lock);
 	for (i = 0; i < IRDMA_REGS_MAX; i++) {
-		if (irdma_regs[i].irm_base == base)
+		if (irdma_regs[i].irm_base == base) {
+			irdma_regs_change();
 			bzero(&irdma_regs[i], sizeof (irdma_regs[i]));
+			irdma_regs_change();
+		}
 	}
-	rw_exit(&irdma_regs_lock);
+	mutex_exit(&irdma_regs_lock);
 }
 
-/* The caller holds irdma_regs_lock. */
-static irdma_regmap_t *
-irdma_regs_find(const volatile void *addr)
+/* Copy the slot that maps addr into rm. */
+static boolean_t
+irdma_regs_find(const volatile void *addr, irdma_regmap_t *rm)
 {
-	uintptr_t a = (uintptr_t)addr;
+	uintptr_t a = (uintptr_t)addr, base;
+	boolean_t found;
+	uint64_t gen;
 	uint_t i;
 
 	if ((a & 3) != 0)
-		return (NULL);
-	for (i = 0; i < IRDMA_REGS_MAX; i++) {
-		uintptr_t base = (uintptr_t)irdma_regs[i].irm_base;
-
-		if (base != 0 && a >= base &&
-		    a - base <= irdma_regs[i].irm_len - sizeof (uint32_t))
-			return (&irdma_regs[i]);
-	}
-	return (NULL);
+		return (B_FALSE);
+	do {
+		while (((gen = irdma_regs_gen) & 1) != 0)
+			;
+		membar_consumer();
+		found = B_FALSE;
+		for (i = 0; i < IRDMA_REGS_MAX; i++) {
+			base = (uintptr_t)irdma_regs[i].irm_base;
+			if (base != 0 && a >= base && a - base <=
+			    irdma_regs[i].irm_len - sizeof (uint32_t)) {
+				*rm = irdma_regs[i];
+				found = B_TRUE;
+				break;
+			}
+		}
+		membar_consumer();
+	} while (gen != irdma_regs_gen);
+	return (found);
 }
 
 static void
@@ -448,33 +480,28 @@ irdma_regs_count(const irdma_regmap_t *rm, const volatile void *addr)
 u32
 readl(const volatile void *addr)
 {
-	irdma_regmap_t *rm;
-	u32 v = UINT32_MAX;
+	irdma_regmap_t rm;
 
-	rw_enter(&irdma_regs_lock, RW_READER);
-	if ((rm = irdma_regs_find(addr)) != NULL)
-		v = ddi_get32(rm->irm_handle, (uint32_t *)(uintptr_t)addr);
-	rw_exit(&irdma_regs_lock);
-	if (rm == NULL)
+	if (!irdma_regs_find(addr, &rm)) {
 		cmn_err(CE_WARN, "!irdma: read of an unmapped address %p",
 		    (void *)addr);
-	return (v);
+		return (UINT32_MAX);
+	}
+	return (ddi_get32(rm.irm_handle, (uint32_t *)(uintptr_t)addr));
 }
 
 void
 writel(u32 v, volatile void *addr)
 {
-	irdma_regmap_t *rm;
+	irdma_regmap_t rm;
 
-	rw_enter(&irdma_regs_lock, RW_READER);
-	if ((rm = irdma_regs_find(addr)) != NULL) {
-		ddi_put32(rm->irm_handle, (uint32_t *)(uintptr_t)addr, v);
-		irdma_regs_count(rm, addr);
-	}
-	rw_exit(&irdma_regs_lock);
-	if (rm == NULL)
+	if (!irdma_regs_find(addr, &rm)) {
 		cmn_err(CE_WARN, "!irdma: write of an unmapped address %p",
 		    (void *)addr);
+		return;
+	}
+	ddi_put32(rm.irm_handle, (uint32_t *)(uintptr_t)addr, v);
+	irdma_regs_count(&rm, addr);
 }
 
 void
