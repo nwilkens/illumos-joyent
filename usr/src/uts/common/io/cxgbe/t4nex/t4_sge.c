@@ -175,11 +175,19 @@ t4_rss_payload(const struct rss_header *rss)
 	return ((void *)(&rss[1]));
 }
 
+/*
+ * The map slot for a queue context ID, or NULL if the ID is outside the range
+ * the firmware gave this PF.  The IDs come from the device and are not
+ * trusted.
+ */
 static inline t4_sge_iq_t **
 t4_iqmap_slot(struct adapter *sc, uint_t cntxt_id)
 {
 	const uint_t idx = cntxt_id - sc->sge.iqmap_start;
-	VERIFY3U(idx, <, sc->sge.iqmap_sz);
+
+	if (cntxt_id < sc->sge.iqmap_start || idx >= sc->sge.iqmap_sz ||
+	    sc->sge.iqmap == NULL)
+		return (NULL);
 	return (&sc->sge.iqmap[idx]);
 }
 
@@ -187,7 +195,10 @@ static inline t4_sge_eq_t **
 t4_eqmap_slot(struct adapter *sc, uint_t cntxt_id)
 {
 	const uint_t idx = cntxt_id - sc->sge.eqmap_start;
-	VERIFY3U(idx, <, sc->sge.eqmap_sz);
+
+	if (cntxt_id < sc->sge.eqmap_start || idx >= sc->sge.eqmap_sz ||
+	    sc->sge.eqmap == NULL)
+		return (NULL);
 	return (&sc->sge.eqmap[idx]);
 }
 
@@ -801,12 +812,16 @@ t4_process_event_iq(t4_sge_iq_t *event_iq)
 			totals.sit_intr++;
 			const uint32_t tgt_qid = BE_32(ctrl.pldbuflen_qid);
 
-			t4_sge_iq_t *tgt_iq = *t4_iqmap_slot(sc, tgt_qid);
-			/*
-			 * Make sure the forwarded interrupt was sent to the
-			 * expected event queue.
-			 */
-			ASSERT3P(tgt_iq->tsi_intr_evtq, ==, event_iq);
+			t4_sge_iq_t **slot = t4_iqmap_slot(sc, tgt_qid);
+			t4_sge_iq_t *tgt_iq = slot != NULL ? *slot : NULL;
+
+			/* Only an Rx queue forwarding to this queue counts. */
+			if (tgt_iq == NULL ||
+			    tgt_iq->tsi_iqtype != TIQT_ETH_RX ||
+			    tgt_iq->tsi_intr_evtq != event_iq) {
+				event_iq->tsi_stats.sis_bad_fwd++;
+				break;
+			}
 
 			if (!list_link_active(&tgt_iq->tsi_intr_fwd_node)) {
 				list_insert_tail(&iql_fwd, tgt_iq);
@@ -1340,6 +1355,7 @@ t4_alloc_iq(struct port_info *pi, const t4_iq_params_t *tip, t4_sge_iq_t *iq,
 
 		fl->bufs_cap = tip->tip_fl_qsize;
 		eq->tse_flags = 0;
+		eq->tse_type = TEQT_FL;
 		eq->tse_qsize = EQ_FLITS_TO_HC(fl->bufs_cap);
 
 		if ((rc = t4_alloc_eq_base(pi, eq)) != 0) {
@@ -1397,22 +1413,33 @@ t4_alloc_iq(struct port_info *pi, const t4_iq_params_t *tip, t4_sge_iq_t *iq,
 	iq->tsi_cntxt_id = BE_16(iq_cmd.iqid);
 	iq->tsi_abs_id = BE_16(iq_cmd.physiqid);
 	iq->tsi_flags |= IQ_ALLOC_DEV;
+	if (fl != NULL) {
+		fl->eq.tse_cntxt_id = BE_16(iq_cmd.fl0id);
+		fl->eq.tse_flags |= EQ_ALLOC_DEV;
+	}
 
 	iq->tsi_cdesc = iq->tsi_desc;
 	iq->tsi_cidx = 0;
 	iq->tsi_gen = F_RSPD_GEN;
 	iq->tsi_adapter = sc;
 
-	*t4_iqmap_slot(sc, iq->tsi_cntxt_id) = iq;
+	t4_sge_iq_t **iqslot = t4_iqmap_slot(sc, iq->tsi_cntxt_id);
+	t4_sge_eq_t **flslot = fl != NULL ?
+	    t4_eqmap_slot(sc, fl->eq.tse_cntxt_id) : NULL;
+	if (iqslot == NULL || (fl != NULL && flslot == NULL)) {
+		cxgb_printf(sc->dip, CE_WARN, "firmware returned an ingress "
+		    "queue ID outside this PF's range: %u/%u", iq->tsi_cntxt_id,
+		    fl != NULL ? fl->eq.tse_cntxt_id : 0);
+		t4_free_iq(pi, iq);
+		return (EIO);
+	}
+	*iqslot = iq;
 
 	if (fl != NULL) {
 		t4_sge_eq_t *eq = &fl->eq;
 
-		eq->tse_cntxt_id = BE_16(iq_cmd.fl0id);
-
 		CTASSERT(offsetof(struct sge_fl, eq) == 0);
-		*t4_eqmap_slot(sc, eq->tse_cntxt_id) = (t4_sge_eq_t *)fl;
-		eq->tse_flags |= EQ_ALLOC_DEV;
+		*flslot = (t4_sge_eq_t *)fl;
 		eq->tse_pidx = eq->tse_cidx = 0;
 		t4_alloc_eq_post(pi, eq);
 		fl->copy_threshold = rx_copy_threshold;
@@ -1488,8 +1515,15 @@ t4_free_iq(struct port_info *pi, t4_sge_iq_t *iq)
 			    iq->tsi_cntxt_id, eq_cntxid, rc);
 			/* attempt to complete the rest of clean-up */
 		}
+		t4_sge_iq_t **iqslot = t4_iqmap_slot(sc, iq->tsi_cntxt_id);
+		if (iqslot != NULL && *iqslot == iq)
+			*iqslot = NULL;
 		iq->tsi_flags &= ~IQ_ALLOC_DEV;
 		if (fl != NULL) {
+			t4_sge_eq_t **flslot = t4_eqmap_slot(sc,
+			    eq->tse_cntxt_id);
+			if (flslot != NULL && *flslot == eq)
+				*flslot = NULL;
 			eq->tse_flags &= ~EQ_ALLOC_DEV;
 		}
 	}
@@ -1719,6 +1753,7 @@ t4_eq_alloc_eth(struct port_info *pi, t4_sge_eq_t *eq)
 	struct adapter *sc = pi->adapter;
 	int rc;
 
+	eq->tse_type = TEQT_ETH;
 	if ((rc = t4_alloc_eq_base(pi, eq)) != 0) {
 		return (rc);
 	}
@@ -1788,8 +1823,14 @@ t4_eq_alloc_eth(struct port_info *pi, t4_sge_eq_t *eq)
 		return (rc);
 	}
 	eq->tse_cntxt_id = G_FW_EQ_ETH_CMD_EQID(BE_32(c.eqid_pkd));
-	*t4_eqmap_slot(sc, eq->tse_cntxt_id) = eq;
 	eq->tse_flags |= EQ_ALLOC_DEV;
+	t4_sge_eq_t **slot = t4_eqmap_slot(sc, eq->tse_cntxt_id);
+	if (slot == NULL) {
+		cxgb_printf(pi->dip, CE_WARN, "firmware returned an egress "
+		    "queue ID outside this PF's range: %u", eq->tse_cntxt_id);
+		return (EIO);
+	}
+	*slot = eq;
 
 	t4_alloc_eq_post(pi, eq);
 
@@ -1800,6 +1841,12 @@ static void
 t4_free_eq(struct port_info *pi, t4_sge_eq_t *eq)
 {
 	struct adapter *sc = pi->adapter;
+
+	if ((eq->tse_flags & EQ_ALLOC_DEV) != 0 && eq->tse_type != TEQT_FL) {
+		t4_sge_eq_t **slot = t4_eqmap_slot(sc, eq->tse_cntxt_id);
+		if (slot != NULL && *slot == eq)
+			*slot = NULL;
+	}
 
 	if (eq->tse_flags & EQ_ALLOC_DEV) {
 		int rc = -t4_eth_eq_free(sc, sc->mbox, sc->pf, 0,
@@ -3568,6 +3615,11 @@ t4_handle_fw_msg(t4_sge_iq_t *iq, const struct rss_header *rss)
 	switch (msg_type) {
 	case FW_TYPE_RSSCPL:	/* also synonym for FW6_TYPE_RSSCPL */
 		rss2 = (const struct rss_header *)&cpl->data[0];
+		/* One level only: each level moves 16 bytes into the entry. */
+		if (rss2->opcode == CPL_FW4_MSG || rss2->opcode == CPL_FW6_MSG) {
+			iq->tsi_stats.sis_bad_cpl++;
+			return (0);
+		}
 		return (t4_handle_cpl_msg(iq, rss2, NULL));
 	case FW6_TYPE_CMD_RPL:
 		return (t4_handle_fw_rpl(sc, &cpl->data[0]));
@@ -3604,8 +3656,15 @@ t4_sge_egr_update(t4_sge_iq_t *iq, const struct rss_header *rss)
 	struct adapter *sc = iq->tsi_adapter;
 	const struct cpl_sge_egr_update *cpl = t4_rss_payload(rss);
 	const uint_t qid = G_EGR_QID(BE_32(cpl->opcode_qid));
-	struct sge_txq *txq = (struct sge_txq *)(*t4_eqmap_slot(sc, qid));
-	t4_sge_eq_t *eq = &txq->eq;
+	t4_sge_eq_t **slot = t4_eqmap_slot(sc, qid);
+	t4_sge_eq_t *eq = slot != NULL ? *slot : NULL;
+
+	/* Only Ethernet Tx queues ask for these updates. */
+	if (eq == NULL || eq->tse_type != TEQT_ETH) {
+		iq->tsi_stats.sis_bad_egr++;
+		return;
+	}
+	struct sge_txq *txq = __containerof(eq, struct sge_txq, eq);
 
 	/*
 	 * Get a "live" snapshot of the flags and PIDX state from the TXQ.

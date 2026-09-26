@@ -157,6 +157,9 @@ struct rxbuf_cache_params {
 struct sge_iq_stats {
 	uint64_t sis_processed;	/* # entries processed from IQ */
 	uint64_t sis_overflow;	/* # entries bearing overflow flag */
+	uint64_t sis_bad_fwd;	/* # forwarded interrupts for no Rx queue */
+	uint64_t sis_bad_egr;	/* # egress updates for no Tx queue */
+	uint64_t sis_bad_cpl;	/* # malformed or nested CPL messages */
 };
 
 /*
@@ -330,11 +333,18 @@ typedef enum t4_doorbells {
 	DOORBELL_KDB	= (1 << 3),
 } t4_doorbells_t;
 
+typedef enum t4_eq_type {
+	TEQT_UNINIT,
+	TEQT_ETH,
+	TEQT_FL,
+} t4_eq_type_t;
+
 /* Egress Queue: driver is producer, T4 is consumer. */
 typedef struct t4_sge_eq {
 	kmutex_t tse_lock;
 
 	t4_eq_flags_t tse_flags;	/* tse_lock */
+	t4_eq_type_t tse_type;		/* Write Once */
 
 	ddi_dma_handle_t tse_ring_dhdl; /* Write Once */
 	ddi_acc_handle_t tse_ring_ahdl; /* Write Once */
