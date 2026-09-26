@@ -702,7 +702,12 @@ mlxcx_intr_async(caddr_t arg, caddr_t arg2)
 		case MLXCX_EVENT_PAGE_REQUEST:
 			func = from_be16(ent->mleqe_page_request.
 			    mled_page_request_function_id);
-			VERIFY3U(func, <=, MLXCX_FUNC_ID_MAX);
+			if (func > MLXCX_FUNC_ID_MAX) {
+				mlxp->mlx_pages_bad_req++;
+				mlxcx_warn(mlxp, "!page request for unknown "
+				    "function %u", func);
+				continue;
+			}
 
 			param = &mlxp->mlx_npages_req[func];
 			mutex_enter(&param->mla_mtx);

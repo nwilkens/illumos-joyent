@@ -1216,6 +1216,8 @@ struct mlxcx {
 	/* The most pages we give, and requests refused for passing it. */
 	uint_t			mlx_npages_max;
 	uint64_t		mlx_pages_refused;
+	/* Page requests for a function we do not manage. */
+	uint64_t		mlx_pages_bad_req;
 
 	mlxcx_async_param_t	mlx_npages_req[MLXCX_FUNC_ID_MAX + 1];
 

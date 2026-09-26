@@ -81,12 +81,25 @@ rejected(void)
 		stub_fail("refused pages not freed");
 }
 
+static void
+bad_function(void)
+{
+	page_request(MLXCX_FUNC_ID_MAX + 1, 16);
+	page_request(0xffff, 16);
+	if (give_calls != 0 || take_calls != 0)
+		stub_fail("acted on a page request for an unknown function");
+	page_request(0, 16);
+	if (mlx.mlx_npages != 16)
+		stub_fail("a good request after bad ones failed");
+}
+
 static const char *const names[] = {
 	"int-min", "runtime-limit", "boot-limit", "alloc-fail", "rejected",
-	NULL
+	"bad-function", NULL
 };
 static void (*const funcs[])(void) = {
-	int_min, runtime_limit, boot_limit, alloc_fail, rejected
+	int_min, runtime_limit, boot_limit, alloc_fail, rejected,
+	bad_function
 };
 
 int
