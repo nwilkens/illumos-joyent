@@ -194,6 +194,8 @@ struct iwc_ep {
 	uint8_t			ep_mtu_idx;
 	hrtime_t		ep_deadline;	/* 0: no timer */
 	int			ep_status;	/* the reason for a close */
+	iwc_ep_t		*ep_lost_next;	/* iwc_cm_qlock */
+	boolean_t		ep_lost;	/* iwc_cm_qlock */
 	/* MPA */
 	iwc_mpa_rx_t		ep_mpa;
 	iwc_mpa_attr_t		ep_attr;
@@ -243,6 +245,8 @@ struct iwc {
 	struct iwc_cmq		*iwc_cm_qhead;
 	struct iwc_cmq		*iwc_cm_qtail;
 	uint_t			iwc_cm_qlen;
+	/* Endpoints whose CPL was dropped; each is held and gets aborted. */
+	iwc_ep_t		*iwc_cm_lost;
 	boolean_t		iwc_cm_queued;
 	boolean_t		iwc_cm_closing;
 	taskq_ent_t		iwc_cm_ent;
@@ -258,6 +262,7 @@ struct iwc {
 	kstat_t			*iwc_ksp;
 	struct iwc_stats {
 		uint64_t	is_cpl_drop;
+		uint64_t	is_cpl_lost;
 		uint64_t	is_cqe_bad;
 		uint64_t	is_mpa_bad;
 		uint64_t	is_syn_refused;

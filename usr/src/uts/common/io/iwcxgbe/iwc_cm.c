@@ -996,24 +996,34 @@ iwc_cm_task(void *arg)
 {
 	iwc_t *iwc = arg;
 	iwc_cmq_t *q;
+	iwc_ep_t *ep, *lost;
 	boolean_t tick;
 
 	for (;;) {
 		mutex_enter(&iwc->iwc_cm_qlock);
 		tick = iwc->iwc_tick_pending;
 		iwc->iwc_tick_pending = B_FALSE;
+		lost = iwc->iwc_cm_lost;
+		iwc->iwc_cm_lost = NULL;
+		for (ep = lost; ep != NULL; ep = ep->ep_lost_next)
+			ep->ep_lost = B_FALSE;
 		if ((q = iwc->iwc_cm_qhead) != NULL) {
 			iwc->iwc_cm_qhead = q->cm_next;
 			if (iwc->iwc_cm_qhead == NULL)
 				iwc->iwc_cm_qtail = NULL;
 			iwc->iwc_cm_qlen--;
-		} else if (!tick) {
+		} else if (!tick && lost == NULL) {
 			iwc->iwc_cm_queued = B_FALSE;
 			mutex_exit(&iwc->iwc_cm_qlock);
 			return;
 		}
 		mutex_exit(&iwc->iwc_cm_qlock);
 
+		while ((ep = lost) != NULL) {
+			lost = ep->ep_lost_next;
+			iwc_ep_abort(ep, ECONNRESET);
+			iwc_ep_rele(ep);
+		}
 		if (tick)
 			iwc_cm_timeouts(iwc);
 		if (q != NULL) {
@@ -1055,6 +1065,54 @@ iwc_cm_tick(void *arg)
 }
 
 /*
+ * Whether dropping this CPL loses the state of a connection.  Listener
+ * replies time out on their own, and SYNs are refused where they drop.
+ */
+static boolean_t
+iwc_cpl_lost(const t4_rdma_cpl_t *cpl)
+{
+	const mblk_t *mp = cpl->trc_mp;
+	const struct cpl_abort_req_rss *req;
+
+	if (cpl->trc_ctx == NULL)
+		return (B_FALSE);
+	switch (cpl->trc_opcode) {
+	case CPL_PASS_OPEN_RPL:
+	case CPL_CLOSE_LISTSRV_RPL:
+	case CPL_PASS_ACCEPT_REQ:
+		return (B_FALSE);
+	case CPL_ABORT_REQ_RSS:
+		if (mp == NULL || MBLKL(mp) < sizeof (*req))
+			return (B_TRUE);
+		req = (const void *)mp->b_rptr;
+		return (req->status != CPL_ERR_RTX_NEG_ADVICE &&
+		    req->status != CPL_ERR_PERSIST_NEG_ADVICE &&
+		    req->status != CPL_ERR_KEEPALV_NEG_ADVICE);
+	default:
+		return (B_TRUE);
+	}
+}
+
+/*
+ * A CPL of ep was dropped: have the CM task abort the connection, since
+ * no later message may come to end it.  No allocation, so this cannot fail.
+ * iwc_cm_qlock is held.
+ */
+static void
+iwc_cm_lose(iwc_t *iwc, iwc_ep_t *ep)
+{
+	ASSERT(MUTEX_HELD(&iwc->iwc_cm_qlock));
+	IWC_STAT(iwc, is_cpl_lost);
+	if (ep->ep_lost)
+		return;
+	ep->ep_lost = B_TRUE;
+	iwc_ep_hold(ep);
+	ep->ep_lost_next = iwc->iwc_cm_lost;
+	iwc->iwc_cm_lost = ep;
+	iwc_cm_kick(iwc);
+}
+
+/*
  * t4nex hands over a CPL, in interrupt context.  The context is an
  * endpoint while t4nex holds its ID, so a hold taken here is safe.
  */
@@ -1068,6 +1126,8 @@ iwc_cpl(void *arg, t4_rdma_cpl_t *cpl)
 	mutex_enter(&iwc->iwc_cm_qlock);
 	if (q == NULL || iwc->iwc_cm_closing ||
 	    iwc->iwc_cm_qlen >= IWC_CM_QMAX) {
+		if (!iwc->iwc_cm_closing && iwc_cpl_lost(cpl))
+			iwc_cm_lose(iwc, cpl->trc_ctx);
 		mutex_exit(&iwc->iwc_cm_qlock);
 		IWC_STAT(iwc, is_cpl_drop);
 		if (cpl->trc_opcode == CPL_PASS_ACCEPT_REQ)
@@ -1423,6 +1483,7 @@ void
 iwc_cm_fini(iwc_t *iwc)
 {
 	iwc_cmq_t *q;
+	iwc_ep_t *ep;
 	timeout_id_t tid;
 
 	mutex_enter(&iwc->iwc_cm_qlock);
@@ -1445,5 +1506,10 @@ iwc_cm_fini(iwc_t *iwc)
 	}
 	iwc->iwc_cm_qtail = NULL;
 	iwc->iwc_cm_qlen = 0;
+	while ((ep = iwc->iwc_cm_lost) != NULL) {
+		iwc->iwc_cm_lost = ep->ep_lost_next;
+		ep->ep_lost = B_FALSE;
+		iwc_ep_rele(ep);
+	}
 	mutex_exit(&iwc->iwc_cm_qlock);
 }
