@@ -20,9 +20,11 @@
  *	rdmatool [opts] loop [test...]		two sessions on one device
  *	rdmatool [opts] server			serve one client at a time
  *	rdmatool [opts] client host [test...]
+ *	rdmatool [opts] bench {loop | host} test [key=value...]
  *
  * Options: -d device, -i local IPv4 (required but for info), -p TCP port,
  * -b buffer MB per QP, -q queue depth, -t seconds per bandwidth run.
+ * rdmabench.c describes the benchmark.
  *
  * The client (or loop) side A runs each test against side B, which is a
  * second local session or the server's session.  The server only executes
@@ -37,7 +39,7 @@
  * Each prints PASS or FAIL with its numbers; the exit status is 0 only if
  * all pass.
  *
- * Build: gcc -m64 -o rdmatool rdmatool.c -lkstat -lsocket -lnsl
+ * Build: gcc -m64 -o rdmatool rdmatool.c rdmabench.c -lkstat -lsocket -lnsl
  */
 
 #include <sys/types.h>
@@ -61,16 +63,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "../../uts/common/io/rdma/rdmat_ioctl.h"
+#include <sys/resource.h>
 
-#define	DEVPATH		"/devices/pseudo/rdmat@0:rdmat"
-#define	MAGIC		0x52444d54
-#define	K_ACK		1
-#define	K_RESULT	2
-#define	C_FRESH		0x100	/* reopen the server's session */
-#define	C_BYE		0x101
-#define	C_CPU		0x102	/* the server's busy CPU nanoseconds */
-#define	C_TCP		0x103	/* a TCP ping-pong and bulk transfer */
+#include "rdmatool.h"
+
 #define	ST_REM_ACCESS	10	/* RDK_WC_REM_ACCESS_ERR */
 #define	QPS_ERR		6	/* RDK_QPS_ERR */
 
@@ -83,38 +79,19 @@ typedef struct tcpreq {
 	uint64_t	tr_srv_ns;	/* out: server time from first byte */
 } tcpreq_t;
 
-typedef struct msg {
-	uint32_t	m_magic;
-	uint32_t	m_cmd;
-	uint32_t	m_len;
-	int32_t		m_err;	/* reply; request: 1 for an async run */
-} msg_t;
-
-/* One side of a test: a local session or the server's. */
-typedef struct peer {
-	const char	*p_name;
-	int		p_fd;		/* local session */
-	int		p_sock;		/* remote, or -1 */
-	rdmat_setup_t	p_setup;
-	pthread_t	p_thr;
-	int		p_async;
-	rdmat_run_t	p_arun;
-	int		p_aret;
-} peer_t;
-
-static char *o_dev;
-static uint32_t o_ip;
-static int o_port = 18515;
-static uint64_t o_buf_mb = 16;
-static uint32_t o_depth = 64;
-static int o_secs = 5;
+char *o_dev;
+uint32_t o_ip;
+int o_port = 18515;
+uint64_t o_buf_mb = 16;
+uint32_t o_depth = 64;
+int o_secs = 5;
 static int failures;
-static uint32_t path_mtu = 1024;
-static char *o_server;
+uint32_t path_mtu = 1024;
+char *o_server;
 
 static uint64_t cpu_busy_ns(void);
 
-static void
+void
 fatal(const char *fmt, ...)
 {
 	va_list ap;
@@ -164,6 +141,8 @@ cmd_len(uint32_t cmd)
 		return (sizeof (uint64_t));
 	case C_TCP:
 		return (sizeof (tcpreq_t));
+	case C_STATS:
+		return (sizeof (host_stats_t));
 	default:
 		return ((size_t)-1);
 	}
@@ -188,7 +167,7 @@ xfer(int s, void *buf, size_t len, int out)
 	return (0);
 }
 
-static int
+int
 open_session(void)
 {
 	int fd = open(DEVPATH, O_RDWR);
@@ -199,7 +178,7 @@ open_session(void)
 }
 
 /* Send a request and read one reply of the given kind. */
-static int
+int
 rpc(peer_t *p, uint32_t cmd, void *arg, int async, int kind)
 {
 	msg_t m;
@@ -236,7 +215,7 @@ rpc(peer_t *p, uint32_t cmd, void *arg, int async, int kind)
 	}
 }
 
-static int
+int
 pio(peer_t *p, uint32_t cmd, void *arg)
 {
 	if (p->p_sock >= 0)
@@ -255,7 +234,7 @@ async_thr(void *arg)
 }
 
 /* Start a run that the other side's work completes. */
-static void
+void
 run_start(peer_t *p, const rdmat_run_t *rr)
 {
 	p->p_arun = *rr;
@@ -269,7 +248,7 @@ run_start(peer_t *p, const rdmat_run_t *rr)
 	(void) usleep(50000);
 }
 
-static int
+int
 run_finish(peer_t *p, rdmat_run_t *rr)
 {
 	int ret;
@@ -285,13 +264,13 @@ run_finish(peer_t *p, rdmat_run_t *rr)
 	return (ret);
 }
 
-static int
+int
 run(peer_t *p, rdmat_run_t *rr)
 {
 	return (pio(p, RDMAT_IOC_RUN, rr));
 }
 
-static void
+void
 run_init(rdmat_run_t *rr, uint32_t op, uint32_t size, uint32_t count)
 {
 	bzero(rr, sizeof (*rr));
@@ -302,7 +281,7 @@ run_init(rdmat_run_t *rr, uint32_t op, uint32_t size, uint32_t count)
 	rr->rr_timeout_ms = 10000;
 }
 
-static int
+int
 buf(peer_t *p, uint32_t op, uint64_t off, uint64_t len, uint64_t seed,
     uint64_t base, int64_t *mismatch)
 {
@@ -334,9 +313,11 @@ qp_state(peer_t *p)
  * Fresh sessions on both sides, set up and connected to each other.
  */
 /* The QP access B's next fresh() connection grants (rc_qp_access). */
-static uint32_t fresh_b_access;
+uint32_t fresh_b_access;
+/* The inline size of the next fresh() QPs. */
+uint32_t fresh_inline;
 
-static int
+int
 fresh(peer_t *a, peer_t *b, uint32_t qpt, uint32_t poll)
 {
 	rdmat_connect_t rc;
@@ -362,6 +343,7 @@ fresh(peer_t *a, peer_t *b, uint32_t qpt, uint32_t poll)
 		p->p_setup.rs_poll = poll;
 		p->p_setup.rs_buf_len = o_buf_mb << 20;
 		p->p_setup.rs_depth = o_depth;
+		p->p_setup.rs_inline = fresh_inline;
 		/* The server supplies its own device and address. */
 		if ((ret = pio(p, RDMAT_IOC_SETUP, &p->p_setup)) != 0) {
 			(void) fprintf(stderr, "%s: setup: %s\n", p->p_name,
@@ -847,7 +829,75 @@ cpu_busy_ns(void)
 	return (sum);
 }
 
+/* A named value of a kstat, or 0. */
 static uint64_t
+kval(kstat_ctl_t *kc, kstat_t *ks, const char *name)
+{
+	kstat_named_t *kn;
+
+	if (ks == NULL || kstat_read(kc, ks, NULL) == -1 ||
+	    (kn = kstat_data_lookup(ks, (char *)name)) == NULL)
+		return (0);
+	switch (kn->data_type) {
+	case KSTAT_DATA_UINT32:
+		return (kn->value.ui32);
+	case KSTAT_DATA_INT32:
+		return ((uint64_t)kn->value.i32);
+	default:
+		return (kn->value.ui64);
+	}
+}
+
+void
+host_stats(host_stats_t *hs)
+{
+	struct rusage ru;
+	kstat_ctl_t *kc;
+	kstat_t *ks;
+	char name[32];
+	uint_t v;
+
+	bzero(hs, sizeof (*hs));
+	if (getrusage(RUSAGE_SELF, &ru) == 0) {
+		hs->hs_proc_ns = (uint64_t)ru.ru_utime.tv_sec * 1000000000ULL +
+		    (uint64_t)ru.ru_utime.tv_usec * 1000ULL +
+		    (uint64_t)ru.ru_stime.tv_sec * 1000000000ULL +
+		    (uint64_t)ru.ru_stime.tv_usec * 1000ULL;
+	}
+	if ((kc = kstat_open()) == NULL)
+		return;
+	for (ks = kc->kc_chain; ks != NULL; ks = ks->ks_next) {
+		if (strcmp(ks->ks_module, "cpu") == 0 &&
+		    strcmp(ks->ks_name, "sys") == 0) {
+			uint64_t intr = kval(kc, ks, "cpu_nsec_intr");
+
+			hs->hs_busy_ns += kval(kc, ks, "cpu_nsec_user") +
+			    kval(kc, ks, "cpu_nsec_kernel") + intr;
+			hs->hs_intr_ns += intr;
+			hs->hs_ncpu++;
+		} else if (strcmp(ks->ks_module, "unix") == 0 &&
+		    ks->ks_type == KSTAT_TYPE_NAMED &&
+		    (strcmp(ks->ks_name, "rdk_cq") == 0 ||
+		    strncmp(ks->ks_name, "irdma_", 6) == 0)) {
+			hs->hs_taskq_ns += kval(kc, ks, "totaltime");
+		}
+	}
+	ks = kstat_lookup(kc, "irdma", 0, "ctl");
+	hs->hs_ceq_intrs = kval(kc, ks, "ceq_intrs");
+	hs->hs_aeq_intrs = kval(kc, ks, "aeq_intrs");
+	hs->hs_sq_doorbells = kval(kc, ks, "sq_doorbells");
+	hs->hs_cq_arms = kval(kc, ks, "cq_arms");
+	hs->hs_ceq_ns = kval(kc, ks, "ceq_busy_ns");
+	hs->hs_nvec = (uint32_t)kval(kc, ks, "comp_vectors");
+	for (v = 0; v < hs->hs_nvec && v < 16; v++) {
+		(void) snprintf(name, sizeof (name), "ceq%u_intrs", v + 1);
+		hs->hs_vec_intrs[v] = kval(kc, ks, name);
+	}
+	(void) kstat_close(kc);
+	hs->hs_now_ns = now_ns();
+}
+
+uint64_t
 now_ns(void)
 {
 	struct timespec ts;
@@ -1227,7 +1277,7 @@ find_dev(rdmat_devices_t *d)
 	return (NULL);
 }
 
-static rdmat_devinfo_t local_dev;
+rdmat_devinfo_t local_dev;
 
 static void
 load_devices(void)
@@ -1259,6 +1309,7 @@ serve(int s)
 		rdmat_devices_t f;
 		tcpreq_t g;
 		uint64_t h;
+		host_stats_t i;
 	} u;
 	int fd = open_session();
 	msg_t m;
@@ -1286,6 +1337,9 @@ serve(int s)
 			m.m_err = 0;
 		} else if (m.m_cmd == C_CPU) {
 			u.h = cpu_busy_ns();
+			m.m_err = 0;
+		} else if (m.m_cmd == C_STATS) {
+			host_stats(&u.i);
 			m.m_err = 0;
 		} else if (m.m_cmd == C_TCP) {
 			m.m_err = serve_tcp(&u.g);
@@ -1319,12 +1373,12 @@ listen_on(void)
 	sin.sin_port = htons((uint16_t)o_port);
 	sin.sin_addr.s_addr = o_ip;
 	if (bind(s, (struct sockaddr *)&sin, sizeof (sin)) != 0 ||
-	    listen(s, 1) != 0)
+	    listen(s, 64) != 0)
 		fatal("listen on port %d: %s", o_port, strerror(errno));
 	return (s);
 }
 
-static int
+int
 connect_to(const char *host)
 {
 	struct sockaddr_in sin;
@@ -1355,7 +1409,8 @@ usage(void)
 {
 	(void) fprintf(stderr, "usage: rdmatool [-d dev] [-i ipv4] [-p port] "
 	    "[-b MB] [-q depth] [-t secs]\n"
-	    "\t{info | loop [test...] | server | client host [test...]}\n");
+	    "\t{info | loop [test...] | server | client host [test...] |\n"
+	    "\tbench {loop | host} test [key=value...]}\n");
 	exit(2);
 }
 
@@ -1429,12 +1484,22 @@ main(int argc, char **argv)
 	} else if (strcmp(argv[0], "server") == 0) {
 		int l = listen_on();
 
+		/* A child per connection, so a benchmark's QPs run at once. */
+		(void) close(a.p_fd);
+		(void) signal(SIGCHLD, SIG_IGN);
 		for (;;) {
 			if ((s = accept(l, NULL, NULL)) < 0)
 				continue;
-			serve(s);
+			if (fork() == 0) {
+				(void) close(l);
+				serve(s);
+				_exit(0);
+			}
 			(void) close(s);
 		}
+	} else if (strcmp(argv[0], "bench") == 0) {
+		(void) close(a.p_fd);
+		return (bench_main(&a, &b, argc - 1, argv + 1));
 	} else if (strcmp(argv[0], "client") == 0) {
 		rdmat_devices_t d;
 		rdmat_devinfo_t *di;

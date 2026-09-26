@@ -15,7 +15,7 @@ def main():
         return 0
     # core/ is the imported Linux code and keeps its own style.
     files = sorted(IRDMA.glob("*.[ch]")) + sorted(IRDMA.glob("linux/*.h"))
-    files += sorted(TESTDIR.glob("*.c"))
+    files += sorted(TESTDIR.glob("*.[ch]"))
     files += sorted((REPO / "usr/src/uts/common/io/rdma").glob("*.[ch]"))
     files += [REPO / "usr/src/uts/common/io/ice/ice_rdma.h",
               REPO / "usr/src/uts/common/io/ice/ice_rdma_impl.h"]

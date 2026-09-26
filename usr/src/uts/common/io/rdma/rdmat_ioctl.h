@@ -51,7 +51,8 @@ extern "C" {
 #define	RDMAT_MAX_BUF		(64ULL * 1024 * 1024)
 #define	RDMAT_CHUNK		(1024 * 1024)
 #define	RDMAT_MAX_DEPTH		256
-#define	RDMAT_MAX_COUNT		(1U << 24)
+#define	RDMAT_MAX_BATCH		32
+#define	RDMAT_MAX_COUNT		(1U << 28)
 #define	RDMAT_MAX_TIMEOUT_MS	120000
 /* The GRH a UD receive gets in front of the payload. */
 #define	RDMAT_GRH_LEN		40
@@ -68,6 +69,8 @@ typedef struct rdmat_devinfo {
 	uint32_t	rdi_max_qp_wr;
 	uint32_t	rdi_max_sge;
 	uint32_t	rdi_max_mr_pages;
+	uint32_t	rdi_max_inline;
+	uint32_t	rdi_pad2;
 } rdmat_devinfo_t;
 
 typedef struct rdmat_devices {
@@ -104,7 +107,7 @@ typedef struct rdmat_setup {
 	uint32_t	rs_poll;	/* rdmat_poll_t */
 	uint64_t	rs_buf_len;	/* per QP, multiple of RDMAT_CHUNK */
 	uint32_t	rs_depth;	/* send and receive queue depth */
-	uint32_t	rs_pad;
+	uint32_t	rs_inline;	/* inline bytes the QPs take */
 	/* Out */
 	uint8_t		rs_gid[16];
 	uint8_t		rs_mac[6];
@@ -142,12 +145,22 @@ typedef enum rdmat_op {
 	RDMAT_OP_PING,		/* send, wait for the reply; count times */
 	RDMAT_OP_PONG,		/* wait, send back; count times */
 	RDMAT_OP_REG,		/* rebind the buffer MR: access, new key */
-	RDMAT_OP_LOCAL_INV	/* invalidate the buffer MR */
+	RDMAT_OP_LOCAL_INV,	/* invalidate the buffer MR */
+	RDMAT_OP_RECV_STREAM,	/* receive count, keeping depth posted */
+	RDMAT_OP_WRITE_PING,	/* write, wait for the peer's write; count */
+	RDMAT_OP_WRITE_PONG	/* wait for the peer's write, write back */
 } rdmat_op_t;
 
-/* rr_flags */
-#define	RDMAT_F_UNSIGNALED	0x01	/* signal only the last work request */
+/*
+ * rr_flags.  RDMAT_F_UNSIGNALED with rr_signal 0 signals every rr_depth'th
+ * request and the last.  RDMAT_F_BUSY waits by polling without sleeping
+ * (RDMAT_POLL_DIRECT only).  RDMAT_F_LAT times each READ or WRITE alone.
+ */
+#define	RDMAT_F_UNSIGNALED	0x01
 #define	RDMAT_F_DMA_LKEY	0x02	/* use the local DMA lkey, not the MR */
+#define	RDMAT_F_INLINE		0x04
+#define	RDMAT_F_BUSY		0x08
+#define	RDMAT_F_LAT		0x10
 
 typedef struct rdmat_run {
 	/* In */
@@ -183,6 +196,15 @@ typedef struct rdmat_run {
 	uint64_t	rr_lat_max;
 	uint64_t	rr_lat_p50;
 	uint64_t	rr_lat_p99;
+	/* In */
+	uint32_t	rr_batch;	/* requests per post call; 0 is 1 */
+	uint32_t	rr_signal;	/* signal every rr_signal'th request */
+	uint32_t	rr_run_ms;	/* stop posting after this long */
+	uint32_t	rr_pad2;
+	/* Out */
+	uint64_t	rr_lat_p999;
+	uint64_t	rr_posted;	/* requests posted */
+	uint64_t	rr_post_calls;
 } rdmat_run_t;
 
 #define	RDMAT_ACC_REMOTE_WRITE	0x1

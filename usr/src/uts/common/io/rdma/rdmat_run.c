@@ -33,14 +33,14 @@
 #include <sys/ddi.h>
 #include <sys/sunddi.h>
 #include <sys/systm.h>
+#include <sys/proc.h>
 
 #include "rdmat_impl.h"
 
 /* A wait sleeps in slices this long so it notices signals and teardown. */
 #define	RDMAT_SLICE_US		(100 * 1000)
 /* Empty polls a DIRECT wait spins before it sleeps one tick. */
-#define	RDMAT_SPIN		2000
-#define	RDMAT_LAT_SAMPLES	(1U << 20)
+#define	RDMAT_SPIN		2048
 
 static uint8_t
 rdmat_pattern(uint64_t seed, uint64_t off)
@@ -163,19 +163,21 @@ rdmat_reset_counts(rdmat_qp_t *tq, uint32_t expect_len)
 /*
  * Wait until *ctr reaches want.  Returns EIO once a completion failed,
  * EINTR on a signal, ETIMEDOUT past the deadline and ENXIO when the
- * session is being torn down.
+ * session is being torn down.  A busy wait never sleeps.
  */
-static int
+int
 rdmat_wait(rdmat_qp_t *tq, uint64_t *ctr, uint64_t want, hrtime_t deadline)
 {
 	rdmat_sess_t *ts = tq->tq_sess;
+	boolean_t direct = ts->ts_poll == RDMAT_POLL_DIRECT;
 	uint_t spins = 0;
 	int ret = 0;
 
 	for (;;) {
-		if (ts->ts_poll == RDMAT_POLL_DIRECT) {
+		if (direct) {
 			(void) rdk_process_cq_direct(tq->tq_scq, -1);
-			(void) rdk_process_cq_direct(tq->tq_rcq, -1);
+			if (tq->tq_rcq != tq->tq_scq)
+				(void) rdk_process_cq_direct(tq->tq_rcq, -1);
 		}
 		mutex_enter(&tq->tq_lock);
 		if (tq->tq_errors != 0)
@@ -192,14 +194,21 @@ rdmat_wait(rdmat_qp_t *tq, uint64_t *ctr, uint64_t want, hrtime_t deadline)
 			mutex_exit(&tq->tq_lock);
 			return (ret);
 		}
-		if (ts->ts_poll == RDMAT_POLL_DIRECT && ++spins < RDMAT_SPIN) {
+		if (direct && tq->tq_busy) {
+			mutex_exit(&tq->tq_lock);
+			if ((++spins & (RDMAT_SPIN - 1)) == 0 &&
+			    ISSIG(curthread, JUSTLOOKING))
+				return (EINTR);
+			continue;
+		}
+		if (direct && ++spins < RDMAT_SPIN) {
 			mutex_exit(&tq->tq_lock);
 			continue;
 		}
 		spins = 0;
 		if (cv_reltimedwait_sig(&tq->tq_cv, &tq->tq_lock,
-		    ts->ts_poll == RDMAT_POLL_DIRECT ? 1 :
-		    drv_usectohz(RDMAT_SLICE_US), TR_CLOCK_TICK) == 0) {
+		    direct ? 1 : drv_usectohz(RDMAT_SLICE_US),
+		    TR_CLOCK_TICK) == 0) {
 			mutex_exit(&tq->tq_lock);
 			return (EINTR);
 		}
@@ -283,6 +292,7 @@ rdmat_qp_create(rdmat_sess_t *ts, rdmat_qp_t *tq, uint64_t len)
 	init.cap.max_recv_wr = ts->ts_depth + 1;
 	init.cap.max_send_sge = 1;
 	init.cap.max_recv_sge = 1;
+	init.cap.max_inline_data = ts->ts_inline;
 	init.sq_sig_type = RDK_SIGNAL_REQ_WR;
 	init.qp_type = ts->ts_qpt == RDMAT_QPT_UD ? RDK_QPT_UD : RDK_QPT_RC;
 	init.port_num = 1;
@@ -320,6 +330,7 @@ rdmat_setup(rdmat_sess_t *ts, rdmat_setup_t *rs)
 	    (rs->rs_buf_len % RDMAT_CHUNK) != 0 ||
 	    rs->rs_depth == 0 || rs->rs_depth > RDMAT_MAX_DEPTH ||
 	    rs->rs_depth + 4 > (uint32_t)dev->rd_attr.max_qp_wr ||
+	    rs->rs_inline > dev->rd_attr.max_inline_data ||
 	    rs->rs_buf_len / PAGESIZE > dev->rd_attr.max_fast_reg_page_list_len)
 		return (EINVAL);
 	if ((ret = rdk_query_port(dev, 1, &pa)) != 0)
@@ -328,6 +339,7 @@ rdmat_setup(rdmat_sess_t *ts, rdmat_setup_t *rs)
 	ts->ts_qpt = rs->rs_qpt;
 	ts->ts_poll = rs->rs_poll;
 	ts->ts_depth = rs->rs_depth;
+	ts->ts_inline = rs->rs_inline;
 	ts->ts_setup = B_TRUE;
 
 	rdk_gid_from_ipv4(&gid, rs->rs_ipv4);
@@ -540,228 +552,6 @@ rdmat_connect(rdmat_sess_t *ts, rdmat_connect_t *rc)
 	return (0);
 }
 
-/*
- * The local SGE for [off, off + len) of the buffer.  With the DMA lkey the
- * range must lie in one chunk.
- */
-static int
-rdmat_sge(rdmat_sess_t *ts, rdmat_qp_t *tq, uint64_t off, uint32_t len,
-    boolean_t dma_lkey, struct rdk_sge *sge)
-{
-	uint64_t c;
-
-	if (off >= tq->tq_len || len > tq->tq_len - off)
-		return (EINVAL);
-	if (dma_lkey || tq->tq_lmr == NULL) {
-		c = off / RDMAT_CHUNK;
-		if ((off % RDMAT_CHUNK) + len > RDMAT_CHUNK)
-			return (EINVAL);
-		sge->addr = tq->tq_chunks[c].rdb_pa + (off % RDMAT_CHUNK);
-		sge->lkey = ts->ts_pd->local_dma_lkey;
-	} else {
-		if (!tq->tq_lmr_bound)
-			return (ENXIO);
-		sge->addr = tq->tq_lmr->iova + off;
-		sge->lkey = tq->tq_lmr->lkey;
-	}
-	sge->length = len;
-	return (0);
-}
-
-static int
-rdmat_post_recvs(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
-    uint32_t n, uint64_t *posted)
-{
-	struct rdk_recv_wr wr;
-	struct rdk_sge sge;
-	uint32_t size = rr->rr_size;
-	uint64_t off;
-	int ret;
-
-	if (ts->ts_qpt == RDMAT_QPT_UD)
-		size += RDMAT_GRH_LEN;
-	while (n-- > 0) {
-		off = rr->rr_offset + (*posted % ts->ts_depth) * size;
-		if ((ret = rdmat_sge(ts, tq, off, size,
-		    (rr->rr_flags & RDMAT_F_DMA_LKEY) != 0, &sge)) != 0)
-			return (ret);
-		bzero(&wr, sizeof (wr));
-		wr.wr_cqe = &tq->tq_recv_cqe;
-		wr.sg_list = &sge;
-		wr.num_sge = 1;
-		if ((ret = rdk_post_recv(tq->tq_qp, &wr, NULL)) != 0)
-			return (ret);
-		(*posted)++;
-	}
-	return (0);
-}
-
-/* Post one send-queue work request for index i of a run. */
-static int
-rdmat_post_one(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
-    uint64_t i, boolean_t signal)
-{
-	struct rdk_ud_wr ud;
-	struct rdk_rdma_wr rw;
-	struct rdk_send_wr *wr;
-	struct rdk_sge sge;
-	uint64_t off, roff;
-	int ret;
-
-	off = rr->rr_offset;
-	roff = 0;
-	if (rr->rr_op == RDMAT_OP_WRITE || rr->rr_op == RDMAT_OP_READ) {
-		/* Successive transfers walk the local and remote windows. */
-		uint64_t span = MAX(rr->rr_rlen / rr->rr_size, 1);
-
-		roff = (i % span) * rr->rr_size;
-		off = rr->rr_offset + ((i % ts->ts_depth) * rr->rr_size) %
-		    MAX(tq->tq_len - rr->rr_offset - rr->rr_size + 1, 1);
-	}
-	if ((ret = rdmat_sge(ts, tq, off, rr->rr_size,
-	    (rr->rr_flags & RDMAT_F_DMA_LKEY) != 0, &sge)) != 0)
-		return (ret);
-
-	bzero(&rw, sizeof (rw));
-	bzero(&ud, sizeof (ud));
-	wr = ts->ts_qpt == RDMAT_QPT_UD ? &ud.wr : &rw.wr;
-	wr->wr_cqe = &tq->tq_send_cqe;
-	wr->sg_list = &sge;
-	wr->num_sge = rr->rr_size != 0 ? 1 : 0;
-	wr->send_flags = signal ? RDK_SEND_SIGNALED : 0;
-	switch (rr->rr_op) {
-	case RDMAT_OP_SEND:
-	case RDMAT_OP_PING:
-	case RDMAT_OP_PONG:
-		wr->opcode = RDK_WR_SEND;
-		break;
-	case RDMAT_OP_SEND_INV:
-		wr->opcode = RDK_WR_SEND_WITH_INV;
-		wr->ex.invalidate_rkey = rr->rr_rkey;
-		break;
-	case RDMAT_OP_WRITE:
-		wr->opcode = RDK_WR_RDMA_WRITE;
-		rw.remote_addr = rr->rr_raddr + roff;
-		rw.rkey = rr->rr_rkey;
-		break;
-	case RDMAT_OP_READ:
-		wr->opcode = RDK_WR_RDMA_READ;
-		rw.remote_addr = rr->rr_raddr + roff;
-		rw.rkey = rr->rr_rkey;
-		break;
-	default:
-		return (EINVAL);
-	}
-	if (ts->ts_qpt == RDMAT_QPT_UD) {
-		ud.ah = tq->tq_ah;
-		ud.remote_qpn = tq->tq_rqpn;
-		ud.remote_qkey = tq->tq_rqkey;
-	}
-	return (rdk_post_send(tq->tq_qp, wr, NULL));
-}
-
-/*
- * A windowed stream of count send-queue operations with at most depth in
- * flight.  Unsignaled runs signal every depth'th and the last.
- */
-static int
-rdmat_stream(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
-    hrtime_t deadline)
-{
-	boolean_t unsig = (rr->rr_flags & RDMAT_F_UNSIGNALED) != 0;
-	uint64_t posted = 0, sig = 0, waited = 0;
-	boolean_t signal;
-	int ret;
-
-	while (posted < rr->rr_count) {
-		while (posted < rr->rr_count &&
-		    posted - waited < rr->rr_depth) {
-			signal = !unsig || posted + 1 == rr->rr_count ||
-			    ((posted + 1) % rr->rr_depth) == 0;
-			if ((ret = rdmat_post_one(ts, tq, rr, posted,
-			    signal)) != 0)
-				return (ret);
-			posted++;
-			if (signal)
-				sig++;
-		}
-		/* Wait for the oldest signaled request to finish. */
-		ret = rdmat_wait(tq, &tq->tq_send_done,
-		    unsig ? sig : waited + 1, deadline);
-		if (ret != 0)
-			return (ret);
-		waited = unsig ? posted : waited + 1;
-	}
-	return (rdmat_wait(tq, &tq->tq_send_done, sig, deadline));
-}
-
-/* Shell sort; the kernel has no public qsort(). */
-static void
-rdmat_sort(uint64_t *v, uint64_t n)
-{
-	uint64_t gap, i, j, x;
-
-	for (gap = n / 2; gap > 0; gap /= 2) {
-		for (i = gap; i < n; i++) {
-			x = v[i];
-			for (j = i; j >= gap && v[j - gap] > x; j -= gap)
-				v[j] = v[j - gap];
-			v[j] = x;
-		}
-	}
-}
-
-static int
-rdmat_pingpong(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
-    hrtime_t deadline)
-{
-	uint64_t *lat = NULL, n, i, rposted = 0, sum = 0;
-	boolean_t ping = rr->rr_op == RDMAT_OP_PING;
-	hrtime_t t0;
-	int ret;
-
-	n = MIN(rr->rr_count, RDMAT_LAT_SAMPLES);
-	if (ping)
-		lat = kmem_zalloc(sizeof (uint64_t) * n, KM_SLEEP);
-	if ((ret = rdmat_post_recvs(ts, tq, rr,
-	    (uint32_t)MIN(rr->rr_count, rr->rr_depth), &rposted)) != 0)
-		goto out;
-
-	for (i = 0; i < rr->rr_count; i++) {
-		t0 = gethrtime();
-		if (!ping && (ret = rdmat_wait(tq, &tq->tq_recv_done, i + 1,
-		    deadline)) != 0)
-			break;
-		if ((ret = rdmat_post_one(ts, tq, rr, i, B_TRUE)) != 0)
-			break;
-		if (ping && (ret = rdmat_wait(tq, &tq->tq_recv_done, i + 1,
-		    deadline)) != 0)
-			break;
-		if ((ret = rdmat_wait(tq, &tq->tq_send_done, i + 1,
-		    deadline)) != 0)
-			break;
-		if (ping && i < n) {
-			lat[i] = (uint64_t)(gethrtime() - t0);
-			sum += lat[i];
-		}
-		if (rposted < rr->rr_count && (ret = rdmat_post_recvs(ts, tq,
-		    rr, 1, &rposted)) != 0)
-			break;
-	}
-	if (ping && ret == 0 && n > 0) {
-		rdmat_sort(lat, n);
-		rr->rr_lat_min = lat[0];
-		rr->rr_lat_max = lat[n - 1];
-		rr->rr_lat_avg = sum / n;
-		rr->rr_lat_p50 = lat[n / 2];
-		rr->rr_lat_p99 = lat[MIN(n - 1, (n * 99) / 100)];
-	}
-out:
-	if (lat != NULL)
-		kmem_free(lat, sizeof (uint64_t) * n);
-	return (ret);
-}
-
 int
 rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 {
@@ -770,23 +560,32 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 	rdmat_qp_t *tq;
 	hrtime_t start, deadline;
 	uint64_t posted = 0, len;
-	uint32_t timeout;
+	uint32_t timeout, op = rr->rr_op;
+	boolean_t rw = op == RDMAT_OP_WRITE || op == RDMAT_OP_READ ||
+	    op == RDMAT_OP_WRITE_PING || op == RDMAT_OP_WRITE_PONG;
 	int ret;
 
 	if ((tq = rdmat_qp(ts, rr->rr_qp)) == NULL || !tq->tq_connected)
 		return (ENXIO);
 	timeout = rr->rr_timeout_ms != 0 ? rr->rr_timeout_ms : 10000;
 	if (timeout > RDMAT_MAX_TIMEOUT_MS || rr->rr_count > RDMAT_MAX_COUNT ||
-	    rr->rr_depth > ts->ts_depth ||
-	    (rr->rr_flags & ~(RDMAT_F_UNSIGNALED | RDMAT_F_DMA_LKEY)) != 0)
+	    rr->rr_depth > ts->ts_depth || rr->rr_batch > RDMAT_MAX_BATCH ||
+	    rr->rr_signal > RDMAT_MAX_DEPTH || rr->rr_run_ms > timeout ||
+	    (rr->rr_flags & ~(RDMAT_F_UNSIGNALED | RDMAT_F_DMA_LKEY |
+	    RDMAT_F_INLINE | RDMAT_F_BUSY | RDMAT_F_LAT)) != 0)
+		return (EINVAL);
+	if ((rr->rr_flags & RDMAT_F_BUSY) != 0 &&
+	    ts->ts_poll != RDMAT_POLL_DIRECT)
 		return (EINVAL);
 	if (rr->rr_depth == 0)
 		rr->rr_depth = 1;
+	if (rr->rr_batch == 0)
+		rr->rr_batch = 1;
 	/* The remote window is walked in rr_size steps. */
-	if ((rr->rr_op == RDMAT_OP_WRITE || rr->rr_op == RDMAT_OP_READ) &&
-	    rr->rr_size == 0)
+	if (rw && rr->rr_size == 0)
 		return (EINVAL);
-	if ((rr->rr_op == RDMAT_OP_PING || rr->rr_op == RDMAT_OP_PONG) &&
+	if ((op == RDMAT_OP_PING || op == RDMAT_OP_PONG ||
+	    op == RDMAT_OP_WRITE_PING || op == RDMAT_OP_WRITE_PONG) &&
 	    rr->rr_count == 0)
 		return (EINVAL);
 
@@ -794,30 +593,46 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 	len = (uint64_t)rr->rr_size;
 	if (ts->ts_qpt == RDMAT_QPT_UD)
 		len += RDMAT_GRH_LEN;
-	if (rr->rr_op == RDMAT_OP_POST_RECV || rr->rr_op == RDMAT_OP_PING ||
-	    rr->rr_op == RDMAT_OP_PONG)
+	if (op == RDMAT_OP_POST_RECV || op == RDMAT_OP_PING ||
+	    op == RDMAT_OP_PONG || op == RDMAT_OP_RECV_STREAM)
 		len *= ts->ts_depth;
+	if (op == RDMAT_OP_WRITE_PING || op == RDMAT_OP_WRITE_PONG)
+		len = 2 * P2ROUNDUP(len, 64);
 	if (rr->rr_offset >= tq->tq_len || len > tq->tq_len - rr->rr_offset)
 		return (EINVAL);
-	if (ts->ts_qpt == RDMAT_QPT_UD && rr->rr_op != RDMAT_OP_SEND &&
-	    rr->rr_op != RDMAT_OP_POST_RECV &&
-	    rr->rr_op != RDMAT_OP_WAIT_RECV && rr->rr_op != RDMAT_OP_PING &&
-	    rr->rr_op != RDMAT_OP_PONG)
+	if (ts->ts_qpt == RDMAT_QPT_UD && op != RDMAT_OP_SEND &&
+	    op != RDMAT_OP_POST_RECV && op != RDMAT_OP_WAIT_RECV &&
+	    op != RDMAT_OP_RECV_STREAM && op != RDMAT_OP_PING &&
+	    op != RDMAT_OP_PONG)
 		return (ENOTSUP);
 
-	if (rr->rr_op != RDMAT_OP_WAIT_RECV)
-		rdmat_reset_counts(tq, rr->rr_op == RDMAT_OP_POST_RECV ?
-		    rr->rr_size + (ts->ts_qpt == RDMAT_QPT_UD ?
-		    RDMAT_GRH_LEN : 0) : 0);
+	if (op != RDMAT_OP_WAIT_RECV)
+		rdmat_reset_counts(tq, op == RDMAT_OP_POST_RECV ||
+		    op == RDMAT_OP_RECV_STREAM ? rr->rr_size +
+		    (ts->ts_qpt == RDMAT_QPT_UD ? RDMAT_GRH_LEN : 0) : 0);
+	tq->tq_busy = (rr->rr_flags & RDMAT_F_BUSY) != 0;
+	tq->tq_posted = tq->tq_post_calls = 0;
 	start = gethrtime();
 	deadline = start + MSEC2NSEC(timeout);
 
-	switch (rr->rr_op) {
-	case RDMAT_OP_SEND:
-	case RDMAT_OP_SEND_INV:
+	switch (op) {
 	case RDMAT_OP_WRITE:
 	case RDMAT_OP_READ:
+		if ((rr->rr_flags & RDMAT_F_LAT) != 0) {
+			ret = rdmat_one_lat(ts, tq, rr, deadline);
+			break;
+		}
+		/* FALLTHROUGH */
+	case RDMAT_OP_SEND:
+	case RDMAT_OP_SEND_INV:
 		ret = rdmat_stream(ts, tq, rr, deadline);
+		break;
+	case RDMAT_OP_RECV_STREAM:
+		ret = rdmat_recv_stream(ts, tq, rr, deadline);
+		break;
+	case RDMAT_OP_WRITE_PING:
+	case RDMAT_OP_WRITE_PONG:
+		ret = rdmat_write_pingpong(ts, tq, rr, deadline);
 		break;
 	case RDMAT_OP_POST_RECV:
 		ret = rr->rr_count > ts->ts_depth ? EINVAL :
@@ -859,14 +674,19 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 		break;
 	}
 
+	tq->tq_busy = B_FALSE;
 	mutex_enter(&tq->tq_lock);
 	rr->rr_done = tq->tq_send_done + tq->tq_recv_done + tq->tq_reg_done;
-	rr->rr_bytes = rr->rr_op == RDMAT_OP_WAIT_RECV ? tq->tq_bytes :
+	rr->rr_bytes = op == RDMAT_OP_WAIT_RECV ||
+	    op == RDMAT_OP_RECV_STREAM ? tq->tq_bytes :
 	    tq->tq_send_done * rr->rr_size;
-	/* An unsignaled stream completes every request it posted. */
-	if (ret == 0 && (rr->rr_flags & RDMAT_F_UNSIGNALED) != 0) {
-		rr->rr_done = rr->rr_count;
-		rr->rr_bytes = (uint64_t)rr->rr_count * rr->rr_size;
+	rr->rr_posted = tq->tq_posted;
+	rr->rr_post_calls = tq->tq_post_calls;
+	/* A stream with unsignaled requests completes all it posted. */
+	if (ret == 0 && (op == RDMAT_OP_WRITE || op == RDMAT_OP_READ ||
+	    op == RDMAT_OP_SEND || op == RDMAT_OP_SEND_INV)) {
+		rr->rr_done = tq->tq_posted;
+		rr->rr_bytes = tq->tq_posted * rr->rr_size;
 	}
 	rr->rr_ns = (uint64_t)(MAX(tq->tq_last_ns, start) - start);
 	rr->rr_errors = tq->tq_errors;

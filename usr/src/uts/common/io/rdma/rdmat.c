@@ -154,6 +154,7 @@ rdmat_devices(intptr_t arg, int mode)
 		di->rdi_max_qp_wr = (uint32_t)dev->rd_attr.max_qp_wr;
 		di->rdi_max_sge = (uint32_t)dev->rd_attr.max_send_sge;
 		di->rdi_max_mr_pages = dev->rd_attr.max_fast_reg_page_list_len;
+		di->rdi_max_inline = dev->rd_attr.max_inline_data;
 	}
 	mutex_exit(&rdmat_lock);
 	if (ddi_copyout(out, (void *)arg, sizeof (*out), mode) != 0)
