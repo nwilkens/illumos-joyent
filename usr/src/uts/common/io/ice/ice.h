@@ -570,6 +570,15 @@ typedef struct ice_rx_ring {
  * counters are per logical port and therefore aggregate every VSI and VF on
  * the function, so they describe the wire rather than this interface.
  */
+/* The PCIe link, read at attach; see ice_pcie_kstat_init(). */
+typedef struct ice_pcie_kstats {
+	kstat_named_t	ipc_link_gen;
+	kstat_named_t	ipc_link_width;
+	kstat_named_t	ipc_max_gen;
+	kstat_named_t	ipc_max_width;
+	kstat_named_t	ipc_link_mbps;
+} ice_pcie_kstats_t;
+
 typedef struct ice_pf_kstats {
 	kstat_named_t		ipk_rx_bytes;
 	kstat_named_t		ipk_rx_unicast;
@@ -752,6 +761,7 @@ typedef struct ice {
 	struct ice_eth_stats	ice_stat_vsi_prev;
 	kstat_t			*ice_pf_kstat;
 	kstat_t			*ice_vsi_kstat;
+	kstat_t			*ice_pcie_kstat;
 
 	/*
 	 * Firmware log events queued for ICE_IOC_FWLOG_READ (ice_ioctl.c).
