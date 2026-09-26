@@ -57,6 +57,7 @@ rdk_iw_cm_attach(struct rdk_device *dev, const struct rdk_iw_cm_ops *ops)
 	    ops->iw_connect == NULL || ops->iw_accept == NULL ||
 	    ops->iw_reject == NULL || ops->iw_create_listen == NULL ||
 	    ops->iw_destroy_listen == NULL || ops->iw_disconnect == NULL ||
+	    ops->iw_release == NULL ||
 	    ops->iw_max_pdata > RDK_CM_PDATA_MAX)
 		return (EINVAL);
 	cd = kmem_zalloc(sizeof (*cd), KM_SLEEP);
@@ -101,7 +102,10 @@ rdk_cm_dev_rele(rdk_cm_dev_t *cd)
 	mutex_exit(&rdk_cm_lock);
 }
 
-/* Hold the device's operations for one call; NULL when it is going. */
+/*
+ * Hold the device's operations and the ID's provider state for one call;
+ * NULL when either is going.
+ */
 static const struct rdk_iw_cm_ops *
 rdk_cm_ops_enter(rdk_cm_id_t *id)
 {
@@ -116,6 +120,19 @@ rdk_cm_ops_enter(rdk_cm_id_t *id)
 		ops = cd->rcd_iw;
 	}
 	mutex_exit(&rdk_cm_lock);
+	if (ops == NULL)
+		return (NULL);
+	mutex_enter(&id->rci_lock);
+	if (id->rci_iw_gone) {
+		mutex_exit(&id->rci_lock);
+		mutex_enter(&rdk_cm_lock);
+		if (--cd->rcd_ops == 0)
+			cv_broadcast(&rdk_cm_iw_cv);
+		mutex_exit(&rdk_cm_lock);
+		return (NULL);
+	}
+	id->rci_iw_calls++;
+	mutex_exit(&id->rci_lock);
 	return (ops);
 }
 
@@ -124,11 +141,40 @@ rdk_cm_ops_exit(rdk_cm_id_t *id)
 {
 	rdk_cm_dev_t *cd = id->rci_dev;
 
+	mutex_enter(&id->rci_lock);
+	VERIFY3U(id->rci_iw_calls, >, 0);
+	if (--id->rci_iw_calls == 0)
+		cv_broadcast(&id->rci_cv);
+	mutex_exit(&id->rci_lock);
 	mutex_enter(&rdk_cm_lock);
 	VERIFY3U(cd->rcd_ops, >, 0);
 	if (--cd->rcd_ops == 0)
 		cv_broadcast(&rdk_cm_iw_cv);
 	mutex_exit(&rdk_cm_lock);
+}
+
+/*
+ * The ID is being destroyed and the provider has delivered its final
+ * event: once no call runs, give the provider its state back.
+ */
+void
+rdk_cm_iw_release(rdk_cm_id_t *id)
+{
+	const struct rdk_iw_cm_ops *ops;
+	boolean_t owned;
+
+	if ((ops = rdk_cm_ops_enter(id)) == NULL)
+		return;
+	mutex_enter(&id->rci_lock);
+	while (id->rci_iw_calls != 1)
+		cv_wait(&id->rci_cv, &id->rci_lock);
+	id->rci_iw_gone = B_TRUE;
+	owned = id->rci_iw_owned;
+	id->rci_iw_owned = B_FALSE;
+	mutex_exit(&id->rci_lock);
+	if (owned)
+		ops->iw_release(id->rci_dev->rcd_dev, &id->rci_iw);
+	rdk_cm_ops_exit(id);
 }
 
 int
@@ -196,12 +242,14 @@ rdk_cm_iw_open(rdk_cm_id_t *id, const struct rdk_cm_conn_param *p,
 		ret = ops->iw_connect(id->rci_dev->rcd_dev, &id->rci_iw, &ip);
 	else
 		ret = ops->iw_accept(id->rci_dev->rcd_dev, &id->rci_iw, &ip);
+	mutex_enter(&id->rci_lock);
 	if (ret != 0) {
-		mutex_enter(&id->rci_lock);
 		id->rci_iw_ref = B_FALSE;
 		cv_broadcast(&id->rci_cv);
-		mutex_exit(&id->rci_lock);
+	} else if (active) {
+		id->rci_iw_owned = B_TRUE;
 	}
+	mutex_exit(&id->rci_lock);
 	rdk_cm_ops_exit(id);
 	return (ret);
 }
@@ -237,12 +285,15 @@ rdk_cm_iw_disconnect(rdk_cm_id_t *id, boolean_t abrupt)
 	const struct rdk_iw_cm_ops *ops;
 	boolean_t live;
 
+	if ((ops = rdk_cm_ops_enter(id)) == NULL)
+		return;
 	mutex_enter(&id->rci_lock);
 	live = id->rci_iw_ref;
 	mutex_exit(&id->rci_lock);
-	if (!live || (ops = rdk_cm_ops_enter(id)) == NULL)
-		return;
-	(void) ops->iw_disconnect(id->rci_dev->rcd_dev, &id->rci_iw, abrupt);
+	if (live) {
+		(void) ops->iw_disconnect(id->rci_dev->rcd_dev, &id->rci_iw,
+		    abrupt);
+	}
 	rdk_cm_ops_exit(id);
 }
 
@@ -331,6 +382,7 @@ rdk_cm_iw_request(rdk_cm_id_t *listener, const struct rdk_iw_cm_event *ev)
 	id->rci_iw.iw_vlan = RDK_VLAN_NONE;
 	id->rci_iw.iw_mtu = listener->rci_iw.iw_mtu;
 	id->rci_iw.iw_provider = ev->ev_child;
+	id->rci_iw_owned = B_TRUE;
 	id->rci_state = RCS_REQ;
 	id->rci_listener = listener;
 	listener->rci_refs++;

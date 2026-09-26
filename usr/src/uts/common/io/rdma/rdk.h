@@ -1041,6 +1041,11 @@ extern const char *rdk_cm_event_msg(enum rdk_cm_event_type);
  * iw_connect or iw_accept take no reference.  iw_destroy_listen returns
  * once no CONNECT_REQUEST for the listener can be delivered.
  *
+ * iw_provider stays valid for the framework until iw_release: the
+ * framework calls it once for every ID whose iw_provider a successful
+ * iw_connect set or a CONNECT_REQUEST handed over, after the final event
+ * or reject and when no other operation on the ID runs.
+ *
  * The operations run in thread context without framework locks.
  * rdk_iw_cm_event() takes thread context and copies the event.  For a
  * CONNECT_REQUEST it returns 0 when the framework took ev_child and
@@ -1103,6 +1108,7 @@ struct rdk_iw_cm_ops {
 	    struct rdk_iw_cm_id *);
 	int	(*iw_disconnect)(struct rdk_device *, struct rdk_iw_cm_id *,
 	    boolean_t);
+	void	(*iw_release)(struct rdk_device *, struct rdk_iw_cm_id *);
 };
 
 extern int rdk_iw_cm_attach(struct rdk_device *, const struct rdk_iw_cm_ops *);

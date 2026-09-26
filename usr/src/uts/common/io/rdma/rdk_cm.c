@@ -374,6 +374,7 @@ rdk_cm_destroy_common(rdk_cm_id_t *id, boolean_t from_task)
 		(void) rdk_cm_iw_reject(id, NULL, 0);
 	rdk_cm_iw_disconnect(id, B_TRUE);
 	rdk_cm_iw_wait_final(id);
+	rdk_cm_iw_release(id);
 	rdk_cm_admit_release(id);
 
 	mutex_enter(&rdk_cm_lock);

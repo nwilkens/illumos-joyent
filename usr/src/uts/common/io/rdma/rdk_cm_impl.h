@@ -141,6 +141,9 @@ struct rdk_cm_id {
 	struct rdk_iw_cm_id	rci_iw;
 	boolean_t		rci_iw_ref;	/* the provider holds the ID */
 	boolean_t		rci_iw_listen;
+	boolean_t		rci_iw_owned;	/* iw_release is owed */
+	boolean_t		rci_iw_gone;	/* no more provider calls */
+	uint32_t		rci_iw_calls;	/* provider operations running */
 
 	rdk_cm_acl_t		*rci_acl;
 	uint32_t		rci_backlog;
@@ -191,6 +194,7 @@ extern int rdk_cm_iw_accept(struct rdk_cm_id *,
 extern int rdk_cm_iw_reject(struct rdk_cm_id *, const void *, uint16_t);
 extern void rdk_cm_iw_disconnect(struct rdk_cm_id *, boolean_t);
 extern void rdk_cm_iw_wait_final(struct rdk_cm_id *);
+extern void rdk_cm_iw_release(struct rdk_cm_id *);
 extern void rdk_cm_dev_rele(rdk_cm_dev_t *);
 extern void rdk_cm_iw_init(void);
 extern void rdk_cm_iw_fini(void);
