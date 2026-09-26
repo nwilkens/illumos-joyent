@@ -775,7 +775,7 @@ t4_ot_tpt(t4_ot_t *ot, t4_ofld_test_t *t)
 	int rc;
 
 	if (t->tot_len == 0 || t->tot_len > T4_TPT_MAX_LEN ||
-	    t->tot_id > r->trr_size)
+	    (uint64_t)t->tot_id + t->tot_len > r->trr_size)
 		return (EINVAL);
 	buf = kmem_zalloc(t->tot_len, KM_SLEEP);
 	rc = t4_ofld_tpt_write(ot->ot_of, r->trr_start + t->tot_id, buf,
