@@ -82,6 +82,7 @@ extern uint32_t path_mtu;
 extern char *o_server;
 extern uint32_t fresh_b_access;
 extern uint32_t fresh_inline;
+extern uint32_t fresh_vector;
 extern rdmat_devinfo_t local_dev;
 
 extern void fatal(const char *, ...);

@@ -276,11 +276,11 @@ rdmat_qp_create(rdmat_sess_t *ts, rdmat_qp_t *tq, uint64_t len)
 
 	pc = ts->ts_poll == RDMAT_POLL_TASKQ ? RDK_POLL_TASKQ :
 	    RDK_POLL_DIRECT;
-	if ((ret = rdk_alloc_cq(dev, tq, (int)ts->ts_depth * 2 + 8, 0, pc,
-	    &tq->tq_scq)) != 0)
+	if ((ret = rdk_alloc_cq(dev, tq, (int)ts->ts_depth * 2 + 8,
+	    (int)ts->ts_comp_vector, pc, &tq->tq_scq)) != 0)
 		return (ret);
-	if ((ret = rdk_alloc_cq(dev, tq, (int)ts->ts_depth + 8, 0, pc,
-	    &tq->tq_rcq)) != 0)
+	if ((ret = rdk_alloc_cq(dev, tq, (int)ts->ts_depth + 8,
+	    (int)ts->ts_comp_vector, pc, &tq->tq_rcq)) != 0)
 		return (ret);
 
 	bzero(&init, sizeof (init));
@@ -331,6 +331,7 @@ rdmat_setup(rdmat_sess_t *ts, rdmat_setup_t *rs)
 	    rs->rs_depth == 0 || rs->rs_depth > RDMAT_MAX_DEPTH ||
 	    rs->rs_depth + 4 > (uint32_t)dev->rd_attr.max_qp_wr ||
 	    rs->rs_inline > dev->rd_attr.max_inline_data ||
+	    rs->rs_comp_vector >= dev->rd_num_comp_vectors ||
 	    rs->rs_buf_len / PAGESIZE > dev->rd_attr.max_fast_reg_page_list_len)
 		return (EINVAL);
 	if ((ret = rdk_query_port(dev, 1, &pa)) != 0)
@@ -340,6 +341,7 @@ rdmat_setup(rdmat_sess_t *ts, rdmat_setup_t *rs)
 	ts->ts_poll = rs->rs_poll;
 	ts->ts_depth = rs->rs_depth;
 	ts->ts_inline = rs->rs_inline;
+	ts->ts_comp_vector = rs->rs_comp_vector;
 	ts->ts_setup = B_TRUE;
 
 	rdk_gid_from_ipv4(&gid, rs->rs_ipv4);

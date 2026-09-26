@@ -36,6 +36,8 @@
  *	secs=5		length of a bandwidth run
  *	iters=20000	round trips of a latency run
  *	verify=1	check every byte of the destination after a run
+ *	vec=spread	completion vector of QP i: i modulo the vectors both
+ *			hosts have, or one number for every QP
  *
  * Each run prints one "BENCH key=value ..." line.  Bandwidth is the bytes
  * of every completed request over the time of the slowest QP, from its
@@ -117,6 +119,8 @@ typedef struct bpair {
 
 static bpair_t pairs[B_MAXQP];
 static int remote;
+static uint32_t ncomp = 1;
+static int vec_fixed = -1;
 static double idle_busy_a, idle_intr_a, idle_busy_b, idle_intr_b;
 static pthread_mutex_t go_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t go_cv = PTHREAD_COND_INITIALIZER;
@@ -411,10 +415,10 @@ report(const bconf_t *c, uint64_t wall, const host_stats_t *a0,
 	gbps = span > 0 ? bytes * 8 / (double)span : 0;
 
 	(void) printf("BENCH test=%s where=%s mode=%s size=%u qps=%u "
-	    "depth=%u batch=%u signal=%u inline=%u", tnames[c->c_test],
+	    "depth=%u batch=%u signal=%u inline=%u vecs=%u", tnames[c->c_test],
 	    remote ? "hosts" : "loop", c->c_poll ? "poll" : "intr",
 	    c->c_size, c->c_qps, c->c_depth, c->c_batch, c->c_signal,
-	    c->c_inline);
+	    c->c_inline, vec_fixed >= 0 ? 1 : MIN(ncomp, c->c_qps));
 	if (err != 0) {
 		(void) printf(" result=FAIL error=%s\n", strerror(err));
 		(void) fflush(stdout);
@@ -511,6 +515,7 @@ bench_one(const bconf_t *c)
 	}
 	fresh_inline = c->c_inline ? c->c_size : 0;
 	for (i = 0; i < c->c_qps; i++) {
+		fresh_vector = vec_fixed >= 0 ? (uint32_t)vec_fixed : i % ncomp;
 		if ((ret = fresh(&pairs[i].bp_a, &pairs[i].bp_b, RDMAT_QPT_RC,
 		    c->c_poll ? RDMAT_POLL_DIRECT : RDMAT_POLL_TASKQ)) != 0 ||
 		    prepare(c, &pairs[i]) != 0) {
@@ -623,6 +628,9 @@ bench_main(peer_t *a, peer_t *b, int argc, char **argv)
 			iters = (uint32_t)strtoul(v, NULL, 0);
 		else if (strcmp(argv[i], "verify") == 0)
 			verify = (uint32_t)strtoul(v, NULL, 0);
+		else if (strcmp(argv[i], "vec") == 0)
+			vec_fixed = strcmp(v, "spread") == 0 ? -1 :
+			    (int)strtoul(v, NULL, 0);
 		else
 			usage_bench();
 	}
@@ -655,10 +663,18 @@ bench_main(peer_t *a, peer_t *b, int argc, char **argv)
 			fatal("the server has no RDMA device");
 		if (d.rdd_devs[0].rdi_active_mtu < path_mtu)
 			path_mtu = d.rdd_devs[0].rdi_active_mtu;
+		ncomp = MIN(local_dev.rdi_comp_vectors,
+		    d.rdd_devs[0].rdi_comp_vectors);
+	} else {
+		ncomp = local_dev.rdi_comp_vectors;
 	}
-	(void) printf("# %s %s against %s, path MTU %u, link %llu Mb/s\n",
-	    o_dev, tnames[test], remote ? argv[0] : "itself", path_mtu,
-	    (unsigned long long)(local_dev.rdi_speed / 1000000));
+	ncomp = MAX(ncomp, 1);
+	if (vec_fixed >= (int)ncomp)
+		fatal("vec is below %u", ncomp);
+	(void) printf("# %s %s against %s, path MTU %u, link %llu Mb/s, %u "
+	    "completion vectors\n", o_dev, tnames[test], remote ? argv[0] :
+	    "itself", path_mtu, (unsigned long long)(local_dev.rdi_speed /
+	    1000000), ncomp);
 	idle_rates();
 
 	for (im = 0; im < mode.bl_n; im++)

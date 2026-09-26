@@ -70,7 +70,7 @@ typedef struct rdmat_devinfo {
 	uint32_t	rdi_max_sge;
 	uint32_t	rdi_max_mr_pages;
 	uint32_t	rdi_max_inline;
-	uint32_t	rdi_pad2;
+	uint32_t	rdi_comp_vectors;
 } rdmat_devinfo_t;
 
 typedef struct rdmat_devices {
@@ -108,6 +108,8 @@ typedef struct rdmat_setup {
 	uint64_t	rs_buf_len;	/* per QP, multiple of RDMAT_CHUNK */
 	uint32_t	rs_depth;	/* send and receive queue depth */
 	uint32_t	rs_inline;	/* inline bytes the QPs take */
+	uint32_t	rs_comp_vector;	/* of the CQs */
+	uint32_t	rs_pad;
 	/* Out */
 	uint8_t		rs_gid[16];
 	uint8_t		rs_mac[6];

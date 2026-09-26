@@ -315,8 +315,9 @@ qp_state(peer_t *p)
  */
 /* The QP access B's next fresh() connection grants (rc_qp_access). */
 uint32_t fresh_b_access;
-/* The inline size of the next fresh() QPs. */
+/* The inline size and completion vector of the next fresh() QPs. */
 uint32_t fresh_inline;
+uint32_t fresh_vector;
 
 int
 fresh(peer_t *a, peer_t *b, uint32_t qpt, uint32_t poll)
@@ -345,6 +346,7 @@ fresh(peer_t *a, peer_t *b, uint32_t qpt, uint32_t poll)
 		p->p_setup.rs_buf_len = o_buf_mb << 20;
 		p->p_setup.rs_depth = o_depth;
 		p->p_setup.rs_inline = fresh_inline;
+		p->p_setup.rs_comp_vector = fresh_vector;
 		/* The server supplies its own device and address. */
 		if ((ret = pio(p, RDMAT_IOC_SETUP, &p->p_setup)) != 0) {
 			(void) fprintf(stderr, "%s: setup: %s\n", p->p_name,
@@ -1456,7 +1458,8 @@ main(int argc, char **argv)
 	if (strcmp(argv[0], "info") == 0) {
 		(void) printf("%s port state %u active MTU %u (link %u) speed "
 		    "%llu MAC %02x:%02x:%02x:%02x:%02x:%02x max QP %u max WR "
-		    "%u max SGE %u max MR pages %u\n", local_dev.rdi_name,
+		    "%u max SGE %u max MR pages %u completion vectors %u\n",
+		    local_dev.rdi_name,
 		    local_dev.rdi_port_state, local_dev.rdi_active_mtu,
 		    local_dev.rdi_phys_mtu,
 		    (u_longlong_t)local_dev.rdi_speed, local_dev.rdi_mac[0],
@@ -1464,7 +1467,7 @@ main(int argc, char **argv)
 		    local_dev.rdi_mac[3], local_dev.rdi_mac[4],
 		    local_dev.rdi_mac[5], local_dev.rdi_max_qp,
 		    local_dev.rdi_max_qp_wr, local_dev.rdi_max_sge,
-		    local_dev.rdi_max_mr_pages);
+		    local_dev.rdi_max_mr_pages, local_dev.rdi_comp_vectors);
 		return (0);
 	}
 	if (o_ip == 0)

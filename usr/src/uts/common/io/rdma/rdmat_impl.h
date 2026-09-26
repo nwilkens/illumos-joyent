@@ -132,6 +132,7 @@ typedef struct rdmat_sess {
 	uint32_t		ts_poll;
 	uint32_t		ts_depth;
 	uint32_t		ts_inline;
+	uint32_t		ts_comp_vector;
 	uint16_t		ts_gid_index;
 	boolean_t		ts_gid_added;
 	uint32_t		ts_nqp;
