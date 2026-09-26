@@ -94,8 +94,12 @@ iwc_next_hw_cqe(iwc_cq_t *cq, t4_cqe_t **cqep)
 	return (0);
 }
 
+/*
+ * The next CQE and where it is.  The SWCQE and DRAIN bits are the driver's
+ * own: a hardware CQE that has them is not trusted to carry them.
+ */
 static int
-iwc_next_cqe(iwc_cq_t *cq, t4_cqe_t **cqep)
+iwc_next_cqe(iwc_cq_t *cq, t4_cqe_t **cqep, boolean_t *swp)
 {
 	t4_cq_t *hw = &cq->cq_hw;
 
@@ -103,9 +107,17 @@ iwc_next_cqe(iwc_cq_t *cq, t4_cqe_t **cqep)
 		return (ENODATA);
 	if (hw->sw_in_use != 0) {
 		*cqep = &hw->sw_queue[hw->sw_cidx];
+		*swp = B_TRUE;
 		return (0);
 	}
+	*swp = B_FALSE;
 	return (iwc_next_hw_cqe(cq, cqep));
+}
+
+static boolean_t
+iwc_hw_cqe_ok(const t4_cqe_t *cqe)
+{
+	return (!CQE_SWCQE(cqe) && !CQE_DRAIN(cqe));
 }
 
 static void
@@ -264,6 +276,11 @@ iwc_flush_hw_cq(iwc_cq_t *cq, iwc_qp_t *fqp)
 
 	ASSERT(MUTEX_HELD(&cq->cq_lock));
 	while (iwc_next_hw_cqe(cq, &hw) == 0) {
+		qp = NULL;
+		if (!iwc_hw_cqe_ok(hw)) {
+			IWC_STAT(iwc, is_cqe_bad);
+			goto next;
+		}
 		qp = iwc_qp_get(iwc, CQE_QPID(hw));
 		if (qp == NULL || !iwc_cqe_owner_ok(cq, qp, hw)) {
 			IWC_STAT(iwc, is_cqe_bad);
@@ -429,14 +446,14 @@ typedef struct iwc_polled {
  * filled, EAGAIN when the CQE was consumed without a completion.
  */
 static int
-iwc_poll_one_qp(iwc_cq_t *cq, iwc_qp_t *qp, t4_cqe_t *hw, iwc_polled_t *out)
+iwc_poll_one_qp(iwc_cq_t *cq, iwc_qp_t *qp, t4_cqe_t *hw, boolean_t sw,
+    iwc_polled_t *out)
 {
 	iwc_t *iwc = cq->cq_iwc;
 	t4_wq_t *wq = &qp->qp_wq;
 	t4_cq_t *hc = &cq->cq_hw;
 	t4_cqe_t rd;
 	t4_swsqe_t *swsqe;
-	const boolean_t sw = CQE_SWCQE(hw);
 	uint16_t idx;
 	int ret = 0;
 
@@ -635,15 +652,18 @@ iwc_poll_one(iwc_cq_t *cq, struct rdk_wc *wc)
 	iwc_polled_t p;
 	t4_cqe_t *hw;
 	iwc_qp_t *qp;
+	boolean_t sw;
 	int ret;
 
-	if ((ret = iwc_next_cqe(cq, &hw)) != 0)
+	if ((ret = iwc_next_cqe(cq, &hw, &sw)) != 0)
 		return (ret);
-	qp = iwc_qp_get(iwc, CQE_QPID(hw));
-	if (qp == NULL || !iwc_cqe_owner_ok(cq, qp, hw)) {
-		if (!CQE_SWCQE(hw))
+	qp = NULL;
+	if ((!sw && !iwc_hw_cqe_ok(hw)) ||
+	    (qp = iwc_qp_get(iwc, CQE_QPID(hw))) == NULL ||
+	    !iwc_cqe_owner_ok(cq, qp, hw)) {
+		if (!sw)
 			IWC_STAT(iwc, is_cqe_bad);
-		if (CQE_SWCQE(hw))
+		if (sw)
 			t4_swcq_consume(&cq->cq_hw);
 		else
 			iwc_hwcq_consume(cq);
@@ -652,7 +672,7 @@ iwc_poll_one(iwc_cq_t *cq, struct rdk_wc *wc)
 		return (EAGAIN);
 	}
 	mutex_enter(&qp->qp_lock);
-	ret = iwc_poll_one_qp(cq, qp, hw, &p);
+	ret = iwc_poll_one_qp(cq, qp, hw, sw, &p);
 	mutex_exit(&qp->qp_lock);
 	if (ret == 0 && iwc_wc_fill(qp, &p, wc) != 0) {
 		IWC_STAT(iwc, is_cqe_bad);
