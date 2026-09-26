@@ -150,6 +150,7 @@ hw_access(void)
 static void
 setup(void)
 {
+	memset(&mlx, 0, sizeof (mlx));
 	mlx.mlx_ports = &port;
 	port.mlp_mtu = 1500;
 	mutex_init(&mlx.mlx_quarantine_mtx, NULL, MUTEX_DRIVER, NULL);
@@ -161,11 +162,7 @@ setup(void)
 #endif
 	list_create(&mlx.mlx_wqs, sizeof (mlxcx_work_queue_t),
 	    offsetof(mlxcx_work_queue_t, mlwq_entry));
-	list_create(&mlx.mlx_buf_shards, sizeof (mlxcx_buf_shard_t),
-	    offsetof(mlxcx_buf_shard_t, mlbs_entry));
-	mlx.mlx_bufs_cache = kmem_cache_create("bufs",
-	    sizeof (mlxcx_buffer_t), 8, mlxcx_bufs_cache_constr,
-	    mlxcx_bufs_cache_destr, NULL, &mlx, NULL, 0);
+	(void) mlxcx_setup_bufs(&mlx);
 }
 
 static mlxcx_buf_shard_t *
@@ -414,11 +411,22 @@ orphan_unload(void)
 		stub_fail("module unloads while leaked buffers point into it");
 }
 
+/* The same instance attaches again after a detach that leaked its cache. */
+static void
+orphan_reattach(void)
+{
+	orphan_unload();
+	hw_stopped = B_TRUE;
+	setup();
+	mlxcx_teardown_bufs(&mlx);
+}
+
 static const char *const names[] = {
-	"rx-stuck", "rx-stuck-leak", "tx-stuck", "orphan-unload", NULL
+	"rx-stuck", "rx-stuck-leak", "tx-stuck", "orphan-unload",
+	"orphan-reattach", NULL
 };
 static void (*const funcs[])(void) = {
-	rx_stuck, rx_stuck_leak, tx_stuck, orphan_unload
+	rx_stuck, rx_stuck_leak, tx_stuck, orphan_unload, orphan_reattach
 };
 
 int

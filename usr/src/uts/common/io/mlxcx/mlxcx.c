@@ -1646,9 +1646,19 @@ static boolean_t
 mlxcx_setup_bufs(mlxcx_t *mlxp)
 {
 	char namebuf[KSTAT_STRLEN];
+	uint_t orphans = mlxcx_orphans;
 
-	(void) snprintf(namebuf, KSTAT_STRLEN, "mlxcx%d_bufs_cache",
-	    ddi_get_instance(mlxp->mlx_dip));
+	/*
+	 * An orphaned cache of this instance keeps its name for good, so a
+	 * cache made after an orphaning detach needs a new one.
+	 */
+	if (orphans == 0) {
+		(void) snprintf(namebuf, KSTAT_STRLEN, "mlxcx%d_bufs_cache",
+		    ddi_get_instance(mlxp->mlx_dip));
+	} else {
+		(void) snprintf(namebuf, KSTAT_STRLEN, "mlxcx%d_bufs_cache_%u",
+		    ddi_get_instance(mlxp->mlx_dip), orphans);
+	}
 	mlxp->mlx_bufs_cache = kmem_cache_create(namebuf,
 	    sizeof (mlxcx_buffer_t), sizeof (uint64_t),
 	    mlxcx_bufs_cache_constr, mlxcx_bufs_cache_destr,

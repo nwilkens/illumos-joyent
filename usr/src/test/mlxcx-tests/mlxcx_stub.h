@@ -199,6 +199,8 @@ kmem_free(void *p, size_t size)
  * kernel, so it fails the test.
  */
 typedef struct kmem_cache {
+	struct kmem_cache *kc_next;
+	char		kc_name[32];
 	size_t		kc_size;
 	int		(*kc_constr)(void *, void *, int);
 	void		(*kc_destr)(void *, void *);
@@ -207,6 +209,9 @@ typedef struct kmem_cache {
 	int		kc_dead;
 } kmem_cache_t;
 
+static kmem_cache_t *stub_caches;
+
+/* A live cache owns its kstat name; a second one of that name has none. */
 static kmem_cache_t *
 kmem_cache_create(char *name, size_t size, size_t align,
     int (*constr)(void *, void *, int), void (*destr)(void *, void *),
@@ -214,7 +219,14 @@ kmem_cache_create(char *name, size_t size, size_t align,
 {
 	kmem_cache_t *cp = calloc(1, sizeof (*cp));
 
-	(void) name; (void) align; (void) reclaim; (void) vmp; (void) flags;
+	(void) align; (void) reclaim; (void) vmp; (void) flags;
+	for (kmem_cache_t *o = stub_caches; o != NULL; o = o->kc_next) {
+		if (!o->kc_dead && strcmp(o->kc_name, name) == 0)
+			stub_fail("kmem cache name %s is already in use", name);
+	}
+	(void) snprintf(cp->kc_name, sizeof (cp->kc_name), "%s", name);
+	cp->kc_next = stub_caches;
+	stub_caches = cp;
 	cp->kc_size = size;
 	cp->kc_constr = constr;
 	cp->kc_destr = destr;
@@ -675,6 +687,14 @@ typedef struct {
 #define	DDI_DEFAULT_ACC		1
 #define	DDI_FM_ACC_ERR_CAP(c)	(((c) & 0x2) != 0)
 #define	longlong_t		long long
+#define	KSTAT_STRLEN		31
+
+static int
+ddi_get_instance(dev_info_t *dip)
+{
+	(void) dip;
+	return (0);
+}
 
 static off_t stub_regsize = 32 * 1024 * 1024;
 

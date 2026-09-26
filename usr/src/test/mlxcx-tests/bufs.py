@@ -8,7 +8,8 @@ from c_test import (TESTDIR, CTestFailure, function, mlxcx_types,
                     typedef)
 
 
-NAMES = ("rx-stuck", "rx-stuck-leak", "tx-stuck", "orphan-unload")
+NAMES = ("rx-stuck", "rx-stuck-leak", "tx-stuck", "orphan-unload",
+         "orphan-reattach")
 
 
 def main():
@@ -22,6 +23,9 @@ def main():
         "mlxcx_workq_type_t", "mlxcx_dma_quarantine_t"))
     have = "mlxcx_cq_quarantine_bufs" in ring.read_text(encoding="utf-8")
     parts = ["#define\tHAVE_BUF_QUARANTINE\t1\n" if have else ""]
+    orphans = re.search(r"^static volatile uint_t mlxcx_orphans;$",
+                        main_c.read_text(encoding="utf-8"), re.M)
+    parts.append(orphans.group() + "\n" if orphans else "")
     parts += [function(main_c, name) for name in (
         "mlxcx_bufs_cache_constr", "mlxcx_bufs_cache_destr",
         "mlxcx_mlbs_create")]
@@ -37,10 +41,7 @@ def main():
         "mlxcx_shard_draining", "mlxcx_wq_rele_dma", "mlxcx_wq_teardown")]
     parts.append(optional_function(ring, "mlxcx_buf_quarantine_free"))
     parts += [function(main_c, name) for name in (
-        "mlxcx_mlbs_teardown", "mlxcx_teardown_bufs")]
-    orphans = re.search(r"^static volatile uint_t mlxcx_orphans;$",
-                        main_c.read_text(encoding="utf-8"), re.M)
-    parts.append(orphans.group() + "\n" if orphans else "")
+        "mlxcx_mlbs_teardown", "mlxcx_teardown_bufs", "mlxcx_setup_bufs")]
     parts += [optional_function(main_c, name) for name in (
         "mlxcx_dma_quarantine", "mlxcx_dma_quarantine_free",
         "mlxcx_orphan_bufs", "_fini")]
