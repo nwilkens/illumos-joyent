@@ -42,6 +42,14 @@
 /* Passes a vector makes on its own for entries it finds after the enable. */
 #define	IRDMA_CEQ_RECHECKS	4
 
+/*
+ * How often an idle completion vector looks at its CEQ, and for how long
+ * after its last work.  An entry can sit in the CEQ with no interrupt for
+ * it (see irdma_vec_idle()).
+ */
+#define	IRDMA_VEC_WATCH_US	10000
+#define	IRDMA_VEC_WATCH_SEC	1
+
 /* The PF-relative vector number of entry i of the RDMA block. */
 uint32_t
 irdma_hw_vec(irdma_t *irdma, uint_t i)
@@ -208,6 +216,85 @@ irdma_vec_work(irdma_vec_t *iv, irdma_ceq_t *ic, boolean_t owed,
 		irdma_ceq_resched_run(ic);
 }
 
+static boolean_t
+irdma_aeq_pending(struct irdma_sc_aeq *aeq)
+{
+	u64 temp;
+
+	get_64bit_val(IRDMA_GET_CURRENT_AEQ_ELEM(aeq), 8, &temp);
+	return ((u8)FIELD_GET(IRDMA_AEQE_VALID, temp) == aeq->polarity);
+}
+
+/* Whether a queue of the vector holds an entry; the thread is idle. */
+static boolean_t
+irdma_vec_pending(irdma_vec_t *iv, irdma_ceq_t *ic)
+{
+	irdma_t *irdma = iv->iv_irdma;
+	uint32_t progress = irdma->irdma_progress;
+	boolean_t pending = B_FALSE;
+
+	if (iv->iv_ctl) {
+		if ((progress & BIT(IRDMA_STEP_CEQ0)) != 0) {
+			mutex_enter(&irdma->irdma_ceq_lock);
+			pending = irdma_ceq_pending(&irdma->irdma_ceq0);
+			mutex_exit(&irdma->irdma_ceq_lock);
+		}
+		if (!pending && (progress & BIT(IRDMA_STEP_AEQ)) != 0)
+			pending = irdma_aeq_pending(&irdma->irdma_aeq);
+	}
+	if (!pending && ic != NULL) {
+		mutex_enter(&ic->ic_lock);
+		pending = irdma_ceq_pending(&ic->ic_sc);
+		mutex_exit(&ic->ic_lock);
+	}
+	return (pending);
+}
+
+/*
+ * Sleep until the vector has work.  On E810 an entry has been seen to sit
+ * in a CEQ after the device fired the vector with no call of the handler,
+ * and a CQ with an event pending never fires again, so a vector that did
+ * work in the last IRDMA_VEC_WATCH_SEC looks at its queues every
+ * IRDMA_VEC_WATCH_US.  A rescue records whether the vector was still
+ * enabled, that is whether the device or the host lost the interrupt.
+ */
+static void
+irdma_vec_idle(irdma_vec_t *iv)
+{
+	irdma_t *irdma = iv->iv_irdma;
+	struct irdma_sc_dev *dev = &irdma->irdma_sc;
+	irdma_ceq_t *ic;
+	uint32_t ctl;
+
+	ASSERT(MUTEX_HELD(&iv->iv_lock));
+	while (!iv->iv_exit && !iv->iv_resched &&
+	    (iv->iv_off || !iv->iv_owed)) {
+		ic = iv->iv_ceq;
+		if (iv->iv_off || gethrtime() - iv->iv_last >
+		    SEC2NSEC(IRDMA_VEC_WATCH_SEC)) {
+			cv_wait(&iv->iv_cv, &iv->iv_lock);
+			continue;
+		}
+		if (cv_reltimedwait(&iv->iv_cv, &iv->iv_lock,
+		    drv_usectohz(IRDMA_VEC_WATCH_US), TR_CLOCK_TICK) != -1 ||
+		    iv->iv_owed || iv->iv_resched || iv->iv_exit ||
+		    iv->iv_off || iv->iv_ceq != ic)
+			continue;
+		mutex_exit(&iv->iv_lock);
+		if (!irdma_vec_pending(iv, ic)) {
+			mutex_enter(&iv->iv_lock);
+			continue;
+		}
+		ctl = readl(dev->hw_regs[IRDMA_GLINT_DYN_CTL] +
+		    irdma_hw_vec(irdma, iv->iv_idx));
+		mutex_enter(&iv->iv_lock);
+		iv->iv_rescues++;
+		if ((ctl & IRDMA_GLINT_DYN_CTL_INTENA) != 0)
+			iv->iv_rescues_on++;
+		iv->iv_owed = B_TRUE;
+	}
+}
+
 /*
  * The vector's context.  Work for CQs that asked to be called again runs
  * even when the vector is off, so their handlers see them go away.
@@ -222,9 +309,7 @@ irdma_vec_thread(void *arg)
 
 	mutex_enter(&iv->iv_lock);
 	for (;;) {
-		while (!iv->iv_exit && !iv->iv_resched &&
-		    (iv->iv_off || !iv->iv_owed))
-			cv_wait(&iv->iv_cv, &iv->iv_lock);
+		irdma_vec_idle(iv);
 		if (iv->iv_exit)
 			break;
 		owed = iv->iv_owed && !iv->iv_off;
@@ -238,7 +323,8 @@ irdma_vec_thread(void *arg)
 		irdma_vec_work(iv, ic, owed, resched);
 
 		mutex_enter(&iv->iv_lock);
-		iv->iv_busy_ns += (uint64_t)(gethrtime() - t0);
+		iv->iv_last = gethrtime();
+		iv->iv_busy_ns += (uint64_t)(iv->iv_last - t0);
 		iv->iv_busy = B_FALSE;
 		iv->iv_passes++;
 		cv_broadcast(&iv->iv_cv);

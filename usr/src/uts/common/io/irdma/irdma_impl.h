@@ -124,6 +124,9 @@ typedef struct irdma_vec {
 	uint64_t		iv_passes;
 	uint64_t		iv_intrs;
 	uint64_t		iv_busy_ns;
+	hrtime_t		iv_last;	/* end of the last pass */
+	uint64_t		iv_rescues;	/* see irdma_vec_idle() */
+	uint64_t		iv_rescues_on;
 	struct irdma_ceq	*iv_ceq;
 	kt_did_t		iv_did;
 } irdma_vec_t;
@@ -185,6 +188,8 @@ typedef struct irdma_kstats {
 	kstat_named_t	ik_cq_arms;
 	kstat_named_t	ik_comp_vectors;
 	kstat_named_t	ik_ceq_busy_ns;
+	kstat_named_t	ik_ceq_rescues;
+	kstat_named_t	ik_ceq_rescues_on;
 	kstat_named_t	ik_ceqn_intrs[IRDMA_MAX_VECTORS];
 } irdma_kstats_t;
 

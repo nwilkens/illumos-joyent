@@ -97,6 +97,15 @@ def main():
     for q in ("irdma_ceq_pending(&irdma->irdma_ceq0)",
               "irdma_ceq_pending(&ic->ic_sc)"):
         assert work.index(q) > en, q
+    # The idle watchdog looks at the queues and reads the vector with
+    # iv_lock dropped.
+    idle = body(intr, "irdma_vec_idle")
+    rd = idle.index("readl(")
+    seg = idle[idle.rindex("mutex_exit(&iv->iv_lock);", 0, rd):rd]
+    assert "irdma_vec_pending(iv, ic)" in seg
+    # The only re-entry before the read leaves the loop body at once.
+    for m in re.finditer(r"mutex_enter\(&iv->iv_lock\);", seg):
+        assert seg[m.end():].lstrip().startswith("continue;")
     # Only a CEQ entry uses up a CQ's arm.
     assert re.search(r"if \(event\) \{\n\t\tmutex_enter\(&icq->icq_lock\);"
                      r"\n\t\ticq->icq_armed = B_FALSE;", dispatch)

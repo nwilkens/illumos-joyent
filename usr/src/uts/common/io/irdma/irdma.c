@@ -173,6 +173,8 @@ irdma_kstat_update(kstat_t *ksp, int rw)
 	k->ik_ceq_intrs.value.ui64 = 0;
 	k->ik_aeq_intrs.value.ui64 = 0;
 	k->ik_ceq_busy_ns.value.ui64 = 0;
+	k->ik_ceq_rescues.value.ui64 = 0;
+	k->ik_ceq_rescues_on.value.ui64 = 0;
 	for (i = 0; i < (int)irdma->irdma_nvecs; i++) {
 		irdma_vec_t *iv = &irdma->irdma_vecs[i];
 
@@ -181,6 +183,8 @@ irdma_kstat_update(kstat_t *ksp, int rw)
 		else
 			k->ik_ceq_intrs.value.ui64 += iv->iv_intrs;
 		k->ik_ceq_busy_ns.value.ui64 += iv->iv_busy_ns;
+		k->ik_ceq_rescues.value.ui64 += iv->iv_rescues;
+		k->ik_ceq_rescues_on.value.ui64 += iv->iv_rescues_on;
 	}
 	k->ik_comp_vectors.value.ui32 = irdma->irdma_nceqs;
 	for (i = 0; i < (int)irdma->irdma_nceqs; i++) {
@@ -277,6 +281,9 @@ irdma_kstat_init(irdma_t *irdma)
 	kstat_named_init(&k->ik_comp_vectors, "comp_vectors",
 	    KSTAT_DATA_UINT32);
 	kstat_named_init(&k->ik_ceq_busy_ns, "ceq_busy_ns", KSTAT_DATA_UINT64);
+	kstat_named_init(&k->ik_ceq_rescues, "ceq_rescues", KSTAT_DATA_UINT64);
+	kstat_named_init(&k->ik_ceq_rescues_on, "ceq_rescues_enabled",
+	    KSTAT_DATA_UINT64);
 	for (i = 0; i < irdma->irdma_nceqs; i++) {
 		char name[KSTAT_STRLEN];
 
