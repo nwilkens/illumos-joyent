@@ -700,6 +700,11 @@ t4_ofld_cpl_hwtid(t4_ofld_t *of, t4_rdma_queue_t q, uint8_t opcode,
 	port = e->te_port;
 	mutex_exit(&of->of_tids.td_lock);
 
+	if (opcode == CPL_ABORT_RPL_RSS || (opcode == CPL_ABORT_REQ_RSS &&
+	    !t4_cpl_neg_advice(((const struct cpl_abort_req_rss *)
+	    mp->b_rptr)->status)))
+		t4_ofld_ri_gone(of, tid);
+
 	if ((rc = t4_tid_hold(of, T4_TID_HW, tid, gen, rxq, &ctx)) != 0) {
 		if (rc == EXDEV)
 			T4_OFLD_STAT(of, os_cpl_wrongq);

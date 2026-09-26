@@ -30,6 +30,7 @@
 #include <sys/types.h>
 #include <sys/ksynch.h>
 #include <sys/list.h>
+#include <sys/avl.h>
 #include <sys/kstat.h>
 #include <sys/disp.h>
 #include <sys/socket.h>
@@ -118,6 +119,7 @@ typedef struct t4_tid_ent {
 	uint32_t	te_owner;	/* client generation */
 	uint32_t	te_seq;		/* hwtid: bumped at each claim */
 	uint32_t	te_next;	/* atid free list */
+	uint32_t	te_ri;		/* hwtid: the QP bound to it */
 	void		*te_ctx;
 } t4_tid_ent_t;
 
@@ -196,7 +198,22 @@ typedef struct t4_ofld_buf {
 	ddi_dma_handle_t	ob_dhdl;
 	ddi_acc_handle_t	ob_ahdl;
 	list_node_t		ob_node;
+	boolean_t		ob_bound;	/* queue memory t4nex owns */
+	boolean_t		ob_quar;	/* on of_quar */
 } t4_ofld_buf_t;
+
+/* A CQ or QP of the child (t4_ofld_ri.c); keyed by CQ or SQ ID. */
+typedef struct t4_ri_obj {
+	avl_node_t	ro_node;
+	uint32_t	ro_id;
+	uint32_t	ro_rqid;
+	uint32_t	ro_cq[2];	/* QP: send and receive CQ */
+	uint32_t	ro_gen;
+	uint32_t	ro_tid;		/* QP: the connection after INIT */
+	uint32_t	ro_refs;	/* CQ: QPs using it */
+	uint16_t	ro_flags;
+	t4_ofld_buf_t	*ro_mem[2];
+} t4_ri_obj_t;
 
 struct t4_ofld;
 
@@ -347,6 +364,12 @@ typedef struct t4_ofld {
 	uint64_t		of_dma_bytes;
 	uint64_t		of_quar_bytes;
 
+	kmutex_t		of_ri_lock;
+	kcondvar_t		of_ri_cv;
+	avl_tree_t		of_ri_objs;
+	uint32_t		of_ri_nids;
+	ulong_t			*of_ri_used;	/* IDs a queue may hold */
+
 	kstat_t			*of_ksp;
 	t4_ofld_kstats_t	of_kstats;
 	t4_ofld_stats_t		of_stats;
@@ -472,6 +495,24 @@ extern int t4_ofld_dma_alloc(t4_ofld_t *, size_t, size_t, t4_rdma_dma_t **);
 extern void t4_ofld_dma_free(t4_ofld_t *, t4_rdma_dma_t *, boolean_t);
 extern void t4_ofld_dma_fini(t4_ofld_t *, boolean_t);
 extern void t4_ofld_dma_close(t4_ofld_t *);
+extern t4_ofld_buf_t *t4_ofld_dma_bind(t4_ofld_t *, t4_rdma_dma_t *, size_t);
+extern void t4_ofld_dma_unbind(t4_ofld_t *, t4_ofld_buf_t *);
+extern void t4_ofld_dma_release(t4_ofld_t *, t4_ofld_buf_t *, boolean_t);
+
+/* t4_ofld_ri.c */
+extern void t4_ofld_ri_setup(t4_ofld_t *);
+extern void t4_ofld_ri_teardown(t4_ofld_t *);
+extern void t4_ofld_ri_close(t4_ofld_t *, uint32_t);
+extern void t4_ofld_ri_gone(t4_ofld_t *, uint32_t);
+extern void t4_ofld_ri_untid(t4_ofld_t *, const t4_ri_obj_t *);
+extern int t4_ofld_cq_create(t4_ofld_t *, const t4_rdma_cq_res_t *,
+    t4_rdma_db_t *);
+extern int t4_ofld_cq_destroy(t4_ofld_t *, uint32_t);
+extern int t4_ofld_qp_create(t4_ofld_t *, const t4_rdma_qp_res_t *,
+    t4_rdma_db_t *, t4_rdma_db_t *);
+extern int t4_ofld_qp_destroy(t4_ofld_t *, uint32_t);
+extern int t4_ofld_ri_init(t4_ofld_t *, uint32_t, const t4_rdma_ri_init_t *);
+extern int t4_ofld_ri_fini(t4_ofld_t *, uint32_t, uint32_t);
 
 /* t4_ofld_test.c */
 extern int t4_ofld_test_ioctl(struct adapter *, void *, int);

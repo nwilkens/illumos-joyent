@@ -2017,7 +2017,7 @@ CXGBE_NEX_OBJS =	t4_nexus.o t4_sge.o t4_mac.o t4_ioctl.o t4_debug.o \
 			cudbg.o t4_ofld.o t4_ofld_sge.o t4_ofld_cpl.o \
 			t4_ofld_orphan.o t4_ofld_ops.o t4_ofld_dma.o \
 			t4_rdma_peer.o t4_ofld_test.o t4_tid.o t4_l2t.o \
-			t4_clip.o
+			t4_clip.o t4_ofld_ri.o
 
 #
 #	Chelsio Terminator 4 10G NIC driver module

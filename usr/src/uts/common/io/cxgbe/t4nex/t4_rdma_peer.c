@@ -463,6 +463,105 @@ t4_rdma_op_stopped(t4_rdma_peer_t *peer)
 	return (!ok);
 }
 
+static int
+t4_rdma_op_cq_create(t4_rdma_peer_t *peer, const t4_rdma_cq_res_t *c,
+    t4_rdma_db_t *dbp)
+{
+	t4_rdma_cq_res_t req;
+	t4_rdma_db_t db;
+	t4_ofld_t *of;
+	int rc;
+
+	if (c == NULL || dbp == NULL)
+		return (EINVAL);
+	req = *c;
+	if ((of = t4_rdma_op_enter(peer)) == NULL)
+		return (EIO);
+	if ((rc = t4_ofld_cq_create(of, &req, &db)) == 0)
+		*dbp = db;
+	t4_rdma_op_exit(of);
+	return (rc);
+}
+
+static int
+t4_rdma_op_cq_destroy(t4_rdma_peer_t *peer, uint32_t cqid)
+{
+	t4_ofld_t *of;
+	int rc;
+
+	if ((of = t4_rdma_op_enter(peer)) == NULL)
+		return (EIO);
+	rc = t4_ofld_cq_destroy(of, cqid);
+	t4_rdma_op_exit(of);
+	return (rc);
+}
+
+static int
+t4_rdma_op_qp_create(t4_rdma_peer_t *peer, const t4_rdma_qp_res_t *q,
+    t4_rdma_db_t *sdbp, t4_rdma_db_t *rdbp)
+{
+	t4_rdma_qp_res_t req;
+	t4_rdma_db_t sdb, rdb;
+	t4_ofld_t *of;
+	int rc;
+
+	if (q == NULL || sdbp == NULL || rdbp == NULL)
+		return (EINVAL);
+	req = *q;
+	if ((of = t4_rdma_op_enter(peer)) == NULL)
+		return (EIO);
+	if ((rc = t4_ofld_qp_create(of, &req, &sdb, &rdb)) == 0) {
+		*sdbp = sdb;
+		*rdbp = rdb;
+	}
+	t4_rdma_op_exit(of);
+	return (rc);
+}
+
+static int
+t4_rdma_op_qp_destroy(t4_rdma_peer_t *peer, uint32_t sqid)
+{
+	t4_ofld_t *of;
+	int rc;
+
+	if ((of = t4_rdma_op_enter(peer)) == NULL)
+		return (EIO);
+	rc = t4_ofld_qp_destroy(of, sqid);
+	t4_rdma_op_exit(of);
+	return (rc);
+}
+
+static int
+t4_rdma_op_ri_init(t4_rdma_peer_t *peer, uint32_t tid,
+    const t4_rdma_ri_init_t *ri)
+{
+	t4_rdma_ri_init_t req;
+	t4_ofld_t *of;
+	int rc;
+
+	if (ri == NULL)
+		return (EINVAL);
+	req = *ri;
+	if ((of = t4_rdma_op_enter(peer)) == NULL)
+		return (EIO);
+	rc = t4_ofld_ri_init(of, tid, &req);
+	t4_rdma_op_exit(of);
+	return (rc);
+}
+
+static int
+t4_rdma_op_ri_fini(t4_rdma_peer_t *peer, uint32_t tid, uint32_t sqid)
+{
+	t4_ofld_t *of;
+	int rc;
+
+	if ((of = t4_rdma_op_enter(peer)) == NULL)
+		return (EIO);
+	rc = t4_ofld_ri_fini(of, tid, sqid);
+	t4_rdma_op_exit(of);
+	return (rc);
+}
+
 const t4_rdma_ops_t t4_rdma_ops = {
 	.tro_open = t4_rdma_op_open,
 	.tro_close = t4_rdma_op_close,
@@ -491,5 +590,11 @@ const t4_rdma_ops_t t4_rdma_ops = {
 	.tro_dma_alloc = t4_rdma_op_dma_alloc,
 	.tro_dma_free = t4_rdma_op_dma_free,
 	.tro_reset = t4_rdma_op_reset,
-	.tro_stopped = t4_rdma_op_stopped
+	.tro_stopped = t4_rdma_op_stopped,
+	.tro_cq_create = t4_rdma_op_cq_create,
+	.tro_cq_destroy = t4_rdma_op_cq_destroy,
+	.tro_qp_create = t4_rdma_op_qp_create,
+	.tro_qp_destroy = t4_rdma_op_qp_destroy,
+	.tro_ri_init = t4_rdma_op_ri_init,
+	.tro_ri_fini = t4_rdma_op_ri_fini
 };

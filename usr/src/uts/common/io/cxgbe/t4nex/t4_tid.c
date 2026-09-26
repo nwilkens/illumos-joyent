@@ -314,6 +314,7 @@ t4_tid_free_locked(t4_ofld_t *of, t4_tid_kind_t kind, uint32_t id)
 		e[i].te_ctx = NULL;
 		e[i].te_owner = 0;
 		e[i].te_rxq = 0;
+		e[i].te_ri = T4_TID_NIL;
 	}
 	ASSERT3U(tt->tt_inuse, >=, n);
 	tt->tt_inuse -= n;
@@ -425,6 +426,7 @@ t4_hwtid_claim(t4_ofld_t *of, uint32_t tid, t4_tid_state_t state,
 		e->te_port = port;
 		e->te_rxq = rxq;
 		e->te_ctx = ctx;
+		e->te_ri = T4_TID_NIL;
 		e->te_seq++;
 	}
 	mutex_exit(&td->td_lock);

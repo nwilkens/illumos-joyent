@@ -45,7 +45,7 @@
 extern "C" {
 #endif
 
-#define	T4_RDMA_VERSION		1
+#define	T4_RDMA_VERSION		2
 
 #define	T4_RDMA_MAX_PORTS	4
 #define	T4_RDMA_NMTUS		16
@@ -156,6 +156,7 @@ typedef struct t4_rdma_info {
 	uint32_t		tri_eq_qpp_shift;
 	uint32_t		tri_iq_qpp_shift;
 	boolean_t		tri_write_combine;
+	uint32_t		tri_eq_spg_len;	/* status page, 64B entries */
 } t4_rdma_info_t;
 
 typedef struct t4_rdma_listen {
@@ -216,6 +217,50 @@ typedef struct t4_rdma_dma {
 	size_t		trd_len;
 } t4_rdma_dma_t;
 
+/*
+ * RDMA queues (FW_RI_RES_WR).  t4nex takes the memory from create on: the
+ * child never frees it, and destroy frees it only once the firmware has let
+ * go of the queue.  IDs come from the vres QP range, which the CQs share.
+ */
+typedef struct t4_rdma_cq_res {
+	uint32_t	trcq_cqid;
+	uint32_t	trcq_size;	/* 64B entries, the status page included */
+	t4_rdma_dma_t	*trcq_mem;
+} t4_rdma_cq_res_t;
+
+typedef struct t4_rdma_qp_res {
+	uint32_t	trqp_sqid;
+	uint32_t	trqp_rqid;
+	uint32_t	trqp_scqid;
+	uint32_t	trqp_rcqid;
+	uint32_t	trqp_sq_size;	/* 64B entries, the status page included */
+	uint32_t	trqp_rq_size;
+	t4_rdma_dma_t	*trqp_sq_mem;
+	t4_rdma_dma_t	*trqp_rq_mem;
+} t4_rdma_qp_res_t;
+
+/* Where a queue's BAR2 kernel doorbell and GTS registers are. */
+typedef struct t4_rdma_db {
+	uint64_t	trdb_off;	/* offset in BAR2 */
+	uint32_t	trdb_qid;	/* the BAR2 queue ID to write */
+} t4_rdma_db_t;
+
+/* FW_RI_WR INIT: bind a QP to a connection and enter RDMA mode. */
+typedef struct t4_rdma_ri_init {
+	uint32_t	trri_sqid;
+	uint32_t	trri_pdid;
+	boolean_t	trri_initiator;
+	uint8_t		trri_p2p_type;	/* FW_RI_INIT_P2PTYPE_* */
+	boolean_t	trri_crc;
+	uint32_t	trri_ord;
+	uint32_t	trri_ird;
+	uint32_t	trri_iss;
+	uint32_t	trri_irs;
+	uint32_t	trri_nrqe;
+	uint32_t	trri_rqt_addr;	/* bytes, in the vres RQ range */
+	uint32_t	trri_rqt_size;	/* 64B entries, a power of 2 */
+} t4_rdma_ri_init_t;
+
 typedef struct t4_rdma_ops {
 	int	(*tro_open)(t4_rdma_peer_t *, const t4_rdma_client_t *,
 	    void *, t4_rdma_info_t *);
@@ -257,6 +302,16 @@ typedef struct t4_rdma_ops {
 	void	(*tro_dma_free)(t4_rdma_peer_t *, t4_rdma_dma_t *, boolean_t);
 	int	(*tro_reset)(t4_rdma_peer_t *);
 	boolean_t (*tro_stopped)(t4_rdma_peer_t *);
+
+	int	(*tro_cq_create)(t4_rdma_peer_t *, const t4_rdma_cq_res_t *,
+	    t4_rdma_db_t *);
+	int	(*tro_cq_destroy)(t4_rdma_peer_t *, uint32_t);
+	int	(*tro_qp_create)(t4_rdma_peer_t *, const t4_rdma_qp_res_t *,
+	    t4_rdma_db_t *, t4_rdma_db_t *);
+	int	(*tro_qp_destroy)(t4_rdma_peer_t *, uint32_t);
+	int	(*tro_ri_init)(t4_rdma_peer_t *, uint32_t,
+	    const t4_rdma_ri_init_t *);
+	int	(*tro_ri_fini)(t4_rdma_peer_t *, uint32_t, uint32_t);
 } t4_rdma_ops_t;
 
 typedef struct t4_rdma_peer_hdr {

@@ -101,10 +101,96 @@ t4_ofld_buf_free(t4_ofld_buf_t *ob)
 	kmem_free(ob, sizeof (*ob));
 }
 
+/* of_dma_lock is held. */
+static t4_ofld_buf_t *
+t4_ofld_dma_find(t4_ofld_t *of, const t4_rdma_dma_t *dma)
+{
+	t4_ofld_buf_t *ob;
+
+	ASSERT(MUTEX_HELD(&of->of_dma_lock));
+	for (ob = list_head(&of->of_bufs); ob != NULL;
+	    ob = list_next(&of->of_bufs, ob)) {
+		if (&ob->ob_pub == dma)
+			return (ob);
+	}
+	return (NULL);
+}
+
+/*
+ * Take a buffer of the client for a queue, which t4nex frees from now on.
+ * NULL if the buffer is not the client's, is already a queue's, or is
+ * shorter than len.
+ */
+t4_ofld_buf_t *
+t4_ofld_dma_bind(t4_ofld_t *of, t4_rdma_dma_t *dma, size_t len)
+{
+	t4_ofld_buf_t *ob;
+
+	if (dma == NULL)
+		return (NULL);
+	mutex_enter(&of->of_dma_lock);
+	ob = t4_ofld_dma_find(of, dma);
+	if (ob == NULL || ob->ob_bound || ob->ob_pub.trd_len < len)
+		ob = NULL;
+	else
+		ob->ob_bound = B_TRUE;
+	mutex_exit(&of->of_dma_lock);
+	return (ob);
+}
+
+/* Give a buffer the firmware never saw back to the client. */
+void
+t4_ofld_dma_unbind(t4_ofld_t *of, t4_ofld_buf_t *ob)
+{
+	mutex_enter(&of->of_dma_lock);
+	ob->ob_bound = B_FALSE;
+	mutex_exit(&of->of_dma_lock);
+}
+
+/* of_dma_lock is held; the buffer is off of_bufs. */
+static boolean_t
+t4_ofld_dma_retire(t4_ofld_t *of, t4_ofld_buf_t *ob, boolean_t safe)
+{
+	boolean_t now;
+
+	ASSERT(MUTEX_HELD(&of->of_dma_lock));
+	of->of_dma_bytes -= ob->ob_pub.trd_len;
+	mutex_enter(&of->of_lock);
+	now = safe && !of->of_fatal;
+	mutex_exit(&of->of_lock);
+	if (!now) {
+		of->of_quar_bytes += ob->ob_pub.trd_len;
+		ob->ob_quar = B_TRUE;
+		list_insert_tail(&of->of_quar, ob);
+	}
+	return (now);
+}
+
+/*
+ * Free the memory of a destroyed queue: now if the firmware let go of the
+ * queue, otherwise into the quarantine.
+ */
+void
+t4_ofld_dma_release(t4_ofld_t *of, t4_ofld_buf_t *ob, boolean_t safe)
+{
+	boolean_t now;
+
+	mutex_enter(&of->of_dma_lock);
+	if (ob->ob_quar) {
+		mutex_exit(&of->of_dma_lock);
+		return;
+	}
+	list_remove(&of->of_bufs, ob);
+	now = t4_ofld_dma_retire(of, ob, safe);
+	mutex_exit(&of->of_dma_lock);
+	if (now)
+		t4_ofld_buf_free(ob);
+}
+
 /*
  * Free a buffer now if the client says the device is done with it and the
  * adapter is healthy; otherwise keep it until the adapter is stopped.  An
- * unknown pointer is ignored.
+ * unknown pointer and a queue's memory are ignored.
  */
 void
 t4_ofld_dma_free(t4_ofld_t *of, t4_rdma_dma_t *dma, boolean_t quiesced)
@@ -115,24 +201,12 @@ t4_ofld_dma_free(t4_ofld_t *of, t4_rdma_dma_t *dma, boolean_t quiesced)
 	if (dma == NULL)
 		return;
 	mutex_enter(&of->of_dma_lock);
-	for (ob = list_head(&of->of_bufs); ob != NULL;
-	    ob = list_next(&of->of_bufs, ob)) {
-		if (&ob->ob_pub == dma)
-			break;
-	}
-	if (ob == NULL) {
+	if ((ob = t4_ofld_dma_find(of, dma)) == NULL || ob->ob_bound) {
 		mutex_exit(&of->of_dma_lock);
 		return;
 	}
 	list_remove(&of->of_bufs, ob);
-	of->of_dma_bytes -= ob->ob_pub.trd_len;
-	mutex_enter(&of->of_lock);
-	now = quiesced && !of->of_fatal;
-	mutex_exit(&of->of_lock);
-	if (!now) {
-		of->of_quar_bytes += ob->ob_pub.trd_len;
-		list_insert_tail(&of->of_quar, ob);
-	}
+	now = t4_ofld_dma_retire(of, ob, quiesced);
 	mutex_exit(&of->of_dma_lock);
 	if (now)
 		t4_ofld_buf_free(ob);
@@ -148,6 +222,7 @@ t4_ofld_dma_close(t4_ofld_t *of)
 	while ((ob = list_remove_head(&of->of_bufs)) != NULL) {
 		of->of_dma_bytes -= ob->ob_pub.trd_len;
 		of->of_quar_bytes += ob->ob_pub.trd_len;
+		ob->ob_quar = B_TRUE;
 		list_insert_tail(&of->of_quar, ob);
 	}
 	mutex_exit(&of->of_dma_lock);

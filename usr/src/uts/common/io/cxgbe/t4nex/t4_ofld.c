@@ -506,6 +506,7 @@ t4_ofld_start(struct adapter *sc)
 	list_create(&of->of_quar, sizeof (t4_ofld_buf_t),
 	    offsetof(t4_ofld_buf_t, ob_node));
 	t4_clip_init(of);
+	t4_ofld_ri_setup(of);
 	membar_producer();
 	of->of_ready = B_TRUE;
 
@@ -636,6 +637,7 @@ t4_ofld_fini(struct adapter *sc)
 	t4_ofld_dma_fini(of, (t4_read_reg(sc, A_SGE_CONTROL) &
 	    F_GLOBALENABLE) == 0);
 
+	t4_ofld_ri_teardown(of);
 	t4_clip_fini(of);
 	t4_l2t_fini(of);
 	t4_tids_fini(of);
@@ -701,6 +703,7 @@ t4_ofld_info(t4_ofld_t *of, t4_rdma_info_t *info)
 	info->tri_rxq_id = of->of_rxq.iq.tsi_abs_id;
 	info->tri_ciq_id = of->of_ciq.tsi_abs_id;
 	info->tri_ciq_cntxt = of->of_ciq.tsi_cntxt_id;
+	info->tri_eq_spg_len = sc->sge.eq_spg_len;
 
 	for (uint_t i = 0; i < of->of_nports; i++) {
 		const t4_ofld_port_t *op = &of->of_port[i];
@@ -773,6 +776,7 @@ t4_ofld_client_close(t4_ofld_t *of)
 	mutex_exit(&of->of_lock);
 
 	t4_ofld_orphan_sweep(of, gen);
+	t4_ofld_ri_close(of, gen);
 	t4_ofld_dma_close(of);
 	t4_l2t_reset(of);
 	t4_clip_reset(of);
