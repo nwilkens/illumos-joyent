@@ -2420,6 +2420,8 @@ mlxcx_cmd_create_eq(mlxcx_t *mlxp, mlxcx_event_queue_t *mleq)
 	if (ret) {
 		mleq->mleq_state |= MLXCX_EQ_CREATED;
 		mleq->mleq_num = out.mlxo_create_eq_eqn;
+	} else if (cmd.mlcmd_status == MLXCX_CMD_R_TIMEOUT) {
+		mleq->mleq_state |= MLXCX_EQ_CREATE_UNSURE;
 	}
 	mlxcx_cmd_fini(mlxp, &cmd);
 	return (ret);
@@ -2588,6 +2590,8 @@ mlxcx_cmd_create_cq(mlxcx_t *mlxp, mlxcx_completion_queue_t *mlcq)
 	if (ret) {
 		atomic_or_uint(&mlcq->mlcq_state, MLXCX_CQ_CREATED);
 		mlcq->mlcq_num = from_be24(out.mlxo_create_cq_cqn);
+	} else if (cmd.mlcmd_status == MLXCX_CMD_R_TIMEOUT) {
+		atomic_or_uint(&mlcq->mlcq_state, MLXCX_CQ_CREATE_UNSURE);
 	}
 	mlxcx_cmd_fini(mlxp, &cmd);
 	return (ret);
@@ -2809,6 +2813,8 @@ mlxcx_cmd_create_rq(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 	if (ret) {
 		mlwq->mlwq_state |= MLXCX_WQ_CREATED;
 		mlwq->mlwq_num = from_be24(out.mlxo_create_rq_rqn);
+	} else if (cmd.mlcmd_status == MLXCX_CMD_R_TIMEOUT) {
+		mlwq->mlwq_state |= MLXCX_WQ_CREATE_UNSURE;
 	}
 	mlxcx_cmd_fini(mlxp, &cmd);
 	return (ret);
@@ -3694,6 +3700,8 @@ mlxcx_cmd_create_sq(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 	if (ret) {
 		mlwq->mlwq_state |= MLXCX_WQ_CREATED;
 		mlwq->mlwq_num = from_be24(out.mlxo_create_sq_sqn);
+	} else if (cmd.mlcmd_status == MLXCX_CMD_R_TIMEOUT) {
+		mlwq->mlwq_state |= MLXCX_WQ_CREATE_UNSURE;
 	}
 	mlxcx_cmd_fini(mlxp, &cmd);
 	return (ret);

@@ -1008,8 +1008,9 @@ static void
 mlxcx_eq_rele_dma(mlxcx_t *mlxp, mlxcx_event_queue_t *mleq)
 {
 	VERIFY(mleq->mleq_state & MLXCX_EQ_ALLOC);
-	if ((mleq->mleq_state & MLXCX_EQ_CREATED) &&
-	    !(mleq->mleq_state & MLXCX_EQ_DESTROYED)) {
+	if ((mleq->mleq_state & MLXCX_EQ_CREATE_UNSURE) ||
+	    ((mleq->mleq_state & MLXCX_EQ_CREATED) &&
+	    !(mleq->mleq_state & MLXCX_EQ_DESTROYED))) {
 		mlxcx_dma_quarantine(mlxp, &mleq->mleq_dma);
 	} else {
 		mlxcx_dma_free(&mleq->mleq_dma);

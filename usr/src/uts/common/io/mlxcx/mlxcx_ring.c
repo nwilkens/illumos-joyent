@@ -105,8 +105,9 @@ void
 mlxcx_wq_rele_dma(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 {
 	VERIFY(mlwq->mlwq_state & MLXCX_WQ_ALLOC);
-	if ((mlwq->mlwq_state & MLXCX_WQ_CREATED) &&
-	    !(mlwq->mlwq_state & MLXCX_WQ_DESTROYED)) {
+	if ((mlwq->mlwq_state & MLXCX_WQ_CREATE_UNSURE) ||
+	    ((mlwq->mlwq_state & MLXCX_WQ_CREATED) &&
+	    !(mlwq->mlwq_state & MLXCX_WQ_DESTROYED))) {
 		mlxcx_dma_quarantine(mlxp, &mlwq->mlwq_dma);
 		mlxcx_dma_quarantine(mlxp, &mlwq->mlwq_doorbell_dma);
 	} else {
@@ -176,8 +177,9 @@ static void
 mlxcx_cq_rele_dma(mlxcx_t *mlxp, mlxcx_completion_queue_t *mlcq)
 {
 	VERIFY(mlcq->mlcq_state & MLXCX_CQ_ALLOC);
-	if ((mlcq->mlcq_state & MLXCX_CQ_CREATED) &&
-	    !(mlcq->mlcq_state & MLXCX_CQ_DESTROYED)) {
+	if ((mlcq->mlcq_state & MLXCX_CQ_CREATE_UNSURE) ||
+	    ((mlcq->mlcq_state & MLXCX_CQ_CREATED) &&
+	    !(mlcq->mlcq_state & MLXCX_CQ_DESTROYED))) {
 		mlxcx_dma_quarantine(mlxp, &mlcq->mlcq_dma);
 		mlxcx_dma_quarantine(mlxp, &mlcq->mlcq_doorbell_dma);
 	} else {
@@ -336,7 +338,7 @@ mlxcx_cq_teardown(mlxcx_t *mlxp, mlxcx_completion_queue_t *mlcq)
 
 	mutex_enter(&mlcq->mlcq_mtx);
 	ASSERT0(mlcq->mlcq_state & ~(MLXCX_CQ_CREATED | MLXCX_CQ_DESTROYED |
-	    MLXCX_CQ_TEARDOWN | MLXCX_CQ_ARMED));
+	    MLXCX_CQ_CREATE_UNSURE | MLXCX_CQ_TEARDOWN | MLXCX_CQ_ARMED));
 	mutex_exit(&mlcq->mlcq_mtx);
 
 	mutex_destroy(&mlcq->mlcq_mtx);

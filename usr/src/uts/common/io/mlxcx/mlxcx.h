@@ -293,8 +293,8 @@ typedef struct mlxcx_dma_buffer {
 } mlxcx_dma_buffer_t;
 
 /*
- * Queue memory whose DESTROY command failed. Hardware may still write to it,
- * so we keep it until TEARDOWN_HCA succeeds, or leak it.
+ * Queue memory whose CREATE timed out or whose DESTROY failed. Hardware may
+ * still write to it, so we keep it until TEARDOWN_HCA succeeds, or leak it.
  */
 typedef struct mlxcx_dma_quarantine {
 	list_node_t		mdq_node;
@@ -376,6 +376,7 @@ typedef enum {
 	MLXCX_EQ_INTR_ACTIVE	= 1 << 6,	/* 'rupt handler running */
 	MLXCX_EQ_INTR_QUIESCE	= 1 << 7,	/* 'rupt handler to quiesce */
 	MLXCX_EQ_ATTACHING	= 1 << 8,	/* mlxcx_attach still running */
+	MLXCX_EQ_CREATE_UNSURE	= 1 << 9,	/* CREATE_EQ timed out */
 } mlxcx_eventq_state_t;
 
 typedef struct mlxcx_bf {
@@ -618,6 +619,7 @@ typedef enum {
 	MLXCX_CQ_TEARDOWN	= 1 << 5,
 	MLXCX_CQ_POLLING	= 1 << 6,
 	MLXCX_CQ_ARMED		= 1 << 7,
+	MLXCX_CQ_CREATE_UNSURE	= 1 << 8,	/* CREATE_CQ timed out */
 } mlxcx_completionq_state_t;
 
 typedef struct mlxcx_work_queue mlxcx_work_queue_t;
@@ -681,7 +683,8 @@ typedef enum {
 	MLXCX_WQ_TEARDOWN	= 1 << 4,
 	MLXCX_WQ_BUFFERS	= 1 << 5,
 	MLXCX_WQ_REFILLING	= 1 << 6,
-	MLXCX_WQ_BLOCKED_MAC	= 1 << 7
+	MLXCX_WQ_BLOCKED_MAC	= 1 << 7,
+	MLXCX_WQ_CREATE_UNSURE	= 1 << 8	/* CREATE_RQ/SQ timed out */
 } mlxcx_workq_state_t;
 
 typedef enum {

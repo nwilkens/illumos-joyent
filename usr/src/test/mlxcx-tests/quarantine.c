@@ -237,12 +237,56 @@ stuck_sq(void)
 	stuck(MLXCX_WQ_TYPE_SENDQ);
 }
 
+/*
+ * CREATE timed out, so firmware may yet create the queue on this memory. No
+ * object number exists to destroy, so the memory waits for TEARDOWN_HCA.
+ */
+#ifdef HAVE_UNSURE
+static void
+unsure(void)
+{
+	mlxcx_work_queue_t wq;
+	mlxcx_completion_queue_t cq;
+	mlxcx_event_queue_t eq;
+
+	memset(&wq, 0, sizeof (wq));
+	memset(&cq, 0, sizeof (cq));
+	memset(&eq, 0, sizeof (eq));
+	setup();
+	queue_dma(&wq.mlwq_dma);
+	queue_dma(&wq.mlwq_doorbell_dma);
+	queue_dma(&cq.mlcq_dma);
+	queue_dma(&cq.mlcq_doorbell_dma);
+	queue_dma(&eq.mleq_dma);
+	hw_owns(&wq.mlwq_dma);
+	hw_owns(&wq.mlwq_doorbell_dma);
+	hw_owns(&cq.mlcq_dma);
+	hw_owns(&cq.mlcq_doorbell_dma);
+	hw_owns(&eq.mleq_dma);
+	wq.mlwq_state = MLXCX_WQ_ALLOC | MLXCX_WQ_CREATE_UNSURE;
+	cq.mlcq_state = MLXCX_CQ_ALLOC | MLXCX_CQ_CREATE_UNSURE;
+	eq.mleq_state = MLXCX_EQ_ALLOC | MLXCX_EQ_CREATE_UNSURE;
+	mlxcx_wq_rele_dma(&mlx, &wq);
+	mlxcx_cq_rele_dma(&mlx, &cq);
+	mlxcx_eq_rele_dma(&mlx, &eq);
+	hw_writes();
+	after_teardown_hca();
+}
+#else
+static void
+unsure(void)
+{
+	stub_fail("no queue state records a CREATE that timed out");
+}
+#endif
+
 static const char *const names[] = {
 	"failed-wq", "failed-cq", "failed-eq", "destroyed", "leak",
-	"stuck-rq", "stuck-sq", NULL
+	"stuck-rq", "stuck-sq", "create-timeout", NULL
 };
 static void (*const funcs[])(void) = {
-	failed_wq, failed_cq, failed_eq, destroyed, leak, stuck_rq, stuck_sq
+	failed_wq, failed_cq, failed_eq, destroyed, leak, stuck_rq, stuck_sq,
+	unsure
 };
 
 int
