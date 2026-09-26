@@ -558,6 +558,18 @@ stub_ids_used(id_space_t *is)
 	return (n);
 }
 
+static void
+atomic_or_uint(volatile uint_t *p, uint_t v)
+{
+	*p |= v;
+}
+
+static void
+atomic_and_uint(volatile uint_t *p, uint_t v)
+{
+	*p &= v;
+}
+
 static int
 ddi_ffs(long mask)
 {

@@ -9,6 +9,10 @@ mlxcx_panic() uses them. A variable that an if statement compares with a
 bound counts as checked, and so do values derived from it. The check does
 not follow values across calls; the runtime checks cover the call chains
 that matter. Queue geometry is left out because attach checks it.
+
+A *_DESTROYED state bit is set only when firmware accepts a DESTROY command,
+so it is device-controlled too. No VERIFY or ASSERT anywhere in the driver
+may require it to be set.
 """
 
 import re
@@ -25,6 +29,7 @@ PATHS = {
                      "mlxcx_give_pages_once", "mlxcx_take_pages_once",
                      "mlxcx_pages_task", "mlxcx_link_state_task",
                      "mlxcx_update_link_state"),
+    "mlxcx_ring.c": None,
     "mlxcx.c": ("mlxcx_give_pages", "mlxcx_init_pages",
                 "mlxcx_pages_returned", "mlxcx_teardown_pages",
                 "mlxcx_teardown_flow_table", "mlxcx_uar_put32",
@@ -34,7 +39,7 @@ PATHS = {
 SOURCES = re.compile(
     r"from_be(?:16|24|32|64)\(|get_bits(?:8|16|32|64)\(|"
     r"mlxcx_get(?:16|32|64)\(|\bmce_\w+|\bmleqe_\w+|\bmled_\w+|"
-    r"\bmlxo_\w+|\bmco_\w+|\bmlp_npages\b|\bpas\[")
+    r"\bmlxo_\w+|\bmco_\w+|\bmlcqe_\w+|\bmlp_npages\b|\bpas\[")
 
 CHECKS = re.compile(r"\b(VERIFY\w*|ASSERT\w*|mlxcx_panic)\s*\(")
 ASSIGN = re.compile(r"\b(\w+)(?:\[[^\]]*\])?\s*(?:[-+|&]?=)(?!=)([^;]*);")
@@ -128,6 +133,26 @@ def scan(path, names):
     return found, len(seen)
 
 
+LIFECYCLE_FILES = ("mlxcx.c", "mlxcx_cmd.c", "mlxcx_intr.c", "mlxcx_ring.c",
+                   "mlxcx_gld.c")
+
+
+def scan_lifecycle(path):
+    text = path.read_text(encoding="utf-8")
+    found = []
+    for name, start, body in functions(text):
+        clean = strip(body)
+        for check in re.finditer(r"\b(VERIFY|ASSERT)\s*\(", clean):
+            args = call_args(clean, check.end() - 1)
+            if "_DESTROYED" in args and "!" not in args:
+                line = text.count("\n", 0, start) + clean.count(
+                    "\n", 0, check.start()) + 1
+                found.append(f"{path.name}:{line}: {name}: "
+                             f"{check.group(1)}({' '.join(args.split())}) "
+                             "needs firmware to accept a DESTROY")
+    return found
+
+
 def main():
     args = source_parser(__doc__).parse_args()
     found, scanned = [], 0
@@ -135,6 +160,8 @@ def main():
         hits, count = scan(args.source_dir / file, names)
         found += hits
         scanned += count
+    for file in LIFECYCLE_FILES:
+        found += scan_lifecycle(args.source_dir / file)
     if scanned < 100:
         sys.exit(f"FAIL: scanned only {scanned} functions")
     if found:

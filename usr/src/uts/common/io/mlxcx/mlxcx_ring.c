@@ -13,6 +13,7 @@
  * Copyright 2023 The University of Queensland
  * Copyright (c) 2018, Joyent, Inc.
  * Copyright 2020 RackTop Systems, Inc.
+ * Copyright 2026 MNX Cloud, Inc.
  */
 
 /*
@@ -104,12 +105,15 @@ void
 mlxcx_wq_rele_dma(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 {
 	VERIFY(mlwq->mlwq_state & MLXCX_WQ_ALLOC);
-	if (mlwq->mlwq_state & MLXCX_WQ_CREATED)
-		VERIFY(mlwq->mlwq_state & MLXCX_WQ_DESTROYED);
-
-	mlxcx_dma_free(&mlwq->mlwq_dma);
+	if ((mlwq->mlwq_state & MLXCX_WQ_CREATED) &&
+	    !(mlwq->mlwq_state & MLXCX_WQ_DESTROYED)) {
+		mlxcx_dma_quarantine(mlxp, &mlwq->mlwq_dma);
+		mlxcx_dma_quarantine(mlxp, &mlwq->mlwq_doorbell_dma);
+	} else {
+		mlxcx_dma_free(&mlwq->mlwq_dma);
+		mlxcx_dma_free(&mlwq->mlwq_doorbell_dma);
+	}
 	mlwq->mlwq_send_ent = NULL;
-	mlxcx_dma_free(&mlwq->mlwq_doorbell_dma);
 	mlwq->mlwq_doorbell = NULL;
 
 	mlwq->mlwq_state &= ~MLXCX_CQ_ALLOC;
@@ -172,12 +176,15 @@ static void
 mlxcx_cq_rele_dma(mlxcx_t *mlxp, mlxcx_completion_queue_t *mlcq)
 {
 	VERIFY(mlcq->mlcq_state & MLXCX_CQ_ALLOC);
-	if (mlcq->mlcq_state & MLXCX_CQ_CREATED)
-		VERIFY(mlcq->mlcq_state & MLXCX_CQ_DESTROYED);
-
-	mlxcx_dma_free(&mlcq->mlcq_dma);
+	if ((mlcq->mlcq_state & MLXCX_CQ_CREATED) &&
+	    !(mlcq->mlcq_state & MLXCX_CQ_DESTROYED)) {
+		mlxcx_dma_quarantine(mlxp, &mlcq->mlcq_dma);
+		mlxcx_dma_quarantine(mlxp, &mlcq->mlcq_doorbell_dma);
+	} else {
+		mlxcx_dma_free(&mlcq->mlcq_dma);
+		mlxcx_dma_free(&mlcq->mlcq_doorbell_dma);
+	}
 	mlcq->mlcq_ent = NULL;
-	mlxcx_dma_free(&mlcq->mlcq_doorbell_dma);
 	mlcq->mlcq_doorbell = NULL;
 
 	atomic_and_uint(&mlcq->mlcq_state, ~MLXCX_CQ_ALLOC);

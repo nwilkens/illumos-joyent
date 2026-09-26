@@ -915,6 +915,60 @@ out:
 	kmem_free(pas, sizeof (*pas) * MLXCX_MANAGE_PAGES_MAX_PAGES);
 }
 
+/*
+ * Take over a DMA buffer that hardware may still write to. The caller's copy
+ * is cleared.
+ */
+void
+mlxcx_dma_quarantine(mlxcx_t *mlxp, mlxcx_dma_buffer_t *dma)
+{
+	mlxcx_dma_quarantine_t *mdq;
+
+	mdq = kmem_zalloc(sizeof (*mdq), KM_SLEEP);
+	mdq->mdq_dma = *dma;
+	bzero(dma, sizeof (*dma));
+
+	mutex_enter(&mlxp->mlx_quarantine_mtx);
+	list_insert_tail(&mlxp->mlx_quarantine, mdq);
+	mutex_exit(&mlxp->mlx_quarantine_mtx);
+}
+
+/*
+ * Free the quarantined buffers. Call this only once hardware can no longer
+ * reach them.
+ */
+static void
+mlxcx_dma_quarantine_free(mlxcx_t *mlxp)
+{
+	mlxcx_dma_quarantine_t *mdq;
+
+	mutex_enter(&mlxp->mlx_quarantine_mtx);
+	while ((mdq = list_remove_head(&mlxp->mlx_quarantine)) != NULL) {
+		mlxcx_dma_free(&mdq->mdq_dma);
+		kmem_free(mdq, sizeof (*mdq));
+	}
+	mutex_exit(&mlxp->mlx_quarantine_mtx);
+}
+
+static void
+mlxcx_dma_quarantine_fini(mlxcx_t *mlxp)
+{
+	uint_t n = 0;
+	mlxcx_dma_quarantine_t *mdq;
+
+	for (mdq = list_head(&mlxp->mlx_quarantine); mdq != NULL;
+	    mdq = list_next(&mlxp->mlx_quarantine, mdq))
+		n++;
+
+	if (n != 0) {
+		mlxcx_warn(mlxp, "leaking %u queue buffers that hardware may "
+		    "still write to", n);
+	} else {
+		list_destroy(&mlxp->mlx_quarantine);
+	}
+	mutex_destroy(&mlxp->mlx_quarantine_mtx);
+}
+
 static boolean_t
 mlxcx_eq_alloc_dma(mlxcx_t *mlxp, mlxcx_event_queue_t *mleq)
 {
@@ -954,10 +1008,12 @@ static void
 mlxcx_eq_rele_dma(mlxcx_t *mlxp, mlxcx_event_queue_t *mleq)
 {
 	VERIFY(mleq->mleq_state & MLXCX_EQ_ALLOC);
-	if (mleq->mleq_state & MLXCX_EQ_CREATED)
-		VERIFY(mleq->mleq_state & MLXCX_EQ_DESTROYED);
-
-	mlxcx_dma_free(&mleq->mleq_dma);
+	if ((mleq->mleq_state & MLXCX_EQ_CREATED) &&
+	    !(mleq->mleq_state & MLXCX_EQ_DESTROYED)) {
+		mlxcx_dma_quarantine(mlxp, &mleq->mleq_dma);
+	} else {
+		mlxcx_dma_free(&mleq->mleq_dma);
+	}
 	mleq->mleq_ent = NULL;
 
 	mleq->mleq_state &= ~MLXCX_EQ_ALLOC;
@@ -1195,6 +1251,8 @@ mlxcx_teardown(mlxcx_t *mlxp)
 		if (!mlxcx_cmd_teardown_hca(mlxp)) {
 			mlxcx_warn(mlxp, "failed to send teardown HCA "
 			    "command during device detach");
+		} else {
+			mlxcx_dma_quarantine_free(mlxp);
 		}
 		mlxp->mlx_attach &= ~MLXCX_ATTACH_INIT_HCA;
 	}
@@ -1239,6 +1297,8 @@ mlxcx_teardown(mlxcx_t *mlxp)
 		mlxcx_fm_fini(mlxp);
 		mlxp->mlx_attach &= ~MLXCX_ATTACH_FM;
 	}
+
+	mlxcx_dma_quarantine_fini(mlxp);
 
 	VERIFY3S(mlxp->mlx_attach, ==, 0);
 	ddi_soft_state_free(mlxcx_softstate, mlxp->mlx_inst);
@@ -2836,6 +2896,10 @@ mlxcx_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	mlxp->mlx_dip = dip;
 	mlxp->mlx_inst = inst;
 	ddi_set_driver_private(dip, mlxp);
+
+	mutex_init(&mlxp->mlx_quarantine_mtx, NULL, MUTEX_DRIVER, NULL);
+	list_create(&mlxp->mlx_quarantine, sizeof (mlxcx_dma_quarantine_t),
+	    offsetof(mlxcx_dma_quarantine_t, mdq_node));
 
 	mlxcx_load_props(mlxp);
 

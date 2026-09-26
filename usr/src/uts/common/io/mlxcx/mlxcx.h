@@ -292,6 +292,15 @@ typedef struct mlxcx_dma_buffer {
 	uint_t				mxdb_ncookies;
 } mlxcx_dma_buffer_t;
 
+/*
+ * Queue memory whose DESTROY command failed. Hardware may still write to it,
+ * so we keep it until TEARDOWN_HCA succeeds, or leak it.
+ */
+typedef struct mlxcx_dma_quarantine {
+	list_node_t		mdq_node;
+	mlxcx_dma_buffer_t	mdq_dma;
+} mlxcx_dma_quarantine_t;
+
 typedef struct mlxcx_dev_page {
 	list_node_t		mxdp_list;
 	avl_node_t		mxdp_tree;
@@ -1213,6 +1222,9 @@ struct mlxcx {
 	kmutex_t		mlx_pagemtx;
 	uint_t			mlx_npages;
 	avl_tree_t		mlx_pages;
+	kmutex_t		mlx_quarantine_mtx;
+	list_t			mlx_quarantine;
+
 	/* Returned PAs that we did not give out. */
 	uint64_t		mlx_pages_unknown;
 	/* The most pages we give, and requests refused for passing it. */
@@ -1365,6 +1377,7 @@ extern boolean_t mlxcx_register_mac(mlxcx_t *);
  */
 extern boolean_t mlxcx_wq_alloc_dma(mlxcx_t *, mlxcx_work_queue_t *);
 extern void mlxcx_wq_rele_dma(mlxcx_t *, mlxcx_work_queue_t *);
+extern void mlxcx_dma_quarantine(mlxcx_t *, mlxcx_dma_buffer_t *);
 
 extern boolean_t mlxcx_buf_create(mlxcx_t *, mlxcx_buf_shard_t *,
     mlxcx_buffer_t **);

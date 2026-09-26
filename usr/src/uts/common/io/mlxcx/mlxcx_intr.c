@@ -82,8 +82,6 @@ mlxcx_intr_teardown(mlxcx_t *mlxp)
 
 		mutex_enter(&mleq->mleq_mtx);
 		VERIFY0(mleq->mleq_state & MLXCX_EQ_ALLOC);
-		if (mleq->mleq_state & MLXCX_EQ_CREATED)
-			VERIFY(mleq->mleq_state & MLXCX_EQ_DESTROYED);
 		if (i >= mlxp->mlx_intr_cq0) {
 			VERIFY(avl_is_empty(&mleq->mleq_cqs));
 			avl_destroy(&mleq->mleq_cqs);
