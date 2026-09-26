@@ -1350,6 +1350,8 @@ mlxcx_check_issi(mlxcx_t *mlxp)
 /*
  * Give the device up to MLXCX_MANAGE_PAGES_MAX_PAGES pages. We hold
  * mlx_pagemtx throughout so that the limit check and the page count agree.
+ * If the command times out we keep the pages as given, and return B_FALSE
+ * with *ngiven set to them.
  */
 boolean_t
 mlxcx_give_pages(mlxcx_t *mlxp, int32_t npages, int32_t *ngiven)
@@ -1363,13 +1365,13 @@ mlxcx_give_pages(mlxcx_t *mlxp, int32_t npages, int32_t *ngiven)
 	const ddi_dma_cookie_t *ck;
 	boolean_t timedout, ok = B_TRUE;
 
+	*ngiven = 0;
+
 	/*
 	 * If there are no pages required, then we're done here.
 	 */
-	if (npages <= 0) {
-		*ngiven = 0;
+	if (npages <= 0)
 		return (B_TRUE);
-	}
 
 	npages = MIN(npages, MLXCX_MANAGE_PAGES_MAX_PAGES);
 

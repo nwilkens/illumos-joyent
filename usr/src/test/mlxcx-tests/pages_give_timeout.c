@@ -28,6 +28,9 @@ runtime(void)
 	page_request(0, 16);
 	if (mlx.mlx_npages != 16)
 		stub_fail("kept %u pages, not 16", mlx.mlx_npages);
+	if (alloc_fail_calls != 0)
+		stub_fail("told the device the allocation failed after it may "
+		    "have taken the pages");
 	give_policy = GIVE_ACCEPT;
 	mlxcx_teardown_pages(&mlx);
 	if (mlx.mlx_npages != 0 || dev_npages != 0)
