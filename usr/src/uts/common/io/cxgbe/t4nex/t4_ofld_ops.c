@@ -435,6 +435,7 @@ t4_ofld_accept(t4_ofld_t *of, const t4_rdma_accept_t *a)
 	    roundup(sizeof (rpl), 16));
 	if (rc == 0) {
 		e->te_flags &= ~TEF_EMBRYO;
+		of->of_tids.td_embryos--;
 		e->te_rxq = of->of_rxq.iq.tsi_abs_id;
 	}
 	mutex_exit(&of->of_tids.td_lock);
@@ -578,6 +579,10 @@ t4_ofld_rx_credits(t4_ofld_t *of, uint32_t tid, uint32_t credits)
 		return (EINVAL);
 	if ((e = t4_ofld_conn(of, tid, &rc)) == NULL)
 		return (rc);
+	if ((e->te_flags & TEF_FLOWC) == 0) {
+		mutex_exit(&of->of_tids.td_lock);
+		return (EINVAL);
+	}
 	bzero(&req, sizeof (req));
 	t4_ofld_init_tp_wr(&req, sizeof (req), tid);
 	OPCODE_TID(&req) = BE_32(MK_OPCODE_TID(CPL_RX_DATA_ACK, tid));

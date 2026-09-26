@@ -4,7 +4,8 @@
 The atid free list must hand a freed ID out last, IPv6 servers must take an
 aligned stid pair whose odd half is not an ID, and a chip-assigned TID must be
 range checked, claimable only when free or on its way to release, held only
-by its owner from its own queue, and walkable chunk by chunk.
+by its owner from its own queue, and walkable chunk by chunk.  Unanswered
+SYNs are capped.
 """
 
 from pathlib import Path
@@ -19,6 +20,7 @@ def tid_header():
     real = (T4NEX / "t4_ofld.h").read_text(encoding="utf-8")
     parts = []
     for pattern in (r"#define\tT4_OFLD_M_TID.*?\n",
+                    r"#define\tT4_OFLD_MAX_EMBRYOS.*?\n",
                     r"typedef enum t4_tid_kind \{.*?\} t4_tid_kind_t;",
                     r"typedef enum t4_tid_state \{.*?\} t4_tid_state_t;",
                     r"#define\tTEF_V6.*?#define\tTEF_RELEASING[^\n]*\n",

@@ -63,6 +63,9 @@ extern "C" {
 #define	T4_OFLD_MAX_IRD_ADAPTER	(1U << 24)
 
 #define	T4_OFLD_MAX_CLIP	128
+
+/* SYNs the client may hold unanswered; more are refused. */
+#define	T4_OFLD_MAX_EMBRYOS	1024
 #define	T4_OFLD_MAX_PAYLOAD	65535
 
 /* TPT and PBL writes: 32 byte units, 96 bytes inline per work request. */
@@ -129,6 +132,7 @@ typedef struct t4_tid_tab {
 typedef struct t4_tids {
 	kmutex_t	td_lock;
 	kcondvar_t	td_cv;
+	uint32_t	td_embryos;
 	t4_tid_tab_t	td_atid;
 	t4_tid_tab_t	td_stid;
 	t4_tid_tab_t	td_hw;
@@ -232,6 +236,7 @@ typedef struct t4_ofld_stats {
 	uint64_t	os_tpt_write;
 	uint64_t	os_events;
 	uint64_t	os_eq_bad_cidx;
+	uint64_t	os_syn_refused;
 } t4_ofld_stats_t;
 
 typedef struct t4_ofld_kstats {
@@ -267,6 +272,7 @@ typedef struct t4_ofld_kstats {
 	kstat_named_t	ok_tpt_write;
 	kstat_named_t	ok_events;
 	kstat_named_t	ok_eq_bad_cidx;
+	kstat_named_t	ok_syn_refused;
 	kstat_named_t	ok_dma_bytes;
 	kstat_named_t	ok_quar_bytes;
 } t4_ofld_kstats_t;

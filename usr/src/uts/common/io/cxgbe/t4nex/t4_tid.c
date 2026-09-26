@@ -295,6 +295,8 @@ t4_tid_free_locked(t4_ofld_t *of, t4_tid_kind_t kind, uint32_t id)
 	    ((id - tt->tt_base) & 1) == 0)
 		n = 2;
 
+	if (kind == T4_TID_HW && (e->te_flags & TEF_EMBRYO) != 0)
+		of->of_tids.td_embryos--;
 	for (uint32_t i = 0; i < n; i++) {
 		e[i].te_state = TTS_FREE;
 		e[i].te_flags = 0;
@@ -374,7 +376,8 @@ t4_tid_hold(t4_ofld_t *of, t4_tid_kind_t kind, uint32_t id, uint32_t owner,
 /*
  * Claim a hwtid the chip just assigned.  A live entry cannot be claimed, but
  * one whose TID_RELEASE may have reached the chip can: the chip gives an ID
- * out again only after it processed the release.
+ * out again only after it processed the release.  A SYN (TEF_EMBRYO) for the
+ * client past T4_OFLD_MAX_EMBRYOS fails with EAGAIN.
  */
 int
 t4_hwtid_claim(t4_ofld_t *of, uint32_t tid, t4_tid_state_t state,
@@ -393,9 +396,17 @@ t4_hwtid_claim(t4_ofld_t *of, uint32_t tid, t4_tid_state_t state,
 	} else if (e->te_state != TTS_FREE &&
 	    (e->te_flags & TEF_RELEASING) == 0) {
 		rc = EEXIST;
+	} else if (state == TTS_OWNED && (flags & TEF_EMBRYO) != 0 &&
+	    (e->te_state == TTS_FREE || (e->te_flags & TEF_EMBRYO) == 0) &&
+	    td->td_embryos >= T4_OFLD_MAX_EMBRYOS) {
+		rc = EAGAIN;
 	} else {
 		if (e->te_state == TTS_FREE)
 			td->td_hw.tt_inuse++;
+		else if ((e->te_flags & TEF_EMBRYO) != 0)
+			td->td_embryos--;
+		if ((flags & TEF_EMBRYO) != 0)
+			td->td_embryos++;
 		e->te_state = state;
 		e->te_flags = flags;
 		e->te_owner = owner;

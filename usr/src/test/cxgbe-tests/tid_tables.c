@@ -186,12 +186,62 @@ test_hwtid_claim(void)
 	teardown(of);
 }
 
+/* A SYN flood cannot pin more than T4_OFLD_MAX_EMBRYOS TIDs. */
+static void
+test_embryo_cap(void)
+{
+	const uint32_t max = T4_OFLD_MAX_EMBRYOS;
+	t4_ofld_t *of = setup(2, 2, 0, max + 16, 0);
+	t4_tid_ent_t *e;
+
+	for (uint32_t i = 0; i < max; i++)
+		CHECK(t4_hwtid_claim(of, i, TTS_OWNED, 5, 0, 7, TEF_EMBRYO,
+		    NULL) == 0);
+	CHECK(of->of_tids.td_embryos == max);
+	CHECK(t4_hwtid_claim(of, max, TTS_OWNED, 5, 0, 7, TEF_EMBRYO,
+	    NULL) == EAGAIN);
+	CHECK(t4_hwtid_claim(of, max, TTS_OWNED, 5, 0, 7, 0, NULL) == 0);
+	/* A SYN being refused is never itself refused by the cap. */
+	CHECK(t4_hwtid_claim(of, max + 2, TTS_ORPHAN, 0, 0, 7, TEF_EMBRYO,
+	    NULL) == 0);
+	free_id(of, T4_TID_HW, max + 2);
+	CHECK(of->of_tids.td_embryos == max);
+
+	/* Freeing or accepting an embryo makes room for one more. */
+	free_id(of, T4_TID_HW, 0);
+	CHECK(of->of_tids.td_embryos == max - 1);
+	CHECK(t4_hwtid_claim(of, max + 1, TTS_OWNED, 5, 0, 7, TEF_EMBRYO,
+	    NULL) == 0);
+
+	/* Taking over a releasing embryo does not count it twice. */
+	mutex_enter(&of->of_tids.td_lock);
+	e = t4_tid_ent(of, T4_TID_HW, 1);
+	e->te_flags |= TEF_RELEASING;
+	mutex_exit(&of->of_tids.td_lock);
+	CHECK(t4_hwtid_claim(of, 1, TTS_OWNED, 5, 0, 7, TEF_EMBRYO,
+	    NULL) == 0);
+	CHECK(of->of_tids.td_embryos == max);
+	mutex_enter(&of->of_tids.td_lock);
+	e->te_flags |= TEF_RELEASING;
+	mutex_exit(&of->of_tids.td_lock);
+	CHECK(t4_hwtid_claim(of, 1, TTS_OWNED, 5, 0, 7, 0, NULL) == 0);
+	CHECK(of->of_tids.td_embryos == max - 1);
+
+	mutex_enter(&of->of_tids.td_lock);
+	for (uint32_t i = 0; i < max + 2; i++)
+		t4_tid_free_locked(of, T4_TID_HW, i);
+	mutex_exit(&of->of_tids.td_lock);
+	CHECK(of->of_tids.td_embryos == 0 && of->of_tids.td_hw.tt_inuse == 0);
+	teardown(of);
+}
+
 int
 main(void)
 {
 	test_atid_fifo();
 	test_stid_pairs();
 	test_hwtid_claim();
-	(void) printf("tid tables: 3 scenarios passed\n");
+	test_embryo_cap();
+	(void) printf("tid tables: 4 scenarios passed\n");
 	return (0);
 }

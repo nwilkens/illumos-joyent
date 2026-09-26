@@ -358,6 +358,7 @@ t4_ofld_kstat_update(kstat_t *ksp, int rw)
 	k->ok_tpt_write.value.ui64 = s->os_tpt_write;
 	k->ok_events.value.ui64 = s->os_events;
 	k->ok_eq_bad_cidx.value.ui64 = s->os_eq_bad_cidx;
+	k->ok_syn_refused.value.ui64 = s->os_syn_refused;
 
 	mutex_enter(&of->of_dma_lock);
 	k->ok_dma_bytes.value.ui64 = of->of_dma_bytes;
@@ -416,6 +417,7 @@ t4_ofld_kstat_init(t4_ofld_t *of)
 	OK_U64(ok_tpt_write, "tpt_write");
 	OK_U64(ok_events, "events");
 	OK_U64(ok_eq_bad_cidx, "eq_bad_cidx");
+	OK_U64(ok_syn_refused, "syn_refused");
 	OK_U64(ok_dma_bytes, "dma_bytes");
 	OK_U64(ok_quar_bytes, "quarantine_bytes");
 

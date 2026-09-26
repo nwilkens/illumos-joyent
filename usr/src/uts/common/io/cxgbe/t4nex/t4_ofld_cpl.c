@@ -524,8 +524,11 @@ t4_ofld_cpl_pass_accept(t4_ofld_t *of, t4_rdma_queue_t q, mblk_t *mp)
 
 	if ((rc = t4_hwtid_claim(of, tid, TTS_OWNED, gen, port, rxq,
 	    TEF_EMBRYO, NULL)) != 0) {
-		T4_OFLD_STAT(of, os_cpl_badid);
-		if (rc == ENOMEM)
+		if (rc == EAGAIN)
+			T4_OFLD_STAT(of, os_syn_refused);
+		else
+			T4_OFLD_STAT(of, os_cpl_badid);
+		if (rc == ENOMEM || rc == EAGAIN)
 			t4_ofld_refuse_tid(of, port, rxq, tid);
 		goto drop;
 	}

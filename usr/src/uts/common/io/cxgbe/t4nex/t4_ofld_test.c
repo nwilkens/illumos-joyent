@@ -108,6 +108,14 @@ t4_ot_cq(void *arg, uint32_t cq)
 	_NOTE(ARGUNUSED(arg, cq));
 }
 
+/* A SYN the test cannot queue gets its TID back to the chip at once. */
+static void
+t4_ot_drop(t4_ot_t *ot, const t4_rdma_cpl_t *cpl)
+{
+	if (cpl->trc_opcode == CPL_PASS_ACCEPT_REQ)
+		(void) t4_ofld_tid_release(ot->ot_of, cpl->trc_tid);
+}
+
 static void
 t4_ot_cpl(void *arg, t4_rdma_cpl_t *cpl)
 {
@@ -117,6 +125,7 @@ t4_ot_cpl(void *arg, t4_rdma_cpl_t *cpl)
 	boolean_t run = B_FALSE;
 
 	if ((hdr = allocb(sizeof (*om), BPRI_HI)) == NULL) {
+		t4_ot_drop(ot, cpl);
 		freemsg(cpl->trc_mp);
 		return;
 	}
@@ -131,6 +140,7 @@ t4_ot_cpl(void *arg, t4_rdma_cpl_t *cpl)
 	mutex_enter(&ot->ot_qlock);
 	if (ot->ot_qlen >= T4_OT_QMAX) {
 		mutex_exit(&ot->ot_qlock);
+		t4_ot_drop(ot, cpl);
 		freemsg(hdr);
 		return;
 	}
