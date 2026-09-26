@@ -626,6 +626,8 @@ iwc_cm_dispatch(iwc_t *iwc, iwc_cmq_t *q)
 		iwc_abort_rpl(ep);
 		break;
 	case CPL_RDMA_TERMINATE:
+		/* As Linux: the peer ended RDMA mode, so abort. */
+		IWC_STAT(iwc, is_term_rcvd);
 		iwc_ep_abort(ep, ECONNRESET);
 		break;
 	default:

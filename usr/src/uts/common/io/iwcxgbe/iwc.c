@@ -411,7 +411,8 @@ iwc_locks_fini(iwc_t *iwc)
 
 static const char *const iwc_stat_names[] = {
 	"cpl_drop", "cpl_lost", "cqe_bad", "mpa_bad", "syn_refused",
-	"conn_est", "conn_abort", "async_err", "quarantine"
+	"conn_est", "conn_abort", "async_err", "quarantine", "term_sent",
+	"term_rcvd"
 };
 
 /*

@@ -299,6 +299,8 @@ struct iwc {
 		uint64_t	is_conn_abort;
 		uint64_t	is_async_err;
 		uint64_t	is_quar;
+		uint64_t	is_term_sent;
+		uint64_t	is_term_rcvd;
 	} iwc_stats;
 };
 
@@ -373,6 +375,7 @@ extern int iwc_qp_rts(iwc_qp_t *, iwc_ep_t *);
 extern int iwc_qp_close(iwc_qp_t *, iwc_ep_t *);
 extern void iwc_qp_error(iwc_qp_t *, iwc_ep_t *);
 extern void iwc_qp_async(iwc_t *, const t4_cqe_t *);
+extern void iwc_term_codes(const t4_cqe_t *, uint8_t *, uint8_t *);
 
 /* iwc_ep.c */
 extern iwc_ep_t *iwc_ep_alloc(iwc_t *, iwc_dev_t *);
@@ -392,6 +395,7 @@ extern void iwc_ep_release(iwc_ep_t *, int);
 extern void iwc_ep_abort_locked(iwc_ep_t *, int);
 extern void iwc_ep_abort(iwc_ep_t *, int);
 extern void iwc_ep_close(iwc_ep_t *);
+extern void iwc_ep_terminate(iwc_ep_t *, uint8_t, uint8_t);
 
 /* iwc_cm.c */
 extern void iwc_cpl(void *, t4_rdma_cpl_t *);

@@ -385,3 +385,35 @@ iwc_ep_close(iwc_ep_t *ep)
 	if (iwc->iwc_ops->tro_close_con(iwc->iwc_peer, ep->ep_tid) != 0)
 		iwc_ep_abort_locked(ep, ECONNRESET);
 }
+
+/*
+ * An error the chip found on a connection in RDMA mode: tell the peer with
+ * a TERMINATE, then close.  The FIN follows the TERMINATE on the
+ * connection.  Without RDMA mode, or if the TERMINATE cannot be queued,
+ * the connection is aborted.
+ */
+void
+iwc_ep_terminate(iwc_ep_t *ep, uint8_t layer, uint8_t ecode)
+{
+	iwc_t *iwc = ep->ep_iwc;
+	iwc_qp_t *qp;
+
+	mutex_enter(&ep->ep_lock);
+	qp = ep->ep_qp;
+	if (ep->ep_state != IWC_EP_FPDU || qp == NULL ||
+	    (ep->ep_flags & (EPF_CLOSE_SENT | EPF_RELEASED |
+	    EPF_ABORT_SENT)) != 0 ||
+	    iwc->iwc_ops->tro_ri_terminate(iwc->iwc_peer, ep->ep_tid,
+	    qp->qp_wq.sq.qid, layer, ecode) != 0) {
+		iwc_ep_abort_locked(ep, ECONNRESET);
+		mutex_exit(&ep->ep_lock);
+		return;
+	}
+	IWC_STAT(iwc, is_term_sent);
+	if ((ep->ep_flags & EPF_DISC_SENT) == 0) {
+		ep->ep_flags |= EPF_DISC_SENT;
+		iwc_ep_event(ep, RDK_IW_EVENT_DISCONNECT, ECONNRESET, NULL, 0);
+	}
+	iwc_ep_close(ep);
+	mutex_exit(&ep->ep_lock);
+}

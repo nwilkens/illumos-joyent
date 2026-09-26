@@ -877,6 +877,120 @@ iwc_post_recv(struct rdk_qp *rqp, const struct rdk_recv_wr *wr,
 	return (ret);
 }
 
+/* RFC 5040 TERMINATE layers and error types, and the codes used here. */
+#define	TERM_RDMAP		0x00
+#define	TERM_DDP		0x10
+#define	TERM_MPA		0x20
+#define	TERM_LOCAL_CATA		0x00
+#define	TERM_REMOTE_PROT	0x01	/* RDMAP */
+#define	TERM_REMOTE_OP		0x02	/* RDMAP */
+#define	TERM_DDP_TAGGED		0x01
+#define	TERM_DDP_UNTAGGED	0x02
+#define	TERM_DDP_LLP		0x03
+
+/*
+ * The TERMINATE for an asynchronous error CQE, as Linux build_term_codes()
+ * maps it.
+ */
+void
+iwc_term_codes(const t4_cqe_t *cqe, uint8_t *layer, uint8_t *ecode)
+{
+	const uint_t op = CQE_OPCODE(cqe);
+	const boolean_t send_inv = op == FW_RI_SEND_WITH_INV ||
+	    op == FW_RI_SEND_WITH_SE_INV;
+	const boolean_t tagged = op == FW_RI_RDMA_WRITE ||
+	    (!CQE_SQ(cqe) && op == FW_RI_READ_RESP);
+
+	*layer = TERM_RDMAP | TERM_LOCAL_CATA;
+	*ecode = 0;
+	switch (CQE_STATUS(cqe)) {
+	case T4_ERR_STAG:
+		*layer = TERM_RDMAP | (send_inv ? TERM_REMOTE_OP :
+		    TERM_REMOTE_PROT);
+		*ecode = send_inv ? 0x09 : 0x00;
+		break;
+	case T4_ERR_PDID:
+		*layer = TERM_RDMAP | TERM_REMOTE_PROT;
+		*ecode = send_inv ? 0x09 : 0x03;
+		break;
+	case T4_ERR_QPID:
+		*layer = TERM_RDMAP | TERM_REMOTE_PROT;
+		*ecode = 0x03;
+		break;
+	case T4_ERR_ACCESS:
+		*layer = TERM_RDMAP | TERM_REMOTE_PROT;
+		*ecode = 0x02;
+		break;
+	case T4_ERR_WRAP:
+		*layer = TERM_RDMAP | TERM_REMOTE_PROT;
+		*ecode = 0x04;
+		break;
+	case T4_ERR_BOUND:
+		*layer = tagged ? TERM_DDP | TERM_DDP_TAGGED :
+		    TERM_RDMAP | TERM_REMOTE_PROT;
+		*ecode = 0x01;
+		break;
+	case T4_ERR_INVALIDATE_SHARED_MR:
+	case T4_ERR_INVALIDATE_MR_WITH_MW_BOUND:
+		*layer = TERM_RDMAP | TERM_REMOTE_OP;
+		*ecode = 0x09;
+		break;
+	case T4_ERR_OUT_OF_RQE:
+		*layer = TERM_DDP | TERM_DDP_UNTAGGED;
+		*ecode = 0x02;
+		break;
+	case T4_ERR_PBL_ADDR_BOUND:
+		*layer = TERM_DDP | TERM_DDP_TAGGED;
+		*ecode = 0x01;
+		break;
+	case T4_ERR_CRC:
+		*layer = TERM_MPA | TERM_DDP_LLP;
+		*ecode = 0x02;
+		break;
+	case T4_ERR_MARKER:
+		*layer = TERM_MPA | TERM_DDP_LLP;
+		*ecode = 0x03;
+		break;
+	case T4_ERR_PDU_LEN_ERR:
+		*layer = TERM_DDP | TERM_DDP_UNTAGGED;
+		*ecode = 0x05;
+		break;
+	case T4_ERR_DDP_VERSION:
+		*layer = TERM_DDP | (tagged ? TERM_DDP_TAGGED :
+		    TERM_DDP_UNTAGGED);
+		*ecode = tagged ? 0x04 : 0x06;
+		break;
+	case T4_ERR_RDMA_VERSION:
+		*layer = TERM_RDMAP | TERM_REMOTE_OP;
+		*ecode = 0x05;
+		break;
+	case T4_ERR_OPCODE:
+		*layer = TERM_RDMAP | TERM_REMOTE_OP;
+		*ecode = 0x06;
+		break;
+	case T4_ERR_DDP_QUEUE_NUM:
+		*layer = TERM_DDP | TERM_DDP_UNTAGGED;
+		*ecode = 0x01;
+		break;
+	case T4_ERR_MSN:
+	case T4_ERR_MSN_GAP:
+	case T4_ERR_MSN_RANGE:
+	case T4_ERR_IRD_OVERFLOW:
+		*layer = TERM_DDP | TERM_DDP_UNTAGGED;
+		*ecode = 0x03;
+		break;
+	case T4_ERR_TBIT:
+		*layer = TERM_DDP | TERM_LOCAL_CATA;
+		break;
+	case T4_ERR_MO:
+		*layer = TERM_DDP | TERM_DDP_UNTAGGED;
+		*ecode = 0x04;
+		break;
+	default:
+		break;
+	}
+}
+
 /*
  * An asynchronous error the firmware reported for a QP (Linux ev.c): tell
  * the consumer and end the connection.  CM taskq.
@@ -885,6 +999,7 @@ void
 iwc_qp_async(iwc_t *iwc, const t4_cqe_t *cqe)
 {
 	struct rdk_event ev;
+	uint8_t layer, ecode;
 	iwc_qp_t *qp;
 	iwc_ep_t *ep;
 
@@ -934,7 +1049,8 @@ iwc_qp_async(iwc_t *iwc, const t4_cqe_t *cqe)
 		iwc_ep_hold(ep);
 	mutex_exit(&qp->qp_lock);
 	if (ep != NULL) {
-		iwc_ep_abort(ep, ECONNRESET);
+		iwc_term_codes(cqe, &layer, &ecode);
+		iwc_ep_terminate(ep, layer, ecode);
 		iwc_ep_rele(ep);
 	}
 	iwc_qp_put(iwc, qp);
