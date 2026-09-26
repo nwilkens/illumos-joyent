@@ -102,9 +102,18 @@ stub_fail(const char *fmt, ...)
 #define	MAX(a, b)	((a) < (b) ? (b) : (a))
 #endif
 
-/* Fake clock, in ticks of 10ms. */
+/* Fake clock, in ticks of 10ms. Sleeping for a day of it is a hang. */
+#define	STUB_FOREVER	(100 * 60 * 60 * 24)
+
 static clock_t stub_now;
 static boolean_t stub_sleep_hook(clock_t deadline);
+
+static void
+stub_hang_check(void)
+{
+	if (stub_now > STUB_FOREVER)
+		stub_fail("slept for a day of fake time (hang)");
+}
 
 static clock_t
 ddi_get_lbolt(void)
@@ -127,6 +136,7 @@ delay(clock_t ticks)
 		;
 	if (stub_now < end)
 		stub_now = end;
+	stub_hang_check();
 }
 
 /* Memory. */
@@ -289,6 +299,7 @@ cv_timedwait(kcondvar_t *cv, kmutex_t *m, clock_t deadline)
 		if (!stub_sleep_hook(deadline)) {
 			if (stub_now < deadline)
 				stub_now = deadline;
+			stub_hang_check();
 			ret = -1;
 			break;
 		}

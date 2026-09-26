@@ -34,12 +34,21 @@
 clock_t mlxcx_cmd_init_delay = 1000 * 10; /* 10 ms in us */
 uint_t mlxcx_cmd_init_trys = 100; /* Wait at most 1s */
 
-clock_t mlxcx_cmd_delay = 1000 * 1; /* 1 ms in us */
-uint_t mlxcx_cmd_tries = 5000; /* Wait at most 1s */
+/*
+ * How long a command may take, and how long we wait for a free slot, before
+ * we give up on it.
+ */
+clock_t mlxcx_cmd_timeout = 60 * 1000 * 1000; /* 60 s in us */
 
 /*
- * How often we look for abandoned command slots that hardware has given back
- * while we wait for a free slot.
+ * How often we poll a command in polling mode.
+ */
+clock_t mlxcx_cmd_delay = 1000 * 1; /* 1 ms in us */
+
+/*
+ * How often an event mode waiter checks its entry itself, in case the
+ * completion event was lost, and how often we look for abandoned slots that
+ * hardware has given back while we wait for a free slot.
  */
 clock_t mlxcx_cmd_rescan_delay = 1000 * 1000; /* 1 s in us */
 
@@ -540,11 +549,6 @@ mlxcx_cmd_queue_fini(mlxcx_t *mlxp)
 		cmd->mcmd_tokens = NULL;
 	}
 
-	if (cmd->mcmd_taskq != NULL) {
-		ddi_taskq_destroy(cmd->mcmd_taskq);
-		cmd->mcmd_taskq = NULL;
-	}
-
 	cv_destroy(&cmd->mcmd_cv);
 	mutex_destroy(&cmd->mcmd_lock);
 
@@ -567,7 +571,6 @@ mlxcx_cmd_queue_init(mlxcx_t *mlxp)
 	uint32_t tmp, cmd_low, cmd_high, i;
 	mlxcx_cmd_queue_t *cmd = &mlxp->mlx_cmd;
 	char buf[32];
-	char tq_name[TASKQ_NAMELEN];
 	const ddi_dma_cookie_t *ck;
 
 	ddi_device_acc_attr_t acc;
@@ -617,14 +620,6 @@ mlxcx_cmd_queue_init(mlxcx_t *mlxp)
 	(void) snprintf(buf, sizeof (buf), "mlxcx_tokens_%d", mlxp->mlx_inst);
 	if ((cmd->mcmd_tokens = id_space_create(buf, 1, UINT8_MAX)) == NULL) {
 		mlxcx_warn(mlxp, "failed to allocate token id space");
-		mlxcx_cmd_queue_fini(mlxp);
-		return (B_FALSE);
-	}
-
-	(void) snprintf(tq_name, sizeof (tq_name), "cmdq_%d", mlxp->mlx_inst);
-	if ((cmd->mcmd_taskq = ddi_taskq_create(mlxp->mlx_dip, tq_name, 1,
-	    TASKQ_DEFAULTPRI, 0)) == NULL) {
-		mlxcx_warn(mlxp, "failed to create command queue task queue");
 		mlxcx_cmd_queue_fini(mlxp);
 		return (B_FALSE);
 	}
@@ -895,10 +890,11 @@ mlxcx_cmd_copy_output(mlxcx_cmd_ent_t *ent, mlxcx_cmd_t *cmd)
 
 static boolean_t mlxcx_cmd_reclaim(mlxcx_cmd_queue_t *, uint_t);
 
-static uint_t
-mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq)
+static boolean_t
+mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq, uint_t *slotp)
 {
 	uint_t slot;
+	clock_t deadline = ddi_get_lbolt() + drv_usectohz(mlxcx_cmd_timeout);
 
 	mutex_enter(&cmdq->mcmd_lock);
 	for (;;) {
@@ -908,8 +904,14 @@ mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq)
 		if ((slot = ddi_ffs(cmdq->mcmd_mask)) != 0)
 			break;
 
+		if (ddi_get_lbolt() >= deadline) {
+			mutex_exit(&cmdq->mcmd_lock);
+			return (B_FALSE);
+		}
+
 		(void) cv_timedwait(&cmdq->mcmd_cv, &cmdq->mcmd_lock,
-		    ddi_get_lbolt() + drv_usectohz(mlxcx_cmd_rescan_delay));
+		    MIN(deadline, ddi_get_lbolt() +
+		    drv_usectohz(mlxcx_cmd_rescan_delay)));
 	}
 
 	cmdq->mcmd_mask &= ~(1U << --slot);
@@ -919,7 +921,8 @@ mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq)
 
 	mutex_exit(&cmdq->mcmd_lock);
 
-	return (slot);
+	*slotp = slot;
+	return (B_TRUE);
 }
 
 /*
@@ -1053,25 +1056,28 @@ mlxcx_cmd_reclaim(mlxcx_cmd_queue_t *cmdq, uint_t slot)
 	return (B_TRUE);
 }
 
-static void
-mlxcx_cmd_taskq(void *arg)
+static boolean_t
+mlxcx_cmd_post(mlxcx_t *mlxp, mlxcx_cmd_t *cmd)
 {
-	mlxcx_cmd_t *cmd = arg;
-	mlxcx_t *mlxp = cmd->mlcmd_mlxp;
 	mlxcx_cmd_queue_t *cmdq = &mlxp->mlx_cmd;
 	mlxcx_cmd_ent_t *ent;
-	mlxcx_cmd_abandon_t *mca;
-	uint_t poll, slot;
+	uint_t slot;
 
 	ASSERT3S(cmd->mlcmd_op, !=, 0);
 
-	slot = mlxcx_cmd_reserve_slot(cmdq);
+	if (!mlxcx_cmd_reserve_slot(cmdq, &slot)) {
+		mlxcx_warn(mlxp, "timed out waiting for a slot for command "
+		    "%s (0x%x)", mlxcx_cmd_opcode_string(cmd->mlcmd_op),
+		    cmd->mlcmd_op);
+		return (B_FALSE);
+	}
 	mlxcx_cmd_reap(mlxp);
-	ent = mlxcx_cmd_entry(cmdq, slot);
 
 	/*
-	 * Command queue is currently ours as we set busy.
+	 * The slot is ours, but completions ignore it until we publish the
+	 * command in mcmd_active below.
 	 */
+	ent = mlxcx_cmd_entry(cmdq, slot);
 	bzero(ent, sizeof (*ent));
 	ent->mce_type = MLXCX_CMD_TRANSPORT_PCI;
 	ent->mce_in_length = to_be32(cmd->mlcmd_inlen);
@@ -1083,42 +1089,16 @@ mlxcx_cmd_taskq(void *arg)
 	mlxcx_cmd_prep_output(ent, cmd);
 	MLXCX_DMA_SYNC(cmdq->mcmd_dma, DDI_DMA_SYNC_FORDEV);
 
+	cmd->mlcmd_slot = slot;
+	cmd->mlcmd_deadline = ddi_get_lbolt() + drv_usectohz(mlxcx_cmd_timeout);
+
 	mutex_enter(&cmdq->mcmd_lock);
 	cmdq->mcmd_active[slot] = cmd;
 	mutex_exit(&cmdq->mcmd_lock);
 
 	mlxcx_put32(mlxp, MLXCX_ISS_CMD_DOORBELL, 1 << slot);
 
-	if (!cmd->mlcmd_poll)
-		return;
-
-	for (poll = 0; poll < mlxcx_cmd_tries; poll++) {
-		delay(drv_usectohz(mlxcx_cmd_delay));
-		mutex_enter(&cmdq->mcmd_lock);
-		if (cmdq->mcmd_active[slot] == cmd &&
-		    mlxcx_cmd_returned(cmdq, slot, cmd->mlcmd_token)) {
-			mlxcx_cmd_done(cmdq, cmd, slot);
-			mutex_exit(&cmdq->mcmd_lock);
-			return;
-		}
-		mutex_exit(&cmdq->mcmd_lock);
-	}
-
-	mca = kmem_zalloc(sizeof (*mca), KM_SLEEP);
-	mutex_enter(&cmdq->mcmd_lock);
-	if (mlxcx_cmd_returned(cmdq, slot, cmd->mlcmd_token)) {
-		mlxcx_cmd_done(cmdq, cmd, slot);
-	} else {
-		mlxcx_cmd_abandon(cmdq, cmd, slot, mca);
-		mca = NULL;
-	}
-	mutex_exit(&cmdq->mcmd_lock);
-
-	if (mca != NULL) {
-		kmem_free(mca, sizeof (*mca));
-	} else {
-		mlxcx_fm_ereport(mlxp, DDI_FM_DEVICE_NO_RESPONSE);
-	}
+	return (B_TRUE);
 }
 
 void
@@ -1147,9 +1127,6 @@ mlxcx_cmd_completion(mlxcx_t *mlxp, mlxcx_eventq_ent_t *ent)
 				cmdq->mcmd_stray++;
 			continue;
 		}
-
-		if (cmd->mlcmd_poll)
-			continue;
 
 		if (!mlxcx_cmd_returned(cmdq, slot, cmd->mlcmd_token)) {
 			cmdq->mcmd_stray++;
@@ -1210,28 +1187,64 @@ mlxcx_cmd_send(mlxcx_t *mlxp, mlxcx_cmd_t *cmd, const void *in, uint32_t inlen,
 	cmd->mlcmd_outlen = outlen;
 	cmd->mlcmd_mlxp = mlxp;
 
-	/*
-	 * Now that all allocations have been done, all that remains is for us
-	 * to dispatch the request to process this to the taskq for it to be
-	 * processed.
-	 */
-	if (ddi_taskq_dispatch(mlxp->mlx_cmd.mcmd_taskq, mlxcx_cmd_taskq, cmd,
-	    DDI_SLEEP) != DDI_SUCCESS) {
-		mlxcx_warn(mlxp, "failed to submit command to taskq");
-		return (B_FALSE);
-	}
-
-	return (B_TRUE);
+	return (mlxcx_cmd_post(mlxp, cmd));
 }
 
+/*
+ * Wait for a posted command. We check the entry ourselves in polling mode,
+ * and now and then in event mode in case the completion event is lost. At the
+ * deadline we abandon the command if hardware still owns it.
+ */
 static void
 mlxcx_cmd_wait(mlxcx_cmd_t *cmd)
 {
-	mutex_enter(&cmd->mlcmd_lock);
-	while (cmd->mlcmd_state == 0) {
-		cv_wait(&cmd->mlcmd_cv, &cmd->mlcmd_lock);
+	mlxcx_t *mlxp = cmd->mlcmd_mlxp;
+	mlxcx_cmd_queue_t *cmdq = &mlxp->mlx_cmd;
+	mlxcx_cmd_abandon_t *mca = NULL;
+	uint_t slot = cmd->mlcmd_slot;
+	boolean_t expired, abandoned = B_FALSE;
+
+	for (;;) {
+		mutex_enter(&cmd->mlcmd_lock);
+		if (cmd->mlcmd_state != 0) {
+			mutex_exit(&cmd->mlcmd_lock);
+			break;
+		}
+		if (cmd->mlcmd_poll) {
+			mutex_exit(&cmd->mlcmd_lock);
+			delay(drv_usectohz(mlxcx_cmd_delay));
+		} else {
+			(void) cv_timedwait(&cmd->mlcmd_cv, &cmd->mlcmd_lock,
+			    MIN(cmd->mlcmd_deadline, ddi_get_lbolt() +
+			    drv_usectohz(mlxcx_cmd_rescan_delay)));
+			mutex_exit(&cmd->mlcmd_lock);
+		}
+
+		expired = ddi_get_lbolt() >= cmd->mlcmd_deadline;
+		if (expired && mca == NULL)
+			mca = kmem_zalloc(sizeof (*mca), KM_SLEEP);
+
+		mutex_enter(&cmdq->mcmd_lock);
+		if (cmdq->mcmd_active[slot] == cmd) {
+			if (mlxcx_cmd_returned(cmdq, slot, cmd->mlcmd_token)) {
+				mlxcx_cmd_done(cmdq, cmd, slot);
+			} else if (expired) {
+				mlxcx_cmd_abandon(cmdq, cmd, slot, mca);
+				mca = NULL;
+				abandoned = B_TRUE;
+			}
+		}
+		mutex_exit(&cmdq->mcmd_lock);
 	}
-	mutex_exit(&cmd->mlcmd_lock);
+
+	if (mca != NULL)
+		kmem_free(mca, sizeof (*mca));
+
+	if (abandoned) {
+		mlxcx_warn(mlxp, "command %s (0x%x) timed out",
+		    mlxcx_cmd_opcode_string(cmd->mlcmd_op), cmd->mlcmd_op);
+		mlxcx_fm_ereport(mlxp, DDI_FM_DEVICE_NO_RESPONSE);
+	}
 }
 
 static boolean_t

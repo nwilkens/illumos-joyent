@@ -36,3 +36,4 @@ the device still owns, or if the device would write to freed memory.
 | `cmdq_geometry.py` | Attach refuses a queue size and stride that do not fit the 4 KiB queue page. |
 | `cmdq_completion.py` | A completion event for an idle, out-of-range, still-owned, wrong-token or already finished slot is counted and ignored. |
 | `cmdq_abandon.py` | A timed-out command keeps its slot, token and mailboxes until hardware returns the entry with the right token; detach leaks them if it never does. |
+| `cmdq_deadline.py` | In event mode a command gives up at its deadline when firmware never answers or no slot comes free, and recovers when the completion event is lost. |

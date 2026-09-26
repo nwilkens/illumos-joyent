@@ -11,6 +11,7 @@ TESTS = (
     "cmdq_geometry.py",
     "cmdq_completion.py",
     "cmdq_abandon.py",
+    "cmdq_deadline.py",
 )
 
 

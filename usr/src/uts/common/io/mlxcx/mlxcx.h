@@ -347,7 +347,6 @@ typedef struct mlxcx_cmd_queue {
 	uint64_t		mcmd_stray;
 	uint64_t		mcmd_timeouts;
 
-	ddi_taskq_t		*mcmd_taskq;
 	id_space_t		*mcmd_tokens;
 } mlxcx_cmd_queue_t;
 
@@ -982,6 +981,8 @@ struct mlxcx_cmd {
 	boolean_t		mlcmd_poll;
 	uint8_t			mlcmd_token;
 	mlxcx_cmd_op_t		mlcmd_op;
+	uint_t			mlcmd_slot;
+	clock_t			mlcmd_deadline;
 
 	/*
 	 * Command data and extended mailboxes for responses.
