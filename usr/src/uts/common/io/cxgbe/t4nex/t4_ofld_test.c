@@ -294,6 +294,7 @@ t4_ot_pass_accept(t4_ot_t *ot, const t4_ot_msg_t *om, mblk_t *mp)
 	a.trac_opts.trt_rcv_win = T4_OT_RCV_WIN;
 	a.trac_opts.trt_mtu_idx = NMTUS - 1;
 	a.trac_opts.trt_ulp_mode = ULP_MODE_NONE;
+	a.trac_opts.trt_cong = CONG_ALG_NEWRENO;
 	while (a.trac_opts.trt_mtu_idx > 0 &&
 	    of->of_sc->params.mtus[a.trac_opts.trt_mtu_idx] >
 	    of->of_port[om->om_port].op_pi->mtu)
@@ -668,6 +669,7 @@ t4_ot_connect(t4_ot_t *ot, t4_ofld_test_t *t)
 	a.trao_l2t = l2t;
 	a.trao_opts.trt_rcv_win = T4_OT_RCV_WIN;
 	a.trao_opts.trt_ulp_mode = ULP_MODE_NONE;
+	a.trao_opts.trt_cong = CONG_ALG_NEWRENO;
 	a.trao_opts.trt_mtu_idx = NMTUS - 1;
 	while (a.trao_opts.trt_mtu_idx > 0 &&
 	    of->of_sc->params.mtus[a.trao_opts.trt_mtu_idx] >

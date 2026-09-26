@@ -99,7 +99,7 @@ static int
 t4_ofld_opts_ok(const t4_rdma_tcp_opts_t *o)
 {
 	if ((o->trt_rcv_win >> 10) > M_RCV_BUFSIZ || o->trt_rcv_win < 1024 ||
-	    o->trt_mtu_idx >= NMTUS ||
+	    o->trt_mtu_idx >= NMTUS || o->trt_cong > CONG_ALG_HIGHSPEED ||
 	    (o->trt_ulp_mode != ULP_MODE_NONE &&
 	    o->trt_ulp_mode != ULP_MODE_TCPDDP))
 		return (EINVAL);
@@ -132,9 +132,16 @@ t4_ofld_opt0(const t4_ofld_port_t *op, const t4_rdma_tcp_opts_t *o,
 static uint32_t
 t4_ofld_opt2(const t4_ofld_port_t *op, const t4_rdma_tcp_opts_t *o)
 {
+	const struct adapter *sc = op->op_ofld->of_sc;
+	/*
+	 * The TX modulation queue of the port's channel, as FreeBSD sets it.
+	 * RX channel 0 as Linux: e12 stopped answering on the network when a
+	 * port 1 connection had RX channel 1.
+	 */
 	uint32_t opt2 = V_RX_CHANNEL(0) | F_RSS_QUEUE_VALID |
 	    V_RSS_QUEUE(op->op_ofld->of_rxq.iq.tsi_abs_id) |
-	    F_T5_OPT_2_VALID | V_CONG_CNTRL(CONG_ALG_TAHOE) | F_T5_ISS;
+	    V_TX_QUEUE(sc->params.tp.tx_modq[op->op_pi->tx_chan]) |
+	    F_T5_OPT_2_VALID | V_CONG_CNTRL(o->trt_cong) | F_T5_ISS;
 
 	if (o->trt_timestamps)
 		opt2 |= F_TSTAMPS_EN;

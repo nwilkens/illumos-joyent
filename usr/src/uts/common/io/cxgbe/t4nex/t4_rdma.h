@@ -181,6 +181,7 @@ typedef struct t4_rdma_tcp_opts {
 	uint8_t		trt_ulp_mode;	/* ULP_MODE_NONE or ULP_MODE_TCPDDP */
 	uint8_t		trt_tos;
 	boolean_t	trt_p2p_iss;	/* iWARP peer-to-peer: ISS + 4 */
+	uint8_t		trt_cong;	/* CONG_ALG_* */
 } t4_rdma_tcp_opts_t;
 
 typedef struct t4_rdma_act_open {
