@@ -39,7 +39,7 @@
 #include <sys/ddi_intr.h>
 #include <sys/disp.h>
 
-/* Passes a vector makes on its own for CEQ entries that beat the enable. */
+/* Passes a vector makes on its own for entries it finds after the enable. */
 #define	IRDMA_CEQ_RECHECKS	4
 
 /* The PF-relative vector number of entry i of the RDMA block. */
@@ -133,7 +133,7 @@ irdma_ceq_process(irdma_ceq_t *ic)
 			break;
 		if (icq != NULL) {
 			ic->ic_events++;
-			irdma_cq_ceq_dispatch(icq);
+			irdma_cq_ceq_dispatch(icq, B_TRUE);
 		}
 	}
 }
@@ -154,7 +154,7 @@ irdma_ceq_resched_run(irdma_ceq_t *ic)
 		mutex_enter(&ic->ic_lock);
 		icq->icq_resched = B_FALSE;
 		mutex_exit(&ic->ic_lock);
-		irdma_cq_ceq_dispatch(icq);
+		irdma_cq_ceq_dispatch(icq, B_FALSE);
 	}
 	list_destroy(&todo);
 }
@@ -186,11 +186,12 @@ irdma_vec_work(irdma_vec_t *iv, irdma_ceq_t *ic, boolean_t owed,
 			irdma_aeq_process(irdma);
 		if (ic != NULL)
 			irdma_ceq_process(ic);
-		irdma_vec_enable(irdma, iv->iv_idx);
 		/*
-		 * The enable clears the pending bit, so an entry written
-		 * before it raises no interrupt.
+		 * The device latches an event while the vector is off and
+		 * fires on the enable; looking again first saves that
+		 * interrupt.
 		 */
+		irdma_vec_enable(irdma, iv->iv_idx);
 		if (iv->iv_ctl && (progress & BIT(IRDMA_STEP_CEQ0)) != 0 &&
 		    irdma_ceq_pending(&irdma->irdma_ceq0))
 			again = B_TRUE;

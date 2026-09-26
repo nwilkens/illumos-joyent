@@ -214,7 +214,7 @@ extern void irdma_destroy_cq(struct rdk_cq *);
 extern int irdma_poll_cq(struct rdk_cq *, int, struct rdk_wc *);
 extern int irdma_req_notify_cq(struct rdk_cq *, enum rdk_cq_notify_flags);
 extern irdma_cq_t *irdma_cq_ceq_hold(irdma_ceq_t *, struct irdma_sc_cq *);
-extern void irdma_cq_ceq_dispatch(irdma_cq_t *);
+extern void irdma_cq_ceq_dispatch(irdma_cq_t *, boolean_t);
 extern void irdma_cq_resched(struct rdk_cq *);
 extern void irdma_cq_error(irdma_t *, uint32_t);
 extern boolean_t irdma_cq_empty(irdma_cq_t *);

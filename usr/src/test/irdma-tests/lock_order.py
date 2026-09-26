@@ -79,9 +79,10 @@ def main():
 
     # Consumer completion handlers run from the vector threads with no
     # driver lock held, and never from the interrupt handler.
-    for name in ("irdma_ceq_process", "irdma_ceq_resched_run"):
+    for name, event in (("irdma_ceq_process", "B_TRUE"),
+                        ("irdma_ceq_resched_run", "B_FALSE")):
         ceq = body(intr, name)
-        call = ceq.index("irdma_cq_ceq_dispatch(icq);")
+        call = ceq.index(f"irdma_cq_ceq_dispatch(icq, {event});")
         assert ceq.rindex("mutex_exit(&ic->ic_lock);", 0, call) > \
             ceq.rindex("mutex_enter(&ic->ic_lock);", 0, call), name
     cq = (IRDMA / "irdma_cq.c").read_text(encoding="utf-8")
@@ -90,6 +91,15 @@ def main():
     assert dispatch.rindex("mutex_exit(&icq->icq_lock);", 0, handler) > \
         dispatch.rindex("mutex_enter(&icq->icq_lock);", 0, handler)
     assert "comp_handler" not in isr
+    # A vector looks at its queues again only after the enable.
+    work = body(intr, "irdma_vec_work")
+    en = work.index("irdma_vec_enable(irdma, iv->iv_idx);")
+    for q in ("irdma_ceq_pending(&irdma->irdma_ceq0)",
+              "irdma_ceq_pending(&ic->ic_sc)"):
+        assert work.index(q) > en, q
+    # Only a CEQ entry uses up a CQ's arm.
+    assert re.search(r"if \(event\) \{\n\t\tmutex_enter\(&icq->icq_lock\);"
+                     r"\n\t\ticq->icq_armed = B_FALSE;", dispatch)
     resched = body(cq, "irdma_cq_resched")
     assert resched.index("irdma_ceq_kick(ic);") > \
         resched.rindex("mutex_exit(&ic->ic_lock);")

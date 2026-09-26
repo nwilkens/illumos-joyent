@@ -327,13 +327,20 @@ irdma_cq_resched(struct rdk_cq *rcq)
 
 /* In the CQ's vector thread, with no driver lock held. */
 void
-irdma_cq_ceq_dispatch(irdma_cq_t *icq)
+irdma_cq_ceq_dispatch(irdma_cq_t *icq, boolean_t event)
 {
 	struct rdk_cq *rcq = &icq->icq_rdk;
 
-	mutex_enter(&icq->icq_lock);
-	icq->icq_armed = B_FALSE;
-	mutex_exit(&icq->icq_lock);
+	/*
+	 * Only a CEQ entry uses up the arm.  A CQ called again after a
+	 * resched may still be armed, and a second arm would go to a device
+	 * that has not fired.
+	 */
+	if (event) {
+		mutex_enter(&icq->icq_lock);
+		icq->icq_armed = B_FALSE;
+		mutex_exit(&icq->icq_lock);
+	}
 	if (rcq->comp_handler != NULL)
 		rcq->comp_handler(rcq, rcq->cq_context);
 	irdma_cq_rele(icq);
