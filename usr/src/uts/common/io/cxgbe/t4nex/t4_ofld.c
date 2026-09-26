@@ -585,7 +585,7 @@ t4_ofld_detach(struct adapter *sc)
 	}
 	if (ok) {
 		mutex_enter(&of->of_lock);
-		ok = of->of_client == NULL;
+		ok = of->of_client == NULL && !of->of_closing;
 		mutex_exit(&of->of_lock);
 	}
 
@@ -734,7 +734,7 @@ t4_ofld_client_open(t4_ofld_t *of, const t4_rdma_client_t *client, void *arg,
 		rc = EIO;
 	} else if (of->of_stopping) {
 		rc = EAGAIN;
-	} else if (of->of_client != NULL) {
+	} else if (of->of_client != NULL || of->of_closing) {
 		rc = EBUSY;
 	} else {
 		of->of_client = client;
@@ -762,6 +762,7 @@ t4_ofld_client_close(t4_ofld_t *of)
 		return;
 	}
 	gen = of->of_client_gen;
+	of->of_closing = B_TRUE;
 	of->of_client = NULL;
 	of->of_client_arg = NULL;
 	of->of_client_test = B_FALSE;
@@ -775,6 +776,10 @@ t4_ofld_client_close(t4_ofld_t *of)
 	t4_ofld_dma_close(of);
 	t4_l2t_reset(of);
 	t4_clip_reset(of);
+
+	mutex_enter(&of->of_lock);
+	of->of_closing = B_FALSE;
+	mutex_exit(&of->of_lock);
 }
 
 static void
