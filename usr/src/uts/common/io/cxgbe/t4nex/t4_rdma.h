@@ -29,7 +29,8 @@
  * t4nex never calls into the child with one of its own locks held.  CPL
  * handlers run in interrupt context and must not block; events run on a
  * taskq.  Every operation other than dma_free and close fails with EIO once
- * the generation returned by open is stale.
+ * the generation returned by open is stale.  Close waits for running
+ * operations and callbacks, and fails with EDEADLK when called from one.
  */
 
 #include <sys/types.h>
@@ -218,7 +219,7 @@ typedef struct t4_rdma_dma {
 typedef struct t4_rdma_ops {
 	int	(*tro_open)(t4_rdma_peer_t *, const t4_rdma_client_t *,
 	    void *, t4_rdma_info_t *);
-	void	(*tro_close)(t4_rdma_peer_t *);
+	int	(*tro_close)(t4_rdma_peer_t *);
 
 	int	(*tro_atid_alloc)(t4_rdma_peer_t *, void *, uint32_t *);
 	void	(*tro_atid_free)(t4_rdma_peer_t *, uint32_t);

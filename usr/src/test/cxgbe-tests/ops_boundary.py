@@ -2,7 +2,8 @@
 """Check the boundary between t4nex and its RDMA child.
 
 Every operation in t4_rdma_ops_t is filled in, and every entry point
-validates the peer before using it.  No operation takes a raw work request
+validates the peer before using it.  Operations on the client's IDs pin the
+client, so that close cannot sweep the IDs while one is running.  No operation takes a raw work request
 from the child: the child names IDs and parameters and t4nex builds the
 CPL.  Each connection operation checks that the calling client owns the
 TID, and each work request goes through t4_ofld_wr_send().
@@ -12,6 +13,10 @@ import re
 import sys
 
 from c_src import T4NEX, functions
+
+# Operations that work without a live client, or that manage the client.
+UNPINNED = {"tro_open", "tro_close", "tro_dma_free", "tro_reset",
+            "tro_stopped"}
 
 
 def main():
@@ -30,9 +35,16 @@ def main():
             if re.search(r"wr_send|raw|_wr$|cmd", m)]
 
     bodies = functions(ops)
+    if "t4_rdma_peer_ofld" not in bodies.get("t4_rdma_op_enter", ""):
+        bad.append("t4_rdma_op_enter() does not validate its peer")
     for member, func in assigned.items():
-        if "t4_rdma_peer_ofld" not in bodies.get(func, ""):
-            bad.append(f"{func}() does not validate its peer")
+        body = bodies.get(func, "")
+        if member in UNPINNED:
+            if "t4_rdma_peer_ofld" not in body:
+                bad.append(f"{func}() does not validate its peer")
+        elif "t4_rdma_op_enter" not in body or \
+                "t4_rdma_op_exit" not in body:
+            bad.append(f"{func}() does not pin the client")
 
     for func in ("t4_ofld_accept", "t4_ofld_flowc", "t4_ofld_close_con",
                  "t4_ofld_abort", "t4_ofld_abort_rpl", "t4_ofld_rx_credits",

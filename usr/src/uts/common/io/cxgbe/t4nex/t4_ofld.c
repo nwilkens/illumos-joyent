@@ -767,7 +767,7 @@ t4_ofld_client_close(t4_ofld_t *of)
 	of->of_client_test = B_FALSE;
 	if (of->of_gen == gen)
 		of->of_gen++;
-	while (of->of_cb_busy != 0)
+	while (of->of_cb_busy != 0 || of->of_op_busy != 0)
 		cv_wait(&of->of_cv, &of->of_lock);
 	mutex_exit(&of->of_lock);
 
@@ -790,12 +790,14 @@ t4_ofld_deliver(t4_ofld_t *of, const t4_rdma_event_t *ev)
 	}
 	arg = of->of_client_arg;
 	of->of_cb_busy++;
+	of->of_ev_thread = curthread;
 	mutex_exit(&of->of_lock);
 
 	T4_OFLD_STAT(of, os_events);
 	client->trcl_event(arg, ev);
 
 	mutex_enter(&of->of_lock);
+	of->of_ev_thread = NULL;
 	if (--of->of_cb_busy == 0)
 		cv_broadcast(&of->of_cv);
 	mutex_exit(&of->of_lock);

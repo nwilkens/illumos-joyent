@@ -63,6 +63,7 @@ typedef struct t4_ot {
 	mblk_t		*ot_qtail;
 	uint_t		ot_qlen;
 	boolean_t	ot_qrun;
+	boolean_t	ot_closing;
 
 	kmutex_t	ot_lock;
 	kcondvar_t	ot_cv;
@@ -138,7 +139,7 @@ t4_ot_cpl(void *arg, t4_rdma_cpl_t *cpl)
 	hdr->b_cont = cpl->trc_mp;
 
 	mutex_enter(&ot->ot_qlock);
-	if (ot->ot_qlen >= T4_OT_QMAX) {
+	if (ot->ot_qlen >= T4_OT_QMAX || ot->ot_closing) {
 		mutex_exit(&ot->ot_qlock);
 		t4_ot_drop(ot, cpl);
 		freemsg(hdr);
@@ -461,10 +462,14 @@ t4_ot_task(void *arg)
 		}
 		ot->ot_qhead = hdr->b_next;
 		ot->ot_qlen--;
+		const boolean_t closing = ot->ot_closing;
 		mutex_exit(&ot->ot_qlock);
 
 		hdr->b_next = NULL;
-		t4_ot_handle(ot, (const t4_ot_msg_t *)hdr->b_rptr, hdr->b_cont);
+		if (!closing) {
+			t4_ot_handle(ot, (const t4_ot_msg_t *)hdr->b_rptr,
+			    hdr->b_cont);
+		}
 		freemsg(hdr);
 	}
 }
@@ -543,6 +548,11 @@ t4_ofld_test_fini(t4_ofld_t *of)
 
 	if (ot == NULL)
 		return;
+	/* No task may send for the client once close sweeps its IDs. */
+	mutex_enter(&ot->ot_qlock);
+	ot->ot_closing = B_TRUE;
+	mutex_exit(&ot->ot_qlock);
+	ddi_taskq_wait(ot->ot_tq);
 	t4_ofld_client_close(of);
 	ddi_taskq_wait(ot->ot_tq);
 	ddi_taskq_destroy(ot->ot_tq);

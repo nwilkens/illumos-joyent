@@ -321,6 +321,8 @@ typedef struct t4_ofld {
 	void			*of_client_arg;
 	uint32_t		of_client_gen;
 	uint_t			of_cb_busy;
+	uint_t			of_op_busy;	/* child operations running */
+	kthread_t		*of_ev_thread;	/* delivering an event */
 	boolean_t		of_client_test;
 	ddi_taskq_t		*of_tq;
 	uint32_t		of_ev_pending;
