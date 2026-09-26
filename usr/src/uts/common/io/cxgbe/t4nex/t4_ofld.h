@@ -60,6 +60,7 @@ extern "C" {
 #define	T4_OFLD_MAX_L2T		(M_L2T_IDX + 1)
 #define	T4_OFLD_MAX_WR_CRED	(1U << 16)
 #define	T4_OFLD_MAX_ORDIRD	(1U << 16)
+#define	T4_OFLD_MAX_IRD_ADAPTER	(1U << 24)
 
 #define	T4_OFLD_MAX_CLIP	128
 #define	T4_OFLD_MAX_PAYLOAD	65535

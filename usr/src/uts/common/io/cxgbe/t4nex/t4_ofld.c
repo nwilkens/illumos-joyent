@@ -109,6 +109,14 @@ t4_ofld_range(uint32_t start, uint32_t end, uint64_t limit, uint32_t align,
 	return (B_TRUE);
 }
 
+static int
+t4_ofld_bad(struct adapter *sc, const char *what, uint32_t a, uint32_t b)
+{
+	cxgb_printf(sc->dip, CE_NOTE, "!offload disabled: firmware %s out of "
+	    "bounds: 0x%x 0x%x", what, a, b);
+	return (ERANGE);
+}
+
 static boolean_t
 t4_ofld_overlap(const t4_rdma_range_t *a, const t4_rdma_range_t *b)
 {
@@ -157,20 +165,20 @@ t4_ofld_params(struct adapter *sc, t4_ofld_t *of)
 	if ((rc = t4_ofld_query(sc, 6, p, v)) != 0)
 		return (rc);
 	if (v[0] == 0 || v[0] > T4_OFLD_MAX_NTIDS)
-		return (ERANGE);
+		return (t4_ofld_bad(sc, "ntids", v[0], 0));
 	of->of_ntids = v[0];
 	of->of_natids = MIN(of->of_ntids / 2, T4_OFLD_MAX_NATIDS);
 	if (!t4_ofld_range(v[1], v[2], T4_OFLD_M_TID + 1ULL, 1, &r) ||
 	    r.trr_size > T4_OFLD_MAX_NSTIDS)
-		return (ERANGE);
+		return (t4_ofld_bad(sc, "server range", v[1], v[2]));
 	of->of_stid_base = r.trr_start;
 	of->of_nstids = r.trr_size;
 	if (v[3] == 0 || v[3] >= T4_OFLD_MAX_WR_CRED)
-		return (ERANGE);
+		return (t4_ofld_bad(sc, "ofld wr credits", v[3], 0));
 	vr->trv_ofldq_wr_cred = v[3];
 	/* The last index shares a TID field with the SYNC_WR flag. */
 	if (!t4_ofld_range(v[4], v[5], T4_OFLD_MAX_L2T, 1, &r))
-		return (ERANGE);
+		return (t4_ofld_bad(sc, "l2t range", v[4], v[5]));
 	of->of_l2t_start = r.trr_start;
 	of->of_l2t_size = r.trr_size;
 
@@ -180,16 +188,10 @@ t4_ofld_params(struct adapter *sc, t4_ofld_t *of)
 	} else {
 		of->of_tid_base = 0;
 	}
+	/* Server and connection TIDs share the LE index space. */
 	if ((uint64_t)of->of_tid_base + of->of_ntids > T4_OFLD_M_TID + 1ULL)
-		return (ERANGE);
-	r.trr_start = of->of_tid_base;
-	r.trr_size = of->of_ntids;
-	{
-		t4_rdma_range_t s = { of->of_stid_base, of->of_nstids };
-
-		if (t4_cver_ge(sc, CHELSIO_T6) && t4_ofld_overlap(&r, &s))
-			return (ERANGE);
-	}
+		return (t4_ofld_bad(sc, "tid base", of->of_tid_base,
+		    of->of_ntids));
 
 	p[0] = FW_PARAM_PFVF(STAG_START);
 	p[1] = FW_PARAM_PFVF(STAG_END);
@@ -197,10 +199,11 @@ t4_ofld_params(struct adapter *sc, t4_ofld_t *of)
 	p[3] = FW_PARAM_PFVF(PBL_END);
 	if ((rc = t4_ofld_query(sc, 4, p, v)) != 0)
 		return (rc);
-	if (!t4_ofld_range(v[0], v[1], 1ULL << 32, T4_TPT_UNIT, &vr->trv_stag) ||
-	    !t4_ofld_range(v[2], v[3], 1ULL << 32, T4_TPT_UNIT, &vr->trv_pbl) ||
+	if (!t4_ofld_range(v[0], v[1], 1ULL << 32, T4_TPT_UNIT, &vr->trv_stag))
+		return (t4_ofld_bad(sc, "stag range", v[0], v[1]));
+	if (!t4_ofld_range(v[2], v[3], 1ULL << 32, T4_TPT_UNIT, &vr->trv_pbl) ||
 	    t4_ofld_overlap(&vr->trv_stag, &vr->trv_pbl))
-		return (ERANGE);
+		return (t4_ofld_bad(sc, "pbl range", v[2], v[3]));
 
 	p[0] = FW_PARAM_PFVF(RQ_START);
 	p[1] = FW_PARAM_PFVF(RQ_END);
@@ -211,12 +214,13 @@ t4_ofld_params(struct adapter *sc, t4_ofld_t *of)
 	if ((rc = t4_ofld_query(sc, 6, p, v)) != 0)
 		return (rc);
 	if (!t4_ofld_range(v[0], v[1], 1ULL << 32, 1, &vr->trv_rq) ||
-	    !t4_ofld_range(v[2], v[3], UINT16_MAX + 1ULL, 1, &vr->trv_qp) ||
-	    !t4_ofld_range(v[4], v[5], UINT16_MAX + 1ULL, 1, &vr->trv_cq))
-		return (ERANGE);
-	if (t4_ofld_overlap(&vr->trv_rq, &vr->trv_stag) ||
+	    t4_ofld_overlap(&vr->trv_rq, &vr->trv_stag) ||
 	    t4_ofld_overlap(&vr->trv_rq, &vr->trv_pbl))
-		return (ERANGE);
+		return (t4_ofld_bad(sc, "rq range", v[0], v[1]));
+	if (!t4_ofld_range(v[2], v[3], UINT16_MAX + 1ULL, 1, &vr->trv_qp))
+		return (t4_ofld_bad(sc, "qp range", v[2], v[3]));
+	if (!t4_ofld_range(v[4], v[5], UINT16_MAX + 1ULL, 1, &vr->trv_cq))
+		return (t4_ofld_bad(sc, "cq range", v[4], v[5]));
 
 	p[0] = FW_PARAM_PFVF(OCQ_START);
 	p[1] = FW_PARAM_PFVF(OCQ_END);
@@ -229,13 +233,13 @@ t4_ofld_params(struct adapter *sc, t4_ofld_t *of)
 	/* An empty on-chip queue region is reported as end < start. */
 	if (v[1] >= v[0] &&
 	    !t4_ofld_range(v[0], v[1], 1ULL << 32, 1, &vr->trv_ocq))
-		return (ERANGE);
+		return (t4_ofld_bad(sc, "ocq range", v[0], v[1]));
 	if (v[3] >= v[2] &&
 	    !t4_ofld_range(v[2], v[3], 1ULL << 32, 1, &vr->trv_srq))
-		return (ERANGE);
+		return (t4_ofld_bad(sc, "srq range", v[2], v[3]));
 	if (v[4] == 0 || v[4] > T4_OFLD_MAX_ORDIRD ||
-	    v[5] == 0 || v[5] > T4_OFLD_MAX_ORDIRD)
-		return (ERANGE);
+	    v[5] == 0 || v[5] > T4_OFLD_MAX_IRD_ADAPTER)
+		return (t4_ofld_bad(sc, "ord/ird", v[4], v[5]));
 	vr->trv_max_ordird_qp = v[4];
 	vr->trv_max_ird_adapter = v[5];
 
