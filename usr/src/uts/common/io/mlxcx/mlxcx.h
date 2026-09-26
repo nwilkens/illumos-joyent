@@ -295,6 +295,7 @@ typedef struct mlxcx_dma_buffer {
 /*
  * Queue memory whose CREATE timed out or whose DESTROY failed. Hardware may
  * still write to it, so we keep it until TEARDOWN_HCA succeeds, or leak it.
+ * The packet buffers of such a work queue go on mlx_quarantine_bufs.
  */
 typedef struct mlxcx_dma_quarantine {
 	list_node_t		mdq_node;
@@ -568,6 +569,7 @@ typedef enum {
 typedef enum {
 	MLXCX_SHARD_READY,
 	MLXCX_SHARD_DRAINING,
+	MLXCX_SHARD_ORPHANED,	/* leaked by a detach that could not stop hw */
 } mlxcx_shard_state_t;
 
 typedef struct mlxcx_buf_shard {
@@ -1228,6 +1230,7 @@ struct mlxcx {
 	avl_tree_t		mlx_pages;
 	kmutex_t		mlx_quarantine_mtx;
 	list_t			mlx_quarantine;
+	list_t			mlx_quarantine_bufs;
 
 	/* Returned PAs that we did not give out. */
 	uint64_t		mlx_pages_unknown;
@@ -1380,7 +1383,7 @@ extern boolean_t mlxcx_register_mac(mlxcx_t *);
  * From mlxcx_ring.c
  */
 extern boolean_t mlxcx_wq_alloc_dma(mlxcx_t *, mlxcx_work_queue_t *);
-extern void mlxcx_wq_rele_dma(mlxcx_t *, mlxcx_work_queue_t *);
+extern boolean_t mlxcx_wq_rele_dma(mlxcx_t *, mlxcx_work_queue_t *);
 extern void mlxcx_dma_quarantine(mlxcx_t *, mlxcx_dma_buffer_t *);
 
 extern boolean_t mlxcx_buf_create(mlxcx_t *, mlxcx_buf_shard_t *,
@@ -1394,6 +1397,7 @@ extern boolean_t mlxcx_buf_loan(mlxcx_t *, mlxcx_buffer_t *);
 extern void mlxcx_buf_return(mlxcx_t *, mlxcx_buffer_t *);
 extern void mlxcx_buf_return_chain(mlxcx_t *, mlxcx_buffer_t *, boolean_t);
 extern void mlxcx_buf_destroy(mlxcx_t *, mlxcx_buffer_t *);
+extern void mlxcx_buf_quarantine_free(mlxcx_t *, mlxcx_buffer_t *);
 extern void mlxcx_shard_ready(mlxcx_buf_shard_t *);
 extern void mlxcx_shard_draining(mlxcx_buf_shard_t *);
 

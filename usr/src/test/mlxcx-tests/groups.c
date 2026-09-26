@@ -170,7 +170,14 @@ mlxcx_cq_quarantine_bufs(mlxcx_t *mlxp, mlxcx_completion_queue_t *cq)
 }
 
 void mlxcx_dma_quarantine(mlxcx_t *, mlxcx_dma_buffer_t *);
-void mlxcx_wq_rele_dma(mlxcx_t *, mlxcx_work_queue_t *);
+
+/* bufs.c runs the real one; nothing is quarantined here. */
+void
+mlxcx_buf_quarantine_free(mlxcx_t *mlxp, mlxcx_buffer_t *b)
+{
+	(void) mlxp; (void) b;
+	stub_fail("unexpected quarantined buffer");
+}
 void mlxcx_wq_teardown(mlxcx_t *, mlxcx_work_queue_t *);
 
 #include "mlxcx_groups_body.h"
@@ -192,6 +199,8 @@ setup(uint_t nrings)
 	mutex_init(&mlx.mlx_quarantine_mtx, NULL, MUTEX_DRIVER, NULL);
 	list_create(&mlx.mlx_quarantine, sizeof (mlxcx_dma_quarantine_t),
 	    offsetof(mlxcx_dma_quarantine_t, mdq_node));
+	list_create(&mlx.mlx_quarantine_bufs, sizeof (mlxcx_buffer_t),
+	    offsetof(mlxcx_buffer_t, mlb_entry));
 	list_create(&mlx.mlx_wqs, sizeof (mlxcx_work_queue_t),
 	    offsetof(mlxcx_work_queue_t, mlwq_entry));
 }

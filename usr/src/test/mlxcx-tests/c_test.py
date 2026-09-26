@@ -123,7 +123,9 @@ def mlxcx_types(srcdir):
                  "mlxcx_dev_page_t", "mlxcx_cmd_queue_status_t",
                  "mlxcx_cmd_abandon_t", "mlxcx_cmd_queue_t",
                  "mlxcx_cmd_mbox_t", "mlxcx_bf_t", "mlxcx_uar_t",
-                 "mlxcx_cmd_state_t", "mlxcx_hca_cap_t"):
+                 "mlxcx_cmd_state_t", "mlxcx_hca_cap_t",
+                 "mlxcx_buffer_state_t", "mlxcx_shard_state_t",
+                 "mlxcx_buf_shard_t", "mlxcx_buffer_t"):
         parts.append(typedef(header, name))
     parts.append(struct(header, "mlxcx_cmd"))
     return "\n".join(parts)

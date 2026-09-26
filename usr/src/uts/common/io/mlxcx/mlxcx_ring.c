@@ -37,6 +37,8 @@
 
 #include <mlxcx.h>
 
+static void mlxcx_cq_quarantine_bufs(mlxcx_t *, mlxcx_completion_queue_t *);
+
 boolean_t
 mlxcx_wq_alloc_dma(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 {
@@ -101,13 +103,20 @@ mlxcx_wq_alloc_dma(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 	return (B_TRUE);
 }
 
-void
+/*
+ * Returns B_TRUE if hardware may still use the queue, in which case its
+ * memory is quarantined rather than freed.
+ */
+boolean_t
 mlxcx_wq_rele_dma(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 {
+	boolean_t live;
+
 	VERIFY(mlwq->mlwq_state & MLXCX_WQ_ALLOC);
-	if ((mlwq->mlwq_state & MLXCX_WQ_CREATE_UNSURE) ||
+	live = (mlwq->mlwq_state & MLXCX_WQ_CREATE_UNSURE) ||
 	    ((mlwq->mlwq_state & MLXCX_WQ_CREATED) &&
-	    !(mlwq->mlwq_state & MLXCX_WQ_DESTROYED))) {
+	    !(mlwq->mlwq_state & MLXCX_WQ_DESTROYED));
+	if (live) {
 		mlxcx_dma_quarantine(mlxp, &mlwq->mlwq_dma);
 		mlxcx_dma_quarantine(mlxp, &mlwq->mlwq_doorbell_dma);
 	} else {
@@ -118,6 +127,8 @@ mlxcx_wq_rele_dma(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 	mlwq->mlwq_doorbell = NULL;
 
 	mlwq->mlwq_state &= ~MLXCX_CQ_ALLOC;
+
+	return (live);
 }
 
 static boolean_t
@@ -196,6 +207,7 @@ void
 mlxcx_wq_teardown(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 {
 	mlxcx_completion_queue_t *mlcq;
+	boolean_t live = B_FALSE;
 
 	/*
 	 * If something is holding the lock on a long operation like a
@@ -240,7 +252,7 @@ mlxcx_wq_teardown(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 		}
 	}
 	if (mlwq->mlwq_state & MLXCX_WQ_ALLOC) {
-		mlxcx_wq_rele_dma(mlxp, mlwq);
+		live = mlxcx_wq_rele_dma(mlxp, mlwq);
 	}
 	mlcq = mlwq->mlwq_cq;
 
@@ -257,6 +269,8 @@ mlxcx_wq_teardown(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 		mlcq->mlcq_wq = NULL;
 	ASSERT3P(mlcq->mlcq_wq, ==, NULL);
 	mutex_exit(&mlwq->mlwq_mtx);
+	if (live)
+		mlxcx_cq_quarantine_bufs(mlxp, mlcq);
 	mutex_exit(&mlcq->mlcq_mtx);
 
 	mutex_destroy(&mlwq->mlwq_mtx);
@@ -2528,6 +2542,57 @@ mlxcx_bufshard_adjust_total(mlxcx_buf_shard_t *s, int64_t incr)
 	s->mlbs_hiwat2 = 3 * (s->mlbs_ntotal / 4);
 }
 
+/*
+ * Take a buffer that hardware may still own out of its shard, so that shard
+ * teardown neither waits for it nor frees it.
+ */
+static void
+mlxcx_buf_unshard(mlxcx_buffer_t *b)
+{
+	mlxcx_buf_shard_t *s = b->mlb_shard;
+
+	mutex_enter(&s->mlbs_mtx);
+	list_remove(&s->mlbs_busy, b);
+	mlxcx_bufshard_adjust_total(s, -1);
+	cv_broadcast(&s->mlbs_free_nonempty);
+	mutex_exit(&s->mlbs_mtx);
+	b->mlb_shard = NULL;
+}
+
+/*
+ * The work queue of this CQ may still be live, so hardware may still write
+ * its RX buffers or read its TX buffers. Keep them, with their DMA bindings
+ * and TX mblks, until TEARDOWN_HCA. The caller must hold mlcq_mtx.
+ */
+static void
+mlxcx_cq_quarantine_bufs(mlxcx_t *mlxp, mlxcx_completion_queue_t *mlcq)
+{
+	mlxcx_buffer_t *b0, *b;
+	list_t bufs;
+
+	ASSERT(mutex_owned(&mlcq->mlcq_mtx));
+
+	list_create(&bufs, sizeof (mlxcx_buffer_t),
+	    offsetof(mlxcx_buffer_t, mlb_cq_entry));
+	list_move_tail(&bufs, &mlcq->mlcq_buffers);
+	mutex_enter(&mlcq->mlcq_bufbmtx);
+	list_move_tail(&bufs, &mlcq->mlcq_buffers_b);
+	mutex_exit(&mlcq->mlcq_bufbmtx);
+
+	while ((b0 = list_remove_head(&bufs)) != NULL) {
+		for (b = list_head(&b0->mlb_tx_chain); b != NULL;
+		    b = list_next(&b0->mlb_tx_chain, b)) {
+			mlxcx_buf_unshard(b);
+		}
+		mlxcx_buf_unshard(b0);
+
+		mutex_enter(&mlxp->mlx_quarantine_mtx);
+		list_insert_tail(&mlxp->mlx_quarantine_bufs, b0);
+		mutex_exit(&mlxp->mlx_quarantine_mtx);
+	}
+	list_destroy(&bufs);
+}
+
 void
 mlxcx_buf_return(mlxcx_t *mlxp, mlxcx_buffer_t *b)
 {
@@ -2612,6 +2677,30 @@ mlxcx_buf_return(mlxcx_t *mlxp, mlxcx_buffer_t *b)
 		freemsg(mp);
 }
 
+/*
+ * This is going back to the kmem cache, so it needs to be set up in the same
+ * way we expect a new buffer to come out (state INIT, other fields NULL'd).
+ */
+static void
+mlxcx_buf_free(mlxcx_t *mlxp, mlxcx_buffer_t *b)
+{
+	b->mlb_state = MLXCX_BUFFER_INIT;
+	b->mlb_shard = NULL;
+	b->mlb_tx_head = NULL;
+	b->mlb_tx_mp = NULL;
+	b->mlb_used = 0;
+	b->mlb_wqebbs = 0;
+	b->mlb_wqe_index = 0;
+	if (b->mlb_mp != NULL) {
+		freeb(b->mlb_mp);
+		ASSERT(b->mlb_mp == NULL);
+	}
+	mlxcx_dma_free(&b->mlb_dma);
+	ASSERT(list_is_empty(&b->mlb_tx_chain));
+
+	kmem_cache_free(mlxp->mlx_bufs_cache, b);
+}
+
 void
 mlxcx_buf_destroy(mlxcx_t *mlxp, mlxcx_buffer_t *b)
 {
@@ -2626,21 +2715,29 @@ mlxcx_buf_destroy(mlxcx_t *mlxp, mlxcx_buffer_t *b)
 		mlxcx_bufshard_adjust_total(s, -1);
 	}
 
-	/*
-	 * This is going back to the kmem cache, so it needs to be set up in
-	 * the same way we expect a new buffer to come out (state INIT, other
-	 * fields NULL'd)
-	 */
-	b->mlb_state = MLXCX_BUFFER_INIT;
-	b->mlb_shard = NULL;
-	if (b->mlb_mp != NULL) {
-		freeb(b->mlb_mp);
-		ASSERT(b->mlb_mp == NULL);
-	}
-	mlxcx_dma_free(&b->mlb_dma);
-	ASSERT(list_is_empty(&b->mlb_tx_chain));
+	mlxcx_buf_free(mlxp, b);
+}
 
-	kmem_cache_free(mlxp->mlx_bufs_cache, b);
+/*
+ * Free a quarantined buffer and its TX chain, once hardware can no longer
+ * reach them.
+ */
+void
+mlxcx_buf_quarantine_free(mlxcx_t *mlxp, mlxcx_buffer_t *b0)
+{
+	mlxcx_buffer_t *b;
+	mblk_t *mp = NULL;
+
+	if (b0->mlb_tx_head == b0)
+		mp = b0->mlb_tx_mp;
+
+	while ((b = list_remove_head(&b0->mlb_tx_chain)) != NULL)
+		mlxcx_buf_free(mlxp, b);
+	mlxcx_buf_free(mlxp, b0);
+
+	/* The mblk may hold loaned RX buffers; they go back to their shard. */
+	if (mp != NULL)
+		freemsg(mp);
 }
 
 void

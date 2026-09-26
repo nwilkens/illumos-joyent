@@ -194,6 +194,65 @@ kmem_free(void *p, size_t size)
 	free(h);
 }
 
+/*
+ * Object caches. Freeing to a destroyed cache is a use after free in the
+ * kernel, so it fails the test.
+ */
+typedef struct kmem_cache {
+	size_t		kc_size;
+	int		(*kc_constr)(void *, void *, int);
+	void		(*kc_destr)(void *, void *);
+	void		*kc_arg;
+	int64_t		kc_live;
+	int		kc_dead;
+} kmem_cache_t;
+
+static kmem_cache_t *
+kmem_cache_create(char *name, size_t size, size_t align,
+    int (*constr)(void *, void *, int), void (*destr)(void *, void *),
+    void (*reclaim)(void *), void *arg, void *vmp, int flags)
+{
+	kmem_cache_t *cp = calloc(1, sizeof (*cp));
+
+	(void) name; (void) align; (void) reclaim; (void) vmp; (void) flags;
+	cp->kc_size = size;
+	cp->kc_constr = constr;
+	cp->kc_destr = destr;
+	cp->kc_arg = arg;
+	return (cp);
+}
+
+static void *
+kmem_cache_alloc(kmem_cache_t *cp, int flag)
+{
+	void *p;
+
+	if (cp->kc_dead)
+		stub_fail("kmem_cache_alloc from a destroyed cache");
+	p = calloc(1, cp->kc_size);
+	if (cp->kc_constr != NULL)
+		(void) cp->kc_constr(p, cp->kc_arg, flag);
+	cp->kc_live++;
+	return (p);
+}
+
+static void
+kmem_cache_free(kmem_cache_t *cp, void *p)
+{
+	if (cp == NULL || cp->kc_dead)
+		stub_fail("kmem_cache_free to a destroyed cache");
+	if (cp->kc_destr != NULL)
+		cp->kc_destr(p, cp->kc_arg);
+	cp->kc_live--;
+	free(p);
+}
+
+static void
+kmem_cache_destroy(kmem_cache_t *cp)
+{
+	cp->kc_dead = 1;
+}
+
 /* Locks. */
 typedef struct {
 	int	km_init;
@@ -559,6 +618,12 @@ stub_ids_used(id_space_t *is)
 }
 
 static void
+atomic_inc_uint(volatile uint_t *p)
+{
+	(*p)++;
+}
+
+static void
 atomic_or_uint(volatile uint_t *p, uint_t v)
 {
 	*p |= v;
@@ -740,6 +805,58 @@ ddi_taskq_dispatch(ddi_taskq_t *tq, void (*func)(void *), void *arg, uint_t f)
 	(void) tq; (void) f;
 	func(arg);
 	return (DDI_SUCCESS);
+}
+
+/*
+ * STREAMS messages. A freed mblk is kept and marked, so that a later device
+ * read of it can be caught.
+ */
+typedef struct frtn {
+	void		(*free_func)(caddr_t);
+	caddr_t		free_arg;
+} frtn_t;
+
+typedef struct msgb {
+	struct msgb	*b_cont;
+	unsigned char	*b_rptr;
+	unsigned char	*b_wptr;
+	frtn_t		*b_frtn;
+	int		b_freed;
+} mblk_t;
+
+#define	MBLKL(mp)	((mp)->b_wptr - (mp)->b_rptr)
+
+static mblk_t *
+desballoc(unsigned char *base, size_t size, uint_t pri, frtn_t *frtn)
+{
+	mblk_t *mp = calloc(1, sizeof (*mp));
+
+	(void) pri;
+	mp->b_rptr = base;
+	mp->b_wptr = base + size;
+	mp->b_frtn = frtn;
+	return (mp);
+}
+
+static void
+freeb(mblk_t *mp)
+{
+	if (mp->b_freed)
+		stub_fail("freeb of a freed mblk");
+	mp->b_freed = 1;
+	if (mp->b_frtn != NULL)
+		mp->b_frtn->free_func(mp->b_frtn->free_arg);
+}
+
+static void
+freemsg(mblk_t *mp)
+{
+	while (mp != NULL) {
+		mblk_t *next = mp->b_cont;
+
+		freeb(mp);
+		mp = next;
+	}
 }
 
 #endif /* _MLXCX_STUB_H */

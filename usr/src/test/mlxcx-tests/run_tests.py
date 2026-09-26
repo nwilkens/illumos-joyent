@@ -22,6 +22,7 @@ TESTS = (
     "teardown_order.py",
     "quarantine.py",
     "groups.py",
+    "bufs.py",
     "cmdq_hca_cap.py",
     "no_device_panic.py",
 )

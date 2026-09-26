@@ -133,7 +133,7 @@ struct mlxcx {
 	int			mlx_intr_cq0;
 	mlxcx_pd_t		mlx_pd;
 	mlxcx_tdom_t		mlx_tdom;
-	void			*mlx_bufs_cache;
+	kmem_cache_t		*mlx_bufs_cache;
 	list_t			mlx_buf_shards;
 	struct {
 		uint_t		mldp_tx_nrings_per_group;

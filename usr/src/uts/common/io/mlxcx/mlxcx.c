@@ -441,6 +441,7 @@
 #include <sys/conf.h>
 #include <sys/devops.h>
 #include <sys/sysmacros.h>
+#include <sys/atomic.h>
 #include <sys/time.h>
 #include <sys/pci.h>
 #include <sys/mac_provider.h>
@@ -470,6 +471,12 @@ uint_t mlxcx_reclaim_tries = 100; /* Wait at most 5000ms */
 uint_t mlxcx_max_fw_pages = 1024 * 1024; /* 4 GiB */
 
 static void *mlxcx_softstate;
+
+/*
+ * Detaches that leaked packet buffers. Their mblk free routine and the
+ * buffer cache callbacks still point at this module, so it must stay loaded.
+ */
+static volatile uint_t mlxcx_orphans;
 
 /*
  * Fault detection thresholds.
@@ -941,13 +948,46 @@ static void
 mlxcx_dma_quarantine_free(mlxcx_t *mlxp)
 {
 	mlxcx_dma_quarantine_t *mdq;
+	mlxcx_buffer_t *b;
+	list_t bufs;
+
+	list_create(&bufs, sizeof (mlxcx_buffer_t),
+	    offsetof(mlxcx_buffer_t, mlb_entry));
 
 	mutex_enter(&mlxp->mlx_quarantine_mtx);
 	while ((mdq = list_remove_head(&mlxp->mlx_quarantine)) != NULL) {
 		mlxcx_dma_free(&mdq->mdq_dma);
 		kmem_free(mdq, sizeof (*mdq));
 	}
+	list_move_tail(&bufs, &mlxp->mlx_quarantine_bufs);
 	mutex_exit(&mlxp->mlx_quarantine_mtx);
+
+	/* Freeing a TX mblk can return loaned buffers, so drop the lock. */
+	while ((b = list_remove_head(&bufs)) != NULL)
+		mlxcx_buf_quarantine_free(mlxp, b);
+	list_destroy(&bufs);
+}
+
+/*
+ * TEARDOWN_HCA failed, so hardware may still use the quarantined packet
+ * buffers. Leak them, their shards and the buffer cache, and keep the module
+ * loaded. The stack can still return loaned buffers after detach frees mlxp;
+ * an orphaned shard is not DRAINING, so mlxcx_buf_return() then only puts
+ * them on its free list.
+ */
+static void
+mlxcx_orphan_bufs(mlxcx_t *mlxp)
+{
+	mlxcx_buf_shard_t *s;
+
+	for (s = list_head(&mlxp->mlx_buf_shards); s != NULL;
+	    s = list_next(&mlxp->mlx_buf_shards, s)) {
+		mutex_enter(&s->mlbs_mtx);
+		s->mlbs_state = MLXCX_SHARD_ORPHANED;
+		mutex_exit(&s->mlbs_mtx);
+	}
+	atomic_inc_uint(&mlxcx_orphans);
+	mlxcx_warn(mlxp, "leaking packet buffers that hardware may still use");
 }
 
 static void
@@ -966,6 +1006,8 @@ mlxcx_dma_quarantine_fini(mlxcx_t *mlxp)
 	} else {
 		list_destroy(&mlxp->mlx_quarantine);
 	}
+	if (list_is_empty(&mlxp->mlx_quarantine_bufs))
+		list_destroy(&mlxp->mlx_quarantine_bufs);
 	mutex_destroy(&mlxp->mlx_quarantine_mtx);
 }
 
@@ -1213,7 +1255,12 @@ mlxcx_teardown(mlxcx_t *mlxp)
 		mlxp->mlx_attach &= ~MLXCX_ATTACH_CQS;
 	}
 
-	if (mlxp->mlx_attach & MLXCX_ATTACH_BUFS) {
+	/*
+	 * Packet buffers that hardware may still use keep their shards and
+	 * the buffer cache until after TEARDOWN_HCA.
+	 */
+	if ((mlxp->mlx_attach & MLXCX_ATTACH_BUFS) &&
+	    list_is_empty(&mlxp->mlx_quarantine_bufs)) {
 		mlxcx_teardown_bufs(mlxp);
 		mlxp->mlx_attach &= ~MLXCX_ATTACH_BUFS;
 	}
@@ -1256,6 +1303,14 @@ mlxcx_teardown(mlxcx_t *mlxp)
 			mlxcx_dma_quarantine_free(mlxp);
 		}
 		mlxp->mlx_attach &= ~MLXCX_ATTACH_INIT_HCA;
+	}
+
+	if (mlxp->mlx_attach & MLXCX_ATTACH_BUFS) {
+		if (list_is_empty(&mlxp->mlx_quarantine_bufs))
+			mlxcx_teardown_bufs(mlxp);
+		else
+			mlxcx_orphan_bufs(mlxp);
+		mlxp->mlx_attach &= ~MLXCX_ATTACH_BUFS;
 	}
 
 	if (mlxp->mlx_attach & MLXCX_ATTACH_PAGE_LIST) {
@@ -2901,6 +2956,8 @@ mlxcx_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	mutex_init(&mlxp->mlx_quarantine_mtx, NULL, MUTEX_DRIVER, NULL);
 	list_create(&mlxp->mlx_quarantine, sizeof (mlxcx_dma_quarantine_t),
 	    offsetof(mlxcx_dma_quarantine_t, mdq_node));
+	list_create(&mlxp->mlx_quarantine_bufs, sizeof (mlxcx_buffer_t),
+	    offsetof(mlxcx_buffer_t, mlb_entry));
 
 	mlxcx_load_props(mlxp);
 
@@ -3234,6 +3291,9 @@ int
 _fini(void)
 {
 	int ret;
+
+	if (mlxcx_orphans != 0)
+		return (EBUSY);
 
 	if ((ret = mod_remove(&mlxcx_modlinkage)) != DDI_SUCCESS) {
 		return (ret);
