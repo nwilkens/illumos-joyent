@@ -167,6 +167,8 @@ extern int rdmat_write_pingpong(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
     hrtime_t);
 extern int rdmat_one_lat(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
     hrtime_t);
+extern int rdmat_mr_cost(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
+    hrtime_t);
 
 #ifdef __cplusplus
 }

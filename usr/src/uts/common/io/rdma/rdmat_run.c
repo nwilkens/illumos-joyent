@@ -678,6 +678,12 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 		len = 2 * P2ROUNDUP(len, 64);
 	if (rr->rr_offset >= tq->tq_len || len > tq->tq_len - rr->rr_offset)
 		return (EINVAL);
+	if ((op == RDMAT_OP_MR_ALLOC || op == RDMAT_OP_FRWR) &&
+	    (rr->rr_size == 0 || (rr->rr_size % PAGESIZE) != 0 ||
+	    rr->rr_offset != 0 || rr->rr_count == 0 ||
+	    rr->rr_size / PAGESIZE >
+	    ts->ts_dev->rd_attr.max_fast_reg_page_list_len))
+		return (EINVAL);
 	if (ts->ts_qpt == RDMAT_QPT_UD && op != RDMAT_OP_SEND &&
 	    op != RDMAT_OP_POST_RECV && op != RDMAT_OP_WAIT_RECV &&
 	    op != RDMAT_OP_RECV_STREAM && op != RDMAT_OP_PING &&
@@ -713,6 +719,10 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 	case RDMAT_OP_WRITE_PING:
 	case RDMAT_OP_WRITE_PONG:
 		ret = rdmat_write_pingpong(ts, tq, rr, deadline);
+		break;
+	case RDMAT_OP_MR_ALLOC:
+	case RDMAT_OP_FRWR:
+		ret = rdmat_mr_cost(ts, tq, rr, deadline);
 		break;
 	case RDMAT_OP_POST_RECV:
 		ret = rr->rr_count > ts->ts_depth ? EINVAL :

@@ -20,7 +20,9 @@
  *	rdmatool -i ip [-d dev] [-p port] bench {loop | host} test
  *	    [key=value...]
  *
- * test is write_bw, read_bw, send_bw, write_lat, read_lat or send_lat.  In
+ * test is write_bw, read_bw, send_bw, write_lat, read_lat, send_lat, or
+ * mr_alloc and frwr, which time registering size bytes: an MR allocated
+ * and freed, or bound with REG_MR and unbound with LOCAL_INV.  In
  * loop both sides are sessions on this host; otherwise the other side is
  * "rdmatool -i ip server" on host, one connection and server process per
  * QP.  Each key takes a comma-separated list and every combination runs:
@@ -78,14 +80,15 @@
 #define	MB		(1ULL << 20)
 
 enum {
-	T_WRITE_BW, T_READ_BW, T_SEND_BW, T_WRITE_LAT, T_READ_LAT, T_SEND_LAT
+	T_WRITE_BW, T_READ_BW, T_SEND_BW, T_WRITE_LAT, T_READ_LAT, T_SEND_LAT,
+	T_MR_ALLOC, T_FRWR
 };
 enum { M_INTR, M_POLL, M_ADAPT };
 static const char *const mnames[] = { "intr", "poll", "adapt" };
 
 static const char *const tnames[] = {
 	"write_bw", "read_bw", "send_bw", "write_lat", "read_lat", "send_lat",
-	NULL
+	"mr_alloc", "frwr", NULL
 };
 
 typedef struct blist {
@@ -338,6 +341,11 @@ prepare(const bconf_t *c, bpair_t *bp)
 		side_init(sa, a, RDMAT_OP_PING, c, c->c_iters);
 		side_init(sb, b, RDMAT_OP_PONG, c, c->c_iters);
 		break;
+	case T_MR_ALLOC:
+	case T_FRWR:
+		side_init(sa, a, c->c_test == T_MR_ALLOC ? RDMAT_OP_MR_ALLOC :
+		    RDMAT_OP_FRWR, c, c->c_iters);
+		break;
 	}
 	return (0);
 }
@@ -587,7 +595,8 @@ static void
 usage_bench(void)
 {
 	(void) fprintf(stderr, "usage: rdmatool -i ip bench {loop | host} "
-	    "{write_bw|read_bw|send_bw|write_lat|read_lat|send_lat}\n"
+	    "{write_bw|read_bw|send_bw|write_lat|read_lat|send_lat|mr_alloc|"
+	    "frwr}\n"
 	    "\t[size=] [qps=] [depth=] [batch=] [signal=] [inline=]\n"
 	    "\t[mode=poll,intr,adapt] [spin=] [modc=] [modus=] [secs=] "
 	    "[iters=] [verify=] [vec=]\n");

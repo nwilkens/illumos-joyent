@@ -79,7 +79,9 @@ tcp`) against `rdmatool -i <ip> server` on the other host.
 
 `rdmatool bench` runs perftest-style benchmarks (write_bw, read_bw,
 send_bw, write_lat, read_lat, send_lat) in loopback or against
-`rdmatool server` on another host:
+`rdmatool server` on another host.  mr_alloc and frwr time memory
+registration: an MR allocated and freed, or bound with REG_MR and unbound
+with LOCAL_INV.  For example:
 
     rdmatool -i <local_ip> bench {loop | <server_ip>} write_bw \
         size=4096,65536 qps=1,4 depth=64 batch=8 signal=32 mode=intr,poll

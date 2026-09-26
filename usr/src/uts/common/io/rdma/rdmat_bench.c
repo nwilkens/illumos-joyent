@@ -540,3 +540,87 @@ rdmat_one_lat(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
 	rdmat_lat_free(lat, n);
 	return (ret);
 }
+
+/*
+ * The cost of memory registration, per cycle.  RDMAT_OP_MR_ALLOC allocates
+ * and frees an MR for rr_size bytes, which takes two control commands.
+ * RDMAT_OP_FRWR binds one MR over the first rr_size bytes of the buffer
+ * with REG_MR and unbinds it with LOCAL_INV, on the send queue.
+ */
+int
+rdmat_mr_cost(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
+    hrtime_t deadline)
+{
+	uint32_t pages = rr->rr_size / PAGESIZE;
+	uint_t nc = (rr->rr_size + RDMAT_CHUNK - 1) / RDMAT_CHUNK, k;
+	boolean_t frwr = rr->rr_op == RDMAT_OP_FRWR;
+	ddi_dma_cookie_t *ck = NULL;
+	struct rdk_reg_wr reg;
+	struct rdk_send_wr inv;
+	struct rdk_mr *mr = NULL, *m;
+	uint64_t *lat, n, i, sum = 0, off;
+	hrtime_t t0;
+	int ret = 0;
+
+	lat = rdmat_lat_alloc(rr, &n);
+	if (frwr) {
+		if ((ret = rdk_alloc_mr(ts->ts_pd, RDK_MR_TYPE_MEM_REG, pages,
+		    &mr)) != 0)
+			goto out;
+		ck = kmem_alloc(sizeof (*ck) * nc, KM_SLEEP);
+		for (k = 0; k < nc; k++) {
+			ck[k] = tq->tq_cookies[k];
+			ck[k].dmac_size = MIN(RDMAT_CHUNK,
+			    rr->rr_size - k * RDMAT_CHUNK);
+		}
+	}
+	for (i = 0; i < rr->rr_count; i++) {
+		t0 = gethrtime();
+		if (!frwr) {
+			if ((ret = rdk_alloc_mr(ts->ts_pd, RDK_MR_TYPE_MEM_REG,
+			    pages, &m)) != 0 || (ret = rdk_dereg_mr(m)) != 0)
+				break;
+		} else {
+			rdk_update_fast_reg_key(mr, (uint8_t)(mr->rkey + 1));
+			off = 0;
+			if (rdk_map_mr_sg(mr, ck, nc, &off, PAGESIZE) !=
+			    (int)nc || mr->length != rr->rr_size) {
+				ret = EIO;
+				break;
+			}
+			bzero(&reg, sizeof (reg));
+			reg.wr.wr_cqe = &tq->tq_reg_cqe;
+			reg.wr.opcode = RDK_WR_REG_MR;
+			reg.wr.send_flags = RDK_SEND_SIGNALED;
+			reg.mr = mr;
+			reg.key = mr->rkey;
+			reg.access = RDK_ACCESS_LOCAL_WRITE |
+			    RDK_ACCESS_REMOTE_WRITE | RDK_ACCESS_REMOTE_READ;
+			bzero(&inv, sizeof (inv));
+			inv.wr_cqe = &tq->tq_reg_cqe;
+			inv.opcode = RDK_WR_LOCAL_INV;
+			inv.send_flags = RDK_SEND_SIGNALED;
+			inv.ex.invalidate_rkey = mr->rkey;
+			if ((ret = rdk_post_send(tq->tq_qp, &reg.wr,
+			    NULL)) != 0 || (ret = rdmat_wait(tq,
+			    &tq->tq_reg_done, 2 * i + 1, deadline)) != 0 ||
+			    (ret = rdk_post_send(tq->tq_qp, &inv, NULL)) != 0 ||
+			    (ret = rdmat_wait(tq, &tq->tq_reg_done, 2 * i + 2,
+			    deadline)) != 0)
+				break;
+		}
+		if (i < n) {
+			lat[i] = (uint64_t)(gethrtime() - t0);
+			sum += lat[i];
+		}
+	}
+	if (ret == 0)
+		rdmat_lat_stats(rr, lat, n, sum);
+out:
+	if (mr != NULL)
+		(void) rdk_dereg_mr(mr);
+	if (ck != NULL)
+		kmem_free(ck, sizeof (*ck) * nc);
+	rdmat_lat_free(lat, n);
+	return (ret);
+}
