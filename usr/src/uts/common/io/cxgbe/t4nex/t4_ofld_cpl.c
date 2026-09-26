@@ -856,10 +856,11 @@ t4_ofld_cpl_dispatch(t4_ofld_t *of, t4_rdma_queue_t q, uint8_t opcode,
  * device; one outside the RDMA CQ range is dropped.
  */
 void
-t4_ofld_cq_notify(t4_ofld_t *of, const uint32_t *cqs, uint_t n)
+t4_ofld_cq_notify(t4_ofld_t *of, uint_t vec, uint32_t *cqs, uint_t n)
 {
 	const t4_rdma_range_t *r = &of->of_vres.trv_cq;
 	const t4_rdma_client_t *cl;
+	uint_t ok = 0;
 	uint32_t gen;
 	void *arg;
 
@@ -874,7 +875,9 @@ t4_ofld_cq_notify(t4_ofld_t *of, const uint32_t *cqs, uint_t n)
 			continue;
 		}
 		T4_OFLD_STAT(of, os_cq_notify);
-		cl->trcl_cq(arg, cqs[i]);
+		cqs[ok++] = cqs[i];
 	}
+	if (ok != 0)
+		cl->trcl_cq(arg, vec, cqs, ok);
 	t4_ofld_cl_exit(of);
 }

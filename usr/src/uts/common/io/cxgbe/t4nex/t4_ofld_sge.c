@@ -34,6 +34,7 @@
 #include "common/t4_regs_values.h"
 #include "t4_ofld.h"
 
+/* The handler argument: T4_OFLD_Q_RX, or T4_OFLD_Q_CIQ plus the CIQ. */
 #define	T4_OFLD_Q_RX	1
 #define	T4_OFLD_Q_CIQ	2
 
@@ -194,18 +195,20 @@ t4_ofld_iqs_init(t4_ofld_t *of)
 	if ((rc = t4_alloc_iq(pi, &rxp, &of->of_rxq.iq, &of->of_rxq.fl)) != 0)
 		return (rc);
 
-	const t4_iq_params_t ciqp = {
-		.tip_iq_type	= TIQT_OFLD_CIQ,
-		.tip_tmr_idx	= sc->props.ethq_tmr_idx,
-		.tip_pktc_idx	= sc->props.ethq_pktc_idx,
-		.tip_qsize	= T4_OFLD_CIQ_QSIZE,
-		.tip_esize	= RX_IQ_ESIZE,
-		.tip_cong_chan	= -1,
-		.tip_intr_evtq	= NULL,
-		.tip_intr_idx	= of->of_ciq_vec,
-	};
-	if ((rc = t4_alloc_iq(pi, &ciqp, &of->of_ciq, NULL)) != 0)
-		return (rc);
+	for (uint_t i = 0; i < of->of_nciq; i++) {
+		const t4_iq_params_t ciqp = {
+			.tip_iq_type	= TIQT_OFLD_CIQ,
+			.tip_tmr_idx	= sc->props.ethq_tmr_idx,
+			.tip_pktc_idx	= sc->props.ethq_pktc_idx,
+			.tip_qsize	= T4_OFLD_CIQ_QSIZE,
+			.tip_esize	= RX_IQ_ESIZE,
+			.tip_cong_chan	= -1,
+			.tip_intr_evtq	= NULL,
+			.tip_intr_idx	= of->of_ciq_vec + i,
+		};
+		if ((rc = t4_alloc_iq(pi, &ciqp, &of->of_ciq[i], NULL)) != 0)
+			return (rc);
+	}
 
 	/* CPLs name the connection queue in a 10 bit field. */
 	if (of->of_rxq.iq.tsi_abs_id > M_TID_QID) {
@@ -241,8 +244,10 @@ t4_ofld_iqs_fini(t4_ofld_t *of)
 {
 	struct port_info *pi = of->of_port[0].op_pi;
 
-	if ((of->of_ciq.tsi_flags & IQ_ALLOC_HOST) != 0)
-		t4_free_iq(pi, &of->of_ciq);
+	for (uint_t i = 0; i < of->of_nciq; i++) {
+		if ((of->of_ciq[i].tsi_flags & IQ_ALLOC_HOST) != 0)
+			t4_free_iq(pi, &of->of_ciq[i]);
+	}
 	if ((of->of_rxq.iq.tsi_flags & IQ_ALLOC_HOST) != 0)
 		t4_free_iq(pi, &of->of_rxq.iq);
 	bzero(&of->of_rxq, sizeof (of->of_rxq));
@@ -266,8 +271,10 @@ t4_ofld_queues_free_dev(t4_ofld_t *of)
 		if (t4_free_eq_dev(of->of_sc, &op->op_txq) != 0)
 			ok = B_FALSE;
 	}
-	if (t4_free_iq_dev(&of->of_ciq) != 0)
-		ok = B_FALSE;
+	for (uint_t i = 0; i < of->of_nciq; i++) {
+		if (t4_free_iq_dev(&of->of_ciq[i]) != 0)
+			ok = B_FALSE;
+	}
 	if (t4_free_iq_dev(&of->of_rxq.iq) != 0)
 		ok = B_FALSE;
 	if (!ok) {
@@ -279,7 +286,7 @@ t4_ofld_queues_free_dev(t4_ofld_t *of)
 			bzero(&of->of_port[i].op_txq,
 			    sizeof (of->of_port[i].op_txq));
 		}
-		bzero(&of->of_ciq, sizeof (of->of_ciq));
+		bzero(of->of_ciq, sizeof (of->of_ciq));
 		bzero(&of->of_rxq, sizeof (of->of_rxq));
 	}
 	return (ok);
@@ -302,7 +309,8 @@ t4_ofld_queues_init(t4_ofld_t *of)
 		return (rc);
 	}
 	t4_ofld_iq_enable(&of->of_rxq.iq);
-	t4_ofld_iq_enable(&of->of_ciq);
+	for (uint_t i = 0; i < of->of_nciq; i++)
+		t4_ofld_iq_enable(&of->of_ciq[i]);
 	return (0);
 }
 
@@ -314,7 +322,8 @@ t4_ofld_queues_fini(t4_ofld_t *of)
 	mutex_exit(&of->of_lock);
 
 	t4_ofld_iq_disable(&of->of_rxq.iq);
-	t4_ofld_iq_disable(&of->of_ciq);
+	for (uint_t i = 0; i < of->of_nciq; i++)
+		t4_ofld_iq_disable(&of->of_ciq[i]);
 	t4_ofld_fl_doom(of);
 	if (!t4_ofld_queues_free_dev(of))
 		return;
@@ -342,18 +351,22 @@ t4_ofld_intr_handlers(t4_ofld_t *of, int *handlers)
 
 	of->of_rxq_vec = iaq->intr_rdma_first;
 	of->of_ciq_vec = iaq->intr_rdma_first + 1;
-	VERIFY3U(of->of_ciq_vec, <, iaq->intr_count);
+	VERIFY3U(iaq->intr_rdma, ==, 1 + of->of_nciq);
+	VERIFY3U(of->of_ciq_vec + of->of_nciq, <=, iaq->intr_count);
 
 	rc = ddi_intr_add_handler(sc->intr_handle[of->of_rxq_vec],
 	    t4_intr_ofld, (caddr_t)of, (caddr_t)T4_OFLD_Q_RX);
 	if (rc != DDI_SUCCESS)
 		return (rc);
 	*handlers += 1;
-	rc = ddi_intr_add_handler(sc->intr_handle[of->of_ciq_vec],
-	    t4_intr_ofld, (caddr_t)of, (caddr_t)T4_OFLD_Q_CIQ);
-	if (rc != DDI_SUCCESS)
-		return (rc);
-	*handlers += 1;
+	for (uint_t i = 0; i < of->of_nciq; i++) {
+		rc = ddi_intr_add_handler(sc->intr_handle[of->of_ciq_vec + i],
+		    t4_intr_ofld, (caddr_t)of,
+		    (caddr_t)(uintptr_t)(T4_OFLD_Q_CIQ + i));
+		if (rc != DDI_SUCCESS)
+			return (rc);
+		*handlers += 1;
+	}
 	return (DDI_SUCCESS);
 }
 
@@ -362,7 +375,8 @@ t4_ofld_intr_handlers(t4_ofld_t *of, int *handlers)
  * lock and handed out after it is dropped.
  */
 static void
-t4_ofld_iq_service(t4_ofld_t *of, t4_sge_iq_t *iq, t4_rdma_queue_t q)
+t4_ofld_iq_service(t4_ofld_t *of, t4_sge_iq_t *iq, t4_rdma_queue_t q,
+    uint_t vec)
 {
 	struct adapter *sc = iq->tsi_adapter;
 	struct sge_fl *fl = iq->tsi_fl;
@@ -458,7 +472,7 @@ t4_ofld_iq_service(t4_ofld_t *of, t4_sge_iq_t *iq, t4_rdma_queue_t q)
 	}
 
 	if (ncq != 0)
-		t4_ofld_cq_notify(of, cqs, ncq);
+		t4_ofld_cq_notify(of, vec, cqs, ncq);
 	while ((mp = head) != NULL) {
 		const uint8_t opcode = mp->b_band;
 
@@ -474,11 +488,14 @@ uint_t
 t4_intr_ofld(caddr_t arg1, caddr_t arg2)
 {
 	t4_ofld_t *of = (t4_ofld_t *)arg1;
+	const uintptr_t q = (uintptr_t)arg2;
 
-	if ((uintptr_t)arg2 == T4_OFLD_Q_CIQ)
-		t4_ofld_iq_service(of, &of->of_ciq, T4_RDMA_Q_CIQ);
-	else
-		t4_ofld_iq_service(of, &of->of_rxq.iq, T4_RDMA_Q_RX);
+	if (q >= T4_OFLD_Q_CIQ && q - T4_OFLD_Q_CIQ < of->of_nciq) {
+		t4_ofld_iq_service(of, &of->of_ciq[q - T4_OFLD_Q_CIQ],
+		    T4_RDMA_Q_CIQ, (uint_t)(q - T4_OFLD_Q_CIQ));
+	} else {
+		t4_ofld_iq_service(of, &of->of_rxq.iq, T4_RDMA_Q_RX, 0);
+	}
 	return (DDI_INTR_CLAIMED);
 }
 

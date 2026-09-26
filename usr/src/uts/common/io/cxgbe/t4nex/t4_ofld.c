@@ -305,17 +305,25 @@ t4_ofld_init(struct adapter *sc)
 }
 
 /*
- * Whether the adapter can give offload its vector block.  Called by
- * t4_cfg_intrs_queues() before the interrupt allocation.
+ * The vectors offload takes: the connection queue's and one per CIQ, as
+ * many CIQs as rdma-cq-vectors asks for while the LAN keeps one vector per
+ * port; 0 if not even one CIQ fits.  Called by t4_cfg_intrs_queues()
+ * before the interrupt allocation.
  */
-boolean_t
+uint_t
 t4_ofld_vectors(struct adapter *sc, uint_t avail)
 {
 	t4_ofld_t *of = sc->ofld;
+	uint_t lan, nciq;
 
 	if (of == NULL)
-		return (B_FALSE);
-	return (avail >= 2 + of->of_nports + T4_OFLD_VECS);
+		return (0);
+	lan = 2 + of->of_nports;
+	if (avail < lan + 2)
+		return (0);
+	nciq = MIN(sc->props.rdma_cq_vectors, avail - lan - 1);
+	of->of_nciq = MAX(MIN(nciq, T4_RDMA_MAX_CIQ), 1);
+	return (1 + of->of_nciq);
 }
 
 static int
@@ -373,6 +381,7 @@ t4_ofld_kstat_update(kstat_t *ksp, int rw)
 	mutex_enter(&of->of_dma_lock);
 	k->ok_dma_bytes.value.ui64 = of->of_dma_bytes;
 	k->ok_quar_bytes.value.ui64 = of->of_quar_bytes;
+
 	mutex_exit(&of->of_dma_lock);
 	return (0);
 }
@@ -702,8 +711,9 @@ t4_ofld_info(t4_ofld_t *of, t4_rdma_info_t *info)
 	info->tri_iq_qpp_shift = sc->params.sge.iq_qpp;
 	info->tri_write_combine = (sc->doorbells & DOORBELL_WCWR) != 0;
 	info->tri_rxq_id = of->of_rxq.iq.tsi_abs_id;
-	info->tri_ciq_id = of->of_ciq.tsi_abs_id;
-	info->tri_ciq_cntxt = of->of_ciq.tsi_cntxt_id;
+	info->tri_nciq = of->of_nciq;
+	for (uint_t i = 0; i < of->of_nciq; i++)
+		info->tri_ciq_id[i] = of->of_ciq[i].tsi_abs_id;
 	info->tri_eq_spg_len = sc->sge.eq_spg_len;
 
 	for (uint_t i = 0; i < of->of_nports; i++) {

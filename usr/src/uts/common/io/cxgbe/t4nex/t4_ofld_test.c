@@ -104,9 +104,9 @@ t4_ot_event(void *arg, const t4_rdma_event_t *ev)
 }
 
 static void
-t4_ot_cq(void *arg, uint32_t cq)
+t4_ot_cq(void *arg, uint_t vec, const uint32_t *cqs, uint_t n)
 {
-	_NOTE(ARGUNUSED(arg, cq));
+	_NOTE(ARGUNUSED(arg, vec, cqs, n));
 }
 
 /* A SYN the test cannot queue gets its TID back to the chip at once. */

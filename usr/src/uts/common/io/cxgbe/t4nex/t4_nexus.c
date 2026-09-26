@@ -2158,6 +2158,11 @@ t4_init_driver_props(struct adapter *sc)
 	(void) ddi_prop_update_int(dev, dip, "rdma-enable",
 	    p->rdma_enable ? 1 : 0);
 
+	val = prop_lookup_int(sc, "rdma-cq-vectors", T4_OFLD_DEF_CIQ);
+	p->rdma_cq_vectors = MAX(MIN(val, T4_RDMA_MAX_CIQ), 1);
+	(void) ddi_prop_update_int(dev, dip, "rdma-cq-vectors",
+	    p->rdma_cq_vectors);
+
 	p->t4_fw_install = prop_lookup_int(sc, "t4_fw_install", 1);
 	if (p->t4_fw_install != 0 && p->t4_fw_install != 2)
 		p->t4_fw_install = 1;
@@ -2264,13 +2269,15 @@ t4_cfg_intrs_queues(struct adapter *sc)
 	 */
 	uint_t rdma = 0, ofld_iqs = 0, ofld_eqs = 0, ofld_ctrl = 0;
 	if (sc->ofld != NULL) {
-		if (itype == DDI_INTR_TYPE_MSIX &&
-		    t4_ofld_vectors(sc, iaq->intr_count) &&
-		    pfres->niqflint > 3 + port_count &&
+		uint_t want = itype == DDI_INTR_TYPE_MSIX ?
+		    t4_ofld_vectors(sc, iaq->intr_count) : 0;
+
+		if (want != 0 &&
+		    pfres->niqflint > 1 + want + port_count &&
 		    pfres->neq > 1 + port_count * 4 &&
 		    pfres->nethctrl > port_count * 2) {
-			rdma = T4_OFLD_VECS;
-			ofld_iqs = 2;
+			rdma = want;
+			ofld_iqs = want;
 			ofld_eqs = 1 + port_count * 2;
 			ofld_ctrl = port_count;
 		} else {

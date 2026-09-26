@@ -257,7 +257,7 @@ t4_ofld_cq_create(t4_ofld_t *of, const t4_rdma_cq_res_t *c, t4_rdma_db_t *db)
 		return (EFAULT);
 	if (c->trcq_size < T4_RI_MIN_IQ_SIZE ||
 	    c->trcq_size > T4_RI_MAX_IQ_SIZE || (c->trcq_size % 16) != 0 ||
-	    !t4_ri_id_ok(of, c->trcq_cqid) ||
+	    c->trcq_vec >= of->of_nciq || !t4_ri_id_ok(of, c->trcq_cqid) ||
 	    ob->ob_pub.trd_len < (size_t)c->trcq_size * T4_RI_ENTRY)
 		rc = EINVAL;
 	else
@@ -286,7 +286,7 @@ t4_ofld_cq_create(t4_ofld_t *of, const t4_rdma_cq_res_t *c, t4_rdma_db_t *db)
 	cq->iqid = BE_32(c->trcq_cqid);
 	cq->iqandst_to_iqandstindex = BE_32(V_FW_RI_RES_WR_IQANUS(0) |
 	    V_FW_RI_RES_WR_IQANUD(1) | F_FW_RI_RES_WR_IQANDST |
-	    V_FW_RI_RES_WR_IQANDSTINDEX(of->of_ciq.tsi_abs_id));
+	    V_FW_RI_RES_WR_IQANDSTINDEX(of->of_ciq[c->trcq_vec].tsi_abs_id));
 	cq->iqdroprss_to_iqesize = BE_16(F_FW_RI_RES_WR_IQDROPRSS |
 	    V_FW_RI_RES_WR_IQPCIECH(2) | V_FW_RI_RES_WR_IQINTCNTTHRESH(0) |
 	    F_FW_RI_RES_WR_IQO | V_FW_RI_RES_WR_IQESIZE(2));

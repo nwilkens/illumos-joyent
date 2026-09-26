@@ -684,6 +684,7 @@ struct driver_properties {
 	bool write_combine;
 	int t4_fw_install;
 	bool rdma_enable;
+	uint_t rdma_cq_vectors;
 };
 
 typedef struct t4_mbox_waiter {

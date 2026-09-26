@@ -51,7 +51,8 @@ extern "C" {
 #define	T4_OFLD_CIQ_QSIZE	1024
 #define	T4_OFLD_CTRLQ_QSIZE	256
 #define	T4_OFLD_TXQ_QSIZE	1024
-#define	T4_OFLD_VECS		2
+/* Offload vectors: the connection queue and 1 to T4_RDMA_MAX_CIQ CIQs. */
+#define	T4_OFLD_DEF_CIQ		8
 
 /* Firmware values past these bounds disable offload. */
 #define	T4_OFLD_M_TID		0xffffffU
@@ -321,9 +322,10 @@ typedef struct t4_ofld {
 	uint_t			of_nports;
 	t4_ofld_port_t		of_port[MAX_NPORTS];
 	struct sge_rxq		of_rxq;		/* connection CPLs */
-	t4_sge_iq_t		of_ciq;		/* RDMA CQ notifications */
+	t4_sge_iq_t		of_ciq[T4_RDMA_MAX_CIQ]; /* CQ notifications */
+	uint_t			of_nciq;
 	uint_t			of_rxq_vec;
-	uint_t			of_ciq_vec;
+	uint_t			of_ciq_vec;	/* of of_ciq[0] */
 	volatile boolean_t	of_ready;	/* locks initialized */
 	boolean_t		of_queues_up;
 
@@ -383,7 +385,7 @@ typedef struct t4_ofld {
 extern boolean_t t4_ofld_requested(struct adapter *);
 extern void t4_ofld_caps(struct adapter *, struct fw_caps_config_cmd *);
 extern int t4_ofld_init(struct adapter *);
-extern boolean_t t4_ofld_vectors(struct adapter *, uint_t);
+extern uint_t t4_ofld_vectors(struct adapter *, uint_t);
 extern void t4_ofld_start(struct adapter *);
 extern boolean_t t4_ofld_detach(struct adapter *);
 extern void t4_ofld_fini(struct adapter *);
@@ -408,7 +410,7 @@ extern uint_t t4_intr_ofld(caddr_t, caddr_t);
 /* t4_ofld_cpl.c */
 extern void t4_ofld_cpl_dispatch(t4_ofld_t *, t4_rdma_queue_t, uint8_t,
     mblk_t *);
-extern void t4_ofld_cq_notify(t4_ofld_t *, const uint32_t *, uint_t);
+extern void t4_ofld_cq_notify(t4_ofld_t *, uint_t, uint32_t *, uint_t);
 
 /* t4_ofld_orphan.c */
 extern void t4_ofld_orphan_sweep(t4_ofld_t *, uint32_t);

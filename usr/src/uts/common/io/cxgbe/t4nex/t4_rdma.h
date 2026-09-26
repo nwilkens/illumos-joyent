@@ -45,9 +45,11 @@
 extern "C" {
 #endif
 
-#define	T4_RDMA_VERSION		2
+#define	T4_RDMA_VERSION		3
 
 #define	T4_RDMA_MAX_PORTS	4
+/* Completion vectors: CQ event queues, each with its own interrupt. */
+#define	T4_RDMA_MAX_CIQ		16
 #define	T4_RDMA_NMTUS		16
 
 /* No hardware TID in a CPL, or no L2T entry. */
@@ -98,13 +100,14 @@ typedef struct t4_rdma_cpl {
 } t4_rdma_cpl_t;
 
 /*
- * trcl_cq is called, in interrupt context, with the ID of an RDMA completion
- * queue that has new entries.  The ID is inside the vres CQ range.
+ * trcl_cq is called, in the interrupt of completion vector vec, with the IDs
+ * of RDMA completion queues that have new entries.  Each ID is inside the
+ * vres CQ range.
  */
 typedef struct t4_rdma_client {
 	void	(*trcl_event)(void *, const t4_rdma_event_t *);
 	void	(*trcl_cpl)(void *, t4_rdma_cpl_t *);
-	void	(*trcl_cq)(void *, uint32_t);
+	void	(*trcl_cq)(void *, uint_t, const uint32_t *, uint_t);
 } t4_rdma_client_t;
 
 typedef struct t4_rdma_range {
@@ -148,8 +151,8 @@ typedef struct t4_rdma_info {
 	t4_rdma_vres_t		tri_vres;
 	uint16_t		tri_mtus[T4_RDMA_NMTUS];
 	uint16_t		tri_rxq_id;	/* abs ID, connection queue */
-	uint16_t		tri_ciq_id;	/* abs ID, CQ event queue */
-	uint16_t		tri_ciq_cntxt;	/* context ID, CQ event queue */
+	uint32_t		tri_nciq;	/* completion vectors */
+	uint16_t		tri_ciq_id[T4_RDMA_MAX_CIQ];	/* abs IDs */
 	/* BAR2 user doorbell region, for the queues the child creates. */
 	caddr_t			tri_bar2;
 	ddi_acc_handle_t	tri_bar2_handle;
@@ -229,6 +232,7 @@ typedef struct t4_rdma_dma {
 typedef struct t4_rdma_cq_res {
 	uint32_t	trcq_cqid;
 	uint32_t	trcq_size;	/* 64B entries, status page included */
+	uint32_t	trcq_vec;	/* completion vector, below tri_nciq */
 	t4_rdma_dma_t	*trcq_mem;
 } t4_rdma_cq_res_t;
 
