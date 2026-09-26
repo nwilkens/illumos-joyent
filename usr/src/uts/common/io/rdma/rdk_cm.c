@@ -304,11 +304,21 @@ rdk_cm_task(void *arg)
 		mutex_enter(&id->rci_lock);
 		id->rci_cb_thread = NULL;
 		if (ret != 0) {
-			/* The handler gave the ID back; this task owns it. */
+			boolean_t mine = !id->rci_destroying;
+
+			/*
+			 * The handler gave the ID back; this task drops the
+			 * base reference too, unless rdk_cm_destroy_id()
+			 * claimed the ID first.
+			 */
+			id->rci_destroying = B_TRUE;
 			id->rci_queued = B_FALSE;
 			cv_broadcast(&id->rci_cv);
 			mutex_exit(&id->rci_lock);
-			rdk_cm_destroy_common(id, B_TRUE);
+			if (mine) {
+				rdk_cm_destroy_common(id, B_TRUE);
+				rdk_cm_rele(id);
+			}
 			rdk_cm_rele(id);
 			return;
 		}
@@ -398,6 +408,7 @@ rdk_cm_destroy_id(rdk_cm_id_t *id)
 		mutex_exit(&id->rci_lock);
 		return (EINVAL);
 	}
+	id->rci_destroying = B_TRUE;
 	mutex_exit(&id->rci_lock);
 	rdk_cm_destroy_common(id, B_FALSE);
 	rdk_cm_rele(id);
