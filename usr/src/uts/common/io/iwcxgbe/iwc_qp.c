@@ -728,10 +728,12 @@ iwc_post_send(struct rdk_qp *rqp, const struct rdk_send_wr *wr,
 		case RDK_WR_RDMA_READ:
 			fwop = FW_RI_RDMA_READ_WR;
 			swsqe->opcode = FW_RI_READ_REQ;
+			/*
+			 * The read response completes a read.  A hardware
+			 * completion would come when the request is sent,
+			 * before the data is placed.
+			 */
 			flags = 0;
-			if ((wr->send_flags & RDK_SEND_SIGNALED) != 0 ||
-			    qp->qp_sig_all)
-				flags |= FW_RI_COMPLETION_FLAG;
 			ret = iwc_build_read(wqe, wr, &len16);
 			if (ret != 0)
 				break;
@@ -761,7 +763,8 @@ iwc_post_send(struct rdk_qp *rqp, const struct rdk_send_wr *wr,
 		if (ret != 0)
 			break;
 		swsqe->idx = wq->sq.pidx;
-		swsqe->signaled = (flags & FW_RI_COMPLETION_FLAG) != 0;
+		swsqe->signaled = (wr->send_flags & RDK_SEND_SIGNALED) != 0 ||
+		    qp->qp_sig_all;
 		swsqe->wr_id = wr->wr_id;
 		iwc_init_wr_hdr(wqe, wq->sq.pidx, fwop, flags, len16);
 		t4_sq_produce(wq, len16);

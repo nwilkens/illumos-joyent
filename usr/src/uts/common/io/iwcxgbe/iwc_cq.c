@@ -187,9 +187,10 @@ iwc_read_req_cqe(const t4_wq_t *wq, const t4_cqe_t *hw, t4_cqe_t *rd)
 	bzero(rd, sizeof (*rd));
 	rd->u.scqe.cidx = wq->sq.oldest_read->idx;
 	rd->len = BE_32(wq->sq.oldest_read->read_len);
+	/* Linux drops the status here, so a failed response looked good. */
 	rd->header = BE_32(V_CQE_QPID(CQE_QPID(hw)) |
 	    V_CQE_SWCQE(CQE_SWCQE(hw)) | V_CQE_OPCODE(FW_RI_READ_REQ) |
-	    V_CQE_TYPE(1));
+	    V_CQE_TYPE(1) | V_CQE_STATUS(CQE_STATUS(hw)));
 	rd->bits_type_ts = hw->bits_type_ts;
 }
 
