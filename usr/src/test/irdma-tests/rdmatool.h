@@ -31,6 +31,7 @@
 #define	C_TCP		0x103	/* a TCP ping-pong and bulk transfer */
 #define	ST_REM_ACCESS	10	/* RDK_WC_REM_ACCESS_ERR */
 #define	QPS_ERR		6	/* RDK_QPS_ERR */
+#define	QPE_ACCESS	3	/* RDK_EVENT_QP_ACCESS_ERR */
 
 typedef struct tcpreq {
 	uint64_t	tr_count;	/* ping-pong round trips */

@@ -486,19 +486,70 @@ t_rw(peer_t *a, peer_t *b, uint32_t op)
 	    "byte checked; 8 MB in %.2f ms", ns / 1e6);
 }
 
-/* Expect a remote access error on A with A's QP in error. */
-static int
-expect_rae(peer_t *a, rdmat_run_t *rr, const char *name, const char *what)
+static uint64_t
+qp_events(peer_t *p, uint32_t *last)
 {
-	int ret = run(a, rr);
-	uint32_t st = qp_state(a);
+	rdmat_query_t q;
 
-	if (ret == EIO && rr->rr_status == ST_REM_ACCESS && st == QPS_ERR)
+	bzero(&q, sizeof (q));
+	if (pio(p, RDMAT_IOC_QUERY, &q) != 0)
 		return (0);
+	*last = q.rq_last_event;
+	return (q.rq_events);
+}
+
+/*
+ * Expect a remote access error on A with A's QP in error.  On iWARP a
+ * write completes once TCP took it; B refuses it with an access error event
+ * and a TERMINATE that moves A's QP to error.
+ */
+static int rae_ret;
+
+static int
+expect_rae(peer_t *a, peer_t *b, rdmat_run_t *rr, const char *name,
+    const char *what)
+{
+	uint32_t last = 0;
+	uint64_t ev0 = qp_events(b, &last);
+	int ret = rae_ret = run(a, rr);
+	uint32_t st = qp_state(a);
+	int i;
+
+	if (o_iwarp) {
+		for (i = 0; i < 30 && st != QPS_ERR; i++) {
+			(void) usleep(100000);
+			st = qp_state(a);
+		}
+		if (st == QPS_ERR && (ret == 0 || ret == EIO) &&
+		    qp_events(b, &last) > ev0 && last == QPE_ACCESS)
+			return (0);
+	} else if (ret == EIO && rr->rr_status == ST_REM_ACCESS &&
+	    st == QPS_ERR) {
+		return (0);
+	}
 	result(0, name, "%s: ret %s status %u opcode %u vendor 0x%x qp "
-	    "state %u", what, strerror(ret), rr->rr_status, rr->rr_err_opcode,
-	    rr->rr_vendor_err, st);
+	    "state %u, B events %llu last %u", what, strerror(ret),
+	    rr->rr_status, rr->rr_err_opcode, rr->rr_vendor_err, st,
+	    (unsigned long long)(qp_events(b, &last) - ev0), last);
 	return (-1);
+}
+
+/* How expect_rae() saw the error, for the PASS line. */
+static const char *
+rae_how(const rdmat_run_t *rr)
+{
+	static char s[96];
+
+	if (o_iwarp) {
+		(void) snprintf(s, sizeof (s), "A's WR %s status %u, B raised "
+		    "an access error event", rae_ret == 0 ? "done" : "failed",
+		    rr->rr_status);
+	} else {
+		(void) snprintf(s, sizeof (s), "remote access error (status "
+		    "%u, vendor 0x%x) on A's send CQ", rr->rr_status,
+		    rr->rr_vendor_err);
+	}
+	return (s);
 }
 
 static void
@@ -553,12 +604,12 @@ t_frwr(peer_t *a, peer_t *b)
 	rr.rr_raddr = b->p_setup.rs_qp[0].rqi_addr;
 	rr.rr_rkey = key;
 	rr.rr_rlen = 4096;
-	if (expect_rae(a, &rr, "frwr", "write after invalidate") != 0)
+	if (expect_rae(a, b, &rr, "frwr", "write after invalidate") != 0)
 		return;
 	result(1, "frwr", "REG to key 0x%x, 1 MB write checked, send with "
-	    "invalidate reported rkey 0x%x on B, the next write got remote "
-	    "access error and A's QP is in error (B state %u)", key,
-	    rw.rr_inv_rkey, qp_state(b));
+	    "invalidate reported rkey 0x%x on B, the next write refused (%s), "
+	    "A's QP in error (B state %u)", key, rw.rr_inv_rkey, rae_how(&rr),
+	    qp_state(b));
 }
 
 static void
@@ -583,10 +634,10 @@ t_localinv(peer_t *a, peer_t *b)
 	rr.rr_raddr = b->p_setup.rs_qp[0].rqi_addr;
 	rr.rr_rkey = key;
 	rr.rr_rlen = 4096;
-	if (expect_rae(a, &rr, "localinv", "read after local invalidate") != 0)
+	if (expect_rae(a, b, &rr, "localinv", "read after local invalidate") != 0)
 		return;
-	result(1, "localinv", "B invalidated rkey 0x%x locally; A's read got "
-	    "remote access error, A's QP in error", key);
+	result(1, "localinv", "B invalidated rkey 0x%x locally; A's read "
+	    "refused (%s), A's QP in error", key, rae_how(&rr));
 }
 
 /* A write with a bad rkey, address or right: remote access error. */
@@ -594,6 +645,7 @@ static void
 t_reject(peer_t *a, peer_t *b, const char *name)
 {
 	rdmat_run_t rr;
+	int64_t bad;
 	uint64_t addr, len;
 	uint32_t key;
 	uint64_t ns;
@@ -636,11 +688,19 @@ t_reject(peer_t *a, peer_t *b, const char *name)
 		rr.rr_raddr = addr;
 		rr.rr_rkey = key;
 	}
-	if (expect_rae(a, &rr, name, "write") != 0)
+	/* B's first page must not change, whatever A's side reports. */
+	(void) buf(b, RDMAT_BUF_FILL, 0, 4096, 0x5eed, 0, NULL);
+	(void) buf(a, RDMAT_BUF_FILL, 0, 4096, 0xbad, 0, NULL);
+	if (expect_rae(a, b, &rr, name, "write") != 0)
 		return;
-	result(1, name, "remote access error (status %u, vendor 0x%x) on A's "
-	    "send CQ, A's QP in error; B's QP state %u", rr.rr_status,
-	    rr.rr_vendor_err, qp_state(b));
+	(void) buf(b, RDMAT_BUF_VERIFY, 0, 4096, 0x5eed, 0, &bad);
+	if (bad != -1) {
+		result(0, name, "the refused write changed B at %lld",
+		    (long long)bad);
+		return;
+	}
+	result(1, name, "%s, A's QP in error; B's QP state %u, B's page "
+	    "unchanged", rae_how(&rr), qp_state(b));
 }
 
 /*
