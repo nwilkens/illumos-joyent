@@ -22,8 +22,6 @@
 
 #include "cmdq_test.h"
 
-#define	NREQ		8
-
 static boolean_t hang;
 static int last_slot = -1;
 
@@ -39,20 +37,21 @@ model_on_doorbell(uint_t slot, model_slot_t *ms, uint_t seq)
 static void
 model_output(uint_t slot, model_slot_t *ms, uint8_t *out, uint8_t *delivery)
 {
-	(void) slot; (void) delivery;
-	if (ms->ms_op == MLXCX_OP_MANAGE_PAGES)
-		model_put_be32(out + offsetof(mlxcx_cmd_manage_pages_out_t,
-		    mlxo_manage_pages_npages), 0);
+	(void) slot; (void) ms; (void) out; (void) delivery;
 }
 
-/* Issue a command that uses output mailboxes; return whether it worked. */
+/*
+ * Issue a command that uses output mailboxes. QUERY_HCA_CAP does not report
+ * every failure, so a timeout is also judged by the ereport it raises.
+ */
 static boolean_t
 command(void)
 {
-	uint64_t pas[NREQ];
-	int32_t nret = -1;
+	mlxcx_hca_cap_t cap;
+	uint64_t ereports = stub_ereports;
 
-	return (mlxcx_cmd_return_pages(model_mlxp, NREQ, pas, &nret));
+	return (mlxcx_cmd_query_hca_cap(model_mlxp, MLXCX_HCA_CAP_GENERAL,
+	    MLXCX_HCA_CAP_MODE_CURRENT, &cap) && stub_ereports == ereports);
 }
 
 static void
@@ -109,7 +108,10 @@ no_alias(void)
 		stub_fail("returned slot %u was not reused", first);
 }
 
-/* Every slot is abandoned; a new command waits for one to come back. */
+/*
+ * Every ordinary slot is abandoned; a new command waits for one to come
+ * back.
+ */
 static void
 give_back_first(void)
 {
@@ -119,8 +121,9 @@ give_back_first(void)
 static void
 all_abandoned(void)
 {
-	model_cmd_low = (1 << 4) | 6;
+	model_cmd_low = (2 << 4) | 6;
 	model_attach(B_FALSE);
+	timeout_one();
 	timeout_one();
 	timeout_one();
 	model_schedule(stub_now + 500, EV_CALL, 0, 0, give_back_first);
@@ -144,7 +147,7 @@ forge_return(void)
 static void
 late_wrong_token(void)
 {
-	model_cmd_low = (1 << 4) | 6;
+	model_cmd_low = (2 << 4) | 6;
 	model_attach(B_FALSE);
 	timeout_one();
 	model_schedule(stub_now + 1, EV_CALL, 0, 0, forge_return);

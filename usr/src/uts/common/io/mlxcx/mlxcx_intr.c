@@ -13,6 +13,7 @@
  * Copyright (c) 2021, the University of Queensland
  * Copyright 2020 RackTop Systems, Inc.
  * Copyright 2020 OmniOS Community Edition (OmniOSce) Association.
+ * Copyright 2026 MNX Cloud, Inc.
  */
 
 /*
@@ -801,7 +802,7 @@ mlxcx_intr_async(caddr_t arg, caddr_t arg2)
 			ASSERT3P(param->mla_mlx, ==, mlxp);
 			mutex_exit(&param->mla_mtx);
 
-			taskq_dispatch_ent(mlxp->mlx_async_tq, mlxcx_pages_task,
+			taskq_dispatch_ent(mlxp->mlx_pages_tq, mlxcx_pages_task,
 			    param, 0, &param->mla_tqe);
 			continue;
 		}

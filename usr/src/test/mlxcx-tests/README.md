@@ -37,3 +37,4 @@ the device still owns, or if the device would write to freed memory.
 | `cmdq_completion.py` | A completion event for an idle, out-of-range, still-owned, wrong-token or already finished slot is counted and ignored. |
 | `cmdq_abandon.py` | A timed-out command keeps its slot, token and mailboxes until hardware returns the entry with the right token; detach leaks them if it never does. |
 | `cmdq_deadline.py` | In event mode a command gives up at its deadline when firmware never answers or no slot comes free, and recovers when the completion event is lost. |
+| `cmdq_pageslot.py` | MANAGE_PAGES has the last slot to itself and completes behind a full queue; other commands never take it; a one-slot queue is refused; page requests do not share the link-state taskq. |

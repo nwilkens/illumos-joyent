@@ -13,7 +13,7 @@
  * Copyright 2023, The University of Queensland
  * Copyright (c) 2018, Joyent, Inc.
  * Copyright 2023 RackTop Systems, Inc.
- * Copyright 2023 MNX Cloud, Inc.
+ * Copyright 2026 MNX Cloud, Inc.
  */
 
 /*
@@ -1157,6 +1157,8 @@ mlxcx_teardown(mlxcx_t *mlxp)
 			mlxp->mlx_npages_req[i].mla_mlx = NULL;
 			mutex_destroy(&mlxp->mlx_npages_req[i].mla_mtx);
 		}
+		taskq_destroy(mlxp->mlx_pages_tq);
+		mlxp->mlx_pages_tq = NULL;
 		taskq_destroy(mlxp->mlx_async_tq);
 		mlxp->mlx_async_tq = NULL;
 		mlxp->mlx_attach &= ~MLXCX_ATTACH_ASYNC_TQ;
@@ -2821,6 +2823,10 @@ mlxcx_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	(void) snprintf(tq_name, sizeof (tq_name), "%s_async_%d",
 	    ddi_driver_name(mlxp->mlx_dip), mlxp->mlx_inst);
 	mlxp->mlx_async_tq = taskq_create(tq_name, 1, minclsyspri, 1, INT_MAX,
+	    TASKQ_PREPOPULATE);
+	(void) snprintf(tq_name, sizeof (tq_name), "%s_pages_%d",
+	    ddi_driver_name(mlxp->mlx_dip), mlxp->mlx_inst);
+	mlxp->mlx_pages_tq = taskq_create(tq_name, 1, minclsyspri, 1, INT_MAX,
 	    TASKQ_PREPOPULATE);
 	/*
 	 * Initialize any pre-allocated taskq param structs.

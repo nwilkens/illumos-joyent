@@ -601,6 +601,13 @@ mlxcx_cmd_queue_init(mlxcx_t *mlxp)
 		return (B_FALSE);
 	}
 
+	/* The last slot is kept for MANAGE_PAGES. */
+	if (cmd->mcmd_size < 2) {
+		mlxcx_warn(mlxp, "command queue size %u is too small",
+		    cmd->mcmd_size);
+		return (B_FALSE);
+	}
+
 	if ((1U << cmd->mcmd_stride_l2) < sizeof (mlxcx_cmd_ent_t) ||
 	    ((cmd->mcmd_size - 1) << cmd->mcmd_stride_l2) +
 	    sizeof (mlxcx_cmd_ent_t) > MLXCX_CMD_DMA_PAGE_SIZE) {
@@ -890,18 +897,26 @@ mlxcx_cmd_copy_output(mlxcx_cmd_ent_t *ent, mlxcx_cmd_t *cmd)
 
 static boolean_t mlxcx_cmd_reclaim(mlxcx_cmd_queue_t *, uint_t);
 
+/*
+ * Firmware may need pages before it can finish other commands, so page
+ * commands have a slot of their own and never wait behind a full queue.
+ */
 static boolean_t
-mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq, uint_t *slotp)
+mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq, mlxcx_cmd_op_t op,
+    uint_t *slotp)
 {
 	uint_t slot;
+	uint32_t usable, page = 1U << (cmdq->mcmd_size - 1);
 	clock_t deadline = ddi_get_lbolt() + drv_usectohz(mlxcx_cmd_timeout);
+
+	usable = (op == MLXCX_OP_MANAGE_PAGES) ? page : ~page;
 
 	mutex_enter(&cmdq->mcmd_lock);
 	for (;;) {
 		for (slot = 0; slot < cmdq->mcmd_size; slot++)
 			(void) mlxcx_cmd_reclaim(cmdq, slot);
 
-		if ((slot = ddi_ffs(cmdq->mcmd_mask)) != 0)
+		if ((slot = ddi_ffs(cmdq->mcmd_mask & usable)) != 0)
 			break;
 
 		if (ddi_get_lbolt() >= deadline) {
@@ -1065,7 +1080,7 @@ mlxcx_cmd_post(mlxcx_t *mlxp, mlxcx_cmd_t *cmd)
 
 	ASSERT3S(cmd->mlcmd_op, !=, 0);
 
-	if (!mlxcx_cmd_reserve_slot(cmdq, &slot)) {
+	if (!mlxcx_cmd_reserve_slot(cmdq, cmd->mlcmd_op, &slot)) {
 		mlxcx_warn(mlxp, "timed out waiting for a slot for command "
 		    "%s (0x%x)", mlxcx_cmd_opcode_string(cmd->mlcmd_op),
 		    cmd->mlcmd_op);
@@ -1096,7 +1111,7 @@ mlxcx_cmd_post(mlxcx_t *mlxp, mlxcx_cmd_t *cmd)
 	cmdq->mcmd_active[slot] = cmd;
 	mutex_exit(&cmdq->mcmd_lock);
 
-	mlxcx_put32(mlxp, MLXCX_ISS_CMD_DOORBELL, 1 << slot);
+	mlxcx_put32(mlxp, MLXCX_ISS_CMD_DOORBELL, 1U << slot);
 
 	return (B_TRUE);
 }

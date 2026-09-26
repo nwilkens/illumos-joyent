@@ -1220,6 +1220,12 @@ struct mlxcx {
 	taskq_t			*mlx_async_tq;
 
 	/*
+	 * Page requests have their own taskq so that they never wait behind
+	 * an async task whose command needs those pages.
+	 */
+	taskq_t			*mlx_pages_tq;
+
+	/*
 	 * Port state
 	 */
 	uint_t			mlx_nports;
