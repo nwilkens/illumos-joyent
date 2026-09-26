@@ -406,6 +406,48 @@ iwc_locks_fini(iwc_t *iwc)
 	mutex_destroy(&iwc->iwc_res_lock);
 }
 
+static const char *const iwc_stat_names[] = {
+	"cpl_drop", "cpl_lost", "cqe_bad", "mpa_bad", "syn_refused",
+	"conn_est", "conn_abort", "async_err", "quarantine"
+};
+
+static int
+iwc_kstat_update(kstat_t *ksp, int rw)
+{
+	const iwc_t *iwc = ksp->ks_private;
+	const uint64_t *v = (const uint64_t *)&iwc->iwc_stats;
+	kstat_named_t *kn = ksp->ks_data;
+	uint_t i;
+
+	if (rw == KSTAT_WRITE)
+		return (EACCES);
+	for (i = 0; i < ARRAY_SIZE(iwc_stat_names); i++)
+		kn[i].value.ui64 = v[i];
+	return (0);
+}
+
+static void
+iwc_kstat_init(iwc_t *iwc)
+{
+	kstat_named_t *kn;
+	kstat_t *ksp;
+	uint_t i;
+
+	CTASSERT(sizeof (iwc->iwc_stats) ==
+	    ARRAY_SIZE(iwc_stat_names) * sizeof (uint64_t));
+	ksp = kstat_create(IWC_NAME, ddi_get_instance(iwc->iwc_dip), "stats",
+	    "misc", KSTAT_TYPE_NAMED, ARRAY_SIZE(iwc_stat_names), 0);
+	if (ksp == NULL)
+		return;
+	kn = ksp->ks_data;
+	for (i = 0; i < ARRAY_SIZE(iwc_stat_names); i++)
+		kstat_named_init(&kn[i], iwc_stat_names[i], KSTAT_DATA_UINT64);
+	ksp->ks_private = iwc;
+	ksp->ks_update = iwc_kstat_update;
+	kstat_install(ksp);
+	iwc->iwc_ksp = ksp;
+}
+
 static int
 iwc_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 {
@@ -451,6 +493,7 @@ iwc_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		iwc_warn(iwc, "cannot register the RDMA devices: %d", ret);
 		goto fail;
 	}
+	iwc_kstat_init(iwc);
 	ddi_report_dev(dip);
 	return (DDI_SUCCESS);
 fail:
@@ -478,6 +521,8 @@ iwc_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	if ((iwc = ddi_get_soft_state(iwc_state, instance)) == NULL)
 		return (DDI_FAILURE);
 
+	if (iwc->iwc_ksp != NULL)
+		kstat_delete(iwc->iwc_ksp);
 	iwc_unregister(iwc);
 	iwc_cm_fini(iwc);
 	(void) iwc->iwc_ops->tro_close(iwc->iwc_peer);
