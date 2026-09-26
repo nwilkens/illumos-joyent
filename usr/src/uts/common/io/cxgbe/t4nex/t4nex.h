@@ -55,7 +55,8 @@ typedef enum t4_ofld_test_op {
 	T4_OFLD_TEST_SEND,
 	T4_OFLD_TEST_DISCONNECT,
 	T4_OFLD_TEST_ABORT,
-	T4_OFLD_TEST_STATUS
+	T4_OFLD_TEST_STATUS,
+	T4_OFLD_TEST_TPT
 } t4_ofld_test_op_t;
 
 #define	T4_OFLD_TEST_NCONN	16

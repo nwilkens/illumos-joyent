@@ -22,6 +22,7 @@
  *	t4ofld DEV connect PORT LADDR LPORT FADDR FPORT DMAC
  *	t4ofld DEV send TID LEN
  *	t4ofld DEV disconnect TID | abort TID
+ *	t4ofld DEV tpt OFFSET LEN
  *
  * DEV is the nexus minor node, for example /devices/pci@...:t4nex,0.
  */
@@ -50,7 +51,8 @@ usage(void)
 	    "       t4ofld DEV listen PORT LADDR LPORT\n"
 	    "       t4ofld DEV connect PORT LADDR LPORT FADDR FPORT DMAC\n"
 	    "       t4ofld DEV send TID LEN\n"
-	    "       t4ofld DEV disconnect|abort TID\n");
+	    "       t4ofld DEV disconnect|abort TID\n"
+	    "       t4ofld DEV tpt OFFSET LEN\n");
 	exit(2);
 }
 
@@ -131,6 +133,10 @@ main(int argc, char **argv)
 		t.tot_op = T4_OFLD_TEST_SEND;
 		t.tot_id = num(argv[3], UINT32_MAX);
 		t.tot_len = num(argv[4], 4096);
+	} else if (strcmp(cmd, "tpt") == 0 && argc == 5) {
+		t.tot_op = T4_OFLD_TEST_TPT;
+		t.tot_id = num(argv[3], UINT32_MAX);
+		t.tot_len = num(argv[4], 1U << 20);
 	} else if ((strcmp(cmd, "disconnect") == 0 ||
 	    strcmp(cmd, "abort") == 0) && argc == 4) {
 		t.tot_op = strcmp(cmd, "abort") == 0 ? T4_OFLD_TEST_ABORT :

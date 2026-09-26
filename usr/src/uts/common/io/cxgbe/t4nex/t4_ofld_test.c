@@ -742,6 +742,28 @@ t4_ot_disconnect(t4_ot_t *ot, t4_ofld_test_t *t, boolean_t abort)
 	return (rc);
 }
 
+/*
+ * Write tot_len zero bytes at byte offset tot_id of the STAG region: TPT
+ * entries that name nothing.
+ */
+static int
+t4_ot_tpt(t4_ot_t *ot, t4_ofld_test_t *t)
+{
+	const t4_rdma_range_t *r = &ot->ot_of->of_vres.trv_stag;
+	uint8_t *buf;
+	int rc;
+
+	if (t->tot_len == 0 || t->tot_len > T4_TPT_MAX_LEN ||
+	    t->tot_id > r->trr_size)
+		return (EINVAL);
+	buf = kmem_zalloc(t->tot_len, KM_SLEEP);
+	rc = t4_ofld_tpt_write(ot->ot_of, r->trr_start + t->tot_id, buf,
+	    t->tot_len);
+	kmem_free(buf, t->tot_len);
+	t->tot_status = rc;
+	return (rc);
+}
+
 static void
 t4_ot_status(t4_ot_t *ot, t4_ofld_test_t *t)
 {
@@ -830,6 +852,9 @@ t4_ofld_test_ioctl(struct adapter *sc, void *data, int mode)
 		break;
 	case T4_OFLD_TEST_STATUS:
 		t4_ot_status(ot, t);
+		break;
+	case T4_OFLD_TEST_TPT:
+		rc = t4_ot_tpt(ot, t);
 		break;
 	default:
 		rc = EINVAL;
