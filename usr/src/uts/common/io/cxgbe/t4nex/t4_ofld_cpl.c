@@ -374,7 +374,7 @@ t4_ofld_orphan_unlisten_locked(t4_ofld_t *of, t4_tid_ent_t *e, uint32_t stid)
 {
 	ASSERT(MUTEX_HELD(&of->of_tids.td_lock));
 
-	if ((e->te_flags & TEF_UNLISTEN) != 0)
+	if ((e->te_flags & (TEF_LISTEN | TEF_UNLISTEN)) != TEF_LISTEN)
 		return;
 	if (t4_ofld_send_unlisten(of, e->te_port, stid,
 	    (e->te_flags & TEF_V6) != 0) == 0)
@@ -476,19 +476,27 @@ t4_ofld_cpl_stid(t4_ofld_t *of, t4_rdma_queue_t q, uint8_t opcode,
 		T4_OFLD_STAT(of, os_cpl_badid);
 		goto drop;
 	}
-	if (opcode == CPL_CLOSE_LISTSRV_RPL ||
-	    (opcode == CPL_PASS_OPEN_RPL && status != CPL_ERR_NONE))
+	/* Each reply must answer the request t4nex has outstanding. */
+	const uint16_t want = opcode == CPL_PASS_OPEN_RPL ? TEF_OPEN :
+	    TEF_UNLISTEN;
+	if ((e->te_flags & want) == 0) {
+		mutex_exit(&of->of_tids.td_lock);
+		T4_OFLD_STAT(of, os_cpl_mismatch);
+		goto drop;
+	}
+	e->te_flags &= ~want;
+	if (opcode == CPL_PASS_OPEN_RPL ? status != CPL_ERR_NONE :
+	    status == CPL_ERR_NONE)
 		e->te_flags &= ~TEF_LISTEN;
 
 	if (t4_ofld_orphaned(e, gen)) {
 		e->te_state = TTS_ORPHAN;
-		if ((e->te_flags & TEF_LISTEN) == 0) {
+		if ((e->te_flags & TEF_STID_BUSY) == 0)
 			t4_tid_free_locked(of, T4_TID_STID, stid);
-		} else if ((e->te_flags & TEF_UNLISTEN) == 0 &&
-		    t4_ofld_send_unlisten(of, e->te_port, stid,
-		    (e->te_flags & TEF_V6) != 0) == 0) {
-			e->te_flags |= TEF_UNLISTEN;
-		}
+		else if (opcode == CPL_CLOSE_LISTSRV_RPL)
+			t4_ofld_retry_arm_locked(of);
+		else
+			t4_ofld_orphan_unlisten_locked(of, e, stid);
 		mutex_exit(&of->of_tids.td_lock);
 		goto drop;
 	}
@@ -948,7 +956,7 @@ t4_ofld_orphan_sweep(t4_ofld_t *of, uint32_t gen)
 			continue;
 		if ((e->te_flags & TEF_V6) != 0 && (i & 1) != 0)
 			continue;
-		if ((e->te_flags & TEF_LISTEN) == 0) {
+		if ((e->te_flags & TEF_STID_BUSY) == 0) {
 			t4_tid_free_locked(of, T4_TID_STID, id);
 			continue;
 		}

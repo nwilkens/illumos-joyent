@@ -192,7 +192,7 @@ t4_ofld_listen(t4_ofld_t *of, const t4_rdma_listen_t *l)
 		mutex_exit(&of->of_tids.td_lock);
 		return (EINVAL);
 	}
-	e->te_flags |= TEF_LISTEN;
+	e->te_flags |= TEF_LISTEN | TEF_OPEN;
 	e->te_port = l->trl_port;
 	mutex_exit(&of->of_tids.td_lock);
 
@@ -226,7 +226,7 @@ t4_ofld_listen(t4_ofld_t *of, const t4_rdma_listen_t *l)
 		mutex_enter(&of->of_tids.td_lock);
 		if ((e = t4_tid_owned(of, T4_TID_STID, l->trl_stid, gen)) !=
 		    NULL)
-			e->te_flags &= ~TEF_LISTEN;
+			e->te_flags &= ~(TEF_LISTEN | TEF_OPEN);
 		mutex_exit(&of->of_tids.td_lock);
 	}
 	return (rc);
@@ -267,10 +267,10 @@ t4_ofld_stid_free(t4_ofld_t *of, uint32_t stid)
 	mutex_enter(&of->of_tids.td_lock);
 	if ((e = t4_tid_owned(of, T4_TID_STID, stid, gen)) != NULL) {
 		t4_tid_wait_idle(of, e);
-		if ((e->te_flags & TEF_LISTEN) == 0) {
+		if ((e->te_flags & TEF_STID_BUSY) == 0) {
 			t4_tid_free_locked(of, T4_TID_STID, stid);
 		} else {
-			/* Its close reply frees a live server. */
+			/* The last reply for the server frees it. */
 			e->te_state = TTS_ORPHAN;
 			t4_ofld_orphan_unlisten_locked(of, e, stid);
 		}

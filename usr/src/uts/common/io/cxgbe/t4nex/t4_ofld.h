@@ -100,9 +100,10 @@ typedef enum t4_tid_state {
 #define	TEF_EMBRYO	0x02	/* hwtid from PASS_ACCEPT_REQ, not accepted */
 #define	TEF_FLOWC	0x04	/* hwtid: FLOWC sent */
 #define	TEF_ABORT	0x08	/* hwtid: ABORT_REQ sent */
-#define	TEF_LISTEN	0x10	/* stid: PASS_OPEN_REQ sent */
+#define	TEF_LISTEN	0x10	/* stid: the server may be live */
 #define	TEF_UNLISTEN	0x20	/* stid: CLOSE_LISTSRV_REQ sent */
-#define	TEF_OPEN	0x40	/* atid: ACT_OPEN_REQ sent */
+#define	TEF_OPEN	0x40	/* atid, stid: open request sent */
+#define	TEF_STID_BUSY	(TEF_LISTEN | TEF_UNLISTEN | TEF_OPEN)
 #define	TEF_RELEASING	0x80	/* hwtid: TID_RELEASE on its way */
 #define	TEF_RELPEND	0x100	/* hwtid: TID_RELEASE not yet sent */
 
