@@ -246,13 +246,49 @@ rdmat_buf_free(rdmat_sess_t *ts, rdmat_qp_t *tq)
 	tq->tq_nchunks = 0;
 }
 
+/*
+ * The MR page size: the largest one the device takes that divides a
+ * chunk, so that one fast registration covers the whole buffer.
+ */
+static uint32_t
+rdmat_mr_page(struct rdk_device *dev)
+{
+	uint32_t ps;
+
+	for (ps = RDMAT_CHUNK; ps > PAGESIZE; ps >>= 1) {
+		if ((dev->rd_attr.page_size_cap & ps) != 0)
+			return (ps);
+	}
+	return (PAGESIZE);
+}
+
+/* Make the session QP of a slot whose CQs exist. */
+int
+rdmat_qp_make(rdmat_sess_t *ts, rdmat_qp_t *tq)
+{
+	struct rdk_qp_init_attr init;
+
+	bzero(&init, sizeof (init));
+	init.event_handler = rdmat_qp_event;
+	init.qp_context = tq;
+	init.send_cq = tq->tq_scq;
+	init.recv_cq = tq->tq_rcq;
+	init.cap.max_send_wr = ts->ts_depth + 4;
+	init.cap.max_recv_wr = ts->ts_depth + 1;
+	init.cap.max_send_sge = 1;
+	init.cap.max_recv_sge = 1;
+	init.sq_sig_type = RDK_SIGNAL_REQ_WR;
+	init.qp_type = ts->ts_qpt == RDMAT_QPT_UD ? RDK_QPT_UD : RDK_QPT_RC;
+	init.port_num = 1;
+	return (rdk_create_qp(ts->ts_pd, &init, &tq->tq_qp));
+}
+
 static int
 rdmat_qp_create(rdmat_sess_t *ts, rdmat_qp_t *tq, uint64_t len)
 {
 	struct rdk_device *dev = ts->ts_dev;
-	struct rdk_qp_init_attr init;
 	enum rdk_poll_context pc;
-	uint32_t pages = (uint32_t)(len / PAGESIZE);
+	uint32_t pages = (uint32_t)(len / rdmat_mr_page(dev));
 	int ret;
 
 	mutex_init(&tq->tq_lock, NULL, MUTEX_DRIVER, NULL);
@@ -274,19 +310,7 @@ rdmat_qp_create(rdmat_sess_t *ts, rdmat_qp_t *tq, uint64_t len)
 	    &tq->tq_rcq)) != 0)
 		return (ret);
 
-	bzero(&init, sizeof (init));
-	init.event_handler = rdmat_qp_event;
-	init.qp_context = tq;
-	init.send_cq = tq->tq_scq;
-	init.recv_cq = tq->tq_rcq;
-	init.cap.max_send_wr = ts->ts_depth + 4;
-	init.cap.max_recv_wr = ts->ts_depth + 1;
-	init.cap.max_send_sge = 1;
-	init.cap.max_recv_sge = 1;
-	init.sq_sig_type = RDK_SIGNAL_REQ_WR;
-	init.qp_type = ts->ts_qpt == RDMAT_QPT_UD ? RDK_QPT_UD : RDK_QPT_RC;
-	init.port_num = 1;
-	if ((ret = rdk_create_qp(ts->ts_pd, &init, &tq->tq_qp)) != 0)
+	if ((ret = rdmat_qp_make(ts, tq)) != 0)
 		return (ret);
 
 	if ((ret = rdmat_buf_alloc(ts, tq, len)) != 0)
@@ -320,7 +344,8 @@ rdmat_setup(rdmat_sess_t *ts, rdmat_setup_t *rs)
 	    (rs->rs_buf_len % RDMAT_CHUNK) != 0 ||
 	    rs->rs_depth == 0 || rs->rs_depth > RDMAT_MAX_DEPTH ||
 	    rs->rs_depth + 4 > (uint32_t)dev->rd_attr.max_qp_wr ||
-	    rs->rs_buf_len / PAGESIZE > dev->rd_attr.max_fast_reg_page_list_len)
+	    rs->rs_buf_len / rdmat_mr_page(dev) >
+	    dev->rd_attr.max_fast_reg_page_list_len)
 		return (EINVAL);
 	if ((ret = rdk_query_port(dev, 1, &pa)) != 0)
 		return (ret);
@@ -348,19 +373,8 @@ rdmat_setup(rdmat_sess_t *ts, rdmat_setup_t *rs)
 	bcopy(gid.raw, rs->rs_gid, sizeof (rs->rs_gid));
 	bcopy(pa.mac, rs->rs_mac, sizeof (rs->rs_mac));
 	rs->rs_gid_index = ts->ts_gid_index;
-	for (i = 0; i < ts->ts_nqp; i++) {
-		rdmat_qp_t *tq = &ts->ts_qp[i];
-		rdmat_qpinfo_t *qi = &rs->rs_qp[i];
-
-		qi->rqi_qpn = tq->tq_qp->qp_num;
-		qi->rqi_psn = tq->tq_psn;
-		qi->rqi_qkey = RDMAT_QKEY;
-		qi->rqi_len = tq->tq_len;
-		if (tq->tq_rmr != NULL) {
-			qi->rqi_rkey = tq->tq_rkey_next;
-			qi->rqi_addr = tq->tq_cookies[0].dmac_laddress;
-		}
-	}
+	for (i = 0; i < ts->ts_nqp; i++)
+		rdmat_qp_info(&ts->ts_qp[i], &rs->rs_qp[i]);
 	return (0);
 
 fail:
@@ -369,9 +383,9 @@ fail:
 	return (ret);
 }
 
-/* Invalidate the remote MR with a LOCAL_INV work request. */
+/* Invalidate an MR of the QP with a LOCAL_INV work request. */
 static int
-rdmat_local_inv(rdmat_qp_t *tq, hrtime_t deadline)
+rdmat_inv_mr(rdmat_qp_t *tq, struct rdk_mr *mr, hrtime_t deadline)
 {
 	struct rdk_send_wr wr;
 	int ret;
@@ -380,11 +394,19 @@ rdmat_local_inv(rdmat_qp_t *tq, hrtime_t deadline)
 	wr.wr_cqe = &tq->tq_reg_cqe;
 	wr.opcode = RDK_WR_LOCAL_INV;
 	wr.send_flags = RDK_SEND_SIGNALED;
-	wr.ex.invalidate_rkey = tq->tq_rmr->rkey;
+	wr.ex.invalidate_rkey = mr->rkey;
 	rdmat_reset_counts(tq, 0);
 	if ((ret = rdk_post_send(tq->tq_qp, &wr, NULL)) != 0)
 		return (ret);
-	if ((ret = rdmat_wait(tq, &tq->tq_reg_done, 1, deadline)) == 0)
+	return (rdmat_wait(tq, &tq->tq_reg_done, 1, deadline));
+}
+
+static int
+rdmat_local_inv(rdmat_qp_t *tq, hrtime_t deadline)
+{
+	int ret;
+
+	if ((ret = rdmat_inv_mr(tq, tq->tq_rmr, deadline)) == 0)
 		tq->tq_rmr_bound = B_FALSE;
 	return (ret);
 }
@@ -401,7 +423,8 @@ rdmat_reg(rdmat_qp_t *tq, struct rdk_mr *mr, int access, uint32_t key)
 	int n, ret;
 
 	rdk_update_fast_reg_key(mr, (uint8_t)key);
-	n = rdk_map_mr_sg(mr, tq->tq_cookies, tq->tq_nchunks, &off, PAGESIZE);
+	n = rdk_map_mr_sg(mr, tq->tq_cookies, tq->tq_nchunks, &off,
+	    rdmat_mr_page(mr->device));
 	if (n != (int)tq->tq_nchunks || mr->length != tq->tq_len)
 		return (n < 0 ? -n : EIO);
 
@@ -432,7 +455,7 @@ rdmat_connect(rdmat_sess_t *ts, rdmat_connect_t *rc)
 	struct rdk_qp_attr a;
 	struct rdk_ah_attr ah;
 	uint32_t qacc = rc->rc_qp_access;
-	int ret, acc;
+	int ret;
 
 	if ((tq = rdmat_qp(ts, rc->rc_qp)) == NULL || tq->tq_connected ||
 	    rc->rc_rqpn > 0xffffff || rc->rc_retry > 7 ||
@@ -526,6 +549,26 @@ rdmat_connect(rdmat_sess_t *ts, rdmat_connect_t *rc)
 		return (0);
 	}
 
+	return (rdmat_qp_register(tq));
+}
+
+/*
+ * Bind the QP's MRs over the buffer once it is connected: the local one,
+ * and the remote one with the rkey the peer was told.
+ */
+int
+rdmat_qp_register(rdmat_qp_t *tq)
+{
+	const hrtime_t deadline = gethrtime() + SEC2NSEC(10);
+	int ret, acc;
+
+	if (tq->tq_lmr_bound) {
+		if ((ret = rdmat_inv_mr(tq, tq->tq_lmr, deadline)) != 0)
+			return (ret);
+		tq->tq_lmr_bound = B_FALSE;
+	}
+	if (tq->tq_rmr_bound && (ret = rdmat_local_inv(tq, deadline)) != 0)
+		return (ret);
 	if ((ret = rdmat_reg(tq, tq->tq_lmr, RDK_ACCESS_LOCAL_WRITE,
 	    rdk_inc_rkey(tq->tq_lmr->rkey))) != 0)
 		return (ret);
@@ -538,6 +581,21 @@ rdmat_connect(rdmat_sess_t *ts, rdmat_connect_t *rc)
 	tq->tq_rkey_next = rdk_inc_rkey(tq->tq_rmr->rkey);
 	tq->tq_connected = B_TRUE;
 	return (0);
+}
+
+/* What the peer needs to reach the QP's buffer. */
+void
+rdmat_qp_info(rdmat_qp_t *tq, rdmat_qpinfo_t *qi)
+{
+	bzero(qi, sizeof (*qi));
+	qi->rqi_qpn = tq->tq_qp->qp_num;
+	qi->rqi_psn = tq->tq_psn;
+	qi->rqi_qkey = RDMAT_QKEY;
+	qi->rqi_len = tq->tq_len;
+	if (tq->tq_rmr != NULL) {
+		qi->rqi_rkey = tq->tq_rkey_next;
+		qi->rqi_addr = tq->tq_cookies[0].dmac_laddress;
+	}
 }
 
 /*
@@ -953,6 +1011,7 @@ rdmat_teardown(rdmat_sess_t *ts, boolean_t removing)
 {
 	uint_t i;
 
+	rdmat_cm_teardown(ts);
 	for (i = 0; i < ts->ts_nqp; i++) {
 		rdmat_qp_t *tq = &ts->ts_qp[i];
 

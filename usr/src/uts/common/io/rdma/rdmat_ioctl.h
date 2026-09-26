@@ -29,6 +29,9 @@
  * RDMAT_IOC_BUF	Fill, check or clear part of a QP's buffer
  *			(rdmat_buf_t); checking compares every byte.
  * RDMAT_IOC_QUERY	Read a QP's state and counters (rdmat_query_t).
+ * RDMAT_IOC_CM		Connect a QP through the rdmak connection manager
+ *			(rdmat_cm_t); the QPs exchange rdmat_qpinfo_t as
+ *			private data.
  */
 
 #include <sys/types.h>
@@ -44,6 +47,7 @@ extern "C" {
 #define	RDMAT_IOC_RUN		(RDMAT_IOC | 0x04)
 #define	RDMAT_IOC_BUF		(RDMAT_IOC | 0x05)
 #define	RDMAT_IOC_QUERY		(RDMAT_IOC | 0x06)
+#define	RDMAT_IOC_CM		(RDMAT_IOC | 0x07)
 
 #define	RDMAT_NAME_MAX		32
 #define	RDMAT_MAX_DEVS		8
@@ -213,6 +217,49 @@ typedef struct rdmat_query {
 	uint32_t	rq_last_event;
 	uint32_t	rq_pad;
 } rdmat_query_t;
+
+typedef enum rdmat_cm_op {
+	RDMAT_CM_LISTEN = 1,	/* listen on laddr/lport for peers[] */
+	RDMAT_CM_ACCEPT,	/* wait until a request reached QP qp */
+	RDMAT_CM_CONNECT,	/* connect QP qp to raddr/rport */
+	RDMAT_CM_DISCONNECT,	/* disconnect QP qp, wait, make it anew */
+	RDMAT_CM_UNLISTEN,	/* destroy listener number qp */
+	RDMAT_CM_CYCLE,		/* count connect/disconnect cycles on qp */
+	RDMAT_CM_STATUS		/* listener counters */
+} rdmat_cm_op_t;
+
+#define	RDMAT_CM_MAX_PEERS	8
+#define	RDMAT_CM_MAX_LISTEN	2
+
+/* rcm_flags */
+#define	RDMAT_CM_AUTO		0x1	/* LISTEN: accept into new QPs */
+
+typedef struct rdmat_cm {
+	uint32_t	rcm_op;		/* rdmat_cm_op_t */
+	uint32_t	rcm_qp;		/* QP index, or listener index */
+	uint32_t	rcm_laddr;	/* network order */
+	uint32_t	rcm_raddr;
+	uint16_t	rcm_lport;
+	uint16_t	rcm_rport;
+	uint32_t	rcm_backlog;
+	uint32_t	rcm_npeers;
+	uint32_t	rcm_peers[RDMAT_CM_MAX_PEERS];
+	uint32_t	rcm_timeout_ms;
+	uint32_t	rcm_flags;
+	uint32_t	rcm_count;	/* CYCLE */
+	/* Out */
+	int32_t		rcm_status;	/* errno of the last failure */
+	uint32_t	rcm_event;	/* last rdk_cm_event_type */
+	uint32_t	rcm_done;	/* CYCLE: cycles completed */
+	uint32_t	rcm_reqs;	/* STATUS: requests seen */
+	uint32_t	rcm_accepts;
+	uint32_t	rcm_rejects;
+	uint32_t	rcm_live;	/* STATUS: automatic QPs alive */
+	uint16_t	rcm_bound;	/* the local port used */
+	uint16_t	rcm_pad;
+	uint64_t	rcm_ns;
+	rdmat_qpinfo_t	rcm_peer;
+} rdmat_cm_t;
 
 #ifdef __cplusplus
 }

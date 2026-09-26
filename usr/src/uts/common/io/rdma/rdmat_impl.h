@@ -38,6 +38,37 @@ typedef struct rdmat_dev {
 } rdmat_dev_t;
 
 struct rdmat_sess;
+struct rdmat_qp;
+
+/* What an rdk_cm handler's context points at. */
+typedef enum rdmat_cmkind {
+	RCK_QP = 1,
+	RCK_LISTEN,
+	RCK_AUTO
+} rdmat_cmkind_t;
+
+typedef struct rdmat_cmctx {
+	rdmat_cmkind_t		cc_kind;
+	struct rdmat_sess	*cc_sess;
+} rdmat_cmctx_t;
+
+/* A connection a RDMAT_CM_AUTO listener accepted into a QP of its own. */
+typedef struct rdmat_auto {
+	rdmat_cmctx_t		ra_ctx;
+	list_node_t		ra_node;	/* ts_cm_lock */
+	rdk_cm_id_t		*ra_id;
+	struct rdk_qp		*ra_qp;
+} rdmat_auto_t;
+
+typedef struct rdmat_listen {
+	rdmat_cmctx_t		rl_ctx;
+	rdk_cm_id_t		*rl_id;
+	uint32_t		rl_qp;		/* QP to accept into */
+	boolean_t		rl_auto;
+	uint32_t		rl_reqs;	/* ts_cm_lock */
+	uint32_t		rl_accepts;
+	uint32_t		rl_rejects;
+} rdmat_listen_t;
 
 /*
  * A QP with its CQs, buffer and MRs.  The completion counters are under
@@ -86,6 +117,15 @@ typedef struct rdmat_qp {
 	hrtime_t		tq_last_ns;
 	uint64_t		tq_events;
 	uint32_t		tq_last_event;
+
+	/* The connection manager; tq_lock. */
+	rdmat_cmctx_t		tq_cmctx;
+	rdk_cm_id_t		*tq_cmid;
+	uint32_t		tq_cm_seen;	/* 1 << rdk_cm_event_type */
+	uint32_t		tq_cm_last;
+	int			tq_cm_status;
+	rdmat_qpinfo_t		tq_peer;
+	boolean_t		tq_cm_ok;	/* the peer's info was valid */
 } rdmat_qp_t;
 
 /*
@@ -112,6 +152,11 @@ typedef struct rdmat_sess {
 	boolean_t		ts_gid_added;
 	uint32_t		ts_nqp;
 	rdmat_qp_t		ts_qp[RDMAT_MAX_QPS];
+	cred_t			*ts_cred;
+	kmutex_t		ts_cm_lock;
+	rdmat_listen_t		*ts_listen[RDMAT_CM_MAX_LISTEN];
+	list_t			ts_autos;	/* ts_cm_lock */
+	boolean_t		ts_autos_init;
 } rdmat_sess_t;
 
 /* rdmat_run.c */
@@ -121,6 +166,13 @@ extern int rdmat_run(rdmat_sess_t *, rdmat_run_t *);
 extern int rdmat_buf(rdmat_sess_t *, rdmat_buf_t *);
 extern int rdmat_query(rdmat_sess_t *, rdmat_query_t *);
 extern void rdmat_teardown(rdmat_sess_t *, boolean_t);
+extern int rdmat_qp_make(rdmat_sess_t *, rdmat_qp_t *);
+extern int rdmat_qp_register(rdmat_qp_t *);
+extern void rdmat_qp_info(rdmat_qp_t *, rdmat_qpinfo_t *);
+
+/* rdmat_cm.c */
+extern int rdmat_cm(rdmat_sess_t *, rdmat_cm_t *);
+extern void rdmat_cm_teardown(rdmat_sess_t *);
 
 #ifdef __cplusplus
 }

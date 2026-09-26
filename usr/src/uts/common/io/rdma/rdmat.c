@@ -223,7 +223,10 @@ rdmat_open(dev_t *devp, int flag, int otyp, cred_t *cr)
 	ts = ddi_get_soft_state(rdmat_state, minor);
 	ts->ts_minor = (minor_t)minor;
 	mutex_init(&ts->ts_lock, NULL, MUTEX_DRIVER, NULL);
+	mutex_init(&ts->ts_cm_lock, NULL, MUTEX_DRIVER, NULL);
 	cv_init(&ts->ts_cv, NULL, CV_DRIVER, NULL);
+	crhold(cr);
+	ts->ts_cred = cr;
 	*devp = makedevice(getmajor(*devp), (minor_t)minor);
 	return (0);
 }
@@ -243,7 +246,9 @@ rdmat_close(dev_t dev, int flag, int otyp, cred_t *cr)
 	while (ts->ts_holds != 0)
 		cv_wait(&rdmat_cv, &rdmat_lock);
 	mutex_exit(&rdmat_lock);
+	crfree(ts->ts_cred);
 	cv_destroy(&ts->ts_cv);
+	mutex_destroy(&ts->ts_cm_lock);
 	mutex_destroy(&ts->ts_lock);
 	ddi_soft_state_free(rdmat_state, minor);
 	id_free(rdmat_minors, (id_t)minor);
@@ -260,6 +265,7 @@ rdmat_call(rdmat_sess_t *ts, int cmd, intptr_t arg, int mode)
 		rdmat_run_t	run;
 		rdmat_buf_t	buf;
 		rdmat_query_t	query;
+		rdmat_cm_t	cm;
 	} *u;
 	size_t len;
 	int ret;
@@ -279,6 +285,9 @@ rdmat_call(rdmat_sess_t *ts, int cmd, intptr_t arg, int mode)
 		break;
 	case RDMAT_IOC_QUERY:
 		len = sizeof (rdmat_query_t);
+		break;
+	case RDMAT_IOC_CM:
+		len = sizeof (rdmat_cm_t);
 		break;
 	default:
 		return (ENOTTY);
@@ -311,13 +320,16 @@ rdmat_call(rdmat_sess_t *ts, int cmd, intptr_t arg, int mode)
 	case RDMAT_IOC_BUF:
 		ret = ts->ts_setup ? rdmat_buf(ts, &u->buf) : ENXIO;
 		break;
+	case RDMAT_IOC_CM:
+		ret = ts->ts_setup ? rdmat_cm(ts, &u->cm) : ENXIO;
+		break;
 	default:
 		ret = ts->ts_setup ? rdmat_query(ts, &u->query) : ENXIO;
 		break;
 	}
 
-	/* A run reports its counts even when it fails. */
-	if ((ret == 0 || cmd == RDMAT_IOC_RUN) &&
+	/* A run or CM request reports its counts even when it fails. */
+	if ((ret == 0 || cmd == RDMAT_IOC_RUN || cmd == RDMAT_IOC_CM) &&
 	    ddi_copyout(u, (void *)arg, len, mode) != 0)
 		ret = EFAULT;
 	kmem_free(u, sizeof (*u));
