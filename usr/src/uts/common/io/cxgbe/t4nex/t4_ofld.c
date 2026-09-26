@@ -305,8 +305,7 @@ t4_ofld_vectors(struct adapter *sc, uint_t avail)
 
 	if (of == NULL)
 		return (B_FALSE);
-	return (avail >= 2 + of->of_nports +
-	    of->of_nports * T4_OFLD_VECS_PER_PORT);
+	return (avail >= 2 + of->of_nports + T4_OFLD_VECS);
 }
 
 static int
@@ -345,6 +344,8 @@ t4_ofld_kstat_update(kstat_t *ksp, int rw)
 	k->ok_cpl_wrongq.value.ui64 = s->os_cpl_wrongq;
 	k->ok_cpl_mismatch.value.ui64 = s->os_cpl_mismatch;
 	k->ok_cpl_nomem.value.ui64 = s->os_cpl_nomem;
+	k->ok_cq_notify.value.ui64 = s->os_cq_notify;
+	k->ok_cq_badid.value.ui64 = s->os_cq_badid;
 	k->ok_fl_badlen.value.ui64 = s->os_fl_badlen;
 	k->ok_orphan_release.value.ui64 = s->os_orphan_release;
 	k->ok_orphan_abort.value.ui64 = s->os_orphan_abort;
@@ -401,6 +402,8 @@ t4_ofld_kstat_init(t4_ofld_t *of)
 	OK_U64(ok_cpl_wrongq, "cpl_wrongq");
 	OK_U64(ok_cpl_mismatch, "cpl_mismatch");
 	OK_U64(ok_cpl_nomem, "cpl_nomem");
+	OK_U64(ok_cq_notify, "cq_notify");
+	OK_U64(ok_cq_badid, "cq_badid");
 	OK_U64(ok_fl_badlen, "fl_badlen");
 	OK_U64(ok_orphan_release, "orphan_release");
 	OK_U64(ok_orphan_abort, "orphan_abort");
@@ -680,6 +683,9 @@ t4_ofld_info(t4_ofld_t *of, t4_rdma_info_t *info)
 	info->tri_eq_qpp_shift = sc->params.sge.eq_qpp;
 	info->tri_iq_qpp_shift = sc->params.sge.iq_qpp;
 	info->tri_write_combine = (sc->doorbells & DOORBELL_WCWR) != 0;
+	info->tri_rxq_id = of->of_rxq.iq.tsi_abs_id;
+	info->tri_ciq_id = of->of_ciq.tsi_abs_id;
+	info->tri_ciq_cntxt = of->of_ciq.tsi_cntxt_id;
 
 	for (uint_t i = 0; i < of->of_nports; i++) {
 		const t4_ofld_port_t *op = &of->of_port[i];
@@ -693,9 +699,6 @@ t4_ofld_info(t4_ofld_t *of, t4_rdma_info_t *info)
 		p->trpo_mtu = op->op_mtu;
 		p->trpo_link = op->op_link;
 		p->trpo_speed = op->op_speed;
-		p->trpo_rxq_id = op->op_rxq.iq.tsi_abs_id;
-		p->trpo_ciq_id = op->op_ciq.tsi_abs_id;
-		p->trpo_ciq_cntxt = op->op_ciq.tsi_cntxt_id;
 	}
 }
 
@@ -706,7 +709,7 @@ t4_ofld_client_open(t4_ofld_t *of, const t4_rdma_client_t *client, void *arg,
 	int rc = 0;
 
 	if (client == NULL || client->trcl_event == NULL ||
-	    client->trcl_cpl == NULL)
+	    client->trcl_cpl == NULL || client->trcl_cq == NULL)
 		return (EINVAL);
 
 	mutex_enter(&of->of_lock);

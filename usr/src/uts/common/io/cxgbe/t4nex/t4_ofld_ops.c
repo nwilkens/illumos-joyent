@@ -133,8 +133,8 @@ static uint32_t
 t4_ofld_opt2(const t4_ofld_port_t *op, const t4_rdma_tcp_opts_t *o)
 {
 	uint32_t opt2 = V_RX_CHANNEL(0) | F_RSS_QUEUE_VALID |
-	    V_RSS_QUEUE(op->op_rxq.iq.tsi_abs_id) | F_T5_OPT_2_VALID |
-	    V_CONG_CNTRL(CONG_ALG_TAHOE) | F_T5_ISS;
+	    V_RSS_QUEUE(op->op_ofld->of_rxq.iq.tsi_abs_id) |
+	    F_T5_OPT_2_VALID | V_CONG_CNTRL(CONG_ALG_TAHOE) | F_T5_ISS;
 
 	if (o->trt_timestamps)
 		opt2 |= F_TSTAMPS_EN;
@@ -208,7 +208,7 @@ t4_ofld_listen(t4_ofld_t *of, const t4_rdma_listen_t *l)
 		req.v6.opt0 = BE_64(V_TX_CHAN(op->op_pi->tx_chan));
 		req.v6.opt1 = BE_64(V_CONN_POLICY(CPL_CONN_POLICY_ASK) |
 		    F_SYN_RSS_ENABLE |
-		    V_SYN_RSS_QUEUE(op->op_rxq.iq.tsi_abs_id));
+		    V_SYN_RSS_QUEUE(of->of_rxq.iq.tsi_abs_id));
 	} else {
 		len = sizeof (req.v4);
 		t4_ofld_init_tp_wr(&req.v4, len, 0);
@@ -219,7 +219,7 @@ t4_ofld_listen(t4_ofld_t *of, const t4_rdma_listen_t *l)
 		req.v4.opt0 = BE_64(V_TX_CHAN(op->op_pi->tx_chan));
 		req.v4.opt1 = BE_64(V_CONN_POLICY(CPL_CONN_POLICY_ASK) |
 		    F_SYN_RSS_ENABLE |
-		    V_SYN_RSS_QUEUE(op->op_rxq.iq.tsi_abs_id));
+		    V_SYN_RSS_QUEUE(of->of_rxq.iq.tsi_abs_id));
 	}
 	if ((rc = t4_ofld_wr_send(of, &op->op_ctrlq, &req,
 	    roundup(len, 16))) != 0) {
@@ -349,13 +349,13 @@ t4_ofld_act_open(t4_ofld_t *of, const t4_rdma_act_open_t *a)
 	}
 	e->te_flags |= TEF_OPEN;
 	e->te_port = a->trao_port;
-	e->te_rxq = op->op_rxq.iq.tsi_abs_id;
+	e->te_rxq = of->of_rxq.iq.tsi_abs_id;
 	mutex_exit(&of->of_tids.td_lock);
 
 	opt0 = t4_ofld_opt0(op, &a->trao_opts, a->trao_l2t);
 	opt2 = t4_ofld_opt2(op, &a->trao_opts);
 	params = V_FILTER_TUPLE(t4_ofld_ntuple(of, op->op_pi, vlan));
-	tidq = V_TID_QID(op->op_rxq.iq.tsi_abs_id) | a->trao_atid;
+	tidq = V_TID_QID(of->of_rxq.iq.tsi_abs_id) | a->trao_atid;
 
 	bzero(&req, sizeof (req));
 	if (v6) {
@@ -435,7 +435,7 @@ t4_ofld_accept(t4_ofld_t *of, const t4_rdma_accept_t *a)
 	    roundup(sizeof (rpl), 16));
 	if (rc == 0) {
 		e->te_flags &= ~TEF_EMBRYO;
-		e->te_rxq = op->op_rxq.iq.tsi_abs_id;
+		e->te_rxq = of->of_rxq.iq.tsi_abs_id;
 	}
 	mutex_exit(&of->of_tids.td_lock);
 	return (rc);
@@ -557,7 +557,7 @@ t4_ofld_set_tcb_field(t4_ofld_t *of, uint32_t tid, uint16_t word,
 	t4_ofld_init_tp_wr(&req, sizeof (req), tid);
 	OPCODE_TID(&req) = BE_32(MK_OPCODE_TID(CPL_SET_TCB_FIELD, tid));
 	req.reply_ctrl = BE_16(V_NO_REPLY(0) |
-	    V_QUEUENO(op->op_rxq.iq.tsi_abs_id));
+	    V_QUEUENO(of->of_rxq.iq.tsi_abs_id));
 	req.word_cookie = BE_16(V_WORD(word) | V_COOKIE(0));
 	req.mask = BE_64(mask);
 	req.val = BE_64(val);

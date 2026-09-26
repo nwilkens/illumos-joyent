@@ -72,7 +72,7 @@ typedef struct t4_rdma_event {
 
 /*
  * The queue a CPL arrived on.  RX carries connection CPLs and their payload;
- * CIQ carries the firmware's RDMA completion queue notifications.
+ * CIQ carries the firmware's RDMA completion queue messages.
  */
 typedef enum t4_rdma_queue {
 	T4_RDMA_Q_RX = 1,
@@ -95,9 +95,14 @@ typedef struct t4_rdma_cpl {
 	mblk_t			*trc_mp;
 } t4_rdma_cpl_t;
 
+/*
+ * trcl_cq is called, in interrupt context, with the ID of an RDMA completion
+ * queue that has new entries.  The ID is inside the vres CQ range.
+ */
 typedef struct t4_rdma_client {
 	void	(*trcl_event)(void *, const t4_rdma_event_t *);
 	void	(*trcl_cpl)(void *, t4_rdma_cpl_t *);
+	void	(*trcl_cq)(void *, uint32_t);
 } t4_rdma_client_t;
 
 typedef struct t4_rdma_range {
@@ -129,9 +134,6 @@ typedef struct t4_rdma_port {
 	uint32_t	trpo_mtu;
 	link_state_t	trpo_link;
 	uint64_t	trpo_speed;
-	uint16_t	trpo_rxq_id;	/* absolute ID of the connection queue */
-	uint16_t	trpo_ciq_id;	/* absolute ID of the CQ event queue */
-	uint16_t	trpo_ciq_cntxt;	/* context ID of the CQ event queue */
 } t4_rdma_port_t;
 
 /* What the child needs to run the RDMA function. */
@@ -143,6 +145,9 @@ typedef struct t4_rdma_info {
 	t4_rdma_port_t		tri_port[T4_RDMA_MAX_PORTS];
 	t4_rdma_vres_t		tri_vres;
 	uint16_t		tri_mtus[T4_RDMA_NMTUS];
+	uint16_t		tri_rxq_id;	/* absolute ID, connection queue */
+	uint16_t		tri_ciq_id;	/* absolute ID, CQ event queue */
+	uint16_t		tri_ciq_cntxt;	/* context ID, CQ event queue */
 	/* BAR2 user doorbell region, for the queues the child creates. */
 	caddr_t			tri_bar2;
 	ddi_acc_handle_t	tri_bar2_handle;

@@ -2258,20 +2258,20 @@ t4_cfg_intrs_queues(struct adapter *sc)
 	const struct pf_resources *pfres = &sc->params.pfres;
 
 	/*
-	 * Offload takes a vector block after the LAN vectors, plus two
-	 * ingress queues and three egress queues per port, one of which is a
-	 * control queue.  If the adapter cannot spare them, offload is off.
+	 * Offload takes a vector block after the LAN vectors, two ingress
+	 * queues (one with a free list), and a control and an offload egress
+	 * queue per port.  If the adapter cannot spare them, offload is off.
 	 */
 	uint_t rdma = 0, ofld_iqs = 0, ofld_eqs = 0, ofld_ctrl = 0;
 	if (sc->ofld != NULL) {
 		if (itype == DDI_INTR_TYPE_MSIX &&
 		    t4_ofld_vectors(sc, iaq->intr_count) &&
-		    pfres->niqflint > 1 + port_count * 3 &&
-		    pfres->neq > port_count * 5 &&
+		    pfres->niqflint > 3 + port_count &&
+		    pfres->neq > 1 + port_count * 4 &&
 		    pfres->nethctrl > port_count * 2) {
-			rdma = port_count * T4_OFLD_VECS_PER_PORT;
-			ofld_iqs = port_count * 2;
-			ofld_eqs = port_count * 3;
+			rdma = T4_OFLD_VECS;
+			ofld_iqs = 2;
+			ofld_eqs = 1 + port_count * 2;
 			ofld_ctrl = port_count;
 		} else {
 			cxgb_printf(sc->dip, CE_NOTE, "!offload disabled: not "

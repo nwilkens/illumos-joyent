@@ -14,11 +14,11 @@
  */
 
 /*
- * The offload queues.  Each port gets a control queue and an offload Tx queue
- * (egress), a connection queue with a free list for CPLs and their payload,
- * and a CQ event queue for the firmware's RDMA completion notifications.  The
- * two ingress queues take their own MSI-X vectors from the block
- * t4_cfg_intrs_queues() reserved after the LAN vectors.
+ * The offload queues.  Each port gets a control queue and an offload Tx queue.
+ * The adapter gets one connection queue, with a free list for CPLs and their
+ * payload, and one CQ event queue for RDMA completion notifications; each
+ * takes an MSI-X vector from the block t4_cfg_intrs_queues() reserved after
+ * the LAN vectors.
  *
  * The egress queues report progress only through their status page; a queue
  * that fills returns EAGAIN rather than waiting.
@@ -79,7 +79,7 @@ t4_ofld_alloc_eq(t4_ofld_port_t *op, t4_sge_eq_t *eq, t4_eq_type_t type,
 	eq->tse_type = type;
 	eq->tse_qsize = qsize;
 	eq->tse_tx_chan = pi->tx_chan;
-	eq->tse_iqid = op->op_rxq.iq.tsi_cntxt_id;
+	eq->tse_iqid = op->op_ofld->of_rxq.iq.tsi_cntxt_id;
 	if ((rc = t4_alloc_eq_base(pi, eq)) != 0)
 		return (rc);
 	t4_ofld_eq_cmd_common(sc, eq, &fetch, &dca);
@@ -160,11 +160,26 @@ t4_ofld_iq_disable(t4_sge_iq_t *iq)
 static int
 t4_ofld_port_queues_init(t4_ofld_port_t *op)
 {
-	struct port_info *pi = op->op_pi;
-	struct adapter *sc = pi->adapter;
 	int rc;
 
-	op->op_rxq.port = pi;
+	if ((rc = t4_ofld_alloc_eq(op, &op->op_ctrlq, TEQT_CTRL,
+	    T4_OFLD_CTRLQ_QSIZE)) != 0)
+		return (rc);
+	if ((rc = t4_ofld_alloc_eq(op, &op->op_txq, TEQT_OFLD,
+	    T4_OFLD_TXQ_QSIZE)) != 0)
+		return (rc);
+	op->op_mtu = op->op_pi->mtu;
+	return (0);
+}
+
+static int
+t4_ofld_iqs_init(t4_ofld_t *of)
+{
+	struct port_info *pi = of->of_port[0].op_pi;
+	struct adapter *sc = of->of_sc;
+	int rc;
+
+	of->of_rxq.port = pi;
 	const t4_iq_params_t rxp = {
 		.tip_iq_type	= TIQT_OFLD_RX,
 		.tip_tmr_idx	= sc->props.ethq_tmr_idx,
@@ -174,9 +189,9 @@ t4_ofld_port_queues_init(t4_ofld_port_t *op)
 		.tip_fl_qsize	= T4_OFLD_FL_QSIZE,
 		.tip_cong_chan	= -1,
 		.tip_intr_evtq	= NULL,
-		.tip_intr_idx	= op->op_rxq_vec,
+		.tip_intr_idx	= of->of_rxq_vec,
 	};
-	if ((rc = t4_alloc_iq(pi, &rxp, &op->op_rxq.iq, &op->op_rxq.fl)) != 0)
+	if ((rc = t4_alloc_iq(pi, &rxp, &of->of_rxq.iq, &of->of_rxq.fl)) != 0)
 		return (rc);
 
 	const t4_iq_params_t ciqp = {
@@ -187,45 +202,26 @@ t4_ofld_port_queues_init(t4_ofld_port_t *op)
 		.tip_esize	= RX_IQ_ESIZE,
 		.tip_cong_chan	= -1,
 		.tip_intr_evtq	= NULL,
-		.tip_intr_idx	= op->op_ciq_vec,
+		.tip_intr_idx	= of->of_ciq_vec,
 	};
-	if ((rc = t4_alloc_iq(pi, &ciqp, &op->op_ciq, NULL)) != 0)
+	if ((rc = t4_alloc_iq(pi, &ciqp, &of->of_ciq, NULL)) != 0)
 		return (rc);
 
-	if ((rc = t4_ofld_alloc_eq(op, &op->op_ctrlq, TEQT_CTRL,
-	    T4_OFLD_CTRLQ_QSIZE)) != 0)
-		return (rc);
-	if ((rc = t4_ofld_alloc_eq(op, &op->op_txq, TEQT_OFLD,
-	    T4_OFLD_TXQ_QSIZE)) != 0)
-		return (rc);
-
-	/* CPLs name the queue in a 10 bit field. */
-	if (op->op_rxq.iq.tsi_abs_id > M_TID_QID) {
+	/* CPLs name the connection queue in a 10 bit field. */
+	if (of->of_rxq.iq.tsi_abs_id > M_TID_QID) {
 		cxgb_printf(sc->dip, CE_WARN, "offload queue ID %u does not "
-		    "fit in a CPL", op->op_rxq.iq.tsi_abs_id);
+		    "fit in a CPL", of->of_rxq.iq.tsi_abs_id);
 		return (ERANGE);
 	}
-
-	op->op_mtu = pi->mtu;
-	t4_ofld_iq_enable(&op->op_rxq.iq);
-	t4_ofld_iq_enable(&op->op_ciq);
 	return (0);
 }
 
 static void
-t4_ofld_port_queues_fini(t4_ofld_port_t *op)
+t4_ofld_iqs_fini(t4_ofld_t *of)
 {
-	struct port_info *pi = op->op_pi;
-	struct adapter *sc = pi->adapter;
-	struct sge_fl *fl = &op->op_rxq.fl;
-
-	t4_ofld_iq_disable(&op->op_rxq.iq);
-	t4_ofld_iq_disable(&op->op_ciq);
-
-	if ((op->op_ctrlq.tse_flags & EQ_ALLOC_HOST) != 0)
-		t4_free_eq(pi, &op->op_ctrlq);
-	if ((op->op_txq.tse_flags & EQ_ALLOC_HOST) != 0)
-		t4_free_eq(pi, &op->op_txq);
+	struct port_info *pi = of->of_port[0].op_pi;
+	struct adapter *sc = of->of_sc;
+	struct sge_fl *fl = &of->of_rxq.fl;
 
 	/* Keep the starving list from reaching a free list about to go. */
 	if ((fl->eq.tse_flags & EQ_ALLOC_HOST) != 0) {
@@ -239,26 +235,32 @@ t4_ofld_port_queues_fini(t4_ofld_port_t *op)
 		FL_UNLOCK(fl);
 		mutex_exit(&sc->sfl_lock);
 	}
-
-	if ((op->op_ciq.tsi_flags & IQ_ALLOC_HOST) != 0)
-		t4_free_iq(pi, &op->op_ciq);
-	if ((op->op_rxq.iq.tsi_flags & IQ_ALLOC_HOST) != 0)
-		t4_free_iq(pi, &op->op_rxq.iq);
-	bzero(&op->op_rxq, sizeof (op->op_rxq));
+	if ((of->of_ciq.tsi_flags & IQ_ALLOC_HOST) != 0)
+		t4_free_iq(pi, &of->of_ciq);
+	if ((of->of_rxq.iq.tsi_flags & IQ_ALLOC_HOST) != 0)
+		t4_free_iq(pi, &of->of_rxq.iq);
+	bzero(&of->of_rxq, sizeof (of->of_rxq));
 }
 
 int
 t4_ofld_queues_init(t4_ofld_t *of)
 {
-	int rc = 0;
+	int rc;
 
-	for (uint_t i = 0; i < of->of_nports; i++) {
-		if ((rc = t4_ofld_port_queues_init(&of->of_port[i])) != 0)
-			break;
+	if ((rc = t4_ofld_iqs_init(of)) == 0) {
+		for (uint_t i = 0; i < of->of_nports; i++) {
+			if ((rc = t4_ofld_port_queues_init(&of->of_port[i])) !=
+			    0)
+				break;
+		}
 	}
-	if (rc != 0)
+	if (rc != 0) {
 		t4_ofld_queues_fini(of);
-	return (rc);
+		return (rc);
+	}
+	t4_ofld_iq_enable(&of->of_rxq.iq);
+	t4_ofld_iq_enable(&of->of_ciq);
+	return (0);
 }
 
 void
@@ -268,8 +270,17 @@ t4_ofld_queues_fini(t4_ofld_t *of)
 	of->of_queues_up = B_FALSE;
 	mutex_exit(&of->of_lock);
 
-	for (uint_t i = 0; i < of->of_nports; i++)
-		t4_ofld_port_queues_fini(&of->of_port[i]);
+	t4_ofld_iq_disable(&of->of_rxq.iq);
+	t4_ofld_iq_disable(&of->of_ciq);
+	for (uint_t i = 0; i < of->of_nports; i++) {
+		t4_ofld_port_t *op = &of->of_port[i];
+
+		if ((op->op_ctrlq.tse_flags & EQ_ALLOC_HOST) != 0)
+			t4_free_eq(op->op_pi, &op->op_ctrlq);
+		if ((op->op_txq.tse_flags & EQ_ALLOC_HOST) != 0)
+			t4_free_eq(op->op_pi, &op->op_txq);
+	}
+	t4_ofld_iqs_fini(of);
 }
 
 /*
@@ -283,25 +294,20 @@ t4_ofld_intr_handlers(t4_ofld_t *of, int *handlers)
 	const struct t4_intrs_queues *iaq = &sc->intr_queue_cfg;
 	int rc;
 
-	for (uint_t i = 0; i < of->of_nports; i++) {
-		t4_ofld_port_t *op = &of->of_port[i];
+	of->of_rxq_vec = iaq->intr_rdma_first;
+	of->of_ciq_vec = iaq->intr_rdma_first + 1;
+	VERIFY3U(of->of_ciq_vec, <, iaq->intr_count);
 
-		op->op_rxq_vec = iaq->intr_rdma_first +
-		    i * T4_OFLD_VECS_PER_PORT;
-		op->op_ciq_vec = op->op_rxq_vec + 1;
-		VERIFY3U(op->op_ciq_vec, <, iaq->intr_count);
-
-		rc = ddi_intr_add_handler(sc->intr_handle[op->op_rxq_vec],
-		    t4_intr_ofld, (caddr_t)op, (caddr_t)T4_OFLD_Q_RX);
-		if (rc != DDI_SUCCESS)
-			return (rc);
-		*handlers += 1;
-		rc = ddi_intr_add_handler(sc->intr_handle[op->op_ciq_vec],
-		    t4_intr_ofld, (caddr_t)op, (caddr_t)T4_OFLD_Q_CIQ);
-		if (rc != DDI_SUCCESS)
-			return (rc);
-		*handlers += 1;
-	}
+	rc = ddi_intr_add_handler(sc->intr_handle[of->of_rxq_vec],
+	    t4_intr_ofld, (caddr_t)of, (caddr_t)T4_OFLD_Q_RX);
+	if (rc != DDI_SUCCESS)
+		return (rc);
+	*handlers += 1;
+	rc = ddi_intr_add_handler(sc->intr_handle[of->of_ciq_vec],
+	    t4_intr_ofld, (caddr_t)of, (caddr_t)T4_OFLD_Q_CIQ);
+	if (rc != DDI_SUCCESS)
+		return (rc);
+	*handlers += 1;
 	return (DDI_SUCCESS);
 }
 
@@ -310,15 +316,15 @@ t4_ofld_intr_handlers(t4_ofld_t *of, int *handlers)
  * lock and handed out after it is dropped.
  */
 static void
-t4_ofld_iq_service(t4_ofld_port_t *op, t4_sge_iq_t *iq, t4_rdma_queue_t q)
+t4_ofld_iq_service(t4_ofld_t *of, t4_sge_iq_t *iq, t4_rdma_queue_t q)
 {
-	t4_ofld_t *of = op->op_ofld;
 	struct adapter *sc = iq->tsi_adapter;
 	struct sge_fl *fl = iq->tsi_fl;
 	const size_t inl = iq->tsi_esize_bytes - sizeof (struct rsp_ctrl) -
 	    sizeof (struct rss_header);
 	mblk_t *head = NULL, **tailp = &head, *mp;
-	uint_t cidx_incr = 0, budget;
+	uint32_t cqs[T4_OFLD_CIQ_QSIZE / 8];
+	uint_t cidx_incr = 0, budget, ncq = 0;
 	t4_gts_config_t rearm;
 	struct rsp_ctrl ctrl;
 	boolean_t broken = B_FALSE;
@@ -328,7 +334,7 @@ t4_ofld_iq_service(t4_ofld_port_t *op, t4_sge_iq_t *iq, t4_rdma_queue_t q)
 		IQ_UNLOCK(iq);
 		return;
 	}
-	budget = iq->tsi_qsize / 8;
+	budget = MIN(iq->tsi_qsize / 8, ARRAY_SIZE(cqs));
 	rearm = iq->tsi_gts_rearm;
 
 	while (cidx_incr < budget && t4_iq_next_rsp(iq, &ctrl)) {
@@ -370,6 +376,9 @@ t4_ofld_iq_service(t4_ofld_port_t *op, t4_sge_iq_t *iq, t4_rdma_queue_t q)
 				}
 				break;
 			}
+		} else if (type == X_RSPD_TYPE_INTR && q == T4_RDMA_Q_CIQ) {
+			/* A CQ with new entries, named by its context ID. */
+			cqs[ncq++] = BE_32(ctrl.pldbuflen_qid);
 		} else {
 			iq->tsi_stats.sis_bad_cpl++;
 		}
@@ -402,6 +411,8 @@ t4_ofld_iq_service(t4_ofld_port_t *op, t4_sge_iq_t *iq, t4_rdma_queue_t q)
 		t4_ofld_fatal(sc);
 	}
 
+	if (ncq != 0)
+		t4_ofld_cq_notify(of, cqs, ncq);
 	while ((mp = head) != NULL) {
 		const uint8_t opcode = mp->b_band;
 
@@ -409,19 +420,19 @@ t4_ofld_iq_service(t4_ofld_port_t *op, t4_sge_iq_t *iq, t4_rdma_queue_t q)
 		mp->b_next = NULL;
 		mp->b_band = 0;
 		T4_OFLD_STAT(of, os_cpl_rx);
-		t4_ofld_cpl_dispatch(op, q, opcode, mp);
+		t4_ofld_cpl_dispatch(of, q, opcode, mp);
 	}
 }
 
 uint_t
 t4_intr_ofld(caddr_t arg1, caddr_t arg2)
 {
-	t4_ofld_port_t *op = (t4_ofld_port_t *)arg1;
+	t4_ofld_t *of = (t4_ofld_t *)arg1;
 
 	if ((uintptr_t)arg2 == T4_OFLD_Q_CIQ)
-		t4_ofld_iq_service(op, &op->op_ciq, T4_RDMA_Q_CIQ);
+		t4_ofld_iq_service(of, &of->of_ciq, T4_RDMA_Q_CIQ);
 	else
-		t4_ofld_iq_service(op, &op->op_rxq.iq, T4_RDMA_Q_RX);
+		t4_ofld_iq_service(of, &of->of_rxq.iq, T4_RDMA_Q_RX);
 	return (DDI_INTR_CLAIMED);
 }
 

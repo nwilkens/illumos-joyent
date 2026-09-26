@@ -169,7 +169,7 @@ t4_ofld_send_flowc(t4_ofld_t *of, uint8_t port, uint32_t tid,
 	FLOWC(PFNVFN, V_FW_PFVF_CMD_PFN(of->of_sc->pf));
 	FLOWC(CH, op->op_pi->tx_chan);
 	FLOWC(PORT, op->op_pi->tx_chan);
-	FLOWC(IQID, op->op_rxq.iq.tsi_abs_id);
+	FLOWC(IQID, of->of_rxq.iq.tsi_abs_id);
 	if (flowc != NULL) {
 		FLOWC(SNDNXT, flowc->trf_snd_nxt);
 		FLOWC(RCVNXT, flowc->trf_rcv_nxt);
@@ -197,7 +197,7 @@ t4_ofld_send_unlisten(t4_ofld_t *of, uint8_t port, uint32_t stid,
 	t4_ofld_init_tp_wr(&req, sizeof (req), 0);
 	OPCODE_TID(&req) = BE_32(MK_OPCODE_TID(CPL_CLOSE_LISTSRV_REQ, stid));
 	req.reply_ctrl = BE_16(V_NO_REPLY(0) | V_LISTSVR_IPV6(v6 ? 1 : 0) |
-	    V_QUEUENO(op->op_rxq.iq.tsi_abs_id));
+	    V_QUEUENO(of->of_rxq.iq.tsi_abs_id));
 	return (t4_ofld_wr_send(of, &op->op_ctrlq, &req,
 	    roundup(sizeof (req), 16)));
 }
@@ -340,14 +340,14 @@ t4_ofld_cl_exit(t4_ofld_t *of)
 }
 
 static void
-t4_ofld_cl_call(const t4_rdma_client_t *cl, void *arg, t4_ofld_port_t *op,
+t4_ofld_cl_call(const t4_rdma_client_t *cl, void *arg, uint8_t port,
     t4_rdma_queue_t q, uint8_t opcode, uint32_t tid, uint32_t ltid, void *ctx,
     mblk_t *mp)
 {
 	t4_rdma_cpl_t cpl;
 
 	cpl.trc_opcode = opcode;
-	cpl.trc_port = op->op_idx;
+	cpl.trc_port = port;
 	cpl.trc_queue = q;
 	cpl.trc_tid = tid;
 	cpl.trc_ltid = ltid;
@@ -413,10 +413,9 @@ t4_ofld_refuse_tid(t4_ofld_t *of, uint8_t port, uint16_t rxq, uint32_t tid)
 }
 
 static void
-t4_ofld_cpl_stid(t4_ofld_port_t *op, t4_rdma_queue_t q, uint8_t opcode,
+t4_ofld_cpl_stid(t4_ofld_t *of, t4_rdma_queue_t q, uint8_t opcode,
     mblk_t *mp)
 {
-	t4_ofld_t *of = op->op_ofld;
 	const uint32_t stid = GET_TID((const struct cpl_pass_open_rpl *)
 	    mp->b_rptr);
 	const uint8_t status = opcode == CPL_PASS_OPEN_RPL ?
@@ -427,6 +426,7 @@ t4_ofld_cpl_stid(t4_ofld_port_t *op, t4_rdma_queue_t q, uint8_t opcode,
 	uint32_t gen;
 	void *arg, *ctx = NULL;
 	boolean_t live;
+	uint8_t port;
 
 	live = t4_ofld_cl_enter(of, &gen, &cl, &arg);
 
@@ -453,6 +453,7 @@ t4_ofld_cpl_stid(t4_ofld_port_t *op, t4_rdma_queue_t q, uint8_t opcode,
 		mutex_exit(&of->of_tids.td_lock);
 		goto drop;
 	}
+	port = e->te_port;
 	mutex_exit(&of->of_tids.td_lock);
 
 	if (!live || t4_tid_hold(of, T4_TID_STID, stid, gen, UINT16_MAX,
@@ -460,7 +461,7 @@ t4_ofld_cpl_stid(t4_ofld_port_t *op, t4_rdma_queue_t q, uint8_t opcode,
 		T4_OFLD_STAT(of, os_cpl_stale);
 		goto drop;
 	}
-	t4_ofld_cl_call(cl, arg, op, q, opcode, T4_RDMA_TID_NONE, stid, ctx,
+	t4_ofld_cl_call(cl, arg, port, q, opcode, T4_RDMA_TID_NONE, stid, ctx,
 	    mp);
 	t4_tid_rele(of, T4_TID_STID, stid);
 	t4_ofld_cl_exit(of);
@@ -471,15 +472,32 @@ drop:
 		t4_ofld_cl_exit(of);
 }
 
-static void
-t4_ofld_cpl_pass_accept(t4_ofld_port_t *op, t4_rdma_queue_t q,
-    mblk_t *mp)
+/*
+ * The port a SYN arrived on, if it was addressed to that port's own MAC.  A
+ * SYN seen only because the port is promiscuous, or sent to a VNIC's MAC,
+ * gets no offloaded connection.
+ */
+static int
+t4_ofld_syn_port(t4_ofld_t *of, const struct cpl_pass_accept_req *cpl)
 {
-	t4_ofld_t *of = op->op_ofld;
+	const uint16_t l2info = BE_16(cpl->l2info);
+	const uint_t port = G_SYN_INTF(l2info);
+
+	if (port >= of->of_nports || (l2info & F_SYN_XACT_MATCH) == 0 ||
+	    G_SYN_MAC_IDX(l2info) !=
+	    (uint_t)of->of_port[port].op_pi->xact_addr_filt)
+		return (-1);
+	return ((int)port);
+}
+
+static void
+t4_ofld_cpl_pass_accept(t4_ofld_t *of, t4_rdma_queue_t q, mblk_t *mp)
+{
 	const struct cpl_pass_accept_req *cpl = (const void *)mp->b_rptr;
 	const uint32_t tid = GET_TID(cpl);
 	const uint32_t stid = G_PASS_OPEN_TID(BE_32(cpl->tos_stid));
-	const uint16_t rxq = op->op_rxq.iq.tsi_abs_id;
+	const uint16_t rxq = of->of_rxq.iq.tsi_abs_id;
+	const int sport = t4_ofld_syn_port(of, cpl);
 	const t4_rdma_client_t *cl;
 	t4_tid_ent_t *se;
 	uint32_t gen;
@@ -494,11 +512,11 @@ t4_ofld_cpl_pass_accept(t4_ofld_port_t *op, t4_rdma_queue_t q,
 	se = t4_tid_ent(of, T4_TID_STID, stid);
 	if (se == NULL || !live || se->te_state != TTS_OWNED ||
 	    se->te_owner != gen || (se->te_flags & TEF_LISTEN) == 0 ||
-	    se->te_port != op->op_idx) {
+	    sport < 0 || se->te_port != sport) {
 		/* Nobody takes this SYN. */
 		mutex_exit(&of->of_tids.td_lock);
 		T4_OFLD_STAT(of, os_cpl_stale);
-		t4_ofld_refuse_tid(of, op->op_idx, rxq, tid);
+		t4_ofld_refuse_tid(of, sport >= 0 ? sport : 0, rxq, tid);
 		goto drop;
 	}
 	port = se->te_port;
@@ -517,7 +535,7 @@ t4_ofld_cpl_pass_accept(t4_ofld_port_t *op, t4_rdma_queue_t q,
 		mutex_exit(&of->of_tids.td_lock);
 		goto drop;
 	}
-	t4_ofld_cl_call(cl, arg, op, q, CPL_PASS_ACCEPT_REQ, tid, stid, ctx,
+	t4_ofld_cl_call(cl, arg, port, q, CPL_PASS_ACCEPT_REQ, tid, stid, ctx,
 	    mp);
 	t4_tid_rele(of, T4_TID_STID, stid);
 	t4_ofld_cl_exit(of);
@@ -529,9 +547,8 @@ drop:
 }
 
 static void
-t4_ofld_cpl_act_open_rpl(t4_ofld_port_t *op, t4_rdma_queue_t q, mblk_t *mp)
+t4_ofld_cpl_act_open_rpl(t4_ofld_t *of, t4_rdma_queue_t q, mblk_t *mp)
 {
-	t4_ofld_t *of = op->op_ofld;
 	const struct cpl_act_open_rpl *cpl = (const void *)mp->b_rptr;
 	const uint32_t as = BE_32(cpl->atid_status);
 	const uint32_t atid = G_TID_TID(G_AOPEN_ATID(as));
@@ -541,26 +558,33 @@ t4_ofld_cpl_act_open_rpl(t4_ofld_port_t *op, t4_rdma_queue_t q, mblk_t *mp)
 	uint32_t gen;
 	void *arg, *ctx;
 	boolean_t live;
+	uint8_t port;
 
 	live = t4_ofld_cl_enter(of, &gen, &cl, &arg);
 
+	mutex_enter(&of->of_tids.td_lock);
+	e = t4_tid_ent(of, T4_TID_ATID, atid);
+	if (e == NULL || e->te_state == TTS_FREE ||
+	    (e->te_flags & TEF_OPEN) == 0) {
+		mutex_exit(&of->of_tids.td_lock);
+		T4_OFLD_STAT(of, os_cpl_badid);
+		goto drop;
+	}
+	port = e->te_port;
+	e->te_flags &= ~TEF_OPEN;
+	mutex_exit(&of->of_tids.td_lock);
+
 	/* A failed open can still leave a TID in the chip; free it here. */
 	if (status != CPL_ERR_NONE && act_open_has_tid(status) &&
-	    t4_hwtid_claim(of, GET_TID(cpl), TTS_ORPHAN, 0, op->op_idx,
-	    op->op_rxq.iq.tsi_abs_id, 0, NULL) == 0) {
+	    t4_hwtid_claim(of, GET_TID(cpl), TTS_ORPHAN, 0, port,
+	    of->of_rxq.iq.tsi_abs_id, 0, NULL) == 0) {
 		mutex_enter(&of->of_tids.td_lock);
-		t4_ofld_orphan_release_locked(of, op->op_idx, GET_TID(cpl));
+		t4_ofld_orphan_release_locked(of, port, GET_TID(cpl));
 		mutex_exit(&of->of_tids.td_lock);
 	}
 
 	mutex_enter(&of->of_tids.td_lock);
 	e = t4_tid_ent(of, T4_TID_ATID, atid);
-	if (e == NULL || e->te_state == TTS_FREE) {
-		mutex_exit(&of->of_tids.td_lock);
-		T4_OFLD_STAT(of, os_cpl_badid);
-		goto drop;
-	}
-	e->te_flags &= ~TEF_OPEN;
 	if (t4_ofld_orphaned(e, gen)) {
 		t4_tid_free_locked(of, T4_TID_ATID, atid);
 		mutex_exit(&of->of_tids.td_lock);
@@ -569,11 +593,11 @@ t4_ofld_cpl_act_open_rpl(t4_ofld_port_t *op, t4_rdma_queue_t q, mblk_t *mp)
 	mutex_exit(&of->of_tids.td_lock);
 
 	if (!live || t4_tid_hold(of, T4_TID_ATID, atid, gen,
-	    op->op_rxq.iq.tsi_abs_id, &ctx) != 0) {
+	    of->of_rxq.iq.tsi_abs_id, &ctx) != 0) {
 		T4_OFLD_STAT(of, os_cpl_stale);
 		goto drop;
 	}
-	t4_ofld_cl_call(cl, arg, op, q, CPL_ACT_OPEN_RPL, T4_RDMA_TID_NONE,
+	t4_ofld_cl_call(cl, arg, port, q, CPL_ACT_OPEN_RPL, T4_RDMA_TID_NONE,
 	    atid, ctx, mp);
 	t4_tid_rele(of, T4_TID_ATID, atid);
 	t4_ofld_cl_exit(of);
@@ -585,29 +609,30 @@ drop:
 }
 
 static void
-t4_ofld_cpl_act_est(t4_ofld_port_t *op, t4_rdma_queue_t q, mblk_t *mp)
+t4_ofld_cpl_act_est(t4_ofld_t *of, t4_rdma_queue_t q, mblk_t *mp)
 {
-	t4_ofld_t *of = op->op_ofld;
 	const struct cpl_act_establish *cpl = (const void *)mp->b_rptr;
 	const uint32_t tid = GET_TID(cpl);
 	const uint32_t atid = G_TID_TID(G_PASS_OPEN_TID(BE_32(cpl->tos_atid)));
-	const uint16_t rxq = op->op_rxq.iq.tsi_abs_id;
+	const uint16_t rxq = of->of_rxq.iq.tsi_abs_id;
 	const t4_rdma_client_t *cl;
 	t4_tid_ent_t *e;
 	uint32_t gen;
 	void *arg, *ctx;
 	boolean_t live, orphan;
+	uint8_t port;
 
 	live = t4_ofld_cl_enter(of, &gen, &cl, &arg);
 
 	mutex_enter(&of->of_tids.td_lock);
 	e = t4_tid_ent(of, T4_TID_ATID, atid);
 	if (e == NULL || e->te_state == TTS_FREE ||
-	    (e->te_flags & TEF_OPEN) == 0 || e->te_port != op->op_idx) {
+	    (e->te_flags & TEF_OPEN) == 0) {
 		mutex_exit(&of->of_tids.td_lock);
 		T4_OFLD_STAT(of, os_cpl_badid);
 		goto drop;
 	}
+	port = e->te_port;
 	e->te_flags &= ~TEF_OPEN;
 	orphan = t4_ofld_orphaned(e, gen);
 	if (orphan)
@@ -615,7 +640,7 @@ t4_ofld_cpl_act_est(t4_ofld_port_t *op, t4_rdma_queue_t q, mblk_t *mp)
 	mutex_exit(&of->of_tids.td_lock);
 
 	if (orphan) {
-		if (t4_hwtid_claim(of, tid, TTS_ORPHAN, 0, op->op_idx, rxq, 0,
+		if (t4_hwtid_claim(of, tid, TTS_ORPHAN, 0, port, rxq, 0,
 		    NULL) == 0) {
 			mutex_enter(&of->of_tids.td_lock);
 			e = t4_tid_ent(of, T4_TID_HW, tid);
@@ -627,7 +652,7 @@ t4_ofld_cpl_act_est(t4_ofld_port_t *op, t4_rdma_queue_t q, mblk_t *mp)
 		goto drop;
 	}
 
-	if (t4_hwtid_claim(of, tid, TTS_OWNED, gen, op->op_idx, rxq, 0,
+	if (t4_hwtid_claim(of, tid, TTS_OWNED, gen, port, rxq, 0,
 	    NULL) != 0) {
 		T4_OFLD_STAT(of, os_cpl_badid);
 		goto drop;
@@ -639,7 +664,8 @@ t4_ofld_cpl_act_est(t4_ofld_port_t *op, t4_rdma_queue_t q, mblk_t *mp)
 		mutex_exit(&of->of_tids.td_lock);
 		goto drop;
 	}
-	t4_ofld_cl_call(cl, arg, op, q, CPL_ACT_ESTABLISH, tid, atid, ctx, mp);
+	t4_ofld_cl_call(cl, arg, port, q, CPL_ACT_ESTABLISH, tid, atid, ctx,
+	    mp);
 	t4_tid_rele(of, T4_TID_ATID, atid);
 	t4_ofld_cl_exit(of);
 	return;
@@ -650,18 +676,18 @@ drop:
 }
 
 static void
-t4_ofld_cpl_hwtid(t4_ofld_port_t *op, t4_rdma_queue_t q, uint8_t opcode,
+t4_ofld_cpl_hwtid(t4_ofld_t *of, t4_rdma_queue_t q, uint8_t opcode,
     mblk_t *mp)
 {
-	t4_ofld_t *of = op->op_ofld;
 	const uint32_t tid = GET_TID((const struct cpl_peer_close *)
 	    mp->b_rptr);
-	const uint16_t rxq = op->op_rxq.iq.tsi_abs_id;
+	const uint16_t rxq = of->of_rxq.iq.tsi_abs_id;
 	const t4_rdma_client_t *cl;
 	t4_tid_ent_t *e;
 	uint32_t gen;
 	void *arg, *ctx;
 	boolean_t live;
+	uint8_t port;
 	int rc;
 
 	live = t4_ofld_cl_enter(of, &gen, &cl, &arg);
@@ -693,6 +719,7 @@ t4_ofld_cpl_hwtid(t4_ofld_port_t *op, t4_rdma_queue_t q, uint8_t opcode,
 		mutex_exit(&of->of_tids.td_lock);
 		goto drop;
 	}
+	port = e->te_port;
 	mutex_exit(&of->of_tids.td_lock);
 
 	if ((rc = t4_tid_hold(of, T4_TID_HW, tid, gen, rxq, &ctx)) != 0) {
@@ -702,7 +729,8 @@ t4_ofld_cpl_hwtid(t4_ofld_port_t *op, t4_rdma_queue_t q, uint8_t opcode,
 			T4_OFLD_STAT(of, os_cpl_stale);
 		goto drop;
 	}
-	t4_ofld_cl_call(cl, arg, op, q, opcode, tid, T4_RDMA_TID_NONE, ctx, mp);
+	t4_ofld_cl_call(cl, arg, port, q, opcode, tid, T4_RDMA_TID_NONE, ctx,
+	    mp);
 	t4_tid_rele(of, T4_TID_HW, tid);
 	t4_ofld_cl_exit(of);
 	return;
@@ -712,14 +740,13 @@ drop:
 		t4_ofld_cl_exit(of);
 }
 
-static void t4_ofld_cpl_dispatch_one(t4_ofld_port_t *, t4_rdma_queue_t,
+static void t4_ofld_cpl_dispatch_one(t4_ofld_t *, t4_rdma_queue_t,
     uint8_t, mblk_t *, boolean_t);
 
 static void
-t4_ofld_cpl_fw(t4_ofld_port_t *op, t4_rdma_queue_t q, uint8_t opcode,
+t4_ofld_cpl_fw(t4_ofld_t *of, t4_rdma_queue_t q, uint8_t opcode,
     mblk_t *mp, boolean_t nested)
 {
-	t4_ofld_t *of = op->op_ofld;
 	const struct cpl_fw6_msg *cpl = (const void *)mp->b_rptr;
 	const t4_rdma_client_t *cl;
 	uint32_t gen;
@@ -740,7 +767,7 @@ t4_ofld_cpl_fw(t4_ofld_port_t *op, t4_rdma_queue_t q, uint8_t opcode,
 		    MBLKL(mp) <= offsetof(struct cpl_fw6_msg, data[1]))
 			break;
 		mp->b_rptr += offsetof(struct cpl_fw6_msg, data[1]);
-		t4_ofld_cpl_dispatch_one(op, q, op2, mp, B_TRUE);
+		t4_ofld_cpl_dispatch_one(of, q, op2, mp, B_TRUE);
 		return;
 	}
 	case FW6_TYPE_CQE:
@@ -752,7 +779,7 @@ t4_ofld_cpl_fw(t4_ofld_port_t *op, t4_rdma_queue_t q, uint8_t opcode,
 			T4_OFLD_STAT(of, os_cpl_stale);
 			break;
 		}
-		t4_ofld_cl_call(cl, arg, op, q, opcode, T4_RDMA_TID_NONE,
+		t4_ofld_cl_call(cl, arg, 0, q, opcode, T4_RDMA_TID_NONE,
 		    T4_RDMA_TID_NONE, NULL, mp);
 		t4_ofld_cl_exit(of);
 		return;
@@ -764,10 +791,9 @@ t4_ofld_cpl_fw(t4_ofld_port_t *op, t4_rdma_queue_t q, uint8_t opcode,
 }
 
 static void
-t4_ofld_cpl_dispatch_one(t4_ofld_port_t *op, t4_rdma_queue_t q,
+t4_ofld_cpl_dispatch_one(t4_ofld_t *of, t4_rdma_queue_t q,
     uint8_t opcode, mblk_t *mp, boolean_t nested)
 {
-	t4_ofld_t *of = op->op_ofld;
 	const t4_cpl_desc_t *d;
 
 	if (opcode >= NUM_CPL_CMDS ||
@@ -798,22 +824,22 @@ t4_ofld_cpl_dispatch_one(t4_ofld_port_t *op, t4_rdma_queue_t q,
 		freemsg(mp);
 		break;
 	case TCC_STID:
-		t4_ofld_cpl_stid(op, q, opcode, mp);
+		t4_ofld_cpl_stid(of, q, opcode, mp);
 		break;
 	case TCC_PASS_ACCEPT:
-		t4_ofld_cpl_pass_accept(op, q, mp);
+		t4_ofld_cpl_pass_accept(of, q, mp);
 		break;
 	case TCC_ACT_OPEN_RPL:
-		t4_ofld_cpl_act_open_rpl(op, q, mp);
+		t4_ofld_cpl_act_open_rpl(of, q, mp);
 		break;
 	case TCC_ACT_EST:
-		t4_ofld_cpl_act_est(op, q, mp);
+		t4_ofld_cpl_act_est(of, q, mp);
 		break;
 	case TCC_HWTID:
-		t4_ofld_cpl_hwtid(op, q, opcode, mp);
+		t4_ofld_cpl_hwtid(of, q, opcode, mp);
 		break;
 	case TCC_FW:
-		t4_ofld_cpl_fw(op, q, opcode, mp, nested);
+		t4_ofld_cpl_fw(of, q, opcode, mp, nested);
 		break;
 	default:
 		freemsg(mp);
@@ -826,10 +852,38 @@ t4_ofld_cpl_dispatch_one(t4_ofld_port_t *op, t4_rdma_queue_t q,
  * t4nex lock held; mp starts with the CPL and is consumed.
  */
 void
-t4_ofld_cpl_dispatch(t4_ofld_port_t *op, t4_rdma_queue_t q, uint8_t opcode,
+t4_ofld_cpl_dispatch(t4_ofld_t *of, t4_rdma_queue_t q, uint8_t opcode,
     mblk_t *mp)
 {
-	t4_ofld_cpl_dispatch_one(op, q, opcode, mp, B_FALSE);
+	t4_ofld_cpl_dispatch_one(of, q, opcode, mp, B_FALSE);
+}
+
+/*
+ * Tell the client which RDMA CQs have new entries.  The IDs come from the
+ * device; one outside the RDMA CQ range is dropped.
+ */
+void
+t4_ofld_cq_notify(t4_ofld_t *of, const uint32_t *cqs, uint_t n)
+{
+	const t4_rdma_range_t *r = &of->of_vres.trv_cq;
+	const t4_rdma_client_t *cl;
+	uint32_t gen;
+	void *arg;
+
+	if (!t4_ofld_cl_enter(of, &gen, &cl, &arg)) {
+		T4_OFLD_STAT(of, os_cpl_stale);
+		return;
+	}
+	for (uint_t i = 0; i < n; i++) {
+		if (cqs[i] < r->trr_start ||
+		    cqs[i] - r->trr_start >= r->trr_size) {
+			T4_OFLD_STAT(of, os_cq_badid);
+			continue;
+		}
+		T4_OFLD_STAT(of, os_cq_notify);
+		cl->trcl_cq(arg, cqs[i]);
+	}
+	t4_ofld_cl_exit(of);
 }
 
 /*

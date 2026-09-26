@@ -103,6 +103,12 @@ t4_ot_event(void *arg, const t4_rdma_event_t *ev)
 }
 
 static void
+t4_ot_cq(void *arg, uint32_t cq)
+{
+	_NOTE(ARGUNUSED(arg, cq));
+}
+
+static void
 t4_ot_cpl(void *arg, t4_rdma_cpl_t *cpl)
 {
 	t4_ot_t *ot = arg;
@@ -492,6 +498,7 @@ t4_ot_open(t4_ofld_t *of)
 	ot->ot_of = of;
 	ot->ot_client.trcl_event = t4_ot_event;
 	ot->ot_client.trcl_cpl = t4_ot_cpl;
+	ot->ot_client.trcl_cq = t4_ot_cq;
 	ot->ot_listen_stid = T4_TID_NIL;
 	mutex_init(&ot->ot_qlock, NULL, MUTEX_DRIVER,
 	    DDI_INTR_PRI(of->of_sc->intr_pri));

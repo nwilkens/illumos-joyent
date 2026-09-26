@@ -76,7 +76,7 @@ t4_l2t_write(t4_ofld_t *of, t4_l2t_ent_t *e, uint32_t idx)
 	bzero(&req, sizeof (req));
 	t4_ofld_init_tp_wr(&req, sizeof (req), 0);
 	OPCODE_TID(&req) = BE_32(MK_OPCODE_TID(CPL_L2T_WRITE_REQ,
-	    hwidx | F_T4_L2T_SYNC_WR | V_TID_QID(op->op_rxq.iq.tsi_abs_id)));
+	    hwidx | F_T4_L2T_SYNC_WR | V_TID_QID(of->of_rxq.iq.tsi_abs_id)));
 	req.params = BE_16(V_L2T_W_PORT(op->op_pi->lport) |
 	    V_L2T_W_NOREPLY(0));
 	req.l2t_idx = BE_16(hwidx);
