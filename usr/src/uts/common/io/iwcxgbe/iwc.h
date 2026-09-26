@@ -145,6 +145,12 @@ typedef struct iwc_qp {
 	uint32_t	qp_ord;
 	uint32_t	qp_sq_max_sge;
 	uint32_t	qp_rq_max_sge;
+	/*
+	 * With DSGL registration, T4_MAX_FR_DSGL bytes per SQ slot after the
+	 * ring in the SQ memory; a slot's page list lives as long as its
+	 * work request.
+	 */
+	size_t		qp_pbl_off;
 	/* iwc_obj_lock */
 	uint32_t	qp_refs;
 } iwc_qp_t;
@@ -348,6 +354,10 @@ extern void iwc_flush_qp(iwc_qp_t *);
 extern void iwc_cq_insert_drain(iwc_cq_t *, iwc_qp_t *, uint64_t,
     uint8_t, boolean_t);
 extern void iwc_cq_wake(iwc_cq_t *);
+
+/* The pages a fast registration MR may map. */
+#define	IWC_FR_DEPTH(iwc)	((iwc)->iwc_info.tri_vres.trv_memwrite_dsgl ? \
+	T4_MAX_FR_DSGL_DEPTH : T4_MAX_FR_IMMD_DEPTH)
 
 /* iwc_qp.c */
 extern int iwc_create_qp(struct rdk_qp *, struct rdk_qp_init_attr *);

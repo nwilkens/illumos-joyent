@@ -115,7 +115,12 @@ iwc_create_qp(struct rdk_qp *rqp, struct rdk_qp_init_attr *init)
 	wq->sq.flush_cidx = -1;
 	wq->rq.msn = 1;
 	sqbytes = P2ROUNDUP((size_t)sqsize * T4_SQ_NUM_BYTES +
-	    spg * T4_EQ_ENTRY_SIZE + 128, PAGESIZE);
+	    spg * T4_EQ_ENTRY_SIZE + 128, 64);
+	if (iwc->iwc_info.tri_vres.trv_memwrite_dsgl) {
+		qp->qp_pbl_off = sqbytes;
+		sqbytes += (size_t)sqsize * T4_MAX_FR_DSGL;
+	}
+	sqbytes = P2ROUNDUP(sqbytes, PAGESIZE);
 	rqbytes = P2ROUNDUP((size_t)rqsize * T4_RQ_NUM_BYTES +
 	    spg * T4_EQ_ENTRY_SIZE, PAGESIZE);
 
@@ -565,18 +570,20 @@ iwc_build_read(union t4_wr *wqe, const struct rdk_send_wr *wr, uint8_t *len16)
 
 /* A fast registration with the page list inline in the work request. */
 static int
-iwc_build_memreg(t4_sq_t *sq, union t4_wr *wqe, const struct rdk_send_wr *wr,
+iwc_build_memreg(iwc_qp_t *qp, union t4_wr *wqe, const struct rdk_send_wr *wr,
     uint8_t *len16)
 {
 	const struct rdk_reg_wr *rw = RDK_REG_WR(wr);
+	t4_sq_t *sq = &qp->qp_wq.sq;
 	iwc_mr_t *mr = (iwc_mr_t *)rw->mr;
 	struct fw_ri_immd *imdp;
+	struct fw_ri_dsgl *sglp;
 	uint64_t *p, *qe = (uint64_t *)&sq->queue[sq->size];
 	uint32_t pbllen, i;
 	int rem;
 
 	if (mr == NULL || mr->mr_npages == 0 || mr->mr_npages > mr->mr_max ||
-	    mr->mr_npages > T4_MAX_FR_IMMD_DEPTH ||
+	    mr->mr_npages > IWC_FR_DEPTH(qp->qp_iwc) ||
 	    !ISP2(mr->mr_rdk.page_size) || mr->mr_rdk.page_size < 4096 ||
 	    (rw->key >> 8) != (mr->mr_stag >> 8))
 		return (EINVAL);
@@ -590,6 +597,29 @@ iwc_build_memreg(t4_sq_t *sq, union t4_wr *wqe, const struct rdk_send_wr *wr,
 	wqe->fr.stag = BE_32(rw->key);
 	wqe->fr.va_hi = BE_32((uint32_t)(mr->mr_rdk.iova >> 32));
 	wqe->fr.va_lo_fbo = BE_32((uint32_t)mr->mr_rdk.iova);
+
+	if (pbllen > T4_MAX_FR_IMMD) {
+		/* The chip reads the list from this slot's area. */
+		const size_t off = qp->qp_pbl_off +
+		    (size_t)sq->pidx * T4_MAX_FR_DSGL;
+
+		if (qp->qp_pbl_off == 0 || pbllen > T4_MAX_FR_DSGL)
+			return (EINVAL);
+		p = (uint64_t *)(qp->qp_sqmem->trd_va + off);
+		for (i = 0; i < mr->mr_npages; i++)
+			p[i] = BE_64(mr->mr_pages[i]);
+		for (; i < pbllen / sizeof (uint64_t); i++)
+			p[i] = 0;
+		sglp = (struct fw_ri_dsgl *)(&wqe->fr + 1);
+		sglp->op = FW_RI_DATA_DSGL;
+		sglp->r1 = 0;
+		sglp->nsge = BE_16(1);
+		sglp->addr0 = BE_64(qp->qp_sqmem->trd_pa + off);
+		sglp->len0 = BE_32(pbllen);
+		*len16 = (uint8_t)howmany(sizeof (wqe->fr) + sizeof (*sglp),
+		    16);
+		return (0);
+	}
 
 	imdp = (struct fw_ri_immd *)(&wqe->fr + 1);
 	imdp->op = FW_RI_DATA_IMMD;
@@ -746,7 +776,7 @@ iwc_post_send(struct rdk_qp *rqp, const struct rdk_send_wr *wr,
 		case RDK_WR_REG_MR:
 			fwop = FW_RI_FR_NSMR_WR;
 			swsqe->opcode = FW_RI_FAST_REGISTER;
-			ret = iwc_build_memreg(&wq->sq, wqe, wr, &len16);
+			ret = iwc_build_memreg(qp, wqe, wr, &len16);
 			break;
 		case RDK_WR_LOCAL_INV:
 			if ((wr->send_flags & RDK_SEND_FENCE) != 0)

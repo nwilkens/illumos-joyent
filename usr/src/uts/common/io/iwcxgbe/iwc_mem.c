@@ -247,7 +247,7 @@ iwc_alloc_mr(struct rdk_pd *rpd, enum rdk_mr_type type, uint32_t max,
 	int ret;
 
 	if (type != RDK_MR_TYPE_MEM_REG || max == 0 ||
-	    max > T4_MAX_FR_IMMD_DEPTH)
+	    max > IWC_FR_DEPTH(iwc))
 		return (EINVAL);
 	if (iwc->iwc_fatal)
 		return (EIO);

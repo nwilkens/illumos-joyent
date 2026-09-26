@@ -73,6 +73,9 @@ extern "C" {
 #define	T4_MAX_FR_IMMD	((T4_SQ_NUM_BYTES - sizeof (struct fw_ri_fr_nsmr_wr) - \
 	sizeof (struct fw_ri_immd)) & ~31UL)
 #define	T4_MAX_FR_IMMD_DEPTH	(T4_MAX_FR_IMMD / sizeof (uint64_t))
+/* A page list the chip reads from host memory (Linux's limit). */
+#define	T4_MAX_FR_DSGL		1024
+#define	T4_MAX_FR_DSGL_DEPTH	(T4_MAX_FR_DSGL / sizeof (uint64_t))
 
 typedef struct t4_status_page {
 	uint32_t	rsvd1;		/* flit 0: hardware */

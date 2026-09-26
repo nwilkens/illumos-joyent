@@ -144,7 +144,7 @@ iwc_query_device(struct rdk_device *rdev, struct rdk_device_attr *a)
 	a->max_pd = IWC_MAX_PD - 1;
 	a->max_qp_rd_atom = (int)MIN(vr->trv_max_ordird_qp, IWC_MAX_ORDIRD);
 	a->max_qp_init_rd_atom = a->max_qp_rd_atom;
-	a->max_fast_reg_page_list_len = T4_MAX_FR_IMMD_DEPTH;
+	a->max_fast_reg_page_list_len = IWC_FR_DEPTH(iwc);
 	return (0);
 }
 
