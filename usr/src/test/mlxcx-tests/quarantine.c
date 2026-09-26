@@ -36,6 +36,33 @@ stub_sleep_hook(clock_t deadline)
 }
 
 void mlxcx_dma_quarantine(mlxcx_t *, mlxcx_dma_buffer_t *);
+void mlxcx_wq_rele_dma(mlxcx_t *, mlxcx_work_queue_t *);
+
+/* Firmware that will not stop a queue. */
+static uint_t destroys;
+
+static boolean_t
+stop_cmd(mlxcx_t *mlxp, mlxcx_work_queue_t *wq)
+{
+	(void) mlxp; (void) wq;
+	return (B_FALSE);
+}
+
+/* The real DESTROY_RQ and DESTROY_SQ required a stopped queue. */
+static boolean_t
+destroy_cmd(mlxcx_t *mlxp, mlxcx_work_queue_t *wq)
+{
+	(void) mlxp;
+	destroys++;
+	if (wq->mlwq_state & MLXCX_WQ_STARTED)
+		stub_fail("kernel panic: destroy of a queue that did not stop");
+	return (B_TRUE);
+}
+
+#define	mlxcx_cmd_stop_rq	stop_cmd
+#define	mlxcx_cmd_stop_sq	stop_cmd
+#define	mlxcx_cmd_destroy_rq	destroy_cmd
+#define	mlxcx_cmd_destroy_sq	destroy_cmd
 
 #include "mlxcx_quarantine_body.h"
 
@@ -168,11 +195,54 @@ leak(void)
 	hw_writes();
 }
 
+/* The queue did not stop: it must not be destroyed or freed. */
+static void
+stuck(uint_t type)
+{
+	mlxcx_work_queue_t wq;
+	mlxcx_completion_queue_t cq;
+
+	memset(&wq, 0, sizeof (wq));
+	memset(&cq, 0, sizeof (cq));
+	setup();
+	list_create(&mlx.mlx_wqs, sizeof (mlxcx_work_queue_t),
+	    offsetof(mlxcx_work_queue_t, mlwq_entry));
+	list_insert_tail(&mlx.mlx_wqs, &wq);
+	mutex_init(&wq.mlwq_mtx, NULL, MUTEX_DRIVER, NULL);
+	mutex_init(&cq.mlcq_mtx, NULL, MUTEX_DRIVER, NULL);
+	wq.mlwq_cq = &cq;
+	cq.mlcq_wq = &wq;
+	wq.mlwq_type = type;
+	queue_dma(&wq.mlwq_dma);
+	queue_dma(&wq.mlwq_doorbell_dma);
+	hw_owns(&wq.mlwq_dma);
+	hw_owns(&wq.mlwq_doorbell_dma);
+	wq.mlwq_state = MLXCX_WQ_ALLOC | MLXCX_WQ_CREATED | MLXCX_WQ_STARTED;
+	mlxcx_wq_teardown(&mlx, &wq);
+	hw_writes();
+	if (destroys != 0)
+		stub_fail("destroyed a queue that did not stop");
+	after_teardown_hca();
+}
+
+static void
+stuck_rq(void)
+{
+	stuck(MLXCX_WQ_TYPE_RECVQ);
+}
+
+static void
+stuck_sq(void)
+{
+	stuck(MLXCX_WQ_TYPE_SENDQ);
+}
+
 static const char *const names[] = {
-	"failed-wq", "failed-cq", "failed-eq", "destroyed", "leak", NULL
+	"failed-wq", "failed-cq", "failed-eq", "destroyed", "leak",
+	"stuck-rq", "stuck-sq", NULL
 };
 static void (*const funcs[])(void) = {
-	failed_wq, failed_cq, failed_eq, destroyed, leak
+	failed_wq, failed_cq, failed_eq, destroyed, leak, stuck_rq, stuck_sq
 };
 
 int

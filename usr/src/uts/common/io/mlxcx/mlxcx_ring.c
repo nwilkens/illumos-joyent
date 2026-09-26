@@ -219,12 +219,19 @@ mlxcx_wq_teardown(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 			mlxcx_warn(mlxp, "failed to stop "
 			    "send queue num %x", mlwq->mlwq_num);
 		}
-		if (mlwq->mlwq_type == MLXCX_WQ_TYPE_RECVQ &&
+		/*
+		 * A queue that did not stop may still be live, and cannot be
+		 * destroyed. mlxcx_wq_rele_dma() keeps its memory until
+		 * TEARDOWN_HCA.
+		 */
+		if (mlwq->mlwq_state & MLXCX_WQ_STARTED) {
+			mlxcx_warn(mlxp, "not destroying work queue num %x, "
+			    "which did not stop", mlwq->mlwq_num);
+		} else if (mlwq->mlwq_type == MLXCX_WQ_TYPE_RECVQ &&
 		    !mlxcx_cmd_destroy_rq(mlxp, mlwq)) {
 			mlxcx_warn(mlxp, "failed to destroy "
 			    "recv queue num %x", mlwq->mlwq_num);
-		}
-		if (mlwq->mlwq_type == MLXCX_WQ_TYPE_SENDQ &&
+		} else if (mlwq->mlwq_type == MLXCX_WQ_TYPE_SENDQ &&
 		    !mlxcx_cmd_destroy_sq(mlxp, mlwq)) {
 			mlxcx_warn(mlxp, "failed to destroy "
 			    "send queue num %x", mlwq->mlwq_num);

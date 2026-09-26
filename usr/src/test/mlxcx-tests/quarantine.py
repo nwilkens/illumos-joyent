@@ -6,7 +6,8 @@ from c_test import (TESTDIR, CTestFailure, function, mlxcx_types,
                     typedef)
 
 
-NAMES = ("failed-wq", "failed-cq", "failed-eq", "destroyed", "leak")
+NAMES = ("failed-wq", "failed-cq", "failed-eq", "destroyed", "leak",
+         "stuck-rq", "stuck-sq")
 
 
 def main():
@@ -15,7 +16,8 @@ def main():
     header = src / "mlxcx.h"
     types = "\n".join(typedef(header, name) for name in (
         "mlxcx_eventq_state_t", "mlxcx_completionq_state_t",
-        "mlxcx_workq_state_t", "mlxcx_dma_quarantine_t"))
+        "mlxcx_workq_state_t", "mlxcx_workq_type_t",
+        "mlxcx_dma_quarantine_t"))
     helpers = "".join(optional_function(src / "mlxcx.c", name) for name in (
         "mlxcx_dma_quarantine", "mlxcx_dma_quarantine_free",
         "mlxcx_dma_quarantine_fini"))
@@ -27,6 +29,7 @@ def main():
         helpers,
         function(src / "mlxcx_ring.c", "mlxcx_wq_rele_dma"),
         function(src / "mlxcx_ring.c", "mlxcx_cq_rele_dma"),
+        function(src / "mlxcx_ring.c", "mlxcx_wq_teardown"),
         function(src / "mlxcx.c", "mlxcx_eq_rele_dma"),
     ])
     try:

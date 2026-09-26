@@ -11,8 +11,9 @@ not follow values across calls; the runtime checks cover the call chains
 that matter. Queue geometry is left out because attach checks it.
 
 A *_DESTROYED state bit is set only when firmware accepts a DESTROY command,
-so it is device-controlled too. No VERIFY or ASSERT anywhere in the driver
-may require it to be set.
+and *_STARTED is cleared only when it accepts a stop, so both are
+device-controlled too. No VERIFY or ASSERT anywhere in the driver may require
+a DESTROYED bit, and no destroy function may assert STARTED is clear.
 """
 
 import re
@@ -142,14 +143,17 @@ def scan_lifecycle(path):
     found = []
     for name, start, body in functions(text):
         clean = strip(body)
-        for check in re.finditer(r"\b(VERIFY|ASSERT)\s*\(", clean):
+        for check in re.finditer(r"\b(VERIFY0?|ASSERT0?)\s*\(", clean):
             args = call_args(clean, check.end() - 1)
-            if "_DESTROYED" in args and "!" not in args:
+            negated = check.group(1).endswith("0") or "!" in args
+            started = (negated and "destroy" in name and
+                       "_STARTED" in args)
+            if started or ("_DESTROYED" in args and not negated):
                 line = text.count("\n", 0, start) + clean.count(
                     "\n", 0, check.start()) + 1
                 found.append(f"{path.name}:{line}: {name}: "
                              f"{check.group(1)}({' '.join(args.split())}) "
-                             "needs firmware to accept a DESTROY")
+                             "needs firmware to accept a command")
     return found
 
 

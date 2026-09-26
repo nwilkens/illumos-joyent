@@ -2931,7 +2931,9 @@ mlxcx_cmd_destroy_rq(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 	ASSERT(mutex_owned(&mlwq->mlwq_mtx));
 	VERIFY(mlwq->mlwq_state & MLXCX_WQ_ALLOC);
 	VERIFY(mlwq->mlwq_state & MLXCX_WQ_CREATED);
-	VERIFY0(mlwq->mlwq_state & MLXCX_WQ_STARTED);
+	/* Only a successful stop clears STARTED. */
+	if (mlwq->mlwq_state & MLXCX_WQ_STARTED)
+		return (B_FALSE);
 
 	mlxcx_cmd_init(mlxp, &cmd);
 	mlxcx_cmd_in_header_init(&cmd, &in.mlxi_destroy_rq_head,
@@ -3816,7 +3818,9 @@ mlxcx_cmd_destroy_sq(mlxcx_t *mlxp, mlxcx_work_queue_t *mlwq)
 	ASSERT(mutex_owned(&mlwq->mlwq_mtx));
 	VERIFY(mlwq->mlwq_state & MLXCX_WQ_ALLOC);
 	VERIFY(mlwq->mlwq_state & MLXCX_WQ_CREATED);
-	VERIFY0(mlwq->mlwq_state & MLXCX_WQ_STARTED);
+	/* Only a successful stop clears STARTED. */
+	if (mlwq->mlwq_state & MLXCX_WQ_STARTED)
+		return (B_FALSE);
 
 	mlxcx_cmd_init(mlxp, &cmd);
 	mlxcx_cmd_in_header_init(&cmd, &in.mlxi_destroy_sq_head,

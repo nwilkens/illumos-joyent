@@ -32,8 +32,17 @@ typedef struct mlxcx_event_queue {
 	void			*mleq_ent;
 } mlxcx_event_queue_t;
 
-/* Just enough of the work and completion queues for their DMA release. */
+/* Just enough of the work and completion queues for their teardown. */
+typedef struct mlxcx_completion_queue mlxcx_completion_queue_t;
+
 typedef struct mlxcx_work_queue {
+	kmutex_t		mlwq_mtx;
+	list_node_t		mlwq_entry;
+	uint_t			mlwq_type;
+	uint_t			mlwq_num;
+	mlxcx_completion_queue_t *mlwq_cq;
+	void			*mlwq_bufs;
+	void			*mlwq_foreign_bufs;
 	uint_t			mlwq_state;
 	mlxcx_dma_buffer_t	mlwq_dma;
 	mlxcx_dma_buffer_t	mlwq_doorbell_dma;
@@ -41,13 +50,15 @@ typedef struct mlxcx_work_queue {
 	void			*mlwq_doorbell;
 } mlxcx_work_queue_t;
 
-typedef struct mlxcx_completion_queue {
+struct mlxcx_completion_queue {
+	kmutex_t		mlcq_mtx;
+	mlxcx_work_queue_t	*mlcq_wq;
 	uint_t			mlcq_state;
 	mlxcx_dma_buffer_t	mlcq_dma;
 	mlxcx_dma_buffer_t	mlcq_doorbell_dma;
 	void			*mlcq_ent;
 	void			*mlcq_doorbell;
-} mlxcx_completion_queue_t;
+};
 
 struct mlxcx_port {
 	kmutex_t		mlp_mtx;
@@ -83,6 +94,7 @@ struct mlxcx {
 	mlxcx_port_t		*mlx_ports;
 	kmutex_t		mlx_quarantine_mtx;
 	list_t			mlx_quarantine;
+	list_t			mlx_wqs;
 };
 
 #ifdef DEBUG
