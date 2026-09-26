@@ -339,15 +339,33 @@ extern int iwc_qp_close(iwc_qp_t *, iwc_ep_t *);
 extern void iwc_qp_error(iwc_qp_t *, iwc_ep_t *);
 extern void iwc_qp_async(iwc_t *, const t4_cqe_t *);
 
-/* iwc_cm.c */
-extern const struct rdk_iw_cm_ops iwc_iw_ops;
-extern void iwc_cpl(void *, t4_rdma_cpl_t *);
-extern void iwc_cm_task(void *);
+/* iwc_ep.c */
+extern iwc_ep_t *iwc_ep_alloc(iwc_t *, iwc_dev_t *);
 extern void iwc_ep_hold(iwc_ep_t *);
 extern void iwc_ep_rele(iwc_ep_t *);
+extern void iwc_ep_deadline(iwc_ep_t *, uint32_t);
+extern int iwc_cpl_errno(uint_t);
+extern uint32_t iwc_path_mtu(iwc_ep_t *, uint32_t);
+extern void iwc_tcp_opts(iwc_ep_t *, uint32_t, t4_rdma_tcp_opts_t *);
+extern void iwc_set_emss(iwc_ep_t *, uint16_t);
+extern int iwc_flowc(iwc_ep_t *);
+extern int iwc_send_mpa(iwc_ep_t *, boolean_t, uint8_t, const void *,
+    uint16_t);
+extern void iwc_ep_event(iwc_ep_t *, enum rdk_iw_event_type, int,
+    const void *, uint16_t);
+extern void iwc_ep_release(iwc_ep_t *, int);
+extern void iwc_ep_abort_locked(iwc_ep_t *, int);
 extern void iwc_ep_abort(iwc_ep_t *, int);
+extern void iwc_ep_close(iwc_ep_t *);
+
+/* iwc_cm.c */
+extern void iwc_cpl(void *, t4_rdma_cpl_t *);
+extern void iwc_cm_task(void *);
 extern void iwc_cm_tick(void *);
 extern void iwc_cm_fini(iwc_t *);
+
+/* iwc_cm_ops.c */
+extern const struct rdk_iw_cm_ops iwc_iw_ops;
 
 #ifdef __cplusplus
 }

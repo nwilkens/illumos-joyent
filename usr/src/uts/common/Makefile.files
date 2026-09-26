@@ -2130,7 +2130,8 @@ IRDMA_CORE_OBJS = ctrl.o hmc.o pble.o uk.o puda.o uda.o ws.o icrdma_hw.o
 #
 #	rdmak: the kernel RDMA verbs framework
 #
-IWCXGBE_OBJS =	iwc.o iwc_cm.o iwc_cq.o iwc_mem.o iwc_mpa.o iwc_qp.o
+IWCXGBE_OBJS =	iwc.o iwc_cm.o iwc_cm_ops.o iwc_cq.o iwc_ep.o iwc_mem.o \
+		iwc_mpa.o iwc_qp.o
 
 RDMAK_OBJS =	rdk_device.o rdk_verbs.o rdk_cq.o rdk_cm.o rdk_cm_iw.o \
 		rdk_cm_addr.o
