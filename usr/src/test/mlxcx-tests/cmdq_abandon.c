@@ -127,7 +127,7 @@ all_abandoned(void)
 	timeout_one();
 	timeout_one();
 	timeout_one();
-	model_schedule(stub_now + 500, EV_CALL, 0, 0, give_back_first);
+	model_schedule(stub_now + 50, EV_CALL, 0, 0, give_back_first);
 	if (!command())
 		stub_fail("command after a slot came back failed");
 	if (last_slot != 0)

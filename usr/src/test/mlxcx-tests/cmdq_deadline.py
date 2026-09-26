@@ -4,7 +4,7 @@
 import cmdq
 
 
-NAMES = ("event-hang", "lost-event", "slot-wait")
+NAMES = ("event-hang", "lost-event", "slot-wait", "dead-firmware")
 
 if __name__ == "__main__":
     cmdq.run(__doc__, "cmdq_deadline.c", NAMES)

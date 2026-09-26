@@ -40,7 +40,7 @@ device writes to each of them, so freeing one it holds fails the test.
 | `cmdq_geometry.py` | Attach refuses a queue size and stride that do not fit the 4 KiB queue page. |
 | `cmdq_completion.py` | A completion event for an idle, out-of-range, still-owned, wrong-token or already finished slot is counted and ignored. |
 | `cmdq_abandon.py` | A timed-out command keeps its slot, token and mailboxes until hardware returns the entry with the right token; detach leaks them if it never does. |
-| `cmdq_deadline.py` | In event mode a command gives up at its deadline when firmware never answers or no slot comes free, and recovers when the completion event is lost. |
+| `cmdq_deadline.py` | In event mode a command gives up at its deadline when firmware never answers or no slot comes free, and recovers when the completion event is lost. Once hardware holds every usable slot past its timeout, new commands fail within a rescan period. |
 | `cmdq_pageslot.py` | MANAGE_PAGES has the last slot to itself and completes behind a full queue; other commands never take it; a one-slot queue is refused; page requests do not share the link-state taskq. |
 | `cmdq_return_pages.py` | RETURN_PAGES refuses a returned count above the request, including one with the sign bit set, and a request above the page limit. |
 | `pages_return.py` | Unknown and repeated returned PAs are counted and skipped in both the request and teardown paths; teardown stops when hardware returns nothing we know; a reclaim request with no pages given does not assert. |

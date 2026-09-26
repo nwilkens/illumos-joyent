@@ -60,6 +60,12 @@ command(void)
 	return (mlxcx_cmd_return_pages(model_mlxp, NREQ, pas, &nret));
 }
 
+static boolean_t
+command_other(void)
+{
+	return (mlxcx_cmd_enable_hca(model_mlxp));
+}
+
 /* Firmware never answers; the caller gets an error in bounded time. */
 static void
 event_hang(void)
@@ -118,11 +124,36 @@ slot_wait(void)
 		stub_fail("waited more than an hour for a slot");
 }
 
+/*
+ * Hardware has kept every slot past its timeout. Later commands, such as the
+ * many that detach sends, must fail quickly instead of each waiting out a
+ * full timeout for a slot.
+ */
+static void
+dead_firmware(void)
+{
+	clock_t start;
+
+	model_cmd_low = (2 << 4) | 6;
+	model_attach(B_TRUE);
+	hang = B_TRUE;
+	for (int i = 0; i < 3; i++)
+		(void) command_other();
+	for (int i = 0; i < 10; i++) {
+		start = stub_now;
+		if (command_other())
+			stub_fail("command succeeded with every slot held");
+		if (stub_now - start > 5 * 100)
+			stub_fail("waited %ld ticks for a slot hardware holds",
+			    (long)(stub_now - start));
+	}
+}
+
 static const char *const names[] = {
-	"event-hang", "lost-event", "slot-wait", NULL
+	"event-hang", "lost-event", "slot-wait", "dead-firmware", NULL
 };
 static void (*const funcs[])(void) = {
-	event_hang, lost_event, slot_wait
+	event_hang, lost_event, slot_wait, dead_firmware
 };
 
 int

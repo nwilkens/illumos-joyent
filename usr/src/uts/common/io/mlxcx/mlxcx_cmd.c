@@ -906,18 +906,37 @@ mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq, mlxcx_cmd_op_t op,
     uint_t *slotp)
 {
 	uint_t slot;
-	uint32_t usable, page = 1U << (cmdq->mcmd_size - 1);
+	uint32_t usable, abandoned, page = 1U << (cmdq->mcmd_size - 1);
 	clock_t deadline = ddi_get_lbolt() + drv_usectohz(mlxcx_cmd_timeout);
+	clock_t stuck = 0;
 
-	usable = (op == MLXCX_OP_MANAGE_PAGES) ? page : ~page;
+	usable = (op == MLXCX_OP_MANAGE_PAGES) ? page : (page - 1);
 
 	mutex_enter(&cmdq->mcmd_lock);
 	for (;;) {
-		for (slot = 0; slot < cmdq->mcmd_size; slot++)
-			(void) mlxcx_cmd_reclaim(cmdq, slot);
+		abandoned = 0;
+		for (slot = 0; slot < cmdq->mcmd_size; slot++) {
+			if (!mlxcx_cmd_reclaim(cmdq, slot) &&
+			    cmdq->mcmd_abandoned[slot] != NULL)
+				abandoned |= 1U << slot;
+		}
 
 		if ((slot = ddi_ffs(cmdq->mcmd_mask & usable)) != 0)
 			break;
+
+		/*
+		 * If hardware has held every slot we may use for a whole
+		 * rescan period after they timed out, it is not answering.
+		 * Fail now rather than make each caller wait out the timeout.
+		 */
+		if (abandoned != usable) {
+			stuck = 0;
+		} else if (stuck == 0) {
+			stuck = ddi_get_lbolt() +
+			    drv_usectohz(mlxcx_cmd_rescan_delay);
+		} else if (ddi_get_lbolt() >= stuck) {
+			deadline = stuck;
+		}
 
 		if (ddi_get_lbolt() >= deadline) {
 			mutex_exit(&cmdq->mcmd_lock);
