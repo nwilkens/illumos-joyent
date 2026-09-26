@@ -110,6 +110,16 @@ t4_ofld_range(uint32_t start, uint32_t end, uint64_t limit, uint32_t align,
 	return (B_TRUE);
 }
 
+/*
+ * Firmware reports a region it does not have as end < start, or as 0 to
+ * 0xffffffff (a size that wraps to zero; a T62100 does this for OCQ).
+ */
+static boolean_t
+t4_ofld_optional(uint32_t start, uint32_t end)
+{
+	return (end < start || (start == 0 && end == UINT32_MAX));
+}
+
 static int
 t4_ofld_bad(struct adapter *sc, const char *what, uint32_t a, uint32_t b)
 {
@@ -231,11 +241,10 @@ t4_ofld_params(struct adapter *sc, t4_ofld_t *of)
 	p[5] = FW_PARAM_DEV(MAXIRD_ADAPTER);
 	if ((rc = t4_ofld_query(sc, 6, p, v)) != 0)
 		return (rc);
-	/* An empty on-chip queue region is reported as end < start. */
-	if (v[1] >= v[0] &&
+	if (!t4_ofld_optional(v[0], v[1]) &&
 	    !t4_ofld_range(v[0], v[1], 1ULL << 32, 1, &vr->trv_ocq))
 		return (t4_ofld_bad(sc, "ocq range", v[0], v[1]));
-	if (v[3] >= v[2] &&
+	if (!t4_ofld_optional(v[2], v[3]) &&
 	    !t4_ofld_range(v[2], v[3], 1ULL << 32, 1, &vr->trv_srq))
 		return (t4_ofld_bad(sc, "srq range", v[2], v[3]));
 	if (v[4] == 0 || v[4] > T4_OFLD_MAX_ORDIRD ||

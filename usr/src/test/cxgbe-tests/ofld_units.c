@@ -33,6 +33,12 @@ test_ranges(void)
 	CHECK(t4_ofld_range(0x100, 0x100, 0x101, 1, &r) && r.trr_size == 1);
 	CHECK(!t4_ofld_range(0, UINT16_MAX + 1U, UINT16_MAX + 1ULL, 1, &r));
 
+	/* How firmware says it has no OCQ or SRQ region. */
+	CHECK(t4_ofld_optional(0, UINT32_MAX));
+	CHECK(t4_ofld_optional(0x200, 0x1ff));
+	CHECK(!t4_ofld_optional(0, 0));
+	CHECK(!t4_ofld_optional(1, UINT32_MAX));
+
 	a.trr_start = 100; a.trr_size = 10;
 	b.trr_start = 110; b.trr_size = 5;
 	CHECK(!t4_ofld_overlap(&a, &b) && !t4_ofld_overlap(&b, &a));

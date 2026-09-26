@@ -53,6 +53,7 @@ def units_header():
         "#define T4_OFLD_STAT(of, f) ((of)->of_stats.f++)",
         function_source(T4NEX / "t4_ofld.c", "t4_ofld_range"),
         function_source(T4NEX / "t4_ofld.c", "t4_ofld_overlap"),
+        function_source(T4NEX / "t4_ofld.c", "t4_ofld_optional"),
         function_source(T4NEX / "t4_ofld_cpl.c", "t4_ofld_waiter_get"),
         function_source(T4NEX / "t4_ofld_cpl.c", "t4_ofld_waiter_find"),
         function_source(T4NEX / "t4_ofld_cpl.c", "t4_ofld_waiter_put"),
