@@ -577,7 +577,10 @@ enum rdk_poll_context {
 
 struct rdk_cq {
 	struct rdk_device	*device;
-	/* Neither handler may destroy the CQ: destroy waits for them. */
+	/*
+	 * Neither handler may destroy the CQ: destroy waits for them.
+	 * comp_handler runs in the provider's thread for the CQ's vector.
+	 */
 	rdk_comp_handler_t	comp_handler;
 	void			(*event_handler)(struct rdk_event *, void *);
 	void			*cq_context;
@@ -676,6 +679,12 @@ struct rdk_device_ops {
 	int	(*dma_alloc)(struct rdk_device *, size_t, rdk_dma_buf_t *);
 	void	(*dma_free)(struct rdk_device *, rdk_dma_buf_t *);
 
+	/*
+	 * Optional: call the CQ's comp_handler again soon from the context
+	 * of its completion vector.
+	 */
+	void	(*cq_resched)(struct rdk_cq *);
+
 	size_t	size_pd;
 	size_t	size_cq;
 	size_t	size_qp;
@@ -691,6 +700,8 @@ struct rdk_device {
 	const struct rdk_device_ops	*rd_ops;
 	uint32_t			rd_phys_port_cnt;
 	uint64_t			rd_node_guid;
+	/* A CQ's comp_vector is below this; 0 is taken as 1. */
+	uint32_t			rd_num_comp_vectors;
 
 	/* Set by the framework. */
 	struct rdk_device_attr		rd_attr;
