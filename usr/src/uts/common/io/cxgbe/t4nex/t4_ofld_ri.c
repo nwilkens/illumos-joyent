@@ -220,10 +220,10 @@ t4_ri_db(t4_ofld_t *of, uint32_t qid, boolean_t egress, t4_rdma_db_t *db)
 
 	if (t4_bar2_sge_qregs(sc, qid, egress ? T4_BAR2_QTYPE_EGRESS :
 	    T4_BAR2_QTYPE_INGRESS, 0, &off, &bqid) != 0)
-		return (ENXIO);
+		return (ERANGE);
 	if (ddi_dev_regsize(sc->dip, 2, &bar2) != DDI_SUCCESS ||
 	    off + SGE_UDB_WCDOORBELL + 64 > (uint64_t)bar2)
-		return (ENXIO);
+		return (ERANGE);
 	db->trdb_off = off;
 	db->trdb_qid = bqid;
 	return (0);
@@ -251,19 +251,21 @@ t4_ofld_cq_create(t4_ofld_t *of, const t4_rdma_cq_res_t *c, t4_rdma_db_t *db)
 	uint32_t gen;
 	int rc;
 
-	if ((rc = t4_ofld_gen(of, &gen)) != 0)
-		return (rc);
-	if (servicing_interrupt())
-		return (EWOULDBLOCK);
+	if (t4_ofld_gen(of, &gen) != 0 || servicing_interrupt())
+		return (ENXIO);
+	if ((ob = t4_ofld_dma_bind(of, c->trcq_mem, 0)) == NULL)
+		return (EFAULT);
 	if (c->trcq_size < T4_RI_MIN_IQ_SIZE ||
 	    c->trcq_size > T4_RI_MAX_IQ_SIZE || (c->trcq_size % 16) != 0 ||
-	    !t4_ri_id_ok(of, c->trcq_cqid))
-		return (EINVAL);
-	if ((rc = t4_ri_db(of, c->trcq_cqid, B_FALSE, db)) != 0)
+	    !t4_ri_id_ok(of, c->trcq_cqid) ||
+	    ob->ob_pub.trd_len < (size_t)c->trcq_size * T4_RI_ENTRY)
+		rc = EINVAL;
+	else
+		rc = t4_ri_db(of, c->trcq_cqid, B_FALSE, db);
+	if (rc != 0) {
+		t4_ofld_dma_release(of, ob, B_TRUE);
 		return (rc);
-	if ((ob = t4_ofld_dma_bind(of, c->trcq_mem,
-	    (size_t)c->trcq_size * T4_RI_ENTRY)) == NULL)
-		return (EINVAL);
+	}
 
 	ro = t4_ri_obj_new(c->trcq_cqid, gen);
 	ro->ro_mem[0] = ob;
@@ -271,7 +273,7 @@ t4_ofld_cq_create(t4_ofld_t *of, const t4_rdma_cq_res_t *c, t4_rdma_db_t *db)
 	if (!t4_ri_id_free(of, c->trcq_cqid)) {
 		mutex_exit(&of->of_ri_lock);
 		kmem_free(ro, sizeof (*ro));
-		t4_ofld_dma_unbind(of, ob);
+		t4_ofld_dma_release(of, ob, B_TRUE);
 		return (EINVAL);
 	}
 	t4_ri_id_set(of, c->trcq_cqid, B_TRUE);
@@ -406,25 +408,27 @@ t4_ofld_qp_create(t4_ofld_t *of, const t4_rdma_qp_res_t *q, t4_rdma_db_t *sdb,
 	uint32_t gen;
 	int rc;
 
-	if ((rc = t4_ofld_gen(of, &gen)) != 0)
-		return (rc);
-	if (servicing_interrupt())
-		return (EWOULDBLOCK);
+	if (t4_ofld_gen(of, &gen) != 0 || servicing_interrupt())
+		return (ENXIO);
+	if ((sob = t4_ofld_dma_bind(of, q->trqp_sq_mem, 0)) == NULL)
+		return (EFAULT);
+	if ((rob = t4_ofld_dma_bind(of, q->trqp_rq_mem, 0)) == NULL) {
+		t4_ofld_dma_unbind(of, sob);
+		return (EFAULT);
+	}
 	if (q->trqp_sqid == q->trqp_rqid ||
 	    q->trqp_sq_size <= spg || q->trqp_sq_size > T4_RI_MAX_SQ_SIZE ||
 	    q->trqp_rq_size <= spg || q->trqp_rq_size > T4_RI_MAX_RQ_SIZE ||
-	    !t4_ri_id_ok(of, q->trqp_sqid) || !t4_ri_id_ok(of, q->trqp_rqid))
-		return (EINVAL);
-	if ((rc = t4_ri_db(of, q->trqp_sqid, B_TRUE, sdb)) != 0 ||
-	    (rc = t4_ri_db(of, q->trqp_rqid, B_TRUE, rdb)) != 0)
+	    !t4_ri_id_ok(of, q->trqp_sqid) || !t4_ri_id_ok(of, q->trqp_rqid) ||
+	    sob->ob_pub.trd_len < (size_t)q->trqp_sq_size * T4_RI_ENTRY ||
+	    rob->ob_pub.trd_len < (size_t)q->trqp_rq_size * T4_RI_ENTRY)
+		rc = EINVAL;
+	else if ((rc = t4_ri_db(of, q->trqp_sqid, B_TRUE, sdb)) == 0)
+		rc = t4_ri_db(of, q->trqp_rqid, B_TRUE, rdb);
+	if (rc != 0) {
+		t4_ofld_dma_release(of, sob, B_TRUE);
+		t4_ofld_dma_release(of, rob, B_TRUE);
 		return (rc);
-	if ((sob = t4_ofld_dma_bind(of, q->trqp_sq_mem,
-	    (size_t)q->trqp_sq_size * T4_RI_ENTRY)) == NULL)
-		return (EINVAL);
-	if ((rob = t4_ofld_dma_bind(of, q->trqp_rq_mem,
-	    (size_t)q->trqp_rq_size * T4_RI_ENTRY)) == NULL) {
-		t4_ofld_dma_unbind(of, sob);
-		return (EINVAL);
 	}
 
 	ro = t4_ri_obj_new(q->trqp_sqid, gen);
@@ -442,8 +446,8 @@ t4_ofld_qp_create(t4_ofld_t *of, const t4_rdma_qp_res_t *q, t4_rdma_db_t *sdb,
 	    !t4_ri_id_free(of, q->trqp_rqid)) {
 		mutex_exit(&of->of_ri_lock);
 		kmem_free(ro, sizeof (*ro));
-		t4_ofld_dma_unbind(of, sob);
-		t4_ofld_dma_unbind(of, rob);
+		t4_ofld_dma_release(of, sob, B_TRUE);
+		t4_ofld_dma_release(of, rob, B_TRUE);
 		return (EINVAL);
 	}
 	scq->ro_refs++;

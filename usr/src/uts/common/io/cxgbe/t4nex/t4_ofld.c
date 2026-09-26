@@ -493,6 +493,7 @@ t4_ofld_start(struct adapter *sc)
 		return;
 
 	/* The interrupt priority is known only now. */
+	of->of_peer.trp_hdr.trp_intr_pri = sc->intr_pri;
 	mutex_init(&of->of_cfg_lock, NULL, MUTEX_DRIVER, NULL);
 	mutex_init(&of->of_lock, NULL, MUTEX_DRIVER,
 	    DDI_INTR_PRI(sc->intr_pri));

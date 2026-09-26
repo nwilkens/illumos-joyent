@@ -176,6 +176,7 @@ typedef struct t4_rdma_tcp_opts {
 	boolean_t	trt_ecn;
 	uint8_t		trt_ulp_mode;	/* ULP_MODE_NONE or ULP_MODE_TCPDDP */
 	uint8_t		trt_tos;
+	boolean_t	trt_p2p_iss;	/* iWARP peer-to-peer: ISS + 4 */
 } t4_rdma_tcp_opts_t;
 
 typedef struct t4_rdma_act_open {
@@ -218,9 +219,11 @@ typedef struct t4_rdma_dma {
 } t4_rdma_dma_t;
 
 /*
- * RDMA queues (FW_RI_RES_WR).  t4nex takes the memory from create on: the
- * child never frees it, and destroy frees it only once the firmware has let
- * go of the queue.  IDs come from the vres QP range, which the CQs share.
+ * RDMA queues (FW_RI_RES_WR).  Create takes the queue memory whatever it
+ * returns, except EFAULT (a buffer that is not the client's) and ENXIO (a
+ * stale client); the child never frees taken memory, and destroy frees it
+ * only once the firmware has let go of the queue.  IDs come from the vres
+ * QP range, which the CQs share.
  */
 typedef struct t4_rdma_cq_res {
 	uint32_t	trcq_cqid;
@@ -314,9 +317,11 @@ typedef struct t4_rdma_ops {
 	int	(*tro_ri_fini)(t4_rdma_peer_t *, uint32_t, uint32_t);
 } t4_rdma_ops_t;
 
+/* trp_intr_pri: the priority the child's callback locks need. */
 typedef struct t4_rdma_peer_hdr {
 	uint32_t		trp_version;
 	const t4_rdma_ops_t	*trp_ops;
+	uint_t			trp_intr_pri;
 } t4_rdma_peer_hdr_t;
 
 #ifdef __cplusplus

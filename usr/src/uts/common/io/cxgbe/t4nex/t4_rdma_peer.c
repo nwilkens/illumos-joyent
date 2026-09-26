@@ -476,7 +476,7 @@ t4_rdma_op_cq_create(t4_rdma_peer_t *peer, const t4_rdma_cq_res_t *c,
 		return (EINVAL);
 	req = *c;
 	if ((of = t4_rdma_op_enter(peer)) == NULL)
-		return (EIO);
+		return (ENXIO);
 	if ((rc = t4_ofld_cq_create(of, &req, &db)) == 0)
 		*dbp = db;
 	t4_rdma_op_exit(of);
@@ -509,7 +509,7 @@ t4_rdma_op_qp_create(t4_rdma_peer_t *peer, const t4_rdma_qp_res_t *q,
 		return (EINVAL);
 	req = *q;
 	if ((of = t4_rdma_op_enter(peer)) == NULL)
-		return (EIO);
+		return (ENXIO);
 	if ((rc = t4_ofld_qp_create(of, &req, &sdb, &rdb)) == 0) {
 		*sdbp = sdb;
 		*rdbp = rdb;

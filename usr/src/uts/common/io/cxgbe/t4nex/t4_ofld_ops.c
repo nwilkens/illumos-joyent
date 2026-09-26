@@ -148,12 +148,13 @@ t4_ofld_opt2(const t4_ofld_port_t *op, const t4_rdma_tcp_opts_t *o)
 }
 
 static uint32_t
-t4_ofld_isn(void)
+t4_ofld_isn(const t4_rdma_tcp_opts_t *o)
 {
 	uint32_t isn;
 
 	(void) random_get_pseudo_bytes((uint8_t *)&isn, sizeof (isn));
-	return ((isn & ~7U) - 1);
+	isn = (isn & ~7U) - 1;
+	return (o->trt_p2p_iss ? isn + 4 : isn);
 }
 
 int
@@ -349,7 +350,7 @@ t4_ofld_act_open(t4_ofld_t *of, const t4_rdma_act_open_t *a)
 		bcopy(&a->trao_faddr.s6_addr[0], &r6->peer_ip_hi, 8);
 		bcopy(&a->trao_faddr.s6_addr[8], &r6->peer_ip_lo, 8);
 		r6->opt0 = BE_64(opt0);
-		r6->rsvd = BE_32(t4_ofld_isn());
+		r6->rsvd = BE_32(t4_ofld_isn(&a->trao_opts));
 		r6->opt2 = BE_32(opt2);
 		r6->params = BE_64(params);
 	} else {
@@ -361,7 +362,7 @@ t4_ofld_act_open(t4_ofld_t *of, const t4_rdma_act_open_t *a)
 		bcopy(&a->trao_laddr.s6_addr[12], &r4->local_ip, 4);
 		bcopy(&a->trao_faddr.s6_addr[12], &r4->peer_ip, 4);
 		r4->opt0 = BE_64(opt0);
-		r4->rsvd = BE_32(t4_ofld_isn());
+		r4->rsvd = BE_32(t4_ofld_isn(&a->trao_opts));
 		r4->opt2 = BE_32(opt2);
 		r4->params = BE_64(params);
 	}
@@ -414,7 +415,7 @@ t4_ofld_accept(t4_ofld_t *of, const t4_rdma_accept_t *a)
 	    a->trac_tid));
 	rpl.opt0 = BE_64(t4_ofld_opt0(op, &a->trac_opts, a->trac_l2t));
 	rpl.opt2 = BE_32(t4_ofld_opt2(op, &a->trac_opts));
-	rpl.iss = BE_32(t4_ofld_isn());
+	rpl.iss = BE_32(t4_ofld_isn(&a->trac_opts));
 	rc = t4_ofld_wr_send(of, &op->op_ctrlq, &rpl,
 	    roundup(sizeof (rpl), 16));
 	if (rc == 0) {
