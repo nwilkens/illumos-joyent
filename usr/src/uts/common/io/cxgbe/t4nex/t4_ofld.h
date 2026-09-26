@@ -386,10 +386,16 @@ extern uint_t t4_intr_ofld(caddr_t, caddr_t);
 extern void t4_ofld_cpl_dispatch(t4_ofld_t *, t4_rdma_queue_t, uint8_t,
     mblk_t *);
 extern void t4_ofld_cq_notify(t4_ofld_t *, const uint32_t *, uint_t);
+
+/* t4_ofld_orphan.c */
 extern void t4_ofld_orphan_sweep(t4_ofld_t *, uint32_t);
+extern void t4_ofld_retry_arm_locked(t4_ofld_t *);
 extern void t4_ofld_retry_stop(t4_ofld_t *);
 extern void t4_ofld_orphan_unlisten_locked(t4_ofld_t *, t4_tid_ent_t *,
     uint32_t);
+extern void t4_ofld_orphan_abort_locked(t4_ofld_t *, t4_tid_ent_t *,
+    uint32_t);
+extern void t4_ofld_orphan_release_locked(t4_ofld_t *, uint8_t, uint32_t);
 extern int t4_ofld_waiter_get(t4_ofld_t *, uint64_t *);
 extern int t4_ofld_waiter_wait(t4_ofld_t *, uint64_t);
 extern void t4_ofld_waiter_put(t4_ofld_t *, uint64_t);
@@ -438,8 +444,11 @@ extern void t4_clip_put(t4_ofld_t *, const in6_addr_t *);
 extern boolean_t t4_clip_held(t4_ofld_t *, const in6_addr_t *);
 extern void t4_clip_reset(t4_ofld_t *);
 
-/* t4_ofld_ops.c */
+/* t4_rdma_peer.c */
 extern const t4_rdma_ops_t t4_rdma_ops;
+
+/* t4_ofld_ops.c */
+extern int t4_ofld_gen(t4_ofld_t *, uint32_t *);
 extern int t4_ofld_listen(t4_ofld_t *, const t4_rdma_listen_t *);
 extern int t4_ofld_unlisten(t4_ofld_t *, uint32_t);
 extern int t4_ofld_act_open(t4_ofld_t *, const t4_rdma_act_open_t *);
@@ -454,7 +463,13 @@ extern int t4_ofld_tx_data(t4_ofld_t *, uint32_t, const void *, size_t);
 extern int t4_ofld_rx_credits(t4_ofld_t *, uint32_t, uint32_t);
 extern void t4_ofld_stid_free(t4_ofld_t *, uint32_t);
 extern void t4_ofld_atid_free(t4_ofld_t *, uint32_t);
+extern int t4_ofld_set_tcb_field(t4_ofld_t *, uint32_t, uint16_t, uint64_t,
+    uint64_t);
 extern int t4_ofld_tpt_write(t4_ofld_t *, uint32_t, const void *, size_t);
+
+/* t4_ofld_dma.c */
+extern int t4_ofld_dma_alloc(t4_ofld_t *, size_t, size_t, t4_rdma_dma_t **);
+extern void t4_ofld_dma_free(t4_ofld_t *, t4_rdma_dma_t *, boolean_t);
 extern void t4_ofld_dma_fini(t4_ofld_t *, boolean_t);
 extern void t4_ofld_dma_close(t4_ofld_t *);
 

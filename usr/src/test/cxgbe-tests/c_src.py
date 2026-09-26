@@ -15,8 +15,10 @@ T4NEX = REPO / "usr/src/uts/common/io/cxgbe/t4nex"
 COMMON = REPO / "usr/src/uts/common/io/cxgbe/common"
 
 # The offload core, as opposed to the NIC code it sits beside.
-OFLD_FILES = ("t4_ofld.c", "t4_ofld_sge.c", "t4_ofld_cpl.c", "t4_ofld_ops.c",
-              "t4_ofld_test.c", "t4_tid.c", "t4_l2t.c", "t4_clip.c")
+OFLD_FILES = ("t4_ofld.c", "t4_ofld_sge.c", "t4_ofld_cpl.c",
+              "t4_ofld_orphan.c", "t4_ofld_ops.c", "t4_ofld_dma.c",
+              "t4_rdma_peer.c", "t4_ofld_test.c", "t4_tid.c", "t4_l2t.c",
+              "t4_clip.c")
 
 KEYWORDS = {"if", "for", "while", "switch", "return", "sizeof", "do",
             "case", "else", "goto", "defined", "offsetof"}

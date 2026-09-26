@@ -21,7 +21,8 @@ UNPINNED = {"tro_open", "tro_close", "tro_dma_free", "tro_reset",
 
 def main():
     header = (T4NEX / "t4_rdma.h").read_text(encoding="utf-8")
-    ops = (T4NEX / "t4_ofld_ops.c").read_text(encoding="utf-8")
+    ops = (T4NEX / "t4_ofld_ops.c").read_text(encoding="utf-8") + \
+        (T4NEX / "t4_rdma_peer.c").read_text(encoding="utf-8")
     vector = re.search(r"typedef struct t4_rdma_ops \{(.*?)\} t4_rdma_ops_t;",
                        header, re.DOTALL).group(1)
     members = re.findall(r"\(\*(tro_\w+)\)", vector)
