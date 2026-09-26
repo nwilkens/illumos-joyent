@@ -1680,6 +1680,8 @@ mlxcx_cmd_alloc_uar(mlxcx_t *mlxp, mlxcx_uar_t *mlup)
 	mlxcx_cmd_alloc_uar_out_t out;
 	boolean_t ret;
 	size_t i;
+	uint32_t num;
+	uint64_t base;
 
 	bzero(&in, sizeof (in));
 	bzero(&out, sizeof (out));
@@ -1695,10 +1697,22 @@ mlxcx_cmd_alloc_uar(mlxcx_t *mlxp, mlxcx_uar_t *mlup)
 
 	ret = mlxcx_cmd_evaluate(mlxp, &cmd);
 	if (ret) {
+		num = from_be24(out.mlxo_alloc_uar_uar);
+		base = (uint64_t)num * MLXCX_HW_PAGE_SIZE;
+		/* UAR 0 would put our doorbells on the init segment. */
+		if (num == 0 ||
+		    base + MLXCX_HW_PAGE_SIZE > (uint64_t)mlxp->mlx_regs_size ||
+		    base + MLXCX_HW_PAGE_SIZE > UINT_MAX) {
+			mlxcx_warn(mlxp, "hardware allocated UAR %u, which is "
+			    "outside the %lld byte register space", num,
+			    (longlong_t)mlxp->mlx_regs_size);
+			ret = B_FALSE;
+		}
+	}
+	if (ret) {
 		mlup->mlu_allocated = B_TRUE;
-		mlup->mlu_num = from_be24(out.mlxo_alloc_uar_uar);
-		VERIFY3U(mlup->mlu_num, >, 0);
-		mlup->mlu_base = mlup->mlu_num * MLXCX_HW_PAGE_SIZE;
+		mlup->mlu_num = num;
+		mlup->mlu_base = (uint_t)base;
 
 		for (i = 0; i < MLXCX_BF_PER_UAR; ++i) {
 			mlup->mlu_bf[i].mbf_even = mlup->mlu_base +

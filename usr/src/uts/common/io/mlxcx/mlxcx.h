@@ -1151,6 +1151,7 @@ struct mlxcx {
 	ddi_acc_handle_t	mlx_cfg_handle;
 	ddi_acc_handle_t	mlx_regs_handle;
 	caddr_t			mlx_regs_base;
+	off_t			mlx_regs_size;
 
 	/*
 	 * MAC handle

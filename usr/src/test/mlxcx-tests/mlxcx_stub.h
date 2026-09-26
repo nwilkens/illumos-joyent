@@ -584,7 +584,40 @@ ddi_ffs(long mask)
 typedef void *dev_info_t;
 typedef void *ddi_acc_handle_t;
 typedef void *ddi_dma_handle_t;
-typedef struct { int unused; } ddi_device_acc_attr_t;
+typedef struct {
+	int	devacc_attr_version;
+	int	devacc_attr_endian_flags;
+	int	devacc_attr_dataorder;
+	int	devacc_attr_access;
+} ddi_device_acc_attr_t;
+
+#define	DDI_DEVICE_ATTR_V0	1
+#define	DDI_STRUCTURE_BE_ACC	2
+#define	DDI_STRICTORDER_ACC	0
+#define	DDI_FLAGERR_ACC		2
+#define	DDI_DEFAULT_ACC		1
+#define	DDI_FM_ACC_ERR_CAP(c)	(((c) & 0x2) != 0)
+#define	longlong_t		long long
+
+static off_t stub_regsize = 32 * 1024 * 1024;
+
+static int
+ddi_dev_regsize(dev_info_t *dip, int rnumber, off_t *result)
+{
+	(void) dip; (void) rnumber;
+	*result = stub_regsize;
+	return (DDI_SUCCESS);
+}
+
+static int
+ddi_regs_map_setup(dev_info_t *dip, int rnumber, caddr_t *addrp, off_t off,
+    off_t len, ddi_device_acc_attr_t *acc, ddi_acc_handle_t *handlep)
+{
+	(void) dip; (void) rnumber; (void) off; (void) len; (void) acc;
+	*addrp = (caddr_t)0x1000000;
+	*handlep = (ddi_acc_handle_t)addrp;
+	return (DDI_SUCCESS);
+}
 typedef struct { int unused; } ddi_dma_attr_t;
 typedef struct { void *tqe_func; } taskq_ent_t;
 

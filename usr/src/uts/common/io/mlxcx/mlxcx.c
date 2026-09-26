@@ -697,18 +697,22 @@ mlxcx_uar_put32(mlxcx_t *mlxp, mlxcx_uar_t *mlu, uintptr_t off, uint32_t val)
 {
 	/*
 	 * The UAR is always inside the first BAR, which we mapped as
-	 * mlx_regs
+	 * mlx_regs. mlxcx_cmd_alloc_uar() checked that the whole UAR page is.
 	 */
-	uintptr_t addr = off + (uintptr_t)mlu->mlu_base +
-	    (uintptr_t)mlxp->mlx_regs_base;
+	uintptr_t addr;
+
+	ASSERT3U(off + sizeof (val), <=, MLXCX_HW_PAGE_SIZE);
+	addr = off + (uintptr_t)mlu->mlu_base + (uintptr_t)mlxp->mlx_regs_base;
 	ddi_put32(mlxp->mlx_regs_handle, (void *)addr, val);
 }
 
 void
 mlxcx_uar_put64(mlxcx_t *mlxp, mlxcx_uar_t *mlu, uintptr_t off, uint64_t val)
 {
-	uintptr_t addr = off + (uintptr_t)mlu->mlu_base +
-	    (uintptr_t)mlxp->mlx_regs_base;
+	uintptr_t addr;
+
+	ASSERT3U(off + sizeof (val), <=, MLXCX_HW_PAGE_SIZE);
+	addr = off + (uintptr_t)mlu->mlu_base + (uintptr_t)mlxp->mlx_regs_base;
 	ddi_put64(mlxp->mlx_regs_handle, (void *)addr, val);
 }
 
@@ -1304,6 +1308,7 @@ mlxcx_regs_map(mlxcx_t *mlxp)
 		mlxcx_warn(mlxp, "failed to map device registers: %d", ret);
 		return (B_FALSE);
 	}
+	mlxp->mlx_regs_size = memsize;
 
 	return (B_TRUE);
 }

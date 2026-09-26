@@ -17,6 +17,7 @@ TESTS = (
     "pages_return.py",
     "pages_request.py",
     "pages_give_timeout.py",
+    "cmdq_uar.py",
 )
 
 
