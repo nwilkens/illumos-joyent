@@ -51,6 +51,7 @@
 #include "common/t4_msg.h"
 #include "common/t4_regs.h"
 #include "common/t4_extra_regs.h"
+#include "t4_ofld.h"
 
 /*
  * Nexus driver for Chelsio Terminator Network Adapters (T4/T5/T6)
@@ -871,6 +872,8 @@ t4_devo_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		pi->xact_addr_filt = -1;
 	}
 
+	(void) t4_ofld_init(sc);
+
 	if ((rc = t4_cfg_intrs_queues(sc)) != 0) {
 		goto done; /* error message displayed already */
 	}
@@ -934,6 +937,8 @@ t4_devo_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		rc = DDI_FAILURE;
 		goto done;
 	}
+
+	t4_ofld_start(sc);
 
 	if (sc->intr_cap & DDI_INTR_FLAG_BLOCK) {
 		rc = ddi_intr_block_enable(sc->intr_handle, iaq->intr_count);
@@ -1000,6 +1005,9 @@ t4_devo_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	if (sc == NULL)
 		return (DDI_SUCCESS);
 
+	if (!t4_ofld_detach(sc))
+		return (DDI_FAILURE);
+
 	struct t4_intrs_queues *iaq = &sc->intr_queue_cfg;
 
 	if (sc->flags & TAF_INIT_DONE) {
@@ -1018,10 +1026,12 @@ t4_devo_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 				(void) ddi_intr_disable(sc->intr_handle[i]);
 		}
 
+		t4_ofld_fini(sc);
 		t4_free_evt_iqs(sc);
 
 		sc->flags &= ~TAF_INIT_DONE;
 	}
+	t4_ofld_fini(sc);
 
 	/* Safe to call no matter what */
 	if (sc->ufm_hdl != NULL) {
@@ -1160,6 +1170,13 @@ t4_bus_ctl(dev_info_t *dip, dev_info_t *rdip, ddi_ctl_enum_t op, void *arg,
 		return (DDI_SUCCESS);
 
 	case DDI_CTLOPS_INITCHILD:
+		if (t4_ofld_is_child(ddi_get_soft_state(t4_soft_state,
+		    ddi_get_instance(dip)), child)) {
+			ddi_set_name_addr(child, "0");
+			return (DDI_SUCCESS);
+		}
+		if (strcmp(ddi_node_name(child), T4_PORT_NAME) != 0)
+			return (DDI_NOT_WELL_FORMED);
 		pi = ddi_get_parent_data(child);
 		if (pi == NULL)
 			return (DDI_NOT_WELL_FORMED);
@@ -1216,6 +1233,11 @@ t4_bus_config(dev_info_t *dip, uint_t flags, ddi_bus_config_op_t op, void *arg,
 	if (op == BUS_CONFIG_ONE) {
 		uint_t dev_num;
 
+		if (t4_ofld_named(sc, (const char *)arg)) {
+			flags |= NDI_ONLINE_ATTACH;
+			return (ndi_busop_bus_config(dip, flags, op, arg, cdipp,
+			    0));
+		}
 		if (!t4_parse_devnum((const char *)arg, &dev_num)) {
 			return (NDI_FAILURE);
 		}
@@ -1258,6 +1280,8 @@ t4_bus_unconfig(dev_info_t *dip, uint_t flags, ddi_bus_config_op_t op,
 	if (op == BUS_UNCONFIG_ONE) {
 		uint_t dev_num;
 
+		if (t4_ofld_named(sc, (const char *)arg))
+			return (rc);
 		if (!t4_parse_devnum((const char *)arg, &dev_num)) {
 			return (NDI_FAILURE);
 		}
@@ -1708,11 +1732,10 @@ t4_partition_resources(struct adapter *sc)
 	sc->cfcsum = caps.cfcsum;
 
 	/* Disable unused offloads and features */
-	caps.toecaps = 0;
 	caps.iscsicaps = 0;
-	caps.rdmacaps = 0;
 	caps.fcoecaps = 0;
 	caps.cryptocaps = 0;
+	t4_ofld_caps(sc, &caps);
 
 	/* TODO: Disable VNIC cap for now */
 	caps.niccaps &= BE_16(~FW_CAPS_CONFIG_NIC_VM);
@@ -2123,6 +2146,10 @@ t4_init_driver_props(struct adapter *sc)
 	(void) ddi_prop_update_int(dev, dip, "write-combine",
 	    p->write_combine ? 1 : 0);
 
+	p->rdma_enable = prop_lookup_bool(sc, "rdma-enable", false);
+	(void) ddi_prop_update_int(dev, dip, "rdma-enable",
+	    p->rdma_enable ? 1 : 0);
+
 	p->t4_fw_install = prop_lookup_int(sc, "t4_fw_install", 1);
 	if (p->t4_fw_install != 0 && p->t4_fw_install != 2)
 		p->t4_fw_install = 1;
@@ -2220,6 +2247,31 @@ t4_cfg_intrs_queues(struct adapter *sc)
 	}
 
 	const uint_t port_count = sc->params.nports;
+	const struct pf_resources *pfres = &sc->params.pfres;
+
+	/*
+	 * Offload takes a vector block after the LAN vectors, plus two
+	 * ingress queues and three egress queues per port, one of which is a
+	 * control queue.  If the adapter cannot spare them, offload is off.
+	 */
+	uint_t rdma = 0, ofld_iqs = 0, ofld_eqs = 0, ofld_ctrl = 0;
+	if (sc->ofld != NULL) {
+		if (itype == DDI_INTR_TYPE_MSIX &&
+		    t4_ofld_vectors(sc, iaq->intr_count) &&
+		    pfres->niqflint > 1 + port_count * 3 &&
+		    pfres->neq > port_count * 5 &&
+		    pfres->nethctrl > port_count * 2) {
+			rdma = port_count * T4_OFLD_VECS_PER_PORT;
+			ofld_iqs = port_count * 2;
+			ofld_eqs = port_count * 3;
+			ofld_ctrl = port_count;
+		} else {
+			cxgb_printf(sc->dip, CE_NOTE, "!offload disabled: not "
+			    "enough interrupts or queues");
+			t4_ofld_fini(sc);
+		}
+	}
+	iaq->intr_count -= rdma;
 
 	iaq->intr_per_port = 0;
 	/* One IQ for the FWQ */
@@ -2242,7 +2294,13 @@ t4_cfg_intrs_queues(struct adapter *sc)
 		iaq->num_iqs += iaq->intr_per_port * port_count;
 	}
 
-	const struct pf_resources *pfres = &sc->params.pfres;
+	if (rdma != 0) {
+		VERIFY3U(iaq->intr_plan, ==, TIP_PER_PORT);
+		iaq->intr_rdma_first = 2 + iaq->intr_per_port * port_count;
+		iaq->intr_rdma = rdma;
+		iaq->intr_count = iaq->intr_rdma_first + rdma;
+	}
+
 	if (pfres->niqflint <= 1) {
 		/* We cannot achieve much with a single IQ */
 		cxgb_printf(sc->dip, CE_WARN,
@@ -2250,16 +2308,17 @@ t4_cfg_intrs_queues(struct adapter *sc)
 		return (DDI_FAILURE);
 	}
 
-	const uint_t port_iqs = pfres->niqflint - iaq->num_iqs;
+	const uint_t port_iqs = pfres->niqflint - iaq->num_iqs - ofld_iqs;
 	/*
 	 * Every RX queue needs an IQ capable of interrupts (for the receive
 	 * notifications) as well as an EQ (for posting the freelist entries to
 	 * the device.  Half of the total EQs are left for TXQs.
 	 */
-	const uint_t max_rxq = MIN(port_iqs, pfres->neq / 2);
+	const uint_t max_rxq = MIN(port_iqs, (pfres->neq - ofld_eqs) / 2);
 
 	/* Every TX queue needs an ethernet-capable EQ. */
-	const uint_t max_txq = MIN(pfres->nethctrl, pfres->neq / 2);
+	const uint_t max_txq = MIN(pfres->nethctrl - ofld_ctrl,
+	    (pfres->neq - ofld_eqs) / 2);
 
 	if ((max_rxq / port_count) == 0) {
 		cxgb_printf(sc->dip, CE_WARN,
@@ -2414,7 +2473,7 @@ t4_setup_intrs(struct adapter *sc)
 		break;
 
 	case TIP_ERR_QUEUES:
-		VERIFY3U(intr_count, ==, 2);
+		VERIFY3U(intr_count, ==, 2 + iaq->intr_rdma);
 		rc = ddi_intr_add_handler(sc->intr_handle[0], t4_intr_err, sc,
 		    NULL);
 		if (rc != DDI_SUCCESS) {
@@ -2465,6 +2524,13 @@ t4_setup_intrs(struct adapter *sc)
 		}
 
 		break;
+	}
+
+	if (iaq->intr_rdma != 0) {
+		VERIFY3U(handlers, ==, iaq->intr_rdma_first);
+		rc = t4_ofld_intr_handlers(sc->ofld, &handlers);
+		if (rc != DDI_SUCCESS)
+			goto fail;
 	}
 
 	return (DDI_SUCCESS);
@@ -2952,6 +3018,7 @@ t4_fatal_err(struct adapter *sc)
 	t4_intr_disable(sc);
 	cxgb_printf(sc->dip, CE_WARN,
 	    "encountered fatal error, adapter stopped.");
+	t4_ofld_fatal(sc);
 }
 
 int

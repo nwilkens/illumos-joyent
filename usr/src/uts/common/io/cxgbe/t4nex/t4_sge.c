@@ -87,24 +87,8 @@ static const uint16_t t4_iq_esize_bytes[] = {
 	[T4_IQ_ESIZE_128B] = 128,
 };
 
-typedef struct t4_iq_params {
-	t4_iq_type_t	tip_iq_type;
-	uint8_t		tip_tmr_idx;
-	int8_t		tip_pktc_idx;
-	uint16_t	tip_qsize;
-	t4_iq_esize_t	tip_esize;
-	uint16_t	tip_fl_qsize;
-	int		tip_cong_chan;
-	t4_sge_iq_t	*tip_intr_evtq;
-	uint_t		tip_intr_idx;
-} t4_iq_params_t;
-
-static int t4_alloc_eq_base(struct port_info *, t4_sge_eq_t *);
-static void t4_free_iq(struct port_info *, t4_sge_iq_t *);
 static int t4_alloc_rxq(struct port_info *, struct sge_rxq *, uint_t);
 static void t4_free_rxq(struct port_info *, struct sge_rxq *);
-static void t4_free_eq(struct port_info *, t4_sge_eq_t *);
-static void t4_alloc_eq_post(struct port_info *, t4_sge_eq_t *);
 static int t4_alloc_txq(struct port_info *, struct sge_txq *, int);
 static void t4_free_txq(struct port_info *, struct sge_txq *);
 static int alloc_dma_memory(struct adapter *sc, size_t len, int flags,
@@ -202,6 +186,12 @@ t4_eqmap_slot(struct adapter *sc, uint_t cntxt_id)
 	return (&sc->sge.eqmap[idx]);
 }
 
+t4_sge_eq_t **
+t4_eqmap_ent(struct adapter *sc, uint_t cntxt_id)
+{
+	return (t4_eqmap_slot(sc, cntxt_id));
+}
+
 /*
  * Get the address of the EQ host credit at the provided index.
  */
@@ -231,7 +221,8 @@ t4_fl_to_iq(struct sge_fl *fl)
 	 * only case we need to worry about.
 	 */
 	struct sge_rxq *rxq = __containerof(fl, struct sge_rxq, fl);
-	ASSERT(rxq->iq.tsi_iqtype == TIQT_ETH_RX);
+	ASSERT(rxq->iq.tsi_iqtype == TIQT_ETH_RX ||
+	    rxq->iq.tsi_iqtype == TIQT_OFLD_RX);
 
 	return (&rxq->iq);
 }
@@ -1244,7 +1235,7 @@ doorbell:
 	return (frame);
 }
 
-static int
+int
 t4_alloc_iq(struct port_info *pi, const t4_iq_params_t *tip, t4_sge_iq_t *iq,
     struct sge_fl *fl)
 {
@@ -1345,7 +1336,10 @@ t4_alloc_iq(struct port_info *pi, const t4_iq_params_t *tip, t4_sge_iq_t *iq,
 	 * future part or fimrware revision decides to use this information for
 	 * other purposes relevant the behavior of our driver.
 	 */
-	iq_cmd.iqns_to_fl0congen |= BE_32(V_FW_IQ_CMD_IQTYPE(FW_IQ_IQTYPE_NIC));
+	const bool ofld = tip->tip_iq_type == TIQT_OFLD_RX ||
+	    tip->tip_iq_type == TIQT_OFLD_CIQ;
+	iq_cmd.iqns_to_fl0congen |= BE_32(V_FW_IQ_CMD_IQTYPE(ofld ?
+	    FW_IQ_IQTYPE_OFLD : FW_IQ_IQTYPE_NIC));
 
 	if (fl != NULL) {
 		t4_sge_eq_t *eq = &fl->eq;
@@ -1486,7 +1480,7 @@ t4_alloc_iq(struct port_info *pi, const t4_iq_params_t *tip, t4_sge_iq_t *iq,
 	return (0);
 }
 
-static void
+void
 t4_free_iq(struct port_info *pi, t4_sge_iq_t *iq)
 {
 	struct adapter *sc = iq->tsi_adapter;
@@ -1678,7 +1672,7 @@ t4_free_rxq(struct port_info *pi, struct sge_rxq *rxq)
 	t4_free_iq(pi, &rxq->iq);
 }
 
-static int
+int
 t4_alloc_eq_base(struct port_info *pi, t4_sge_eq_t *eq)
 {
 	struct adapter *sc = pi->adapter;
@@ -1722,7 +1716,7 @@ t4_alloc_eq_base(struct port_info *pi, t4_sge_eq_t *eq)
 
 #define	UDB_DBS	(DOORBELL_UDB | DOORBELL_UDBWC | DOORBELL_WCWR)
 
-static void
+void
 t4_alloc_eq_post(struct port_info *pi, t4_sge_eq_t *eq)
 {
 	struct adapter *sc = pi->adapter;
@@ -1837,7 +1831,7 @@ t4_eq_alloc_eth(struct port_info *pi, t4_sge_eq_t *eq)
 	return (0);
 }
 
-static void
+void
 t4_free_eq(struct port_info *pi, t4_sge_eq_t *eq)
 {
 	struct adapter *sc = pi->adapter;
@@ -1849,8 +1843,22 @@ t4_free_eq(struct port_info *pi, t4_sge_eq_t *eq)
 	}
 
 	if (eq->tse_flags & EQ_ALLOC_DEV) {
-		int rc = -t4_eth_eq_free(sc, sc->mbox, sc->pf, 0,
-		    eq->tse_cntxt_id);
+		int rc;
+
+		switch (eq->tse_type) {
+		case TEQT_CTRL:
+			rc = -t4_ctrl_eq_free(sc, sc->mbox, sc->pf, 0,
+			    eq->tse_cntxt_id);
+			break;
+		case TEQT_OFLD:
+			rc = -t4_ofld_eq_free(sc, sc->mbox, sc->pf, 0,
+			    eq->tse_cntxt_id);
+			break;
+		default:
+			rc = -t4_eth_eq_free(sc, sc->mbox, sc->pf, 0,
+			    eq->tse_cntxt_id);
+			break;
+		}
 		if (rc != 0) {
 			cxgb_printf(sc->dip, CE_WARN,
 			    "failed to free egress queue: %d", rc);
@@ -2143,6 +2151,18 @@ t4_iq_next_entry(t4_sge_iq_t *iq)
 	}
 }
 
+bool
+t4_iq_next_rsp(const t4_sge_iq_t *iq, struct rsp_ctrl *ctrl)
+{
+	return (t4_get_new_rsp(iq, ctrl));
+}
+
+void
+t4_iq_advance(t4_sge_iq_t *iq)
+{
+	t4_iq_next_entry(iq);
+}
+
 static inline bool
 t4_fl_running_low(const struct sge_fl *fl)
 {
@@ -2334,6 +2354,41 @@ t4_sfl_enqueue(struct adapter *sc, struct sge_fl *fl)
 	}
 	FL_UNLOCK(fl);
 	mutex_exit(&sc->sfl_lock);
+}
+
+/*
+ * The payload of an offload CPL.  len comes from the device, so it is checked
+ * against the buffers actually posted before any of them is touched; ERANGE
+ * means it could not have been placed.
+ */
+mblk_t *
+t4_fl_payload(struct sge_fl *fl, uint32_t len, bool newbuf, int *rcp)
+{
+	struct adapter *sc = t4_fl_to_iq(fl)->tsi_adapter;
+	const uint64_t bsz = sc->sge.rxb_params.buf_size;
+	mblk_t *mp;
+	bool ok;
+
+	FL_LOCK(fl);
+	const bool skip = fl->offset > 0 && newbuf;
+	const uint64_t off = skip ? 0 : fl->offset;
+	ok = (skip ? 1 : 0) + howmany(off + len, bsz) <= fl->bufs_avail;
+	FL_UNLOCK(fl);
+	if (!ok) {
+		*rcp = ERANGE;
+		return (NULL);
+	}
+
+	mp = t4_fl_get_payload(fl, len, newbuf);
+	*rcp = mp == NULL ? ENOMEM : 0;
+	return (mp);
+}
+
+void
+t4_fl_replenish(struct adapter *sc, struct sge_fl *fl)
+{
+	if (t4_fl_periodic_refill(fl))
+		t4_sfl_enqueue(sc, fl);
 }
 
 static void
@@ -3391,8 +3446,12 @@ copy_to_txd(t4_sge_eq_t *eq, caddr_t from, caddr_t *to, size_t len)
 static void
 t4_tx_ring_db(struct sge_txq *txq)
 {
-	t4_sge_eq_t *eq = &txq->eq;
-	struct adapter *sc = txq->port->adapter;
+	t4_eq_ring_db(txq->port->adapter, &txq->eq);
+}
+
+void
+t4_eq_ring_db(struct adapter *sc, t4_sge_eq_t *eq)
+{
 	int val, db_mode;
 	t4_doorbells_t db = eq->tse_doorbells;
 

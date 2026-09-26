@@ -34,6 +34,7 @@
 
 #include "common/common.h"
 #include "common/t4_regs.h"
+#include "t4_ofld.h"
 
 static int t4_mc_getstat(void *arg, uint_t stat, uint64_t *val);
 static int t4_mc_start(void *arg);
@@ -1312,6 +1313,7 @@ t4_mc_setprop(void *arg, const char *name, mac_prop_id_t id, uint_t size,
 		} else if (v32 != pi->mtu) {
 			pi->mtu = v32;
 			(void) mac_maxsdu_update(pi->mh, v32);
+			t4_ofld_mtu_notify(pi);
 			rx_mode = 1;
 		}
 		break;
@@ -2112,6 +2114,7 @@ t4_os_link_changed(struct adapter *sc, int idx, int link_stat)
 	struct port_info *pi = sc->port[idx];
 
 	mac_link_update(pi->mh, link_stat ? LINK_STATE_UP : LINK_STATE_DOWN);
+	t4_ofld_link_notify(sc, idx);
 }
 
 void

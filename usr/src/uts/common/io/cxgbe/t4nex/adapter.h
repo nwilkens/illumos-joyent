@@ -42,6 +42,8 @@ struct adapter;
 struct port_info;
 typedef struct adapter adapter_t;
 struct sge_fl;
+struct t4_ofld;
+struct rsp_ctrl;
 
 /* See the _Ingress Context Contents_ section of the T4 Programmers Guide. */
 typedef enum t4_iq_esize {
@@ -189,6 +191,8 @@ typedef enum t4_iq_type {
 	TIQT_UNINIT,
 	TIQT_EVENT,
 	TIQT_ETH_RX,
+	TIQT_OFLD_RX,
+	TIQT_OFLD_CIQ,
 } t4_iq_type_t;
 
 /* Ingress Queue: T4 is producer, driver is consumer. */
@@ -337,6 +341,8 @@ typedef enum t4_eq_type {
 	TEQT_UNINIT,
 	TEQT_ETH,
 	TEQT_FL,
+	TEQT_CTRL,
+	TEQT_OFLD,
 } t4_eq_type_t;
 
 /* Egress Queue: driver is producer, T4 is consumer. */
@@ -677,6 +683,7 @@ struct driver_properties {
 
 	bool write_combine;
 	int t4_fw_install;
+	bool rdma_enable;
 };
 
 typedef struct t4_mbox_waiter {
@@ -741,6 +748,13 @@ struct t4_intrs_queues {
 	/* The maximum number of RX/TX queues per port. */
 	uint_t port_max_rxq;
 	uint_t port_max_txq;
+
+	/*
+	 * The offload queues' vectors: intr_rdma of them, starting at
+	 * intr_rdma_first.  They follow every LAN vector.
+	 */
+	uint_t intr_rdma_first;
+	uint_t intr_rdma;
 };
 
 /*
@@ -785,6 +799,9 @@ struct adapter {
 	struct port_info *port[MAX_NPORTS];
 	uint8_t chan_map[NCHAN];
 	uint32_t filter_mode;
+
+	/* Offload (TOE-lite) state for the RDMA child; NULL when disabled. */
+	struct t4_ofld *ofld;
 
 	t4_adapter_flags_t flags;
 	t4_doorbells_t doorbells;
@@ -920,6 +937,32 @@ void t4_eq_update_dbq_timer(t4_sge_eq_t *, struct port_info *);
 
 mblk_t *t4_eth_tx(void *, mblk_t *);
 t4_iq_result_t t4_process_rx_iq(t4_sge_iq_t *, uint_t, struct t4_poll_req *);
+
+/* t4_sge.c, for the offload queues in t4_ofld_sge.c */
+typedef struct t4_iq_params {
+	t4_iq_type_t	tip_iq_type;
+	uint8_t		tip_tmr_idx;
+	int8_t		tip_pktc_idx;
+	uint16_t	tip_qsize;
+	t4_iq_esize_t	tip_esize;
+	uint16_t	tip_fl_qsize;
+	int		tip_cong_chan;
+	t4_sge_iq_t	*tip_intr_evtq;
+	uint_t		tip_intr_idx;
+} t4_iq_params_t;
+
+int t4_alloc_iq(struct port_info *, const t4_iq_params_t *, t4_sge_iq_t *,
+    struct sge_fl *);
+void t4_free_iq(struct port_info *, t4_sge_iq_t *);
+int t4_alloc_eq_base(struct port_info *, t4_sge_eq_t *);
+void t4_alloc_eq_post(struct port_info *, t4_sge_eq_t *);
+void t4_free_eq(struct port_info *, t4_sge_eq_t *);
+void t4_eq_ring_db(struct adapter *, t4_sge_eq_t *);
+t4_sge_eq_t **t4_eqmap_ent(struct adapter *, uint_t);
+bool t4_iq_next_rsp(const t4_sge_iq_t *, struct rsp_ctrl *);
+void t4_iq_advance(t4_sge_iq_t *);
+mblk_t *t4_fl_payload(struct sge_fl *, uint32_t, bool, int *);
+void t4_fl_replenish(struct adapter *, struct sge_fl *);
 
 /* t4_mac.c */
 void t4_os_link_changed(struct adapter *sc, int idx, int link_stat);
