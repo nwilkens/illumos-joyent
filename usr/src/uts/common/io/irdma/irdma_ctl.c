@@ -15,9 +15,10 @@
 
 /*
  * The RDMA control plane: bring-up and teardown of the CQP, the HMC, the
- * CCQ, CEQ 0, the AEQ, the PBLE pool and the work scheduler, the CQP request
- * layer, and the event queue processing.  The step order and the core calls
- * follow the Linux irdma driver (hw.c); the code is written for illumos.
+ * CCQ, CEQ 0, the AEQ, the PBLE pool and the work scheduler, and the CQP
+ * request layer.  The step order and the core calls follow the Linux irdma
+ * driver (hw.c); the code is written for illumos.  irdma_intr.c has the
+ * interrupts and the event queue processing.
  *
  * CQP requests: a command lives in a request slot, not on the caller's
  * stack, because the core may queue it.  Its scratch value names the slot
@@ -25,14 +26,12 @@
  * completion then only frees it.  A timeout marks the CQP dead, taints the
  * device and asks ice for a PF reset.
  *
- * Completions: CEQ 0 carries the CCQ.  Its interrupt only queues work on
- * irdma_taskq, which consumes the CCQ and re-enables the vector.  A waiter
- * also polls the CCQ every IRDMA_CQP_POLL_MS, so a lost interrupt delays a
- * completion but does not lose it.
+ * Completions: CEQ 0 carries the CCQ on vector 0, whose thread consumes the
+ * CCQ.  A waiter also polls the CCQ every IRDMA_CQP_POLL_MS, so a lost
+ * interrupt delays a completion but does not lose it.
  *
  * Locks, outermost first: irdma_cfg_lock, irdma_ccq_lock, irdma_req_lock,
- * then the core's own locks.  irdma_intr_lock is at interrupt priority and
- * guards only the owed-work flags.
+ * then the core's own locks.
  */
 
 #include "irdma_verbs.h"
@@ -40,7 +39,6 @@
 #include "virtchnl.h"
 
 #include <sys/bitmap.h>
-#include <sys/ddi_intr.h>
 
 #define	IRDMA_CCQ_SIZE		(IRDMA_CQP_SW_SQSIZE_2048 + 2)
 /* The feature version the core assumes until the query answers. */
@@ -52,7 +50,7 @@
 
 static const char *irdma_step_names[IRDMA_STEP_MAX] = {
 	"open", "dev", "intr", "cqp", "fpm", "hmc", "ccq", "ceq0", "aeq",
-	"pble", "ws", "pefltr"
+	"ceqs", "pble", "ws", "pefltr"
 };
 
 boolean_t
@@ -60,13 +58,6 @@ irdma_hw_ok(irdma_t *irdma)
 {
 	return ((irdma->irdma_flags & IRDMA_F_CQP_DEAD) == 0 &&
 	    !irdma->irdma_ops->iro_resetting(irdma->irdma_peer));
-}
-
-/* The PF-relative vector number of entry i of the RDMA block. */
-static uint32_t
-irdma_hw_vec(irdma_t *irdma, uint_t i)
-{
-	return (irdma->irdma_intr.irin_first + i);
 }
 
 /*
@@ -213,7 +204,7 @@ irdma_cqp_fail_all(irdma_t *irdma)
  * Consume the CCQ.  A malformed entry means the device cannot be trusted;
  * the CCQ is left as it is and the function goes down.
  */
-static void
+void
 irdma_ccq_poll(irdma_t *irdma)
 {
 	struct irdma_ccq_cqe_info info;
@@ -670,157 +661,6 @@ irdma_pble_free_paged_mem(struct irdma_chunk *chunk)
 }
 
 /*
- * Interrupts.  The handler records which queue is owed and queues the
- * work; the vector stays masked until the task re-enables it.
- */
-uint_t
-irdma_intr(caddr_t arg1, caddr_t arg2)
-{
-	irdma_t *irdma = (irdma_t *)(void *)arg1;
-	uint_t vec = (uint_t)(uintptr_t)arg2;
-	boolean_t dispatch = B_FALSE;
-
-	mutex_enter(&irdma->irdma_intr_lock);
-	if (!irdma->irdma_intr_off) {
-		if (vec == irdma->irdma_ceq_vec) {
-			irdma->irdma_ceq_owed = B_TRUE;
-			irdma->irdma_ceq_intrs++;
-		}
-		if (vec == irdma->irdma_aeq_vec) {
-			irdma->irdma_aeq_owed = B_TRUE;
-			irdma->irdma_aeq_intrs++;
-		}
-		if (!irdma->irdma_task_queued) {
-			irdma->irdma_task_queued = B_TRUE;
-			dispatch = B_TRUE;
-		}
-	}
-	mutex_exit(&irdma->irdma_intr_lock);
-
-	if (dispatch && ddi_taskq_dispatch(irdma->irdma_taskq,
-	    irdma_intr_task, irdma, DDI_NOSLEEP) != DDI_SUCCESS) {
-		mutex_enter(&irdma->irdma_intr_lock);
-		irdma->irdma_task_queued = B_FALSE;
-		mutex_exit(&irdma->irdma_intr_lock);
-	}
-	return (DDI_INTR_CLAIMED);
-}
-
-static void
-irdma_vec_enable(irdma_t *irdma, uint_t vec)
-{
-	struct irdma_sc_dev *dev = &irdma->irdma_sc;
-
-	dev->irq_ops->irdma_en_irq(dev, irdma_hw_vec(irdma, vec));
-}
-
-static void
-irdma_vec_disable(irdma_t *irdma, uint_t vec)
-{
-	struct irdma_sc_dev *dev = &irdma->irdma_sc;
-
-	dev->irq_ops->irdma_dis_irq(dev, irdma_hw_vec(irdma, vec));
-}
-
-/*
- * CEQ 0 carries the CCQ and every verbs CQ.  A CQ is held under
- * irdma_ceq_lock, which CQ destroy takes to leave the CEQ, and its handler
- * runs with no lock held.
- */
-static void
-irdma_ceq0_process(irdma_t *irdma)
-{
-	struct irdma_sc_dev *dev = &irdma->irdma_sc;
-	struct irdma_sc_cq *cq;
-	irdma_cq_t *icq;
-	uint32_t n;
-
-	for (n = 0; n < irdma->irdma_ceq0.elem_cnt; n++) {
-		icq = NULL;
-		mutex_enter(&irdma->irdma_ceq_lock);
-		cq = irdma_sc_process_ceq(dev, &irdma->irdma_ceq0);
-		if (cq != NULL && cq != &irdma->irdma_ccq)
-			icq = irdma_cq_ceq_hold(irdma, cq);
-		mutex_exit(&irdma->irdma_ceq_lock);
-		if (cq == NULL)
-			break;
-		if (cq == &irdma->irdma_ccq)
-			irdma_ccq_poll(irdma);
-		else if (icq != NULL)
-			irdma_cq_ceq_dispatch(icq);
-	}
-}
-
-/* Whether CEQ 0 holds an entry that has not been processed. */
-static boolean_t
-irdma_ceq_pending(irdma_t *irdma)
-{
-	struct irdma_sc_ceq *ceq = &irdma->irdma_ceq0;
-	u64 temp;
-
-	get_64bit_val(IRDMA_GET_CURRENT_CEQ_ELEM(ceq), 0, &temp);
-	return ((u8)FIELD_GET(IRDMA_CEQE_VALID, temp) == ceq->polarity);
-}
-
-/* Passes the task makes on its own for CEQ entries that beat the enable. */
-#define	IRDMA_CEQ_RECHECKS	4
-
-void
-irdma_intr_task(void *arg)
-{
-	irdma_t *irdma = arg;
-	boolean_t ceq, aeq;
-	uint_t rechecks = 0;
-
-	for (;;) {
-		mutex_enter(&irdma->irdma_intr_lock);
-		ceq = irdma->irdma_ceq_owed;
-		aeq = irdma->irdma_aeq_owed;
-		irdma->irdma_ceq_owed = irdma->irdma_aeq_owed = B_FALSE;
-		if ((!ceq && !aeq) || irdma->irdma_intr_off) {
-			irdma->irdma_task_queued = B_FALSE;
-			mutex_exit(&irdma->irdma_intr_lock);
-			return;
-		}
-		mutex_exit(&irdma->irdma_intr_lock);
-
-		if (ceq && (irdma->irdma_progress & BIT(IRDMA_STEP_CEQ0))) {
-			irdma_ceq0_process(irdma);
-			irdma_vec_enable(irdma, irdma->irdma_ceq_vec);
-			/*
-			 * The enable clears the pending bit, so an entry
-			 * written before it raises no interrupt.
-			 */
-			if (irdma_ceq_pending(irdma) &&
-			    rechecks++ < IRDMA_CEQ_RECHECKS) {
-				mutex_enter(&irdma->irdma_intr_lock);
-				irdma->irdma_ceq_owed = B_TRUE;
-				mutex_exit(&irdma->irdma_intr_lock);
-			}
-		}
-		if (aeq && (irdma->irdma_progress & BIT(IRDMA_STEP_AEQ))) {
-			irdma_aeq_process(irdma);
-			if (irdma->irdma_aeq_vec != irdma->irdma_ceq_vec ||
-			    !ceq)
-				irdma_vec_enable(irdma, irdma->irdma_aeq_vec);
-		}
-	}
-}
-
-/*
- * Stop queueing interrupt work and wait for the task.  Both handlers stay
- * registered; nothing enables the vectors again.
- */
-static void
-irdma_intr_quiesce(irdma_t *irdma)
-{
-	mutex_enter(&irdma->irdma_intr_lock);
-	irdma->irdma_intr_off = B_TRUE;
-	mutex_exit(&irdma->irdma_intr_lock);
-	ddi_taskq_wait(irdma->irdma_taskq);
-}
-
-/*
  * The bring-up steps.  Each up function undoes its own partial work on
  * failure; each down function undoes a completed step.
  */
@@ -903,67 +743,6 @@ irdma_unstep_dev(irdma_t *irdma)
 	dma_free_coherent(&irdma->irdma_osdev, irdma->irdma_obj_mem.size,
 	    irdma->irdma_obj_mem.va, irdma->irdma_obj_mem.pa);
 	irdma->irdma_obj_mem.va = NULL;
-}
-
-/*
- * A vector whose handler cannot be removed stays in irdma_intr_mask, and
- * the handler's argument must then never be freed.
- */
-static void
-irdma_intr_release(irdma_t *irdma)
-{
-	ice_rdma_intr_t *in = &irdma->irdma_intr;
-	uint_t i;
-	int rc;
-
-	for (i = 0; i < in->irin_count; i++) {
-		if ((irdma->irdma_intr_mask & BIT(i)) == 0)
-			continue;
-		rc = ddi_intr_disable(in->irin_handles[i]);
-		if (rc != DDI_SUCCESS)
-			irdma_error(irdma, "failed to disable RDMA vector "
-			    "%u: %d", i, rc);
-		rc = ddi_intr_remove_handler(in->irin_handles[i]);
-		if (rc != DDI_SUCCESS) {
-			irdma_error(irdma, "failed to remove the handler of "
-			    "RDMA vector %u: %d", i, rc);
-			continue;
-		}
-		irdma->irdma_intr_mask &= ~BIT(i);
-	}
-}
-
-static int
-irdma_step_intr(irdma_t *irdma)
-{
-	ice_rdma_intr_t *in = &irdma->irdma_intr;
-	uint_t i;
-	int rc;
-
-	for (i = 0; i < in->irin_count; i++) {
-		rc = ddi_intr_add_handler(in->irin_handles[i], irdma_intr,
-		    (caddr_t)irdma, (caddr_t)(uintptr_t)i);
-		if (rc != DDI_SUCCESS)
-			goto fail;
-		irdma->irdma_intr_mask |= BIT(i);
-		rc = ddi_intr_enable(in->irin_handles[i]);
-		if (rc != DDI_SUCCESS)
-			goto fail;
-	}
-	return (0);
-
-fail:
-	irdma_error(irdma, "failed to set up RDMA vector %u: %d", i, rc);
-	irdma_intr_quiesce(irdma);
-	irdma_intr_release(irdma);
-	return (EIO);
-}
-
-static void
-irdma_unstep_intr(irdma_t *irdma)
-{
-	irdma_intr_quiesce(irdma);
-	irdma_intr_release(irdma);
 }
 
 static int
@@ -1309,13 +1088,12 @@ irdma_step_ceq0(irdma_t *irdma)
 		goto fail;
 	}
 
-	dev->irq_ops->irdma_cfg_ceq(dev, 0,
-	    irdma_hw_vec(irdma, irdma->irdma_ceq_vec), true);
+	dev->irq_ops->irdma_cfg_ceq(dev, 0, irdma_hw_vec(irdma, 0), true);
 	dev->ceq_valid = true;
 	mutex_enter(&irdma->irdma_ccq_lock);
 	irdma_sc_ccq_arm(&irdma->irdma_ccq);
 	mutex_exit(&irdma->irdma_ccq_lock);
-	irdma_vec_enable(irdma, irdma->irdma_ceq_vec);
+	irdma_vec_enable(irdma, 0);
 	return (0);
 
 fail:
@@ -1337,9 +1115,8 @@ irdma_unstep_ceq0(irdma_t *irdma)
 	struct irdma_sc_ceq *ceq = &irdma->irdma_ceq0;
 	int ret = -EIO;
 
-	dev->irq_ops->irdma_cfg_ceq(dev, 0,
-	    irdma_hw_vec(irdma, irdma->irdma_ceq_vec), false);
-	irdma_vec_disable(irdma, irdma->irdma_ceq_vec);
+	dev->irq_ops->irdma_cfg_ceq(dev, 0, irdma_hw_vec(irdma, 0), false);
+	irdma_vec_disable(irdma, 0);
 	irdma_intr_quiesce(irdma);
 
 	mutex_enter(&irdma->irdma_ccq_lock);
@@ -1385,7 +1162,7 @@ irdma_step_aeq(irdma_t *irdma)
 	info.aeq_elem_pa = irdma->irdma_aeq_mem.pa;
 	info.elem_cnt = size;
 	info.dev = dev;
-	info.msix_idx = irdma_hw_vec(irdma, irdma->irdma_aeq_vec);
+	info.msix_idx = irdma_hw_vec(irdma, 0);
 	ret = irdma_sc_aeq_init(&irdma->irdma_aeq, &info);
 	if (ret == 0) {
 		ret = irdma_cqp_aeq_cmd(dev, &irdma->irdma_aeq,
@@ -1403,8 +1180,6 @@ irdma_step_aeq(irdma_t *irdma)
 	}
 
 	dev->irq_ops->irdma_cfg_aeq(dev, info.msix_idx, true);
-	if (irdma->irdma_aeq_vec != irdma->irdma_ceq_vec)
-		irdma_vec_enable(irdma, irdma->irdma_aeq_vec);
 	return (0);
 }
 
@@ -1414,10 +1189,7 @@ irdma_unstep_aeq(irdma_t *irdma)
 	struct irdma_sc_dev *dev = &irdma->irdma_sc;
 	int ret = -EIO;
 
-	dev->irq_ops->irdma_cfg_aeq(dev,
-	    irdma_hw_vec(irdma, irdma->irdma_aeq_vec), false);
-	if (irdma->irdma_aeq_vec != irdma->irdma_ceq_vec)
-		irdma_vec_disable(irdma, irdma->irdma_aeq_vec);
+	dev->irq_ops->irdma_cfg_aeq(dev, irdma_hw_vec(irdma, 0), false);
 
 	if (irdma_hw_ok(irdma)) {
 		irdma->irdma_aeq.size = 0;
@@ -1578,6 +1350,7 @@ static const struct {
 	[IRDMA_STEP_CCQ] = { irdma_step_ccq, irdma_unstep_ccq },
 	[IRDMA_STEP_CEQ0] = { irdma_step_ceq0, irdma_unstep_ceq0 },
 	[IRDMA_STEP_AEQ] = { irdma_step_aeq, irdma_unstep_aeq },
+	[IRDMA_STEP_CEQS] = { irdma_step_ceqs, irdma_unstep_ceqs },
 	[IRDMA_STEP_PBLE] = { irdma_step_pble, irdma_unstep_pble },
 	[IRDMA_STEP_WS] = { irdma_step_ws, irdma_unstep_ws },
 	[IRDMA_STEP_PEFLTR] = { irdma_step_pefltr, irdma_unstep_pefltr }
@@ -1594,10 +1367,6 @@ irdma_ctl_start(irdma_t *irdma)
 	int ret;
 
 	ASSERT(MUTEX_HELD(&irdma->irdma_cfg_lock));
-
-	/* One vector serves both queues; with more, CEQ 0 has its own. */
-	irdma->irdma_aeq_vec = 0;
-	irdma->irdma_ceq_vec = irdma->irdma_intr.irin_count > 1 ? 1 : 0;
 
 	for (s = IRDMA_STEP_DEV; s < IRDMA_STEP_MAX; s++) {
 #ifdef DEBUG

@@ -83,13 +83,14 @@ typedef struct irdma_cmpl_gen {
 
 /*
  * icq_lock covers polling, arming and the generated completions.  The
- * reference count, under irdma_ceq_lock, keeps the CQ while its completion
- * handler runs.
+ * reference count, under the CEQ's ic_lock, keeps the CQ while its
+ * completion handler runs or it waits on the CEQ's ic_resched.
  */
 typedef struct irdma_cq {
 	struct rdk_cq		icq_rdk;	/* first */
 	struct irdma_sc_cq	icq_sc;
 	irdma_t			*icq_irdma;
+	irdma_ceq_t		*icq_ceq;
 	uint32_t		icq_num;
 	kmutex_t		icq_lock;
 	boolean_t		icq_armed;
@@ -98,8 +99,10 @@ typedef struct irdma_cq {
 	struct irdma_dma_mem	icq_shadow;
 	list_t			icq_gen;
 	uint32_t		icq_refs;
-	boolean_t		icq_live;	/* created; under ceq_lock */
+	boolean_t		icq_live;	/* created; under ic_lock */
 	boolean_t		icq_dying;
+	boolean_t		icq_resched;	/* on ic_resched */
+	list_node_t		icq_rnode;
 	kcondvar_t		icq_cv;
 	uint64_t		icq_bad_cqes;
 	struct irdma_cq_poll_info icq_cur;
@@ -210,8 +213,9 @@ extern int irdma_create_cq(struct rdk_cq *, const struct rdk_cq_init_attr *);
 extern void irdma_destroy_cq(struct rdk_cq *);
 extern int irdma_poll_cq(struct rdk_cq *, int, struct rdk_wc *);
 extern int irdma_req_notify_cq(struct rdk_cq *, enum rdk_cq_notify_flags);
-extern irdma_cq_t *irdma_cq_ceq_hold(irdma_t *, struct irdma_sc_cq *);
+extern irdma_cq_t *irdma_cq_ceq_hold(irdma_ceq_t *, struct irdma_sc_cq *);
 extern void irdma_cq_ceq_dispatch(irdma_cq_t *);
+extern void irdma_cq_resched(struct rdk_cq *);
 extern void irdma_cq_error(irdma_t *, uint32_t);
 extern boolean_t irdma_cq_empty(irdma_cq_t *);
 extern void irdma_cq_purge_qp(irdma_cq_t *, irdma_qp_t *);

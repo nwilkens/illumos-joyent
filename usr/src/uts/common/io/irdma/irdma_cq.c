@@ -6,9 +6,10 @@
  */
 
 /*
- * Completion queues.  Every CQ is registered on CEQ 0, whose interrupt task
- * calls the CQ's completion handler.  The logic follows the Linux irdma
- * verbs.c and utils.c (see README.illumos).
+ * Completion queues.  A CQ is registered on the CEQ of its comp_vector,
+ * whose vector thread calls the CQ's completion handler (irdma_intr.c).
+ * The logic follows the Linux irdma verbs.c and utils.c (see
+ * README.illumos).
  *
  * A CQE names its QP with a pointer and a QP number, both written by the
  * device.  irdma_osdep_cqe_qp() accepts the entry only if the QP table
@@ -125,7 +126,8 @@ irdma_create_cq(struct rdk_cq *rcq, const struct rdk_cq_init_attr *attr)
 	int ret;
 
 	if (attr->cqe == 0 || attr->cqe > IRDMA_MAX_KCQE ||
-	    attr->cqe > dev->hw_attrs.uk_attrs.max_hw_cq_size)
+	    attr->cqe > dev->hw_attrs.uk_attrs.max_hw_cq_size ||
+	    attr->comp_vector >= irdma->irdma_nceqs)
 		return (EINVAL);
 	if ((dev->hw_attrs.uk_attrs.feature_flags &
 	    IRDMA_FEATURE_64_BYTE_CQE) != 0)
@@ -137,6 +139,7 @@ irdma_create_cq(struct rdk_cq *rcq, const struct rdk_cq_init_attr *attr)
 		return (ret);
 
 	icq->icq_irdma = irdma;
+	icq->icq_ceq = &irdma->irdma_ceqs[attr->comp_vector];
 	icq->icq_num = num;
 	mutex_init(&icq->icq_lock, NULL, MUTEX_DRIVER, NULL);
 	cv_init(&icq->icq_cv, NULL, CV_DRIVER, NULL);
@@ -165,7 +168,7 @@ irdma_create_cq(struct rdk_cq *rcq, const struct rdk_cq_init_attr *attr)
 	uk->avoid_mem_cflct = false;
 	info.cq_base_pa = icq->icq_mem.pa;
 	info.shadow_area_pa = icq->icq_shadow.pa;
-	info.ceq_id = 0;
+	info.ceq_id = icq->icq_ceq->ic_id;
 	info.ceq_id_valid = true;
 	info.ceqe_mask = 1;
 	info.type = IRDMA_CQ_TYPE_IWARP;
@@ -187,23 +190,20 @@ irdma_create_cq(struct rdk_cq *rcq, const struct rdk_cq_init_attr *attr)
 	if ((ret = irdma_cqp_exec(irdma, req, NULL)) != 0) {
 		/* The command may have registered the CQ and reached it. */
 		irdma_verbs_uncertain(irdma, "failed to create a CQ");
-		mutex_enter(&irdma->irdma_ceq_lock);
+		mutex_enter(&icq->icq_ceq->ic_lock);
 		icq->icq_dying = B_TRUE;
-		irdma_sc_remove_cq_ctx(&irdma->irdma_ceq0, &icq->icq_sc);
-		if ((irdma->irdma_progress & BIT(IRDMA_STEP_CEQ0)) != 0) {
-			irdma_sc_cleanup_ceqes(&icq->icq_sc,
-			    &irdma->irdma_ceq0);
-		}
-		mutex_exit(&irdma->irdma_ceq_lock);
+		irdma_sc_remove_cq_ctx(&icq->icq_ceq->ic_sc, &icq->icq_sc);
+		irdma_sc_cleanup_ceqes(&icq->icq_sc, &icq->icq_ceq->ic_sc);
+		mutex_exit(&icq->icq_ceq->ic_lock);
 		goto fail;
 	}
 
 	mutex_enter(&irdma->irdma_cqtable_lock);
 	irdma->irdma_cq_table[num] = icq;
 	mutex_exit(&irdma->irdma_cqtable_lock);
-	mutex_enter(&irdma->irdma_ceq_lock);
+	mutex_enter(&icq->icq_ceq->ic_lock);
 	icq->icq_live = B_TRUE;
-	mutex_exit(&irdma->irdma_ceq_lock);
+	mutex_exit(&icq->icq_ceq->ic_lock);
 	atomic_inc_32(&irdma->irdma_ncqs);
 	return (0);
 
@@ -221,13 +221,14 @@ fail:
 
 /*
  * The framework destroys a CQ only once no QP uses it.  After the CQ is off
- * CEQ 0 and no handler holds it, the destroy command stops the device.
+ * its CEQ and no handler holds it, the destroy command stops the device.
  */
 void
 irdma_destroy_cq(struct rdk_cq *rcq)
 {
 	irdma_t *irdma = IRDMA_DEV(rcq->device);
 	irdma_cq_t *icq = IRDMA_CQ(rcq);
+	irdma_ceq_t *ic = icq->icq_ceq;
 	irdma_cmpl_gen_t *g;
 	irdma_cqp_req_t *req;
 
@@ -235,14 +236,13 @@ irdma_destroy_cq(struct rdk_cq *rcq)
 	irdma->irdma_cq_table[icq->icq_num] = NULL;
 	mutex_exit(&irdma->irdma_cqtable_lock);
 
-	mutex_enter(&irdma->irdma_ceq_lock);
+	mutex_enter(&ic->ic_lock);
 	icq->icq_dying = B_TRUE;
-	irdma_sc_remove_cq_ctx(&irdma->irdma_ceq0, &icq->icq_sc);
-	if ((irdma->irdma_progress & BIT(IRDMA_STEP_CEQ0)) != 0)
-		irdma_sc_cleanup_ceqes(&icq->icq_sc, &irdma->irdma_ceq0);
+	irdma_sc_remove_cq_ctx(&ic->ic_sc, &icq->icq_sc);
+	irdma_sc_cleanup_ceqes(&icq->icq_sc, &ic->ic_sc);
 	while (icq->icq_refs != 0)
-		cv_wait(&icq->icq_cv, &irdma->irdma_ceq_lock);
-	mutex_exit(&irdma->irdma_ceq_lock);
+		cv_wait(&icq->icq_cv, &ic->ic_lock);
+	mutex_exit(&ic->ic_lock);
 
 	if ((req = irdma_vreq(irdma, IRDMA_OP_CQ_DESTROY)) == NULL) {
 		irdma_taint(irdma);
@@ -254,10 +254,9 @@ irdma_destroy_cq(struct rdk_cq *rcq)
 			irdma_verbs_uncertain(irdma, "failed to destroy a CQ");
 	}
 	/* Entries the device queued before it dropped the CQ. */
-	mutex_enter(&irdma->irdma_ceq_lock);
-	if ((irdma->irdma_progress & BIT(IRDMA_STEP_CEQ0)) != 0)
-		irdma_sc_cleanup_ceqes(&icq->icq_sc, &irdma->irdma_ceq0);
-	mutex_exit(&irdma->irdma_ceq_lock);
+	mutex_enter(&ic->ic_lock);
+	irdma_sc_cleanup_ceqes(&icq->icq_sc, &ic->ic_sc);
+	mutex_exit(&ic->ic_lock);
 
 	mutex_enter(&icq->icq_lock);
 	while ((g = list_remove_head(&icq->icq_gen)) != NULL)
@@ -276,16 +275,17 @@ irdma_destroy_cq(struct rdk_cq *rcq)
 }
 
 /*
- * CEQ 0 named sc_cq, one of the registered CQs.  The caller holds
- * irdma_ceq_lock, under which destroy takes a CQ off the CEQ.
+ * The CEQ named sc_cq, one of the CQs registered on it.  The caller holds
+ * the CEQ's ic_lock, under which destroy takes a CQ off the CEQ.
  */
 irdma_cq_t *
-irdma_cq_ceq_hold(irdma_t *irdma, struct irdma_sc_cq *sc_cq)
+irdma_cq_ceq_hold(irdma_ceq_t *ic, struct irdma_sc_cq *sc_cq)
 {
 	irdma_cq_t *icq = sc_cq->back_cq;
 
-	ASSERT(MUTEX_HELD(&irdma->irdma_ceq_lock));
-	if (icq == NULL || !icq->icq_live || icq->icq_dying)
+	ASSERT(MUTEX_HELD(&ic->ic_lock));
+	if (icq == NULL || icq->icq_ceq != ic || !icq->icq_live ||
+	    icq->icq_dying)
 		return (NULL);
 	icq->icq_refs++;
 	return (icq);
@@ -294,15 +294,38 @@ irdma_cq_ceq_hold(irdma_t *irdma, struct irdma_sc_cq *sc_cq)
 static void
 irdma_cq_rele(irdma_cq_t *icq)
 {
-	irdma_t *irdma = icq->icq_irdma;
+	irdma_ceq_t *ic = icq->icq_ceq;
 
-	mutex_enter(&irdma->irdma_ceq_lock);
+	mutex_enter(&ic->ic_lock);
 	if (--icq->icq_refs == 0 && icq->icq_dying)
 		cv_broadcast(&icq->icq_cv);
-	mutex_exit(&irdma->irdma_ceq_lock);
+	mutex_exit(&ic->ic_lock);
 }
 
-/* In the interrupt task, with no driver lock held. */
+/*
+ * The provider's cq_resched: call the handler again from the CQ's vector
+ * thread, after the handlers already waiting there.
+ */
+void
+irdma_cq_resched(struct rdk_cq *rcq)
+{
+	irdma_cq_t *icq = IRDMA_CQ(rcq);
+	irdma_ceq_t *ic = icq->icq_ceq;
+	boolean_t kick = B_FALSE;
+
+	mutex_enter(&ic->ic_lock);
+	if (icq->icq_live && !icq->icq_dying && !icq->icq_resched) {
+		icq->icq_resched = B_TRUE;
+		icq->icq_refs++;
+		list_insert_tail(&ic->ic_resched, icq);
+		kick = B_TRUE;
+	}
+	mutex_exit(&ic->ic_lock);
+	if (kick)
+		irdma_ceq_kick(ic);
+}
+
+/* In the CQ's vector thread, with no driver lock held. */
 void
 irdma_cq_ceq_dispatch(irdma_cq_t *icq)
 {
@@ -341,14 +364,16 @@ irdma_cq_error(irdma_t *irdma, uint32_t cq_id)
 	if (cq_id >= irdma->irdma_max_cq)
 		return;
 	mutex_enter(&irdma->irdma_cqtable_lock);
-	mutex_enter(&irdma->irdma_ceq_lock);
 	if ((icq = irdma->irdma_cq_table[cq_id]) != NULL) {
+		irdma_ceq_t *ic = icq->icq_ceq;
+
+		mutex_enter(&ic->ic_lock);
 		if (icq->icq_dying)
 			icq = NULL;
 		else
 			icq->icq_refs++;
+		mutex_exit(&ic->ic_lock);
 	}
-	mutex_exit(&irdma->irdma_ceq_lock);
 	mutex_exit(&irdma->irdma_cqtable_lock);
 	if (icq == NULL)
 		return;

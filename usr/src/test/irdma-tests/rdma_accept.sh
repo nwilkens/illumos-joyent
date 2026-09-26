@@ -34,8 +34,8 @@ PEER=${2:-192.0.2.2}
 TESTS=" ${3:-1 2 3 4 5 6} "
 CONF=/kernel/drv/irdma.conf
 FAILED=0
-STEPS=(open dev intr cqp fpm hmc ccq ceq0 aeq pble ws pefltr)
-FULL=4095
+STEPS=(open dev intr cqp fpm hmc ccq ceq0 aeq ceqs pble ws pefltr)
+FULL=8191
 
 pass() { echo "PASS $*"; }
 fail() { echo "FAIL $*"; FAILED=1; }
@@ -227,13 +227,13 @@ fi
 # 6. An interrupt resource management trim with RDMA enabled.
 if want 6; then
 D=$(dev)
-c0=$(k irdma:0:ctl:ceq_intrs); m=$(msgs)
+c0=$(k irdma:0:ctl:aeq_intrs); m=$(msgs)
 if $CTL "$D" irm-remove 8; then
 	after=$(since "$m" | grep -o 'MSI-X vectors: [0-9]* -> [0-9]* .*' |
 	    tail -1)
 	$CTL "$D" probe && $CTL "$D" wait 10 >/dev/null
 	perr=$?
-	c1=$(k irdma:0:ctl:ceq_intrs)
+	c1=$(k irdma:0:ctl:aeq_intrs)
 	ping -sn "$PEER" 1400 5 >/dev/null 2>&1; pr=$?
 	m=$(msgs)
 	$CTL "$D" irm-add 8
@@ -242,9 +242,10 @@ if $CTL "$D" irm-remove 8; then
 	$CTL "$D" probe && $CTL "$D" wait 10 >/dev/null
 	perr2=$?
 	if [ $perr = 0 ] && [ $perr2 = 0 ] && [ "$c1" -gt "$c0" ] &&
-	    [ $pr = 0 ] && echo "$after" | grep -q 'rdma=2'; then
+	    [ $pr = 0 ] &&
+	    echo "$after" | grep -qw "rdma=$(k ice:0:rdma:vectors)"; then
 		pass "IRM trim: '$after', CQP on CEQ 0 after the trim" \
-		    "(ceq_intrs $c0 -> $c1), ping ok; offer: '$back'"
+		    "(vector 0 interrupts $c0 -> $c1), ping ok; offer: '$back'"
 	else
 		fail "IRM trim: '$after' probe $perr/$perr2 ceq $c0 -> $c1" \
 		    "ping $pr; offer '$back'"

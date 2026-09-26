@@ -560,6 +560,7 @@ static const struct rdk_device_ops irdma_rdk_ops = {
 	.destroy_ah = irdma_destroy_ah,
 	.dma_alloc = irdma_dma_alloc,
 	.dma_free = irdma_dma_free,
+	.cq_resched = irdma_cq_resched,
 	.size_pd = sizeof (irdma_pd_t),
 	.size_cq = sizeof (irdma_cq_t),
 	.size_qp = sizeof (irdma_qp_t),
@@ -672,10 +673,10 @@ irdma_verbs_fini(irdma_t *irdma)
 
 	if (!irdma->irdma_verbs_live)
 		return;
-	/* The interrupt task checks irdma_verbs_live before the tables. */
+	/* The vector threads check irdma_verbs_live before the tables. */
 	irdma->irdma_verbs_live = B_FALSE;
 	membar_producer();
-	ddi_taskq_wait(irdma->irdma_taskq);
+	irdma_intr_barrier(irdma);
 	ddi_taskq_wait(irdma->irdma_wq);
 	ddi_taskq_destroy(irdma->irdma_wq);
 	irdma->irdma_wq = NULL;
@@ -702,6 +703,7 @@ irdma_verbs_register(irdma_t *irdma)
 	rdev->rd_ops = &irdma_rdk_ops;
 	rdev->rd_phys_port_cnt = 1;
 	rdev->rd_node_guid = 0;
+	rdev->rd_num_comp_vectors = irdma->irdma_nceqs;
 	if ((ret = rdk_register_device(rdev)) != 0) {
 		irdma_error(irdma, "failed to register with rdmak: %d", ret);
 		return (ret);
