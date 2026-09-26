@@ -1030,7 +1030,10 @@ mlxcx_intr_n(caddr_t arg, caddr_t arg2)
 	mutex_exit(&mleq->mleq_mtx);
 
 	for (; ent != NULL; ent = mlxcx_eq_next(mleq)) {
-		ASSERT3U(ent->mleqe_event_type, ==, MLXCX_EVENT_COMPLETION);
+		if (ent->mleqe_event_type != MLXCX_EVENT_COMPLETION) {
+			mleq->mleq_badevents++;
+			goto update_eq;
+		}
 
 		probe.mlcq_num =
 		    from_be24(ent->mleqe_completion.mled_completion_cqn);

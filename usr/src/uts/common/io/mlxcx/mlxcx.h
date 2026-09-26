@@ -516,6 +516,8 @@ typedef struct mlxcx_event_queue {
 	uint32_t		mleq_events;
 
 	uint32_t		mleq_badintrs;
+	/* Events of a type this queue was not set up for. */
+	uint64_t		mleq_badevents;
 
 	/* Hardware eq number */
 	uint_t			mleq_num;
