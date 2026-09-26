@@ -218,6 +218,7 @@ const struct rdk_device_ops iwc_rdk_ops = {
 	.destroy_ah = iwc_destroy_ah,
 	.dma_alloc = iwc_dma_alloc,
 	.dma_free = iwc_dma_free,
+	.cq_resched = iwc_cq_resched,
 	.size_pd = sizeof (iwc_pd_t),
 	.size_cq = sizeof (iwc_cq_t),
 	.size_qp = sizeof (iwc_qp_t),
@@ -284,7 +285,8 @@ iwc_info_ok(iwc_t *iwc)
 
 	if (in->tri_chip < CHELSIO_T5 || in->tri_nports == 0 ||
 	    in->tri_nports > T4_RDMA_MAX_PORTS || in->tri_bar2 == NULL ||
-	    in->tri_eq_spg_len == 0 || in->tri_eq_spg_len > 2) {
+	    in->tri_eq_spg_len == 0 || in->tri_eq_spg_len > 2 ||
+	    in->tri_nciq == 0 || in->tri_nciq > T4_RDMA_MAX_CIQ) {
 		iwc_warn(iwc, "unsupported adapter (chip %u, %u ports)",
 		    in->tri_chip, in->tri_nports);
 		return (ENOTSUP);
@@ -369,6 +371,7 @@ iwc_register(iwc_t *iwc)
 		d->d_rdk.rd_dip = iwc->iwc_dip;
 		d->d_rdk.rd_ops = &iwc_rdk_ops;
 		d->d_rdk.rd_phys_port_cnt = 1;
+		d->d_rdk.rd_num_comp_vectors = iwc->iwc_nvec;
 		if ((ret = rdk_iw_cm_attach(&d->d_rdk, &iwc_iw_ops)) != 0)
 			return (ret);
 		d->d_iw_attached = B_TRUE;
@@ -411,18 +414,47 @@ static const char *const iwc_stat_names[] = {
 	"conn_est", "conn_abort", "async_err", "quarantine"
 };
 
+/*
+ * After the counters: the vectors, with the names irdma uses so that one
+ * tool reads both, and a ceqN_intrs for each vector N from 1.
+ */
+static const char *const iwc_vec_names[] = {
+	"comp_vectors", "ceq_intrs", "ceq_busy_ns", "ceq_runs", "cq_arms",
+	"sq_doorbells"
+};
+#define	IWC_KS_FIXED	(ARRAY_SIZE(iwc_stat_names) + ARRAY_SIZE(iwc_vec_names))
+
 static int
 iwc_kstat_update(kstat_t *ksp, int rw)
 {
-	const iwc_t *iwc = ksp->ks_private;
+	iwc_t *iwc = ksp->ks_private;
 	const uint64_t *v = (const uint64_t *)&iwc->iwc_stats;
 	kstat_named_t *kn = ksp->ks_data;
-	uint_t i;
+	uint64_t intrs = 0, busy = 0, runs = 0, arms = 0, db = 0;
+	uint_t i, n = ARRAY_SIZE(iwc_stat_names);
 
 	if (rw == KSTAT_WRITE)
 		return (EACCES);
-	for (i = 0; i < ARRAY_SIZE(iwc_stat_names); i++)
+	for (i = 0; i < n; i++)
 		kn[i].value.ui64 = v[i];
+	for (i = 0; i < iwc->iwc_nvec; i++) {
+		iwc_vec_t *iv = &iwc->iwc_vecs[i];
+
+		mutex_enter(&iv->iv_lock);
+		kn[IWC_KS_FIXED + i].value.ui64 = iv->iv_intrs;
+		intrs += iv->iv_intrs;
+		busy += iv->iv_busy_ns;
+		runs += iv->iv_runs;
+		mutex_exit(&iv->iv_lock);
+		arms += iv->iv_arms;
+		db += iv->iv_sq_db;
+	}
+	kn[n++].value.ui64 = iwc->iwc_nvec;
+	kn[n++].value.ui64 = intrs;
+	kn[n++].value.ui64 = busy;
+	kn[n++].value.ui64 = runs;
+	kn[n++].value.ui64 = arms;
+	kn[n++].value.ui64 = db;
 	return (0);
 }
 
@@ -431,17 +463,24 @@ iwc_kstat_init(iwc_t *iwc)
 {
 	kstat_named_t *kn;
 	kstat_t *ksp;
-	uint_t i;
+	char name[KSTAT_STRLEN];
+	uint_t i, n;
 
 	CTASSERT(sizeof (iwc->iwc_stats) ==
 	    ARRAY_SIZE(iwc_stat_names) * sizeof (uint64_t));
 	ksp = kstat_create(IWC_NAME, ddi_get_instance(iwc->iwc_dip), "stats",
-	    "misc", KSTAT_TYPE_NAMED, ARRAY_SIZE(iwc_stat_names), 0);
+	    "misc", KSTAT_TYPE_NAMED, IWC_KS_FIXED + iwc->iwc_nvec, 0);
 	if (ksp == NULL)
 		return;
 	kn = ksp->ks_data;
 	for (i = 0; i < ARRAY_SIZE(iwc_stat_names); i++)
 		kstat_named_init(&kn[i], iwc_stat_names[i], KSTAT_DATA_UINT64);
+	for (n = 0; n < ARRAY_SIZE(iwc_vec_names); n++, i++)
+		kstat_named_init(&kn[i], iwc_vec_names[n], KSTAT_DATA_UINT64);
+	for (n = 0; n < iwc->iwc_nvec; n++, i++) {
+		(void) snprintf(name, sizeof (name), "ceq%u_intrs", n + 1);
+		kstat_named_init(&kn[i], name, KSTAT_DATA_UINT64);
+	}
 	ksp->ks_private = iwc;
 	ksp->ks_update = iwc_kstat_update;
 	kstat_install(ksp);
@@ -475,8 +514,6 @@ iwc_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	iwc_locks_init(iwc, hdr->trp_intr_pri);
 	iwc->iwc_cm_tq = taskq_create("iwc_cm", 1, minclsyspri, 1, 1,
 	    TASKQ_PREPOPULATE);
-	iwc->iwc_cq_tq = taskq_create("iwc_cq", 1, maxclsyspri, 1, 1,
-	    TASKQ_PREPOPULATE);
 
 	if ((ret = iwc->iwc_ops->tro_open(iwc->iwc_peer, &iwc_client, iwc,
 	    &iwc->iwc_info)) != 0) {
@@ -485,6 +522,7 @@ iwc_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		goto fail;
 	}
 	iwc->iwc_open = B_TRUE;
+	iwc_vecs_init(iwc, hdr->trp_intr_pri);
 	iwc->iwc_ndev = iwc->iwc_info.tri_nports;
 	if ((ret = iwc_info_ok(iwc)) != 0 || (ret = iwc_setup(iwc)) != 0)
 		goto fail;
@@ -502,7 +540,7 @@ fail:
 	if (iwc->iwc_open)
 		(void) iwc->iwc_ops->tro_close(iwc->iwc_peer);
 	iwc_teardown(iwc);
-	taskq_destroy(iwc->iwc_cq_tq);
+	iwc_vecs_fini(iwc);
 	taskq_destroy(iwc->iwc_cm_tq);
 	iwc_locks_fini(iwc);
 	ddi_soft_state_free(iwc_state, instance);
@@ -528,7 +566,7 @@ iwc_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	(void) iwc->iwc_ops->tro_close(iwc->iwc_peer);
 	iwc->iwc_open = B_FALSE;
 	iwc_teardown(iwc);
-	taskq_destroy(iwc->iwc_cq_tq);
+	iwc_vecs_fini(iwc);
 	taskq_destroy(iwc->iwc_cm_tq);
 	iwc_locks_fini(iwc);
 	ddi_soft_state_free(iwc_state, instance);

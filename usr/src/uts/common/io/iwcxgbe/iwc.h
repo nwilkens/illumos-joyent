@@ -23,12 +23,13 @@
  *
  * Contexts: t4nex calls iwc_cpl() and iwc_cq_notify() in interrupt context;
  * they only queue work.  The CM taskq runs every connection state change,
- * one CPL at a time, and the CQ taskq runs completion handlers.
+ * one CPL at a time.  Each completion vector (a t4nex CIQ with its own
+ * interrupt) has a thread that runs the completion handlers of its CQs.
  *
  * Lock order: ep_lock, then the CQ locks (receive CQ first), then qp_lock,
- * then iwc_res_lock.  iwc_obj_lock and iwc_cm_qlock are interrupt priority
- * leaves.  No lock is held across a call into rdmak or t4nex that can
- * block.
+ * then iwc_res_lock.  iwc_obj_lock, then iv_lock; these and iwc_cm_qlock
+ * are interrupt priority.  No lock is held across a call into rdmak or
+ * t4nex that can block.
  */
 
 #include <sys/types.h>
@@ -91,11 +92,33 @@ typedef struct iwc_cq {
 	t4_rdma_dma_t	*cq_mem;
 	size_t		cq_memlen;
 	boolean_t	cq_live;	/* the firmware has the queue */
-	/* iwc_obj_lock */
+	uint32_t	cq_vec;
+	/* The vector's iv_lock */
 	uint32_t	cq_refs;
 	boolean_t	cq_pending;
 	struct iwc_cq	*cq_next;
 } iwc_cq_t;
+
+/*
+ * A completion vector: its CIQ's interrupt queues CQs here and the thread
+ * calls their handlers, oldest first.
+ */
+typedef struct iwc_vec {
+	struct iwc	*iv_iwc;
+	uint_t		iv_idx;
+	kmutex_t	iv_lock;	/* interrupt priority */
+	kcondvar_t	iv_cv;
+	iwc_cq_t	*iv_head;
+	iwc_cq_t	*iv_tail;
+	boolean_t	iv_exit;
+	kt_did_t	iv_did;
+	uint64_t	iv_intrs;	/* notifications taken */
+	uint64_t	iv_runs;	/* handler calls */
+	uint64_t	iv_busy_ns;
+	/* Atomic: the arms of its CQs and the doorbells of their QPs. */
+	uint64_t	iv_arms;
+	uint64_t	iv_sq_db;
+} iwc_vec_t;
 
 typedef enum iwc_qp_state {
 	IWC_QPS_IDLE = 0,
@@ -236,10 +259,9 @@ struct iwc {
 	kcondvar_t		iwc_obj_cv;
 	iwc_cq_t		**iwc_cqs;
 	iwc_qp_t		**iwc_qps;
-	iwc_cq_t		*iwc_cq_pending;
-	boolean_t		iwc_cq_queued;
-	taskq_ent_t		iwc_cq_ent;
-	taskq_t			*iwc_cq_tq;
+
+	uint_t			iwc_nvec;
+	iwc_vec_t		iwc_vecs[T4_RDMA_MAX_CIQ];
 
 	kmutex_t		iwc_cm_qlock;
 	struct iwc_cmq		*iwc_cm_qhead;
@@ -317,8 +339,10 @@ extern int iwc_create_cq(struct rdk_cq *, const struct rdk_cq_init_attr *);
 extern void iwc_destroy_cq(struct rdk_cq *);
 extern int iwc_poll_cq(struct rdk_cq *, int, struct rdk_wc *);
 extern int iwc_req_notify_cq(struct rdk_cq *, enum rdk_cq_notify_flags);
-extern void iwc_cq_notify(void *, uint32_t);
-extern void iwc_cq_task(void *);
+extern void iwc_cq_notify(void *, uint_t, const uint32_t *, uint_t);
+extern void iwc_cq_resched(struct rdk_cq *);
+extern void iwc_vecs_init(iwc_t *, uint_t);
+extern void iwc_vecs_fini(iwc_t *);
 extern void iwc_flush_qp(iwc_qp_t *);
 extern void iwc_cq_insert_drain(iwc_cq_t *, iwc_qp_t *, uint64_t,
     uint8_t, boolean_t);

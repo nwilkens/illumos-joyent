@@ -104,14 +104,14 @@ def main():
     anchors = (
         ("iwc_cm.c", "\tq = kmem_alloc(sizeof (*q), KM_NOSLEEP);\n",
          "\tq = kmem_alloc(sizeof (*q), KM_SLEEP);\n", "blocks"),
-        ("iwc_cq.c", "\tmutex_enter(&iwc->iwc_obj_lock);\n\tif ((cq = ",
+        ("iwc_cq.c", "\tmutex_enter(&iwc->iwc_obj_lock);\n\tfor (uint_t i",
          "\tmutex_enter(&iwc->iwc_ep_lock);\n\tmutex_exit("
          "&iwc->iwc_ep_lock);\n\tmutex_enter(&iwc->iwc_obj_lock);\n"
-         "\tif ((cq = ", "iwc_ep_lock"),
-        ("iwc_cq.c", "cqid - iwc->iwc_qid_start]) != NULL)\n"
-         "\t\tiwc_cq_schedule(iwc, cq);\n",
-         "cqid - iwc->iwc_qid_start]) != NULL)\n"
-         "\t\tiwc_cq_wait_idle(iwc, cq);\n", "iwc_cq_wait_idle() blocks"),
+         "\tfor (uint_t i", "iwc_ep_lock"),
+        ("iwc_cq.c", "id - iwc->iwc_qid_start]) != NULL)\n"
+         "\t\t\tiwc_cq_schedule(iwc, cq);\n",
+         "id - iwc->iwc_qid_start]) != NULL)\n"
+         "\t\t\tiwc_cq_wait_idle(cq);\n", "iwc_cq_wait_idle() blocks"),
     )
     for name, old, new, want in anchors:
         i = names.index(name)

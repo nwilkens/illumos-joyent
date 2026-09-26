@@ -47,6 +47,9 @@
 #include <sys/sunddi.h>
 #include <sys/sysmacros.h>
 #include <sys/atomic.h>
+#include <sys/thread.h>
+#include <sys/proc.h>
+#include <sys/disp.h>
 
 #include "iwc.h"
 #include "common/t4_regs.h"
@@ -712,6 +715,7 @@ iwc_req_notify_cq(struct rdk_cq *rcq, enum rdk_cq_notify_flags flags)
 
 	mutex_enter(&cq->cq_lock);
 	hw->armed = B_TRUE;
+	atomic_inc_64(&cq->cq_iwc->iwc_vecs[cq->cq_vec].iv_arms);
 	while (hw->cidx_inc > M_CIDXINC) {
 		iwc_gts(cq, V_SEINTARM(0) | V_CIDXINC(M_CIDXINC) |
 		    V_TIMERREG(7));
@@ -727,22 +731,34 @@ iwc_req_notify_cq(struct rdk_cq *rcq, enum rdk_cq_notify_flags flags)
 	return (ret);
 }
 
-/* Queue the CQ's completion handler.  iwc_obj_lock is held. */
+/* Queue the CQ's completion handler on its vector.  iv_lock is held. */
 static void
-iwc_cq_schedule(iwc_t *iwc, iwc_cq_t *cq)
+iwc_cq_queue(iwc_vec_t *iv, iwc_cq_t *cq)
 {
-	ASSERT(MUTEX_HELD(&iwc->iwc_obj_lock));
+	ASSERT(MUTEX_HELD(&iv->iv_lock));
 	if (cq->cq_pending)
 		return;
 	cq->cq_pending = B_TRUE;
 	cq->cq_refs++;
-	cq->cq_next = iwc->iwc_cq_pending;
-	iwc->iwc_cq_pending = cq;
-	if (!iwc->iwc_cq_queued) {
-		iwc->iwc_cq_queued = B_TRUE;
-		taskq_dispatch_ent(iwc->iwc_cq_tq, iwc_cq_task, iwc, 0,
-		    &iwc->iwc_cq_ent);
-	}
+	cq->cq_next = NULL;
+	if (iv->iv_tail == NULL)
+		iv->iv_head = cq;
+	else
+		iv->iv_tail->cq_next = cq;
+	iv->iv_tail = cq;
+	cv_signal(&iv->iv_cv);
+}
+
+/* A CQ still in the table gets its handler called.  iwc_obj_lock is held. */
+static void
+iwc_cq_schedule(iwc_t *iwc, iwc_cq_t *cq)
+{
+	iwc_vec_t *iv = &iwc->iwc_vecs[cq->cq_vec];
+
+	ASSERT(MUTEX_HELD(&iwc->iwc_obj_lock));
+	mutex_enter(&iv->iv_lock);
+	iwc_cq_queue(iv, cq);
+	mutex_exit(&iv->iv_lock);
 }
 
 /* Software completions were added; tell an armed CQ's consumer. */
@@ -764,40 +780,63 @@ iwc_cq_wake(iwc_cq_t *cq)
 	mutex_exit(&iwc->iwc_obj_lock);
 }
 
-/* t4nex: an armed CQ has new entries.  Interrupt context. */
+/*
+ * rdmak: call the handler again from the CQ's vector.  The caller holds
+ * the CQ, which destroy waits for.
+ */
 void
-iwc_cq_notify(void *arg, uint32_t cqid)
+iwc_cq_resched(struct rdk_cq *rcq)
+{
+	iwc_cq_t *cq = (iwc_cq_t *)rcq;
+	iwc_vec_t *iv = &cq->cq_iwc->iwc_vecs[cq->cq_vec];
+
+	mutex_enter(&iv->iv_lock);
+	iwc_cq_queue(iv, cq);
+	mutex_exit(&iv->iv_lock);
+}
+
+/* t4nex: armed CQs have new entries.  Interrupt context of vector vec. */
+void
+iwc_cq_notify(void *arg, uint_t vec, const uint32_t *cqids, uint_t n)
 {
 	iwc_t *iwc = arg;
 	iwc_cq_t *cq;
+	uint32_t id;
 
-	if (cqid < iwc->iwc_qid_start || cqid - iwc->iwc_qid_start >=
-	    iwc->iwc_qid_n)
-		return;
+	if (vec < iwc->iwc_nvec)
+		atomic_inc_64(&iwc->iwc_vecs[vec].iv_intrs);
 	mutex_enter(&iwc->iwc_obj_lock);
-	if ((cq = iwc->iwc_cqs[cqid - iwc->iwc_qid_start]) != NULL)
-		iwc_cq_schedule(iwc, cq);
+	for (uint_t i = 0; i < n; i++) {
+		id = cqids[i];
+		if (id < iwc->iwc_qid_start ||
+		    id - iwc->iwc_qid_start >= iwc->iwc_qid_n)
+			continue;
+		if ((cq = iwc->iwc_cqs[id - iwc->iwc_qid_start]) != NULL)
+			iwc_cq_schedule(iwc, cq);
+	}
 	mutex_exit(&iwc->iwc_obj_lock);
 }
 
-void
-iwc_cq_task(void *arg)
+static void
+iwc_vec_thread(void *arg)
 {
-	iwc_t *iwc = arg;
+	iwc_vec_t *iv = arg;
 	iwc_cq_t *cq;
+	hrtime_t t0;
 
+	mutex_enter(&iv->iv_lock);
 	for (;;) {
-		mutex_enter(&iwc->iwc_obj_lock);
-		if ((cq = iwc->iwc_cq_pending) == NULL) {
-			iwc->iwc_cq_queued = B_FALSE;
-			mutex_exit(&iwc->iwc_obj_lock);
-			return;
-		}
-		iwc->iwc_cq_pending = cq->cq_next;
+		while (iv->iv_head == NULL && !iv->iv_exit)
+			cv_wait(&iv->iv_cv, &iv->iv_lock);
+		if ((cq = iv->iv_head) == NULL)
+			break;
+		if ((iv->iv_head = cq->cq_next) == NULL)
+			iv->iv_tail = NULL;
 		cq->cq_next = NULL;
 		cq->cq_pending = B_FALSE;
-		mutex_exit(&iwc->iwc_obj_lock);
+		mutex_exit(&iv->iv_lock);
 
+		t0 = gethrtime();
 		mutex_enter(&cq->cq_lock);
 		cq->cq_hw.armed = B_FALSE;
 		mutex_exit(&cq->cq_lock);
@@ -805,20 +844,65 @@ iwc_cq_task(void *arg)
 			cq->cq_rdk.comp_handler(&cq->cq_rdk,
 			    cq->cq_rdk.cq_context);
 
-		mutex_enter(&iwc->iwc_obj_lock);
+		mutex_enter(&iv->iv_lock);
+		iv->iv_runs++;
+		iv->iv_busy_ns += (uint64_t)(gethrtime() - t0);
 		if (--cq->cq_refs == 0)
-			cv_broadcast(&iwc->iwc_obj_cv);
-		mutex_exit(&iwc->iwc_obj_lock);
+			cv_broadcast(&iv->iv_cv);
+	}
+	mutex_exit(&iv->iv_lock);
+	thread_exit();
+}
+
+/* The vector locks, at the interrupt priority, and the threads. */
+void
+iwc_vecs_init(iwc_t *iwc, uint_t pri)
+{
+	kthread_t *t;
+
+	iwc->iwc_nvec = MAX(MIN(iwc->iwc_info.tri_nciq, T4_RDMA_MAX_CIQ), 1);
+	for (uint_t i = 0; i < iwc->iwc_nvec; i++) {
+		iwc_vec_t *iv = &iwc->iwc_vecs[i];
+
+		iv->iv_iwc = iwc;
+		iv->iv_idx = i;
+		mutex_init(&iv->iv_lock, NULL, MUTEX_DRIVER, DDI_INTR_PRI(pri));
+		cv_init(&iv->iv_cv, NULL, CV_DRIVER, NULL);
+		t = thread_create(NULL, 0, iwc_vec_thread, iv, 0, &p0, TS_RUN,
+		    maxclsyspri);
+		iv->iv_did = t->t_did;
 	}
 }
 
-/* iwc_obj_lock is held. */
-static void
-iwc_cq_wait_idle(iwc_t *iwc, iwc_cq_t *cq)
+/* Every CQ is gone, so no vector has work. */
+void
+iwc_vecs_fini(iwc_t *iwc)
 {
-	ASSERT(MUTEX_HELD(&iwc->iwc_obj_lock));
+	for (uint_t i = 0; i < iwc->iwc_nvec; i++) {
+		iwc_vec_t *iv = &iwc->iwc_vecs[i];
+
+		mutex_enter(&iv->iv_lock);
+		VERIFY3P(iv->iv_head, ==, NULL);
+		iv->iv_exit = B_TRUE;
+		cv_broadcast(&iv->iv_cv);
+		mutex_exit(&iv->iv_lock);
+		thread_join(iv->iv_did);
+		cv_destroy(&iv->iv_cv);
+		mutex_destroy(&iv->iv_lock);
+	}
+	iwc->iwc_nvec = 0;
+}
+
+/* No handler call of the CQ is queued or running. */
+static void
+iwc_cq_wait_idle(iwc_cq_t *cq)
+{
+	iwc_vec_t *iv = &cq->cq_iwc->iwc_vecs[cq->cq_vec];
+
+	mutex_enter(&iv->iv_lock);
 	while (cq->cq_refs != 0)
-		cv_wait(&iwc->iwc_obj_cv, &iwc->iwc_obj_lock);
+		cv_wait(&iv->iv_cv, &iv->iv_lock);
+	mutex_exit(&iv->iv_lock);
 }
 
 int
@@ -832,7 +916,8 @@ iwc_create_cq(struct rdk_cq *rcq, const struct rdk_cq_init_attr *attr)
 	uint32_t entries, hwentries;
 	int ret;
 
-	if (attr->cqe == 0 || attr->cqe > IWC_MAX_CQE || attr->flags != 0)
+	if (attr->cqe == 0 || attr->cqe > IWC_MAX_CQE || attr->flags != 0 ||
+	    attr->comp_vector >= iwc->iwc_nvec)
 		return (EINVAL);
 	if (iwc->iwc_fatal)
 		return (EIO);
@@ -841,6 +926,7 @@ iwc_create_cq(struct rdk_cq *rcq, const struct rdk_cq_init_attr *attr)
 	hwentries = MAX(MIN(entries * 2, 65520), 64);
 
 	cq->cq_iwc = iwc;
+	cq->cq_vec = attr->comp_vector;
 	mutex_init(&cq->cq_lock, NULL, MUTEX_DRIVER, NULL);
 	cq->cq_memlen = (size_t)hwentries * T4_CQE_SIZE;
 	if ((ret = iwc->iwc_ops->tro_dma_alloc(iwc->iwc_peer, cq->cq_memlen,
@@ -853,6 +939,7 @@ iwc_create_cq(struct rdk_cq *rcq, const struct rdk_cq_init_attr *attr)
 	bzero(&res, sizeof (res));
 	res.trcq_cqid = hw->cqid;
 	res.trcq_size = hwentries;
+	res.trcq_vec = cq->cq_vec;
 	res.trcq_mem = cq->cq_mem;
 	ret = iwc->iwc_ops->tro_cq_create(iwc->iwc_peer, &res, &db);
 	if (ret != 0) {
@@ -892,8 +979,8 @@ iwc_destroy_cq(struct rdk_cq *rcq)
 
 	mutex_enter(&iwc->iwc_obj_lock);
 	iwc->iwc_cqs[cq->cq_hw.cqid - iwc->iwc_qid_start] = NULL;
-	iwc_cq_wait_idle(iwc, cq);
 	mutex_exit(&iwc->iwc_obj_lock);
+	iwc_cq_wait_idle(cq);
 
 	/* t4nex frees the ring, or keeps it if the firmware did not answer. */
 	ret = iwc->iwc_ops->tro_cq_destroy(iwc->iwc_peer, cq->cq_hw.cqid);

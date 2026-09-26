@@ -44,6 +44,7 @@
 #include <sys/ddi.h>
 #include <sys/sunddi.h>
 #include <sys/sysmacros.h>
+#include <sys/atomic.h>
 
 #include "iwc.h"
 #include "common/t4_regs.h"
@@ -771,8 +772,11 @@ iwc_post_send(struct rdk_qp *rqp, const struct rdk_send_wr *wr,
 		idx += howmany(len16 * 16, T4_EQ_ENTRY_SIZE);
 		avail--;
 	}
-	if (idx != 0)
+	if (idx != 0) {
 		iwc_ring_sq(qp, idx);
+		atomic_inc_64(&qp->qp_iwc->iwc_vecs[((iwc_cq_t *)
+		    qp->qp_rdk.send_cq)->cq_vec].iv_sq_db);
+	}
 	mutex_exit(&qp->qp_lock);
 	if (ret != 0)
 		*bad = wr;
