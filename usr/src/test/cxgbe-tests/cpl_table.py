@@ -5,13 +5,14 @@ Every opcode appears once.  An opcode routed by the TID in its header must
 be a CPL that starts with union opcode_tid, so GET_TID() reads the TID and
 not some other field.  No NIC or host-to-chip opcode may be accepted from
 the offload queues, and every class in the table has a case in the dispatch
-switch.
+switch.  Negative advice on an active open is dropped before the ATID is
+touched: the chip still owns the open, so the ATID must not be freed.
 """
 
 import re
 import sys
 
-from c_src import COMMON, T4NEX, strip
+from c_src import COMMON, T4NEX, functions, strip
 
 BY_TID = {"TCC_STID", "TCC_PASS_ACCEPT", "TCC_ACT_EST", "TCC_HWTID",
           "TCC_ACT_OPEN_RPL"}
@@ -57,6 +58,10 @@ def main():
     for cls in {c for _, c, _ in entries} - {"TCC_DROP"}:
         if f"case {cls}:" not in switch:
             bad.append(f"no dispatch case for {cls}")
+    rpl = functions(src)["t4_ofld_cpl_act_open_rpl"]
+    advice, owner = rpl.find("t4_cpl_neg_advice("), rpl.find("TEF_OPEN")
+    if advice < 0 or owner < 0 or advice > owner:
+        bad.append("ACT_OPEN_RPL ends the open on negative advice")
     if bad:
         print("\n".join(bad))
         return 1

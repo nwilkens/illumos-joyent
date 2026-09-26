@@ -7,7 +7,8 @@ is needed.
 - `intr_locks.py`: no offload code blocks while it holds an interrupt
   priority lock, and nothing an interrupt handler reaches blocks.
 - `cpl_table.py`: the CPL dispatch table routes each opcode by an ID the
-  CPL really carries, and accepts no NIC or host-to-chip opcode.
+  CPL really carries, accepts no NIC or host-to-chip opcode, and does not
+  end an active open on negative advice.
 - `ops_boundary.py`: every child operation checks its peer and TID
   ownership, and the child never supplies a raw work request.
 - `ioctl_abi.py`: the test ioctl has one layout for ILP32 and LP64.

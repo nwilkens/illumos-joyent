@@ -12,7 +12,7 @@ TID, and each work request goes through t4_ofld_wr_send().
 import re
 import sys
 
-from c_src import T4NEX, functions
+from c_src import T4NEX, calls, functions
 
 # Operations that work without a live client, or that manage the client.
 UNPINNED = {"tro_open", "tro_close", "tro_dma_free", "tro_reset",
@@ -21,8 +21,8 @@ UNPINNED = {"tro_open", "tro_close", "tro_dma_free", "tro_reset",
 
 def main():
     header = (T4NEX / "t4_rdma.h").read_text(encoding="utf-8")
-    ops = (T4NEX / "t4_ofld_ops.c").read_text(encoding="utf-8") + \
-        (T4NEX / "t4_rdma_peer.c").read_text(encoding="utf-8")
+    ops = "".join((T4NEX / f).read_text(encoding="utf-8") for f in
+                  ("t4_ofld_ops.c", "t4_rdma_peer.c", "t4_ofld_ri.c"))
     vector = re.search(r"typedef struct t4_rdma_ops \{(.*?)\} t4_rdma_ops_t;",
                        header, re.DOTALL).group(1)
     members = re.findall(r"\(\*(tro_\w+)\)", vector)
@@ -54,10 +54,12 @@ def main():
         body = bodies[func]
         if not re.search(r"t4_tid_owned\(|t4_ofld_conn\(", body):
             bad.append(f"{func}() does not check TID ownership")
+    builds = re.compile(r"t4_ofld_init_tp_wr|FW_ULPTX_WR|"
+                        r"FW_OFLD_TX_DATA_WR|V_FW_WR_OP\(")
+    builders = {f for f, b in bodies.items() if builds.search(b)}
     for func, body in bodies.items():
-        if "t4_ofld_wr_send" in body and "t4_ofld_init_tp_wr" not in body \
-                and "FW_ULPTX_WR" not in body and "FW_OFLD_TX_DATA_WR" \
-                not in body:
+        if "t4_ofld_wr_send" in body and func not in builders and \
+                not calls(body) & builders:
             bad.append(f"{func}() sends a work request it did not build")
     if bad:
         print("\n".join(bad))
