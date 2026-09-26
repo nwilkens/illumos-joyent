@@ -41,8 +41,9 @@ model_output(uint_t slot, model_slot_t *ms, uint8_t *out, uint8_t *delivery)
 }
 
 /*
- * Issue a command that uses output mailboxes. QUERY_HCA_CAP does not report
- * every failure, so a timeout is also judged by the ereport it raises.
+ * Issue a command that uses output mailboxes. Before its own fix,
+ * QUERY_HCA_CAP did not report failures, so a timeout is also judged by the
+ * ereport it raises.
  */
 static boolean_t
 command(void)

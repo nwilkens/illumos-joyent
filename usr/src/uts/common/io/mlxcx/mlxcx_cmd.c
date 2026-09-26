@@ -1616,7 +1616,7 @@ mlxcx_cmd_query_hca_cap(mlxcx_t *mlxp, mlxcx_hca_cap_type_t type,
 	mlxcx_cmd_fini(mlxp, &cmd);
 
 	kmem_free(out, sizeof (mlxcx_cmd_query_hca_cap_out_t));
-	return (B_TRUE);
+	return (ret);
 }
 
 boolean_t

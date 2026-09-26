@@ -19,6 +19,7 @@ TESTS = (
     "pages_give_timeout.py",
     "cmdq_uar.py",
     "teardown_order.py",
+    "cmdq_hca_cap.py",
 )
 
 
