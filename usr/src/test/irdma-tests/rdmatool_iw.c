@@ -137,9 +137,10 @@ t_iwreject(peer_t *a, peer_t *b)
 {
 	struct in_addr stranger;
 	rdmat_cm_t c;
-	uint32_t baddr, slot;
+	uint32_t baddr, slot, ev;
 	uint16_t port = iw_port();
-	int ret, ok;
+	uint64_t t0, ms;
+	int ret, ok, st;
 
 	iw_no_pair = 1;
 	ret = fresh(a, b, RDMAT_QPT_RC, RDMAT_POLL_TASKQ);
@@ -155,15 +156,20 @@ t_iwreject(peer_t *a, peer_t *b)
 	c.rcm_raddr = baddr;
 	c.rcm_rport = port;
 	c.rcm_timeout_ms = 4000;
+	t0 = now_ns();
 	ret = pio(a, RDMAT_IOC_CM, &c);
 	ok = ret != 0;
+	ev = c.rcm_event;
+	st = c.rcm_status;
+	ms = (now_ns() - t0) / 1000000;
 
 	iw_cm_init(&c, RDMAT_CM_STATUS, slot);
 	if (pio(b, RDMAT_IOC_CM, &c) != 0 || c.rcm_reqs != 0)
 		ok = 0;
-	result(ok, "iwreject", "connect from a peer off the allow-list: %s; "
-	    "requests B's consumer saw: %u", ret == 0 ? "connected" :
-	    strerror(ret), c.rcm_reqs);
+	result(ok, "iwreject", "connect from a peer off the allow-list: %s "
+	    "(event %u status %d after %llu ms); requests B's consumer saw: %u",
+	    ret == 0 ? "connected" : strerror(ret), ev, st,
+	    (unsigned long long)ms, c.rcm_reqs);
 }
 
 /* bind(2) the address and port, as a host application would. */
