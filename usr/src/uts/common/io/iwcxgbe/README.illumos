@@ -1,0 +1,53 @@
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+
+iwcxgbe, the iWARP RDMA function of Chelsio T5 and T6 adapters, follows the
+Linux iw_cxgb4 driver.  The files below are derived from Linux
+v6.18-rc2-10-g552c50713f27, commit 552c50713f273b494ac6c77052032a49bc9255e2,
+drivers/infiniband/hw/cxgb4, and are used under the OpenIB.org BSD license
+that each Linux file offers; see THIRDPARTYLICENSE.  The blob of each Linux
+file is given.
+
+    iwc_ep.c      cm.c  b3b45c49077d5fe26e90499d77c764f7c9e4d359
+    iwc_cm.c      The endpoint state machine, the CPL handlers, the MPA
+    iwc_cm_ops.c  exchange and the connect, accept, reject, listen and
+                  disconnect operations.  The Linux socket, route,
+                  neighbour and iwpm code is not used: rdmak's connection
+                  manager and the t4nex operations take its place.
+
+    iwc_mpa.c     cm.c  b3b45c49077d5fe26e90499d77c764f7c9e4d359
+    iwc_mpa.h     iw_cxgb4.h  e17c1252536bc9f083462d62fce9a64f43e020ef
+                  The MPA start frame layout (struct mpa_message and
+                  struct mpa_v2_conn_params) and the checks of
+                  process_mpa_request() and process_mpa_reply().
+
+    iwc_cq.c      cq.c  14ced7b667fa2e15e4f2b4892e5f97ea598d256e
+                  Polling and flushing, with every CQE field checked
+                  before it is used.
+
+    iwc_qp.c      qp.c  955f061a55e9ae4be5b6ff135b7bbe5e3b695192
+                  QP sizing, the work request builders and posting.
+
+    iwc_mem.c     mem.c  dcdfe250bdbeb050182504760c04706ef20c1475
+                  resource.c  e800e8e8bed5aebcfcd662d6aa363c6f7343e592
+                  The TPT entry layout, the MR life cycle and the PBL and
+                  RQT pools.
+
+    iwc_t4.h      t4.h  c3b0e2896475ecaaa16b924c16d309393f714a1e
+                  t4fw_ri_api.h  1f79537fc8d139286591eca3c3e5b5ca47d0da3b
+                  The work queue entries, the CQE and the queue
+                  bookkeeping.
+
+iwc.c and iwc.h are written for illumos under the CDDL.
+
+No other Linux or FreeBSD file is used, in particular none of the generic
+include/linux headers and not the Linux clip_tbl code.  The Chelsio vendor
+driver was read for reference only; no code comes from it.
