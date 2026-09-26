@@ -25,7 +25,7 @@ def main():
         r"^#define\tICE_RDMA_FIRST_VECTOR\t[\s\S]*?"
         r"\(uint_t\)\(v\) < ICE_INTR_LAN_FIRST\(ice\)\)$")]
     parts = [extract(source, rf"^#define\tICE_RDMA_{n}_VECTORS\t.*$",
-                     args.source) for n in ("DEF", "MAX")]
+                     args.source) for n in ("DEF", "MIN", "MAX")]
     parts += bodies(args.source, ("ice_rdma_vectors",
                                   "ice_prop_get_num_queues", "ice_queue_limit",
                                  "ice_intr_cb", "ice_intr_cb_fini",
