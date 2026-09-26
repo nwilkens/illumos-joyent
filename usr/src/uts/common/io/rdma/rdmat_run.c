@@ -569,7 +569,10 @@ rdmat_qp_register(rdmat_qp_t *tq)
 	}
 	if (tq->tq_rmr_bound && (ret = rdmat_local_inv(tq, deadline)) != 0)
 		return (ret);
-	if ((ret = rdmat_reg(tq, tq->tq_lmr, RDK_ACCESS_LOCAL_WRITE,
+	acc = RDK_ACCESS_LOCAL_WRITE;
+	if (rdk_device_iwarp(tq->tq_qp->device))
+		acc |= RDK_ACCESS_REMOTE_WRITE;
+	if ((ret = rdmat_reg(tq, tq->tq_lmr, acc,
 	    rdk_inc_rkey(tq->tq_lmr->rkey))) != 0)
 		return (ret);
 	tq->tq_lmr_bound = B_TRUE;

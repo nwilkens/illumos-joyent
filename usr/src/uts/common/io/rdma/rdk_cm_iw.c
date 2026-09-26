@@ -74,6 +74,17 @@ rdk_iw_cm_attach(struct rdk_device *dev, const struct rdk_iw_cm_ops *ops)
 	return (0);
 }
 
+boolean_t
+rdk_device_iwarp(struct rdk_device *dev)
+{
+	boolean_t ret;
+
+	mutex_enter(&rdk_cm_lock);
+	ret = rdk_cm_dev_find_locked(dev) != NULL;
+	mutex_exit(&rdk_cm_lock);
+	return (ret);
+}
+
 void
 rdk_iw_cm_detach(struct rdk_device *dev)
 {

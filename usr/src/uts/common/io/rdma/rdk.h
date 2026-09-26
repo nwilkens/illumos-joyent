@@ -1112,6 +1112,8 @@ struct rdk_iw_cm_ops {
 };
 
 extern int rdk_iw_cm_attach(struct rdk_device *, const struct rdk_iw_cm_ops *);
+/* An iWARP device: an RDMA READ sink there needs REMOTE_WRITE access. */
+extern boolean_t rdk_device_iwarp(struct rdk_device *);
 extern void rdk_iw_cm_detach(struct rdk_device *);
 extern int rdk_iw_cm_event(struct rdk_iw_cm_id *,
     const struct rdk_iw_cm_event *);
