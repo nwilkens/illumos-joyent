@@ -188,6 +188,25 @@ def main():
     assert create.index("irdma->irdma_qp_table[num] = iqp;") < \
         create.index("irdma_cq_add_qp(iqp->iqp_scq, num);")
 
+    # A moderation delay is cancelled, waiting for one in progress, before
+    # the CQ is freed; the delay hands the poller back with no poller lock.
+    free = body(rdk, "rdk_free_cq")
+    assert free.index("untimeout_generic(tid, 0);") < \
+        free.index("rdk_cq_wait_idle(cp);") < free.rindex("rdk_destroy_cq(cq);")
+    assert free.index("cp->rcp_dying = B_TRUE;") < \
+        free.index("untimeout_generic(tid, 0);")
+    fire = body(rdk, "rdk_cq_mod_fire")
+    call = fire.index("resched(cq);")
+    assert fire.rindex("mutex_exit(&cp->rcp_lock);", 0, call) > \
+        fire.rindex("mutex_enter(&cp->rcp_lock);", 0, call)
+    # Busy polling runs only on a poller it holds.
+    begin = body(rdk, "rdk_cq_poll_begin")
+    assert "cp->rcp_queued = cp->rcp_busy = B_TRUE;" in begin
+    assert "if (cp->rcp_dying || cp->rcp_queued) {" in begin
+    # The ITR of a vector is the least any CQ on its CEQ asked for.
+    itr = body(intr, "irdma_ceq_set_itr")
+    assert "us = MIN(us, icq->icq_hold_us);" in itr
+
     # The ice theory statement records the peer locks.
     assert "ir_cfg_lock" in ice and "ir_lock" in ice
     print("PASS: interrupt priority and peer lock ordering")

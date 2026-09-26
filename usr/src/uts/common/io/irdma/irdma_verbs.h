@@ -106,6 +106,7 @@ typedef struct irdma_cq {
 	kcondvar_t		icq_cv;
 	uint64_t		icq_bad_cqes;
 	struct irdma_cq_poll_info icq_cur;
+	uint16_t		icq_hold_us;	/* modify_cq; ic_lock */
 	ulong_t			*icq_qpmap;	/* QPs on it; icq_lock */
 	size_t			icq_qpmap_size;
 } irdma_cq_t;
@@ -230,6 +231,7 @@ extern int irdma_req_notify_cq(struct rdk_cq *, enum rdk_cq_notify_flags);
 extern irdma_cq_t *irdma_cq_ceq_hold(irdma_ceq_t *, struct irdma_sc_cq *);
 extern void irdma_cq_ceq_dispatch(irdma_cq_t *, boolean_t);
 extern void irdma_cq_resched(struct rdk_cq *);
+extern int irdma_modify_cq(struct rdk_cq *, uint16_t, uint16_t);
 extern void irdma_cq_error(irdma_t *, uint32_t);
 extern boolean_t irdma_cq_empty(irdma_cq_t *);
 extern void irdma_cq_add_qp(irdma_cq_t *, uint32_t);

@@ -206,6 +206,7 @@ irdma_create_cq(struct rdk_cq *rcq, const struct rdk_cq_init_attr *attr)
 	mutex_exit(&irdma->irdma_cqtable_lock);
 	mutex_enter(&icq->icq_ceq->ic_lock);
 	icq->icq_live = B_TRUE;
+	irdma_ceq_set_itr(icq->icq_ceq);
 	mutex_exit(&icq->icq_ceq->ic_lock);
 	atomic_inc_32(&irdma->irdma_ncqs);
 	return (0);
@@ -244,6 +245,7 @@ irdma_destroy_cq(struct rdk_cq *rcq)
 	icq->icq_dying = B_TRUE;
 	irdma_sc_remove_cq_ctx(&ic->ic_sc, &icq->icq_sc);
 	irdma_sc_cleanup_ceqes(&icq->icq_sc, &ic->ic_sc);
+	irdma_ceq_set_itr(ic);
 	while (icq->icq_refs != 0)
 		cv_wait(&icq->icq_cv, &ic->ic_lock);
 	mutex_exit(&ic->ic_lock);
@@ -328,6 +330,26 @@ irdma_cq_resched(struct rdk_cq *rcq)
 	mutex_exit(&ic->ic_lock);
 	if (kick)
 		irdma_ceq_kick(ic);
+}
+
+/*
+ * The provider's modify_cq: the CQ's vector holds its interrupt up to
+ * usec.  The device has no per-CQ count, so rdmak keeps that.
+ */
+int
+irdma_modify_cq(struct rdk_cq *rcq, uint16_t count, uint16_t usec)
+{
+	irdma_cq_t *icq = IRDMA_CQ(rcq);
+	irdma_ceq_t *ic = icq->icq_ceq;
+
+	_NOTE(ARGUNUSED(count));
+	if (usec > IRDMA_MAX_CQ_HOLD_US)
+		return (EINVAL);
+	mutex_enter(&ic->ic_lock);
+	icq->icq_hold_us = usec;
+	irdma_ceq_set_itr(ic);
+	mutex_exit(&ic->ic_lock);
+	return (0);
 }
 
 /* In the CQ's vector thread, with no driver lock held. */

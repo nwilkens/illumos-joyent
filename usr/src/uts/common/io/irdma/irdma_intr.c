@@ -57,12 +57,63 @@ irdma_hw_vec(irdma_t *irdma, uint_t i)
 	return (irdma->irdma_intr.irin_first + i);
 }
 
+/* As icrdma_ena_irq(), with the vector's own ITR0 interval. */
 void
 irdma_vec_enable(irdma_t *irdma, uint_t vec)
 {
 	struct irdma_sc_dev *dev = &irdma->irdma_sc;
+	uint32_t val;
 
-	dev->irq_ops->irdma_en_irq(dev, irdma_hw_vec(irdma, vec));
+	val = FIELD_PREP(IRDMA_GLINT_DYN_CTL_ITR_INDX, 0) |
+	    FIELD_PREP(IRDMA_GLINT_DYN_CTL_INTERVAL,
+	    irdma->irdma_vecs[vec].iv_itr_us >> 1) |
+	    FIELD_PREP(IRDMA_GLINT_DYN_CTL_INTENA, 1) |
+	    FIELD_PREP(IRDMA_GLINT_DYN_CTL_CLEARPBA, 1);
+	writel(val, dev->hw_regs[IRDMA_GLINT_DYN_CTL] +
+	    irdma_hw_vec(irdma, vec));
+}
+
+/*
+ * Map a completion CEQ to its vector.  The core maps CEQs with no ITR; a
+ * completion CEQ uses ITR0, whose interval is the vector's iv_itr_us.
+ */
+static void
+irdma_ceq_cfg(irdma_t *irdma, irdma_ceq_t *ic, boolean_t enable)
+{
+	struct irdma_sc_dev *dev = &irdma->irdma_sc;
+	uint32_t val;
+
+	val = FIELD_PREP(IRDMA_GLINT_CEQCTL_CAUSE_ENA, enable) |
+	    FIELD_PREP(IRDMA_GLINT_CEQCTL_MSIX_INDX,
+	    irdma_hw_vec(irdma, ic->ic_vec->iv_idx)) |
+	    FIELD_PREP(IRDMA_GLINT_CEQCTL_ITR_INDX, 0);
+	writel(val, dev->hw_regs[IRDMA_GLINT_CEQCTL] + ic->ic_id);
+}
+
+/*
+ * The vector's interrupt hold: the least that any CQ on its CEQ asked for,
+ * so no CQ waits longer than it chose.  The caller holds ic_lock.
+ */
+void
+irdma_ceq_set_itr(irdma_ceq_t *ic)
+{
+	struct irdma_sc_ceq *ceq = &ic->ic_sc;
+	uint16_t us = IRDMA_MAX_CQ_HOLD_US;
+	unsigned long flags;
+	irdma_cq_t *icq;
+	uint32_t i;
+
+	ASSERT(MUTEX_HELD(&ic->ic_lock));
+	spin_lock_irqsave(&ceq->req_cq_lock, flags);
+	for (i = 0; i < ceq->reg_cq_size; i++) {
+		icq = ceq->reg_cq[i]->back_cq;
+		if (icq != NULL && !icq->icq_dying)
+			us = MIN(us, icq->icq_hold_us);
+	}
+	if (ceq->reg_cq_size == 0)
+		us = 0;
+	spin_unlock_irqrestore(&ceq->req_cq_lock, flags);
+	ic->ic_vec->iv_itr_us = us;
 }
 
 void
@@ -523,8 +574,7 @@ irdma_ceq_create(irdma_t *irdma, irdma_ceq_t *ic, uint32_t size)
 	}
 	ic->ic_live = B_TRUE;
 
-	dev->irq_ops->irdma_cfg_ceq(dev, ic->ic_id,
-	    irdma_hw_vec(irdma, iv->iv_idx), true);
+	irdma_ceq_cfg(irdma, ic, B_TRUE);
 	mutex_enter(&iv->iv_lock);
 	iv->iv_ceq = ic;
 	mutex_exit(&iv->iv_lock);
@@ -585,8 +635,7 @@ irdma_unstep_ceqs(irdma_t *irdma)
 		ic = &irdma->irdma_ceqs[i];
 		iv = ic->ic_vec;
 		if (ic->ic_live) {
-			dev->irq_ops->irdma_cfg_ceq(dev, ic->ic_id,
-			    irdma_hw_vec(irdma, iv->iv_idx), false);
+			irdma_ceq_cfg(irdma, ic, B_FALSE);
 			irdma_vec_disable(irdma, iv->iv_idx);
 			mutex_enter(&iv->iv_lock);
 			iv->iv_ceq = NULL;

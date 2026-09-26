@@ -62,6 +62,8 @@ typedef enum irdma_step {
 } irdma_step_t;
 
 #define	IRDMA_MAX_VECTORS	32
+/* The longest a vector holds its interrupt; the device takes 8160. */
+#define	IRDMA_MAX_CQ_HOLD_US	1000
 
 /* irdma_flags */
 #define	IRDMA_F_TAINTED		0x01	/* device may still reach freed DMA */
@@ -124,6 +126,7 @@ typedef struct irdma_vec {
 	uint64_t		iv_passes;
 	uint64_t		iv_intrs;
 	uint64_t		iv_busy_ns;
+	uint16_t		iv_itr_us;	/* see irdma_ceq_set_itr() */
 	hrtime_t		iv_last;	/* end of the last pass */
 	uint64_t		iv_rescues;	/* see irdma_vec_idle() */
 	uint64_t		iv_rescues_on;
@@ -381,6 +384,7 @@ extern void irdma_unstep_intr(irdma_t *);
 extern int irdma_step_ceqs(irdma_t *);
 extern void irdma_unstep_ceqs(irdma_t *);
 extern void irdma_ceq_kick(irdma_ceq_t *);
+extern void irdma_ceq_set_itr(irdma_ceq_t *);
 
 /*
  * irdma_osdep.c

@@ -561,6 +561,7 @@ static const struct rdk_device_ops irdma_rdk_ops = {
 	.dma_alloc = irdma_dma_alloc,
 	.dma_free = irdma_dma_free,
 	.cq_resched = irdma_cq_resched,
+	.modify_cq = irdma_modify_cq,
 	.size_pd = sizeof (irdma_pd_t),
 	.size_cq = sizeof (irdma_cq_t),
 	.size_qp = sizeof (irdma_qp_t),
