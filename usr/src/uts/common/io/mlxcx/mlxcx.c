@@ -972,11 +972,15 @@ mlxcx_teardown_flow_table(mlxcx_t *mlxp, mlxcx_flow_table_t *ft)
 
 	ASSERT(mutex_owned(&ft->mlft_mtx));
 
+	/*
+	 * If firmware fails to destroy an object, it keeps it until
+	 * TEARDOWN_HCA. It holds no host memory, so we free our side anyway.
+	 */
 	for (i = ft->mlft_nents - 1; i >= 0; --i) {
 		fe = &ft->mlft_ent[i];
 		if (fe->mlfe_state & MLXCX_FLOW_ENTRY_CREATED) {
 			if (!mlxcx_cmd_delete_flow_table_entry(mlxp, fe)) {
-				mlxcx_panic(mlxp, "failed to delete flow "
+				mlxcx_warn(mlxp, "failed to delete flow "
 				    "entry %u on table %u", i,
 				    ft->mlft_num);
 			}
@@ -987,7 +991,7 @@ mlxcx_teardown_flow_table(mlxcx_t *mlxp, mlxcx_flow_table_t *ft)
 		if (fg->mlfg_state & MLXCX_FLOW_GROUP_CREATED &&
 		    !(fg->mlfg_state & MLXCX_FLOW_GROUP_DESTROYED)) {
 			if (!mlxcx_cmd_destroy_flow_group(mlxp, fg)) {
-				mlxcx_panic(mlxp, "failed to destroy flow "
+				mlxcx_warn(mlxp, "failed to destroy flow "
 				    "group %u", fg->mlfg_num);
 			}
 		}
@@ -997,7 +1001,7 @@ mlxcx_teardown_flow_table(mlxcx_t *mlxp, mlxcx_flow_table_t *ft)
 	if (ft->mlft_state & MLXCX_FLOW_TABLE_CREATED &&
 	    !(ft->mlft_state & MLXCX_FLOW_TABLE_DESTROYED)) {
 		if (!mlxcx_cmd_destroy_flow_table(mlxp, ft)) {
-			mlxcx_panic(mlxp, "failed to destroy flow table %u",
+			mlxcx_warn(mlxp, "failed to destroy flow table %u",
 			    ft->mlft_num);
 		}
 	}
