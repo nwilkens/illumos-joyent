@@ -562,6 +562,20 @@ t4_rdma_op_ri_fini(t4_rdma_peer_t *peer, uint32_t tid, uint32_t sqid)
 	return (rc);
 }
 
+static int
+t4_rdma_op_ri_terminate(t4_rdma_peer_t *peer, uint32_t tid, uint32_t sqid,
+    uint8_t layer_etype, uint8_t ecode)
+{
+	t4_ofld_t *of;
+	int rc;
+
+	if ((of = t4_rdma_op_enter(peer)) == NULL)
+		return (EIO);
+	rc = t4_ofld_ri_terminate(of, tid, sqid, layer_etype, ecode);
+	t4_rdma_op_exit(of);
+	return (rc);
+}
+
 const t4_rdma_ops_t t4_rdma_ops = {
 	.tro_open = t4_rdma_op_open,
 	.tro_close = t4_rdma_op_close,
@@ -596,5 +610,6 @@ const t4_rdma_ops_t t4_rdma_ops = {
 	.tro_qp_create = t4_rdma_op_qp_create,
 	.tro_qp_destroy = t4_rdma_op_qp_destroy,
 	.tro_ri_init = t4_rdma_op_ri_init,
-	.tro_ri_fini = t4_rdma_op_ri_fini
+	.tro_ri_fini = t4_rdma_op_ri_fini,
+	.tro_ri_terminate = t4_rdma_op_ri_terminate
 };

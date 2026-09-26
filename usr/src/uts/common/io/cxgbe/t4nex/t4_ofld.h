@@ -520,6 +520,8 @@ extern int t4_ofld_qp_create(t4_ofld_t *, const t4_rdma_qp_res_t *,
 extern int t4_ofld_qp_destroy(t4_ofld_t *, uint32_t);
 extern int t4_ofld_ri_init(t4_ofld_t *, uint32_t, const t4_rdma_ri_init_t *);
 extern int t4_ofld_ri_fini(t4_ofld_t *, uint32_t, uint32_t);
+extern int t4_ofld_ri_terminate(t4_ofld_t *, uint32_t, uint32_t, uint8_t,
+    uint8_t);
 
 /* t4_ofld_test.c */
 extern int t4_ofld_test_ioctl(struct adapter *, void *, int);

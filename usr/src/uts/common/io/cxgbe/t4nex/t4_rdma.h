@@ -322,6 +322,13 @@ typedef struct t4_rdma_ops {
 	int	(*tro_ri_init)(t4_rdma_peer_t *, uint32_t,
 	    const t4_rdma_ri_init_t *);
 	int	(*tro_ri_fini)(t4_rdma_peer_t *, uint32_t, uint32_t);
+	/*
+	 * Send an iWARP TERMINATE (RFC 5040 layer, error type and code) on a
+	 * connection in RDMA mode.  The firmware sends it after the data
+	 * queued before it.
+	 */
+	int	(*tro_ri_terminate)(t4_rdma_peer_t *, uint32_t, uint32_t,
+	    uint8_t, uint8_t);
 } t4_rdma_ops_t;
 
 /* trp_intr_pri: the priority the child's callback locks need. */

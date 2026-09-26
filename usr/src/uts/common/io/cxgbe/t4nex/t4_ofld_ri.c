@@ -732,6 +732,49 @@ t4_ofld_ri_fini(t4_ofld_t *of, uint32_t tid, uint32_t sqid)
 }
 
 /*
+ * An iWARP TERMINATE on the QP's connection: the four byte header of RFC
+ * 5040 with no copied headers.  Only for a QP that entered RDMA mode on
+ * this connection and has not left it.
+ */
+int
+t4_ofld_ri_terminate(t4_ofld_t *of, uint32_t tid, uint32_t sqid,
+    uint8_t layer_etype, uint8_t ecode)
+{
+	struct fw_ri_wr wr;
+	t4_tid_ent_t *e;
+	t4_ri_obj_t *ro;
+	uint32_t gen;
+	int rc;
+
+	if ((rc = t4_ofld_gen(of, &gen)) != 0)
+		return (rc);
+	if ((ro = t4_ri_busy(of, sqid, gen, B_TRUE, &rc)) == NULL)
+		return (rc);
+	if ((ro->ro_flags & ROF_INIT) == 0 || ro->ro_tid != tid) {
+		t4_ri_unbusy(of, ro, 0);
+		return (EINVAL);
+	}
+
+	bzero(&wr, sizeof (wr));
+	wr.op_compl = BE_32(V_FW_WR_OP(FW_RI_WR));
+	wr.flowid_len16 = BE_32(V_FW_WR_FLOWID(tid) |
+	    V_FW_WR_LEN16(howmany(sizeof (wr), 16)));
+	wr.u.terminate.type = FW_RI_TYPE_TERMINATE;
+	wr.u.terminate.immdlen = BE_32(4);
+	wr.u.terminate.termmsg[0] = layer_etype;
+	wr.u.terminate.termmsg[1] = ecode;
+	if ((e = t4_ri_conn(of, tid, gen)) == NULL) {
+		t4_ri_unbusy(of, ro, 0);
+		return (EINVAL);
+	}
+	rc = t4_ofld_wr_send(of, &of->of_port[e->te_port].op_txq, &wr,
+	    roundup(sizeof (wr), 16));
+	mutex_exit(&of->of_tids.td_lock);
+	t4_ri_unbusy(of, ro, 0);
+	return (rc);
+}
+
+/*
  * The chip aborted a connection: a QP bound to it has left RDMA mode.
  * Called from the CPL dispatch with no t4nex lock held.
  */
