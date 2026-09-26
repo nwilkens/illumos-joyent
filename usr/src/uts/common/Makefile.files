@@ -2124,7 +2124,8 @@ ICE_INTC_OBJS =	ice_common.o ice_controlq.o ice_sched.o ice_switch.o \
 #	irdma: the E800 series RDMA function, and the Linux shared code it runs
 #
 IRDMA_OBJS =	irdma.o irdma_ctl.o irdma_osdep.o irdma_verbs.o irdma_cq.o \
-		irdma_qp.o irdma_post.o irdma_mr.o irdma_aeq.o
+		irdma_qp.o irdma_post.o irdma_mr.o irdma_aeq.o irdma_intr.o \
+		irdma_numa.o
 IRDMA_CORE_OBJS = ctrl.o hmc.o pble.o uk.o puda.o uda.o ws.o icrdma_hw.o
 
 #
@@ -2139,7 +2140,7 @@ RDMAK_OBJS =	rdk_device.o rdk_verbs.o rdk_cq.o rdk_cm.o rdk_cm_iw.o \
 #
 #	rdmat: the rdmak test client
 #
-RDMAT_OBJS =	rdmat.o rdmat_run.o rdmat_cm.o
+RDMAT_OBJS =	rdmat.o rdmat_run.o rdmat_bench.o rdmat_cm.o
 
 #
 #	Solarflare 1/10/40GbE NIC driver module

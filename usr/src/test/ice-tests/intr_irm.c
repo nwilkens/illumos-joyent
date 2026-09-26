@@ -891,6 +891,12 @@ irm_rdma(void)
 	assert(ice_alloc_intrs(&dev) && dev.ice_intr_rdma == 2);
 	assert(m.errors == 1);
 	ice_free_intrs(&dev);
+	/* One vector leaves no completion vector. */
+	rdma_want = 1;
+	reset(1024);
+	assert(ice_alloc_intrs(&dev) && dev.ice_intr_rdma == 2);
+	assert(m.errors == 1);
+	ice_free_intrs(&dev);
 	rdma_want = 0;
 }
 

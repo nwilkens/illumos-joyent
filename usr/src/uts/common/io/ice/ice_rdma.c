@@ -386,7 +386,7 @@ ice_rdma_link_notify(ice_t *ice)
 
 	mutex_enter(&ice->ice_lse_lock);
 	link = ice_link_state_effective(ice, ice->ice_link_state);
-	speed = ice->ice_link_speed;
+	speed = ice->ice_link_speed * 1000000ULL;
 	mutex_exit(&ice->ice_lse_lock);
 
 	mutex_enter(&ir->ir_lock);

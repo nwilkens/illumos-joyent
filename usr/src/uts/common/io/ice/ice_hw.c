@@ -435,6 +435,7 @@ ice_phy_fw_wait(ice_t *ice)
 
 /* Defaults and bounds of the RDMA properties in ice.conf. */
 #define	ICE_RDMA_DEF_VECTORS	2
+#define	ICE_RDMA_MIN_VECTORS	2	/* control and one completion vector */
 #define	ICE_RDMA_MAX_VECTORS	16
 
 /*
@@ -463,9 +464,10 @@ ice_rdma_vectors(ice_t *ice)
 
 	value = ddi_prop_get_int(DDI_DEV_T_ANY, ice->ice_dip, DDI_PROP_DONTPASS,
 	    "rdma_vectors", ICE_RDMA_DEF_VECTORS);
-	if (value < 1 || value > ICE_RDMA_MAX_VECTORS) {
-		ice_error(ice, "rdma_vectors %d is outside 1 to %d; using %d",
-		    value, ICE_RDMA_MAX_VECTORS, ICE_RDMA_DEF_VECTORS);
+	if (value < ICE_RDMA_MIN_VECTORS || value > ICE_RDMA_MAX_VECTORS) {
+		ice_error(ice, "rdma_vectors %d is outside %d to %d; using %d",
+		    value, ICE_RDMA_MIN_VECTORS, ICE_RDMA_MAX_VECTORS,
+		    ICE_RDMA_DEF_VECTORS);
 		value = ICE_RDMA_DEF_VECTORS;
 	}
 	/* The OICR and one LAN queue vector come first. */

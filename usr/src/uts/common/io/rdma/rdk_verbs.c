@@ -187,7 +187,7 @@ rdk_create_cq_poll(struct rdk_device *dev, rdk_comp_handler_t comp,
 
 	*cqp = NULL;
 	if (attr->cqe == 0 || attr->cqe > (uint32_t)dev->rd_attr.max_cqe ||
-	    attr->flags != 0)
+	    attr->comp_vector >= dev->rd_num_comp_vectors || attr->flags != 0)
 		return (EINVAL);
 	if ((ret = rdk_obj_hold(dev)) != 0)
 		return (ret);

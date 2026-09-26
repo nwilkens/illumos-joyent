@@ -34,6 +34,8 @@
 #include <sys/kstat.h>
 #include <sys/ddifm.h>
 #include <sys/time.h>
+#include <sys/pci_cap.h>
+#include <sys/pcie.h>
 
 #include "ice.h"
 #include "ice_common.h"
@@ -369,6 +371,79 @@ ice_vsi_kstat_update(kstat_t *ksp, int rw)
 	return (0);
 }
 
+/* Data rate of a PCIe link after line coding, each way. */
+static uint32_t
+ice_pcie_mbps(uint_t gen, uint_t width)
+{
+	static const uint32_t mts[] = { 0, 2500, 5000, 8000, 16000, 32000 };
+
+	if (gen == 0 || gen >= ARRAY_SIZE(mts) || width > 32)
+		return (0);
+	if (gen <= 2)
+		return (mts[gen] * width / 10 * 8);
+	return ((uint32_t)((uint64_t)mts[gen] * width * 128 / 130));
+}
+
+static const char *
+ice_pcie_gts(uint_t gen)
+{
+	static const char *const gts[] = {
+		"?", "2.5", "5.0", "8.0", "16.0", "32.0"
+	};
+
+	return (gen < ARRAY_SIZE(gts) ? gts[gen] : "?");
+}
+
+/*
+ * The PCIe link the PF trained to bounds what the port can move: Gen3 x8
+ * carries about 63 Gb/s each way, less than one 100G port.
+ */
+static boolean_t
+ice_pcie_kstat_init(ice_t *ice)
+{
+	ddi_acc_handle_t cfg = ice->ice_osdep.ios_cfg_handle;
+	ice_pcie_kstats_t *ipc;
+	uint_t gen = 0, width = 0, mgen = 0, mwidth = 0;
+	uint16_t cap, sts;
+	uint32_t lcap;
+	kstat_t *ksp;
+
+	if (PCI_CAP_LOCATE(cfg, PCI_CAP_ID_PCI_E, &cap) == DDI_SUCCESS) {
+		sts = PCI_CAP_GET16(cfg, 0, cap, PCIE_LINKSTS);
+		lcap = PCI_CAP_GET32(cfg, 0, cap, PCIE_LINKCAP);
+		if (sts != PCI_CAP_EINVAL16 && lcap != PCI_CAP_EINVAL32) {
+			gen = sts & PCIE_LINKSTS_SPEED_MASK;
+			width = (sts & PCIE_LINKSTS_NEG_WIDTH_MASK) >> 4;
+			mgen = lcap & PCIE_LINKCAP_MAX_SPEED_MASK;
+			mwidth = (lcap & PCIE_LINKCAP_MAX_WIDTH_MASK) >> 4;
+		}
+	}
+	dev_err(ice->ice_dip, CE_NOTE, "!PCIe link %s GT/s x%u, device "
+	    "supports %s GT/s x%u: about %u Mb/s each way", ice_pcie_gts(gen),
+	    width, ice_pcie_gts(mgen), mwidth, ice_pcie_mbps(gen, width));
+
+	ksp = kstat_create(ICE_MODULE_NAME, ice->ice_instance, "pcie", "net",
+	    KSTAT_TYPE_NAMED, sizeof (ice_pcie_kstats_t) /
+	    sizeof (kstat_named_t), 0);
+	if (ksp == NULL)
+		return (B_FALSE);
+	ipc = ksp->ks_data;
+	kstat_named_init(&ipc->ipc_link_gen, "link_gen", KSTAT_DATA_UINT32);
+	kstat_named_init(&ipc->ipc_link_width, "link_width",
+	    KSTAT_DATA_UINT32);
+	kstat_named_init(&ipc->ipc_max_gen, "max_gen", KSTAT_DATA_UINT32);
+	kstat_named_init(&ipc->ipc_max_width, "max_width", KSTAT_DATA_UINT32);
+	kstat_named_init(&ipc->ipc_link_mbps, "link_mbps", KSTAT_DATA_UINT32);
+	ipc->ipc_link_gen.value.ui32 = gen;
+	ipc->ipc_link_width.value.ui32 = width;
+	ipc->ipc_max_gen.value.ui32 = mgen;
+	ipc->ipc_max_width.value.ui32 = mwidth;
+	ipc->ipc_link_mbps.value.ui32 = ice_pcie_mbps(gen, width);
+	ice->ice_pcie_kstat = ksp;
+	kstat_install(ksp);
+	return (B_TRUE);
+}
+
 static boolean_t
 ice_pf_kstat_init(ice_t *ice)
 {
@@ -489,6 +564,8 @@ ice_stats_init(ice_t *ice)
 		goto fail;
 	if (!ice_vsi_kstat_init(ice))
 		goto fail;
+	if (!ice_pcie_kstat_init(ice))
+		goto fail;
 
 	return (B_TRUE);
 
@@ -500,6 +577,10 @@ fail:
 void
 ice_stats_fini(ice_t *ice)
 {
+	if (ice->ice_pcie_kstat != NULL) {
+		kstat_delete(ice->ice_pcie_kstat);
+		ice->ice_pcie_kstat = NULL;
+	}
 	if (ice->ice_vsi_kstat != NULL) {
 		kstat_delete(ice->ice_vsi_kstat);
 		ice->ice_vsi_kstat = NULL;

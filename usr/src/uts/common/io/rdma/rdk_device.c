@@ -227,6 +227,8 @@ rdk_register_device(struct rdk_device *dev)
 	bzero(&dev->rd_attr, sizeof (dev->rd_attr));
 	if ((ret = dev->rd_ops->query_device(dev, &dev->rd_attr)) != 0)
 		return (ret);
+	if (dev->rd_num_comp_vectors == 0)
+		dev->rd_num_comp_vectors = 1;
 
 	p = kmem_zalloc(sizeof (*p), KM_SLEEP);
 	p->rdp_dev = dev;

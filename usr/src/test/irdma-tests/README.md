@@ -62,7 +62,7 @@ enabled for the LAN.
 `rdma_verbs.sh` runs the verbs tests on hardware with irdma, rdmak and
 rdmat installed; `rdmatool.c` drives rdmat:
 
-    gcc -m64 -o rdmatool rdmatool.c -lkstat -lsocket -lnsl
+    gcc -m64 -pthread -o rdmatool rdmatool.c rdmabench.c -lkstat -lsocket -lnsl
     rdma_verbs.sh -i <local_ip> [-p <peer_ip>] [-s <server_ip>] [tests]
 
 On one host it runs the rdmatool suite between two sessions (SEND/RECV,
@@ -74,3 +74,19 @@ stream in flight, a PF reset (DEBUG ice `_reset`) with a stream in flight,
 and an interrupt resource management trim with a stream in flight.  With
 `-s` it runs the suite and a TCP baseline (`rdmatool ... client <server>
 tcp`) against `rdmatool -i <ip> server` on the other host.
+
+## Benchmark
+
+`rdmatool bench` runs perftest-style benchmarks (write_bw, read_bw,
+send_bw, write_lat, read_lat, send_lat) in loopback or against
+`rdmatool server` on another host:
+
+    rdmatool -i <local_ip> bench {loop | <server_ip>} write_bw \
+        size=4096,65536 qps=1,4 depth=64 batch=8 signal=32 mode=intr,poll
+
+Every key takes a list and each combination prints one `BENCH` line with
+Gb/s, operations per second, latency percentiles (p50, p99, p99.9), CPU
+seconds per GiB and microseconds per operation for each host, and
+interrupts, doorbells and CQ arms per operation.  The comment at the top of
+`rdmabench.c` explains how CPU is counted.  Bandwidth runs check every byte
+of the destination afterwards.

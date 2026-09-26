@@ -49,6 +49,7 @@
 #include <sys/policy.h>
 #include <sys/zone.h>
 #include <sys/varargs.h>
+#include <sys/cpuvar.h>
 
 #include "irdma_verbs.h"
 
@@ -138,9 +139,7 @@ irdma_event(void *arg, const ice_rdma_event_t *ev)
 		break;
 	case ICE_RDMA_EV_RESET_PREP:
 		irdma_taint(irdma);
-		mutex_enter(&irdma->irdma_intr_lock);
-		irdma->irdma_intr_off = B_TRUE;
-		mutex_exit(&irdma->irdma_intr_lock);
+		irdma_intr_off(irdma);
 		irdma_cqp_fail_all(irdma);
 		irdma_verbs_event(irdma, RDK_EVENT_DEVICE_FATAL);
 		break;
@@ -160,6 +159,7 @@ irdma_kstat_update(kstat_t *ksp, int rw)
 	irdma_t *irdma = ksp->ks_private;
 	irdma_kstats_t *k = &irdma->irdma_kstats;
 	struct irdma_hmc_info *hmc = irdma->irdma_sc.hmc_info;
+	int i;
 
 	if (rw == KSTAT_WRITE)
 		return (EACCES);
@@ -170,8 +170,28 @@ irdma_kstat_update(kstat_t *ksp, int rw)
 	k->ik_cqp_completed.value.ui64 = irdma->irdma_cqp_completed;
 	k->ik_cqp_timeouts.value.ui64 = irdma->irdma_cqp_timeouts;
 	k->ik_cqp_errors.value.ui64 = irdma->irdma_cqp_errors;
-	k->ik_ceq_intrs.value.ui64 = irdma->irdma_ceq_intrs;
-	k->ik_aeq_intrs.value.ui64 = irdma->irdma_aeq_intrs;
+	k->ik_ceq_intrs.value.ui64 = 0;
+	k->ik_aeq_intrs.value.ui64 = 0;
+	k->ik_ceq_busy_ns.value.ui64 = 0;
+	k->ik_ceq_rescues.value.ui64 = 0;
+	k->ik_ceq_rescues_on.value.ui64 = 0;
+	for (i = 0; i < (int)irdma->irdma_nvecs; i++) {
+		irdma_vec_t *iv = &irdma->irdma_vecs[i];
+
+		if (i == 0)
+			k->ik_aeq_intrs.value.ui64 = iv->iv_intrs;
+		else
+			k->ik_ceq_intrs.value.ui64 += iv->iv_intrs;
+		k->ik_ceq_busy_ns.value.ui64 += iv->iv_busy_ns;
+		k->ik_ceq_rescues.value.ui64 += iv->iv_rescues;
+		k->ik_ceq_rescues_on.value.ui64 += iv->iv_rescues_on;
+	}
+	k->ik_comp_vectors.value.ui32 = irdma->irdma_nceqs;
+	k->ik_numa_lgrp.value.i32 = (int32_t)irdma->irdma_numa_lgrp;
+	for (i = 0; i < (int)irdma->irdma_nceqs; i++) {
+		k->ik_ceqn_intrs[i].value.ui64 =
+		    irdma->irdma_ceqs[i].ic_vec->iv_intrs;
+	}
 	k->ik_aeqes.value.ui64 = irdma->irdma_aeqes;
 	k->ik_bad_entries.value.ui64 = irdma->irdma_bad_entries;
 	k->ik_events.value.ui64 = irdma->irdma_events;
@@ -187,6 +207,14 @@ irdma_kstat_update(kstat_t *ksp, int rw)
 	k->ik_bad_cqes.value.ui64 = irdma->irdma_bad_cqes;
 	k->ik_qp_errors.value.ui64 = irdma->irdma_qp_errors;
 	k->ik_flushes.value.ui64 = irdma->irdma_flushes;
+	k->ik_sq_doorbells.value.ui64 = 0;
+	k->ik_cq_arms.value.ui64 = 0;
+	for (i = 0; irdma->irdma_dbstats != NULL && i < max_ncpus; i++) {
+		k->ik_sq_doorbells.value.ui64 +=
+		    irdma->irdma_dbstats[i].ids_sq_doorbells;
+		k->ik_cq_arms.value.ui64 +=
+		    irdma->irdma_dbstats[i].ids_cq_arms;
+	}
 	if (hmc != NULL && hmc->hmc_obj != NULL) {
 		k->ik_hmc_sds.value.ui32 = hmc->sd_table.sd_cnt;
 		k->ik_qp_cnt.value.ui32 = hmc->hmc_obj[IRDMA_HMC_IW_QP].cnt;
@@ -203,9 +231,12 @@ irdma_kstat_init(irdma_t *irdma)
 {
 	irdma_kstats_t *k = &irdma->irdma_kstats;
 	kstat_t *ksp;
+	uint_t i;
 
+	/* One ceqN_intrs per completion CEQ; they come last. */
 	ksp = kstat_create(IRDMA_MODULE_NAME, irdma->irdma_instance, "ctl",
-	    "net", KSTAT_TYPE_NAMED, sizeof (*k) / sizeof (kstat_named_t), 0);
+	    "net", KSTAT_TYPE_NAMED, sizeof (*k) / sizeof (kstat_named_t) -
+	    (IRDMA_MAX_VECTORS - irdma->irdma_nceqs), 0);
 	if (ksp == NULL) {
 		irdma_error(irdma, "failed to create the kstat");
 		return;
@@ -245,6 +276,23 @@ irdma_kstat_init(irdma_t *irdma)
 	kstat_named_init(&k->ik_bad_cqes, "bad_cqes", KSTAT_DATA_UINT64);
 	kstat_named_init(&k->ik_qp_errors, "qp_errors", KSTAT_DATA_UINT64);
 	kstat_named_init(&k->ik_flushes, "flushes", KSTAT_DATA_UINT64);
+	kstat_named_init(&k->ik_sq_doorbells, "sq_doorbells",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&k->ik_cq_arms, "cq_arms", KSTAT_DATA_UINT64);
+	kstat_named_init(&k->ik_comp_vectors, "comp_vectors",
+	    KSTAT_DATA_UINT32);
+	kstat_named_init(&k->ik_ceq_busy_ns, "ceq_busy_ns", KSTAT_DATA_UINT64);
+	kstat_named_init(&k->ik_ceq_rescues, "ceq_rescues", KSTAT_DATA_UINT64);
+	kstat_named_init(&k->ik_ceq_rescues_on, "ceq_rescues_enabled",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&k->ik_numa_lgrp, "numa_lgrp", KSTAT_DATA_INT32);
+	for (i = 0; i < irdma->irdma_nceqs; i++) {
+		char name[KSTAT_STRLEN];
+
+		(void) snprintf(name, sizeof (name), "ceq%u_intrs", i + 1);
+		kstat_named_init(&k->ik_ceqn_intrs[i], name,
+		    KSTAT_DATA_UINT64);
+	}
 
 	kstat_install(ksp);
 	irdma->irdma_kstat = ksp;
@@ -331,11 +379,8 @@ irdma_unsetup(irdma_t *irdma)
 		ddi_taskq_destroy(irdma->irdma_test_taskq);
 		irdma->irdma_test_taskq = NULL;
 	}
-	if (irdma->irdma_taskq != NULL && irdma->irdma_intr_mask == 0) {
-		ddi_taskq_destroy(irdma->irdma_taskq);
-		irdma->irdma_taskq = NULL;
-		mutex_destroy(&irdma->irdma_intr_lock);
-	}
+	if (irdma->irdma_intr_mask == 0)
+		irdma_vecs_fini(irdma);
 	if (irdma->irdma_info.iri_bar0 != NULL)
 		irdma_osdep_regs_remove(irdma->irdma_info.iri_bar0);
 	if ((irdma->irdma_progress & BIT(IRDMA_STEP_OPEN)) != 0) {
@@ -372,13 +417,18 @@ irdma_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	irdma->irdma_peer = (ice_rdma_peer_t *)hdr;
 	irdma->irdma_ops = hdr->irp_ops;
 	irdma->irdma_link = LINK_STATE_UNKNOWN;
+	irdma->irdma_numa_lgrp = LGRP_NONE;
 	irdma_locks_init(irdma);
+	irdma->irdma_dbstats = kmem_zalloc(sizeof (irdma_dbstat_t) *
+	    max_ncpus, KM_SLEEP);
 
 	irdma->irdma_qp_limit = irdma_prop(irdma, "qp_limit",
 	    IRDMA_DEF_QP_LIMIT, IRDMA_MIN_QP_LIMIT, IRDMA_MAX_QP_LIMIT);
 	irdma->irdma_cqp_timeout_ms = irdma_prop(irdma, "cqp_timeout_ms",
 	    IRDMA_DEF_CQP_TIMEOUT, IRDMA_MIN_CQP_TIMEOUT,
 	    IRDMA_MAX_CQP_TIMEOUT);
+	irdma->irdma_comp_limit = irdma_prop(irdma, "comp_vectors",
+	    IRDMA_MAX_VECTORS, 1, IRDMA_MAX_VECTORS);
 #ifdef DEBUG
 	irdma->irdma_fail_step = irdma_prop(irdma, "fail_step", 0, 0,
 	    IRDMA_STEP_MAX);
@@ -402,19 +452,17 @@ irdma_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 
 	ret = irdma->irdma_ops->iro_intr_get(irdma->irdma_peer,
 	    &irdma->irdma_intr);
-	if (ret != 0 || irdma->irdma_intr.irin_count == 0 ||
+	if (ret != 0 || irdma->irdma_intr.irin_count < 2 ||
 	    irdma->irdma_intr.irin_count > IRDMA_MAX_VECTORS) {
-		irdma_error(irdma, "no RDMA vectors: %d", ret);
+		irdma_error(irdma, "need 2 to %u RDMA vectors, have %u: %d",
+		    IRDMA_MAX_VECTORS, irdma->irdma_intr.irin_count, ret);
 		goto fail;
 	}
-	(mutex_init)(&irdma->irdma_intr_lock, NULL, MUTEX_DRIVER,
-	    DDI_INTR_PRI(irdma->irdma_intr.irin_pri));
-	irdma->irdma_taskq = ddi_taskq_create(dip, "irdma_intr", 1,
-	    TASKQ_DEFAULTPRI, 0);
+	irdma_vecs_init(irdma);
 	irdma->irdma_test_taskq = ddi_taskq_create(dip, "irdma_test", 1,
 	    TASKQ_DEFAULTPRI, 0);
-	if (irdma->irdma_taskq == NULL || irdma->irdma_test_taskq == NULL) {
-		irdma_error(irdma, "failed to create the taskqs");
+	if (irdma->irdma_test_taskq == NULL) {
+		irdma_error(irdma, "failed to create the test taskq");
 		goto fail;
 	}
 	if (!irdma_osdep_regs_add(irdma->irdma_info.iri_bar0,
@@ -430,6 +478,8 @@ irdma_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	mutex_exit(&irdma->irdma_cfg_lock);
 	if (ret != 0)
 		goto fail;
+
+	irdma_numa_place(irdma);
 
 	if (ddi_create_minor_node(dip, IRDMA_MODULE_NAME, S_IFCHR, instance,
 	    DDI_PSEUDO, 0) != DDI_SUCCESS) {
@@ -455,9 +505,9 @@ irdma_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	}
 
 	dev_err(dip, CE_NOTE, "!RDMA control plane up: PF %u, VSI %u, "
-	    "%u vectors, %u QPs, %u CQs, %u SDs",
+	    "%u vectors, %u completion CEQs, %u QPs, %u CQs, %u SDs",
 	    irdma->irdma_info.iri_pf_id, irdma->irdma_info.iri_vsi_num,
-	    irdma->irdma_intr.irin_count,
+	    irdma->irdma_intr.irin_count, irdma->irdma_nceqs,
 	    irdma->irdma_sc.hmc_info->hmc_obj[IRDMA_HMC_IW_QP].cnt,
 	    irdma->irdma_sc.hmc_info->hmc_obj[IRDMA_HMC_IW_CQ].cnt,
 	    irdma->irdma_sc.hmc_info->sd_table.sd_cnt);
@@ -470,6 +520,7 @@ fail:
 		    "handler is still registered");
 		return (DDI_FAILURE);
 	}
+	kmem_free(irdma->irdma_dbstats, sizeof (irdma_dbstat_t) * max_ncpus);
 	irdma_locks_fini(irdma);
 	ddi_soft_state_free(irdma_state, instance);
 	return (DDI_FAILURE);
@@ -509,6 +560,7 @@ irdma_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 		return (DDI_FAILURE);
 
 	irdma_unsetup(irdma);
+	kmem_free(irdma->irdma_dbstats, sizeof (irdma_dbstat_t) * max_ncpus);
 	irdma_locks_fini(irdma);
 	ddi_soft_state_free(irdma_state, instance);
 	return (DDI_SUCCESS);

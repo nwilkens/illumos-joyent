@@ -18,6 +18,7 @@
 
 #include <sys/list.h>
 #include <sys/kstat.h>
+#include <sys/lgrp.h>
 #include <sys/ddifm.h>
 #include <sys/fm/protocol.h>
 #include <sys/fm/io/ddi.h>
@@ -54,6 +55,7 @@ typedef enum irdma_step {
 	IRDMA_STEP_CCQ,
 	IRDMA_STEP_CEQ0,
 	IRDMA_STEP_AEQ,
+	IRDMA_STEP_CEQS,	/* the completion CEQs */
 	IRDMA_STEP_PBLE,
 	IRDMA_STEP_WS,		/* work scheduler tree and the TC0 qset */
 	IRDMA_STEP_PEFLTR,
@@ -61,6 +63,8 @@ typedef enum irdma_step {
 } irdma_step_t;
 
 #define	IRDMA_MAX_VECTORS	32
+/* The longest a vector holds its interrupt; the device takes 8160. */
+#define	IRDMA_MAX_CQ_HOLD_US	1000
 
 /* irdma_flags */
 #define	IRDMA_F_TAINTED		0x01	/* device may still reach freed DMA */
@@ -104,6 +108,59 @@ struct irdma_qp;
 struct irdma_cq;
 struct irdma_arp_entry;
 
+/*
+ * A reserved RDMA vector and its thread; see irdma_intr.c.  iv_lock is at
+ * the priority of the vectors and covers the fields up to iv_did.
+ */
+typedef struct irdma_vec {
+	struct irdma		*iv_irdma;
+	uint_t			iv_idx;		/* index into irdma_intr */
+	boolean_t		iv_ctl;		/* vector 0: AEQ and CEQ 0 */
+	kmutex_t		iv_lock;
+	kcondvar_t		iv_cv;
+	boolean_t		iv_owed;	/* the vector fired */
+	boolean_t		iv_resched;	/* a CQ wants another call */
+	boolean_t		iv_off;
+	boolean_t		iv_busy;
+	boolean_t		iv_exit;
+	uint_t			iv_rechecks;
+	uint64_t		iv_passes;
+	uint64_t		iv_intrs;
+	uint64_t		iv_busy_ns;
+	uint16_t		iv_itr_us;	/* see irdma_ceq_set_itr() */
+	hrtime_t		iv_last;	/* end of the last pass */
+	uint64_t		iv_rescues;	/* see irdma_vec_idle() */
+	uint64_t		iv_rescues_on;
+	struct irdma_ceq	*iv_ceq;
+	processorid_t		iv_cpu;		/* irdma_numa_place() */
+	processorid_t		iv_bound;	/* the thread's own */
+	kt_did_t		iv_did;
+} irdma_vec_t;
+
+/*
+ * A completion CEQ.  ic_lock covers the ring, the holds of its CQs and
+ * ic_resched.
+ */
+typedef struct irdma_ceq {
+	irdma_vec_t		*ic_vec;
+	uint32_t		ic_id;
+	struct irdma_sc_ceq	ic_sc;
+	struct irdma_dma_mem	ic_mem;
+	struct irdma_sc_cq	**ic_reg;
+	uint32_t		ic_nreg;
+	boolean_t		ic_live;	/* created on the device */
+	kmutex_t		ic_lock;
+	list_t			ic_resched;
+	uint64_t		ic_events;
+} irdma_ceq_t;
+
+/* Doorbell counts, one per CPU, padded to a cache line. */
+typedef struct irdma_dbstat {
+	uint64_t	ids_sq_doorbells;
+	uint64_t	ids_cq_arms;
+	uint64_t	ids_pad[6];
+} irdma_dbstat_t;
+
 typedef struct irdma_kstats {
 	kstat_named_t	ik_progress;
 	kstat_named_t	ik_flags;
@@ -133,6 +190,14 @@ typedef struct irdma_kstats {
 	kstat_named_t	ik_bad_cqes;
 	kstat_named_t	ik_qp_errors;
 	kstat_named_t	ik_flushes;
+	kstat_named_t	ik_sq_doorbells;
+	kstat_named_t	ik_cq_arms;
+	kstat_named_t	ik_comp_vectors;
+	kstat_named_t	ik_ceq_busy_ns;
+	kstat_named_t	ik_ceq_rescues;
+	kstat_named_t	ik_ceq_rescues_on;
+	kstat_named_t	ik_numa_lgrp;
+	kstat_named_t	ik_ceqn_intrs[IRDMA_MAX_VECTORS];
 } irdma_kstats_t;
 
 typedef struct irdma {
@@ -153,8 +218,12 @@ typedef struct irdma {
 	ice_rdma_info_t		irdma_info;
 	ice_rdma_intr_t		irdma_intr;
 	uint32_t		irdma_intr_mask;	/* handlers added */
-	uint_t			irdma_aeq_vec;	/* index into irdma_intr */
-	uint_t			irdma_ceq_vec;
+	irdma_vec_t		irdma_vecs[IRDMA_MAX_VECTORS];
+	uint_t			irdma_nvecs;
+	irdma_ceq_t		*irdma_ceqs;	/* CEQ 1 and on */
+	uint32_t		irdma_nceqs;
+	uint32_t		irdma_ceqs_alloc;
+	lgrp_id_t		irdma_numa_lgrp;
 
 	struct device		irdma_osdev;
 	struct ib_device	irdma_ibdev;
@@ -177,7 +246,7 @@ typedef struct irdma {
 	uint_t			irdma_req_waiters;
 	kcondvar_t		irdma_req_cv;	/* a request became free */
 
-	/* CCQ, CEQ 0 and the AEQ */
+	/* CCQ, CEQ 0 and the AEQ, on vector 0 */
 	struct irdma_sc_cq	irdma_ccq;
 	struct irdma_dma_mem	irdma_ccq_mem;
 	struct irdma_dma_mem	irdma_ccq_shadow;
@@ -197,17 +266,10 @@ typedef struct irdma {
 	unsigned long		*irdma_ws_ids;
 	uint16_t		irdma_ws_max;
 
-	/* Deferred interrupt work. */
-	ddi_taskq_t		*irdma_taskq;
-	kmutex_t		irdma_intr_lock;	/* interrupt priority */
-	boolean_t		irdma_ceq_owed;
-	boolean_t		irdma_aeq_owed;
-	boolean_t		irdma_task_queued;
-	boolean_t		irdma_intr_off;
-
 	/* Tunables, read at attach. */
 	uint32_t		irdma_qp_limit;
 	uint32_t		irdma_cqp_timeout_ms;
+	uint32_t		irdma_comp_limit;	/* completion vectors */
 
 	/* Test hooks; see irdma_ioctl.h. */
 	uint32_t		irdma_fail_step;	/* 0: none */
@@ -217,12 +279,11 @@ typedef struct irdma {
 
 	kstat_t			*irdma_kstat;
 	irdma_kstats_t		irdma_kstats;
+	irdma_dbstat_t		*irdma_dbstats;	/* max_ncpus */
 	uint64_t		irdma_cqp_submitted;
 	uint64_t		irdma_cqp_completed;
 	uint64_t		irdma_cqp_timeouts;
 	uint64_t		irdma_cqp_errors;
-	uint64_t		irdma_ceq_intrs;
-	uint64_t		irdma_aeq_intrs;
 	uint64_t		irdma_aeqes;
 	uint64_t		irdma_bad_entries;
 	uint64_t		irdma_events;
@@ -237,7 +298,7 @@ typedef struct irdma {
 	 * tables and bitmaps are sized from the HMC once the control plane
 	 * is up.  Lock order: a QP's iqp_mod_lock, then irdma_arp_cmd_lock,
 	 * then a CQ's icq_lock, then the QP's iqp_lock, then
-	 * irdma_cqtable_lock, irdma_qptable_lock and irdma_ceq_lock, then
+	 * irdma_cqtable_lock, irdma_qptable_lock and a CEQ's ic_lock, then
 	 * irdma_rsrc_lock and irdma_arp_lock.  Only iqp_mod_lock and
 	 * irdma_arp_cmd_lock are held across a CQP command.
 	 */
@@ -274,7 +335,7 @@ typedef struct irdma {
 	kmutex_t		irdma_arp_lock;
 	kmutex_t		irdma_arp_cmd_lock;	/* ARP adds, deletes */
 	struct irdma_arp_entry	*irdma_arp_table;
-	kmutex_t		irdma_ceq_lock;
+	kmutex_t		irdma_ceq_lock;	/* CEQ 0 */
 	ddi_taskq_t		*irdma_wq;	/* QP errors and flushes */
 	uint32_t		irdma_nqps;
 	uint32_t		irdma_ncqs;
@@ -305,11 +366,35 @@ extern u64 irdma_req_scratch(irdma_t *, irdma_cqp_req_t *);
 extern int irdma_cqp_exec(irdma_t *, irdma_cqp_req_t *,
     struct irdma_ccq_cqe_info *);
 extern int irdma_ctl_stop(irdma_t *);
-extern uint_t irdma_intr(caddr_t, caddr_t);
-extern void irdma_intr_task(void *);
+extern void irdma_ccq_poll(irdma_t *);
 extern int irdma_cqp_probe(irdma_t *);
 extern void irdma_ctl_hold_release(irdma_t *);
 extern void irdma_cqp_fail_all(irdma_t *);
+
+/*
+ * irdma_intr.c: the vectors, their threads and the completion CEQs.
+ */
+extern uint32_t irdma_hw_vec(irdma_t *, uint_t);
+extern void irdma_vec_enable(irdma_t *, uint_t);
+extern void irdma_vec_disable(irdma_t *, uint_t);
+extern uint_t irdma_intr(caddr_t, caddr_t);
+extern void irdma_vecs_init(irdma_t *);
+extern void irdma_vecs_fini(irdma_t *);
+extern void irdma_vec_barrier(irdma_vec_t *);
+extern void irdma_intr_barrier(irdma_t *);
+extern void irdma_intr_off(irdma_t *);
+extern void irdma_intr_quiesce(irdma_t *);
+extern int irdma_step_intr(irdma_t *);
+extern void irdma_unstep_intr(irdma_t *);
+extern int irdma_step_ceqs(irdma_t *);
+extern void irdma_unstep_ceqs(irdma_t *);
+extern void irdma_ceq_kick(irdma_ceq_t *);
+extern void irdma_ceq_set_itr(irdma_ceq_t *);
+
+/*
+ * irdma_numa.c
+ */
+extern void irdma_numa_place(irdma_t *);
 
 /*
  * irdma_osdep.c
@@ -319,6 +404,7 @@ extern void irdma_osdep_regs_fini(void);
 extern void irdma_osdep_init(irdma_t *);
 extern void irdma_osdep_fini(irdma_t *);
 extern boolean_t irdma_osdep_regs_add(caddr_t, size_t, ddi_acc_handle_t);
+extern void irdma_osdep_regs_dbs(caddr_t, caddr_t, caddr_t, irdma_dbstat_t *);
 extern void irdma_osdep_regs_remove(caddr_t);
 extern boolean_t irdma_quiesced(irdma_t *);
 extern void irdma_taint(irdma_t *);

@@ -109,7 +109,7 @@ ice_rdma_op_open(ice_rdma_peer_t *peer, const ice_rdma_client_t *client,
 
 	mutex_enter(&ice->ice_lse_lock);
 	ir->ir_link = ice_link_state_effective(ice, ice->ice_link_state);
-	ir->ir_speed = ice->ice_link_speed;
+	ir->ir_speed = ice->ice_link_speed * 1000000ULL;
 	mutex_exit(&ice->ice_lse_lock);
 	info->iri_link = ir->ir_link;
 	info->iri_speed = ir->ir_speed;

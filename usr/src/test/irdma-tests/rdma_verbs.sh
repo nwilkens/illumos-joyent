@@ -66,7 +66,7 @@ dev() { find /devices -name 'irdma@0:irdma' 2>/dev/null | head -1; }
 up() {
 	local i
 	for i in $(seq 1 ${1:-60}); do
-		[ "$(k irdma:0:ctl:progress)" = 4095 ] &&
+		[ "$(k irdma:0:ctl:progress)" = 8191 ] &&
 		    [ "$(k ice:0:rdma:state)" = 2 ] && return 0
 		sleep 1
 	done
@@ -213,7 +213,7 @@ $CTL "$D" irm-add 8; r2=$?
 stream_wait $out 180
 trim=$(since $m | grep -o 'MSI-X vectors: [0-9]* -> [0-9]* .*' | head -1)
 if [ $r1 = 0 ] && [ $r2 = 0 ] && grep -q '^rc=0' $out &&
-    echo "$trim" | grep -q 'rdma=2'; then
+    echo "$trim" | grep -qw "rdma=$(k ice:0:rdma:vectors)"; then
 	pass "IRM trim in flight: '$trim', every bandwidth run passed"
 elif [ $r1 != 0 ]; then
 	fail "IRM trim in flight: irm-remove refused (DEBUG irdma needed)"

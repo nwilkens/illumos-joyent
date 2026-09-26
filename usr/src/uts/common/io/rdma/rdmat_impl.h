@@ -29,6 +29,22 @@ extern "C" {
 
 #define	RDMAT_NCHUNKS	(RDMAT_MAX_BUF / RDMAT_CHUNK)
 #define	RDMAT_QKEY	0x11111111
+#define	RDMAT_LAT_SAMPLES	(1U << 20)
+
+/* One send work request of a chain, with its gather element. */
+typedef struct rdmat_swr {
+	union {
+		struct rdk_send_wr	sw_wr;
+		struct rdk_rdma_wr	sw_rdma;
+		struct rdk_ud_wr	sw_ud;
+	};
+	struct rdk_sge		sw_sge;
+} rdmat_swr_t;
+
+typedef struct rdmat_rwr {
+	struct rdk_recv_wr	rw_wr;
+	struct rdk_sge		rw_sge;
+} rdmat_rwr_t;
 
 /* A device rdmak offered us, with the sessions on it. */
 typedef struct rdmat_dev {
@@ -126,6 +142,16 @@ typedef struct rdmat_qp {
 	int			tq_cm_status;
 	rdmat_qpinfo_t		tq_peer;
 	boolean_t		tq_cm_ok;	/* the peer's info was valid */
+
+	/* The ioctl thread's, for the run in progress. */
+	boolean_t		tq_busy;	/* RDMAT_F_BUSY */
+	hrtime_t		tq_spin_ns;	/* RDMAT_F_ADAPT */
+	boolean_t		tq_spoll;	/* busy polling tq_scq */
+	boolean_t		tq_rpoll;
+	uint64_t		tq_posted;
+	uint64_t		tq_post_calls;
+	rdmat_swr_t		tq_swr[RDMAT_MAX_BATCH];
+	rdmat_rwr_t		tq_rwr[RDMAT_MAX_BATCH];
 } rdmat_qp_t;
 
 /*
@@ -148,6 +174,10 @@ typedef struct rdmat_sess {
 	uint32_t		ts_qpt;
 	uint32_t		ts_poll;
 	uint32_t		ts_depth;
+	uint32_t		ts_inline;
+	uint32_t		ts_comp_vector;
+	uint16_t		ts_mod_count;
+	uint16_t		ts_mod_us;
 	uint16_t		ts_gid_index;
 	boolean_t		ts_gid_added;
 	uint32_t		ts_nqp;
@@ -173,6 +203,23 @@ extern void rdmat_qp_info(rdmat_qp_t *, rdmat_qpinfo_t *);
 /* rdmat_cm.c */
 extern int rdmat_cm(rdmat_sess_t *, rdmat_cm_t *);
 extern void rdmat_cm_teardown(rdmat_sess_t *);
+
+extern int rdmat_wait(rdmat_qp_t *, uint64_t *, uint64_t, hrtime_t);
+extern void rdmat_spin_end(rdmat_qp_t *);
+
+/* rdmat_bench.c: the data path runs */
+extern int rdmat_post_recvs(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
+    uint32_t, uint64_t *);
+extern int rdmat_stream(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
+    hrtime_t);
+extern int rdmat_recv_stream(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
+    hrtime_t);
+extern int rdmat_pingpong(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
+    hrtime_t);
+extern int rdmat_write_pingpong(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
+    hrtime_t);
+extern int rdmat_one_lat(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
+    hrtime_t);
 
 #ifdef __cplusplus
 }
