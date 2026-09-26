@@ -105,12 +105,21 @@ mlxcx_cmd_query_pages(mlxcx_t *mlxp, uint_t type, int32_t *npages)
 	return (B_TRUE);
 }
 
-boolean_t
-mlxcx_cmd_give_pages(mlxcx_t *mlxp, uint_t type, int32_t npages,
-    mlxcx_dev_page_t **pages)
+/*
+ * The driver passes a timed out flag only once it can act on one, so the
+ * stand-in takes it as an optional fifth argument.
+ */
+#define	mlxcx_cmd_give_pages(m, t, n, p, ...)	\
+	stub_give_pages(m, t, n, p, (boolean_t *)(__VA_ARGS__ + 0))
+
+static boolean_t
+stub_give_pages(mlxcx_t *mlxp, uint_t type, int32_t npages,
+    mlxcx_dev_page_t **pages, boolean_t *timedoutp)
 {
 	(void) mlxp;
 	dev_touch();
+	if (timedoutp != NULL)
+		*timedoutp = (give_policy == GIVE_TIMEOUT);
 	if (type == MLXCX_MANAGE_PAGES_OPMOD_ALLOC_FAIL) {
 		alloc_fail_calls++;
 		return (B_TRUE);

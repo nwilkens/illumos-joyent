@@ -1347,6 +1347,7 @@ mlxcx_give_pages(mlxcx_t *mlxp, int32_t npages, int32_t *ngiven)
 	mlxcx_dev_page_t *mdp;
 	mlxcx_dev_page_t **pages;
 	const ddi_dma_cookie_t *ck;
+	boolean_t timedout, ok = B_TRUE;
 
 	/*
 	 * If there are no pages required, then we're done here.
@@ -1400,13 +1401,22 @@ mlxcx_give_pages(mlxcx_t *mlxp, int32_t npages, int32_t *ngiven)
 	}
 
 	if (!mlxcx_cmd_give_pages(mlxp,
-	    MLXCX_MANAGE_PAGES_OPMOD_GIVE_PAGES, npages, pages)) {
-		mlxcx_warn(mlxp, "!hardware refused our gift of %u "
-		    "pages!", npages);
-		for (i = 0; i < npages; i++) {
-			list_insert_tail(&plist, pages[i]);
+	    MLXCX_MANAGE_PAGES_OPMOD_GIVE_PAGES, npages, pages, &timedout)) {
+		if (!timedout) {
+			mlxcx_warn(mlxp, "!hardware refused our gift of %u "
+			    "pages!", npages);
+			for (i = 0; i < npages; i++) {
+				list_insert_tail(&plist, pages[i]);
+			}
+			goto cleanup_npages;
 		}
-		goto cleanup_npages;
+		/*
+		 * Hardware may have taken the pages before it stopped
+		 * answering, so we keep them as given.
+		 */
+		mlxcx_warn(mlxp, "gift of %d pages timed out, keeping them",
+		    npages);
+		ok = B_FALSE;
 	}
 
 	for (i = 0; i < npages; i++) {
@@ -1420,7 +1430,7 @@ mlxcx_give_pages(mlxcx_t *mlxp, int32_t npages, int32_t *ngiven)
 
 	*ngiven = npages;
 
-	return (B_TRUE);
+	return (ok);
 
 cleanup_npages:
 	mutex_exit(&mlxp->mlx_pagemtx);

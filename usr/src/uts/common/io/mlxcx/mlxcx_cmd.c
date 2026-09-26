@@ -1453,7 +1453,7 @@ mlxcx_cmd_query_pages(mlxcx_t *mlxp, uint_t type, int32_t *npages)
 
 boolean_t
 mlxcx_cmd_give_pages(mlxcx_t *mlxp, uint_t type, int32_t npages,
-    mlxcx_dev_page_t **pages)
+    mlxcx_dev_page_t **pages, boolean_t *timedoutp)
 {
 	mlxcx_cmd_t cmd;
 	mlxcx_cmd_manage_pages_in_t *in;
@@ -1463,6 +1463,9 @@ mlxcx_cmd_give_pages(mlxcx_t *mlxp, uint_t type, int32_t npages,
 	uint32_t i;
 	uint64_t pa;
 	const ddi_dma_cookie_t *ck;
+
+	if (timedoutp != NULL)
+		*timedoutp = B_FALSE;
 
 	switch (type) {
 	case MLXCX_MANAGE_PAGES_OPMOD_ALLOC_FAIL:
@@ -1509,6 +1512,8 @@ mlxcx_cmd_give_pages(mlxcx_t *mlxp, uint_t type, int32_t npages,
 	if ((ret = mlxcx_cmd_send(mlxp, &cmd, in, insize, &out, outsize))) {
 		mlxcx_cmd_wait(&cmd);
 		ret = mlxcx_cmd_evaluate(mlxp, &cmd);
+		if (timedoutp != NULL)
+			*timedoutp = (cmd.mlcmd_status == MLXCX_CMD_R_TIMEOUT);
 	}
 
 	mlxcx_cmd_fini(mlxp, &cmd);

@@ -445,7 +445,7 @@ mlxcx_give_pages_once(mlxcx_t *mlxp, size_t npages)
 	if (!mlxcx_give_pages(mlxp, (int32_t)npages, &given)) {
 		/* Tell the hardware we had an allocation failure. */
 		(void) mlxcx_cmd_give_pages(mlxp,
-		    MLXCX_MANAGE_PAGES_OPMOD_ALLOC_FAIL, 0, NULL);
+		    MLXCX_MANAGE_PAGES_OPMOD_ALLOC_FAIL, 0, NULL, NULL);
 	}
 }
 

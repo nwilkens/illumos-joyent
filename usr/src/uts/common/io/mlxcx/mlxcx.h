@@ -1446,7 +1446,7 @@ extern boolean_t mlxcx_cmd_set_issi(mlxcx_t *, uint16_t);
 
 extern boolean_t mlxcx_cmd_query_pages(mlxcx_t *, uint_t, int32_t *);
 extern boolean_t mlxcx_cmd_give_pages(mlxcx_t *, uint_t, int32_t,
-    mlxcx_dev_page_t **);
+    mlxcx_dev_page_t **, boolean_t *);
 extern boolean_t mlxcx_cmd_return_pages(mlxcx_t *, int32_t, uint64_t *,
     int32_t *);
 
