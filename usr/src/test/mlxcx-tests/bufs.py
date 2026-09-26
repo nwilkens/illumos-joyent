@@ -9,7 +9,7 @@ from c_test import (TESTDIR, CTestFailure, function, mlxcx_types,
 
 
 NAMES = ("rx-stuck", "rx-stuck-leak", "tx-stuck", "orphan-unload",
-         "orphan-reattach")
+         "orphan-reattach", "long-name")
 
 
 def main():
@@ -23,7 +23,7 @@ def main():
         "mlxcx_workq_type_t", "mlxcx_dma_quarantine_t"))
     have = "mlxcx_cq_quarantine_bufs" in ring.read_text(encoding="utf-8")
     parts = ["#define\tHAVE_BUF_QUARANTINE\t1\n" if have else ""]
-    orphans = re.search(r"^static volatile uint_t mlxcx_orphans;$",
+    orphans = re.search(r"^static volatile uint(?:_t|64_t) mlxcx_orphans;$",
                         main_c.read_text(encoding="utf-8"), re.M)
     parts.append(orphans.group() + "\n" if orphans else "")
     parts += [function(main_c, name) for name in (

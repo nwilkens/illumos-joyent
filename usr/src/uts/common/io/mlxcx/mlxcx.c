@@ -476,7 +476,7 @@ static void *mlxcx_softstate;
  * Detaches that leaked packet buffers. Their mblk free routine and the
  * buffer cache callbacks still point at this module, so it must stay loaded.
  */
-static volatile uint_t mlxcx_orphans;
+static volatile uint64_t mlxcx_orphans;
 
 /*
  * Fault detection thresholds.
@@ -986,7 +986,7 @@ mlxcx_orphan_bufs(mlxcx_t *mlxp)
 		s->mlbs_state = MLXCX_SHARD_ORPHANED;
 		mutex_exit(&s->mlbs_mtx);
 	}
-	atomic_inc_uint(&mlxcx_orphans);
+	atomic_inc_64(&mlxcx_orphans);
 	mlxcx_warn(mlxp, "leaking packet buffers that hardware may still use");
 }
 
@@ -1646,18 +1646,21 @@ static boolean_t
 mlxcx_setup_bufs(mlxcx_t *mlxp)
 {
 	char namebuf[KSTAT_STRLEN];
-	uint_t orphans = mlxcx_orphans;
+	uint64_t orphans = mlxcx_orphans;
 
 	/*
 	 * An orphaned cache of this instance keeps its name for good, so a
-	 * cache made after an orphaning detach needs a new one.
+	 * cache made after an orphaning detach needs a new one. A truncated
+	 * name could match a leaked cache, so we refuse it.
 	 */
 	if (orphans == 0) {
 		(void) snprintf(namebuf, KSTAT_STRLEN, "mlxcx%d_bufs_cache",
 		    ddi_get_instance(mlxp->mlx_dip));
-	} else {
-		(void) snprintf(namebuf, KSTAT_STRLEN, "mlxcx%d_bufs_cache_%u",
-		    ddi_get_instance(mlxp->mlx_dip), orphans);
+	} else if (snprintf(namebuf, KSTAT_STRLEN, "mlxcx%d_bufs_cache_%llu",
+	    ddi_get_instance(mlxp->mlx_dip), (u_longlong_t)orphans) >=
+	    KSTAT_STRLEN) {
+		mlxcx_warn(mlxp, "no unique name for the buffer cache");
+		return (B_FALSE);
 	}
 	mlxp->mlx_bufs_cache = kmem_cache_create(namebuf,
 	    sizeof (mlxcx_buffer_t), sizeof (uint64_t),

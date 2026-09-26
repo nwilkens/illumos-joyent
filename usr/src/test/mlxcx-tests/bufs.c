@@ -421,12 +421,28 @@ orphan_reattach(void)
 	mlxcx_teardown_bufs(&mlx);
 }
 
+/*
+ * With a long instance number the orphan count no longer fits the cache
+ * name; a truncated name could match a leaked cache.
+ */
+static void
+long_name(void)
+{
+	stub_instance = 2147483647;
+	mlxcx_orphans = 100;
+	if (!mlxcx_setup_bufs(&mlx))
+		stub_fail("cache with a name that fits refused");
+	mlxcx_orphans = 1000;
+	(void) mlxcx_setup_bufs(&mlx);
+}
+
 static const char *const names[] = {
 	"rx-stuck", "rx-stuck-leak", "tx-stuck", "orphan-unload",
-	"orphan-reattach", NULL
+	"orphan-reattach", "long-name", NULL
 };
 static void (*const funcs[])(void) = {
-	rx_stuck, rx_stuck_leak, tx_stuck, orphan_unload, orphan_reattach
+	rx_stuck, rx_stuck_leak, tx_stuck, orphan_unload, orphan_reattach,
+	long_name
 };
 
 int

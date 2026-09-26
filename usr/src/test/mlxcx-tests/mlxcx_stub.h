@@ -636,6 +636,12 @@ atomic_inc_uint(volatile uint_t *p)
 }
 
 static void
+atomic_inc_64(volatile uint64_t *p)
+{
+	(*p)++;
+}
+
+static void
 atomic_or_uint(volatile uint_t *p, uint_t v)
 {
 	*p |= v;
@@ -689,11 +695,14 @@ typedef struct {
 #define	longlong_t		long long
 #define	KSTAT_STRLEN		31
 
+typedef unsigned long long u_longlong_t;
+static int stub_instance;
+
 static int
 ddi_get_instance(dev_info_t *dip)
 {
 	(void) dip;
-	return (0);
+	return (stub_instance);
 }
 
 static off_t stub_regsize = 32 * 1024 * 1024;
