@@ -152,6 +152,26 @@ def main():
     assert unconf.index("ice_rdma_fini(ice, reset_ok);") > \
         unconf.index("ice_reset(&ice->ice_hw, ICE_RESET_PFR)")
 
+    # Register access takes no lock; the map changes only under its writer
+    # lock with the generation odd.
+    osd = (IRDMA / "irdma_osdep.c").read_text(encoding="utf-8")
+    for name in ("readl", "writel", "irdma_regs_find"):
+        assert "mutex_enter" not in body(osd, name), name
+        assert "rw_enter" not in body(osd, name), name
+    for name in ("irdma_osdep_regs_add", "irdma_osdep_regs_dbs",
+                 "irdma_osdep_regs_remove"):
+        text = body(osd, name)
+        assert text.count("irdma_regs_change();") == 2, name
+        first = text.index("irdma_regs_change();")
+        assert text.rindex("mutex_enter(&irdma_regs_lock);", 0, first) >= 0
+    find = body(osd, "irdma_regs_find")
+    assert "& 1) != 0" in find and "while (gen != irdma_regs_gen)" in find
+    # The post path does not ask ice, whose lock every QP would share.
+    post = (IRDMA / "irdma_post.c").read_text(encoding="utf-8")
+    for name in ("irdma_post_send", "irdma_post_recv"):
+        assert "irdma_post_ok(" in body(post, name)
+        assert "irdma_healthy(" not in body(post, name)
+
     # The ice theory statement records the peer locks.
     assert "ir_cfg_lock" in ice and "ir_lock" in ice
     print("PASS: interrupt priority and peer lock ordering")

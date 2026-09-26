@@ -88,7 +88,7 @@ irdma_post_send(struct rdk_qp *rqp, const struct rdk_send_wr *wr,
 	int err = 0;
 
 	/* The device may reset at any time; this only stops new work. */
-	if (!irdma_healthy(iqp->iqp_irdma)) {
+	if (!irdma_post_ok(iqp->iqp_irdma)) {
 		*bad = wr;
 		return (EIO);
 	}
@@ -245,7 +245,7 @@ irdma_post_recv(struct rdk_qp *rqp, const struct rdk_recv_wr *wr,
 	boolean_t flushed;
 	int i, err = 0;
 
-	if (!irdma_healthy(iqp->iqp_irdma)) {
+	if (!irdma_post_ok(iqp->iqp_irdma)) {
 		*bad = wr;
 		return (EIO);
 	}

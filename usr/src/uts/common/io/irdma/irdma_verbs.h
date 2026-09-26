@@ -179,6 +179,18 @@ typedef struct irdma_ah {
 	boolean_t		iah_created;
 } irdma_ah_t;
 
+/*
+ * Whether posts may go to the device.  Before a PF reset ice takes this
+ * function offline or sends RESET_PREP, which taints it, so the post path
+ * need not ask ice and take its lock.
+ */
+static inline boolean_t
+irdma_post_ok(const irdma_t *irdma)
+{
+	return ((irdma->irdma_flags & (IRDMA_F_TAINTED | IRDMA_F_CQP_DEAD)) ==
+	    0);
+}
+
 #define	IRDMA_DEV(d)	((irdma_t *)(void *)((char *)(d) - \
 	offsetof(irdma_t, irdma_rdk)))
 #define	IRDMA_PD(p)	((irdma_pd_t *)(void *)(p))
