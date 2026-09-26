@@ -308,6 +308,18 @@ typedef enum {
 	MLXCX_CMD_QUEUE_S_BROKEN
 } mlxcx_cmd_queue_status_t;
 
+/*
+ * A command that timed out while hardware still owned its entry. The slot,
+ * the token and the mailboxes stay reserved until hardware gives the entry
+ * back.
+ */
+typedef struct mlxcx_cmd_abandon {
+	list_node_t		mca_node;
+	uint8_t			mca_token;
+	list_t			mca_mbox_in;
+	list_t			mca_mbox_out;
+} mlxcx_cmd_abandon_t;
+
 typedef struct mlxcx_cmd_queue {
 	kmutex_t		mcmd_lock;
 	kcondvar_t		mcmd_cv;
@@ -326,9 +338,14 @@ typedef struct mlxcx_cmd_queue {
 	uint32_t		mcmd_mask;
 
 	mlxcx_cmd_t		*mcmd_active[MLXCX_CMD_MAX];
+	mlxcx_cmd_abandon_t	*mcmd_abandoned[MLXCX_CMD_MAX];
+
+	/* Abandoned commands that hardware has returned, to be freed. */
+	list_t			mcmd_reap;
 
 	/* Completions that named no command we are waiting for. */
 	uint64_t		mcmd_stray;
+	uint64_t		mcmd_timeouts;
 
 	ddi_taskq_t		*mcmd_taskq;
 	id_space_t		*mcmd_tokens;

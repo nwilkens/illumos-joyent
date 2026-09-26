@@ -63,7 +63,15 @@ def region(path, first, last):
                     re.MULTILINE)
     if start is None or end is None or end.end() <= start.start():
         raise CTestFailure("extract", f"no region {first}..{last} in {path}")
-    return _located(text, start.start(), end.end(), path)
+    begin = start.start()
+    # Keep the forward declarations that sit just above the first function.
+    while True:
+        proto = re.search(r"(?:^static [^\n;]*\);\n)+\n?\Z",
+                          text[:begin], re.MULTILINE)
+        if proto is None:
+            break
+        begin = proto.start()
+    return _located(text, begin, end.end(), path)
 
 
 def typedef(path, name):

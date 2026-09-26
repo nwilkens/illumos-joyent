@@ -38,6 +38,12 @@ clock_t mlxcx_cmd_delay = 1000 * 1; /* 1 ms in us */
 uint_t mlxcx_cmd_tries = 5000; /* Wait at most 1s */
 
 /*
+ * How often we look for abandoned command slots that hardware has given back
+ * while we wait for a free slot.
+ */
+clock_t mlxcx_cmd_rescan_delay = 1000 * 1000; /* 1 s in us */
+
+/*
  * This macro is used to identify that we care about our own function that we're
  * communicating with. We always use this function.
  */
@@ -511,10 +517,23 @@ mlxcx_eth_proto_to_string(mlxcx_eth_proto_t p, mlxcx_ext_eth_proto_t ep,
 		buf[strlen(buf) - 1] = '\0';
 }
 
+static void mlxcx_cmd_abandon_free(mlxcx_t *, mlxcx_cmd_abandon_t *);
+
 void
 mlxcx_cmd_queue_fini(mlxcx_t *mlxp)
 {
 	mlxcx_cmd_queue_t *cmd = &mlxp->mlx_cmd;
+	mlxcx_cmd_abandon_t *mca;
+	uint_t slot, nowned = 0;
+
+	while ((mca = list_remove_head(&cmd->mcmd_reap)) != NULL)
+		mlxcx_cmd_abandon_free(mlxp, mca);
+	list_destroy(&cmd->mcmd_reap);
+
+	for (slot = 0; slot < MLXCX_CMD_MAX; slot++) {
+		if (cmd->mcmd_abandoned[slot] != NULL)
+			nowned++;
+	}
 
 	if (cmd->mcmd_tokens != NULL) {
 		id_space_destroy(cmd->mcmd_tokens);
@@ -528,6 +547,16 @@ mlxcx_cmd_queue_fini(mlxcx_t *mlxp)
 
 	cv_destroy(&cmd->mcmd_cv);
 	mutex_destroy(&cmd->mcmd_lock);
+
+	/*
+	 * Hardware may still write to the queue and to the mailboxes of
+	 * commands it never gave back, so we must leak them.
+	 */
+	if (nowned != 0) {
+		mlxcx_warn(mlxp, "hardware still owns %u timed out commands, "
+		    "leaking the command queue", nowned);
+		return;
+	}
 
 	mlxcx_dma_free(&cmd->mcmd_dma);
 }
@@ -582,6 +611,8 @@ mlxcx_cmd_queue_init(mlxcx_t *mlxp)
 
 	mutex_init(&cmd->mcmd_lock, NULL, MUTEX_DRIVER, NULL);
 	cv_init(&cmd->mcmd_cv, NULL, CV_DRIVER, NULL);
+	list_create(&cmd->mcmd_reap, sizeof (mlxcx_cmd_abandon_t),
+	    offsetof(mlxcx_cmd_abandon_t, mca_node));
 
 	(void) snprintf(buf, sizeof (buf), "mlxcx_tokens_%d", mlxp->mlx_inst);
 	if ((cmd->mcmd_tokens = id_space_create(buf, 1, UINT8_MAX)) == NULL) {
@@ -701,21 +732,35 @@ mlxcx_cmd_mbox_free(mlxcx_cmd_mbox_t *mbox)
 }
 
 static void
-mlxcx_cmd_fini(mlxcx_t *mlxp, mlxcx_cmd_t *cmd)
+mlxcx_cmd_mbox_list_free(list_t *listp)
 {
 	mlxcx_cmd_mbox_t *mbox;
 
-	while ((mbox = list_remove_head(&cmd->mlcmd_mbox_out)) != NULL) {
+	while ((mbox = list_remove_head(listp)) != NULL) {
 		mlxcx_cmd_mbox_free(mbox);
 	}
-	list_destroy(&cmd->mlcmd_mbox_out);
-	while ((mbox = list_remove_head(&cmd->mlcmd_mbox_in)) != NULL) {
-		mlxcx_cmd_mbox_free(mbox);
-	}
-	list_destroy(&cmd->mlcmd_mbox_in);
-	id_free(mlxp->mlx_cmd.mcmd_tokens, cmd->mlcmd_token);
+	list_destroy(listp);
+}
+
+static void
+mlxcx_cmd_fini(mlxcx_t *mlxp, mlxcx_cmd_t *cmd)
+{
+	mlxcx_cmd_mbox_list_free(&cmd->mlcmd_mbox_out);
+	mlxcx_cmd_mbox_list_free(&cmd->mlcmd_mbox_in);
+	/* A timed out command gave its token to the abandoned slot. */
+	if (cmd->mlcmd_token != 0)
+		id_free(mlxp->mlx_cmd.mcmd_tokens, cmd->mlcmd_token);
 	cv_destroy(&cmd->mlcmd_cv);
 	mutex_destroy(&cmd->mlcmd_lock);
+}
+
+static void
+mlxcx_cmd_abandon_free(mlxcx_t *mlxp, mlxcx_cmd_abandon_t *mca)
+{
+	mlxcx_cmd_mbox_list_free(&mca->mca_mbox_out);
+	mlxcx_cmd_mbox_list_free(&mca->mca_mbox_in);
+	id_free(mlxp->mlx_cmd.mcmd_tokens, mca->mca_token);
+	kmem_free(mca, sizeof (*mca));
 }
 
 static void
@@ -848,34 +893,55 @@ mlxcx_cmd_copy_output(mlxcx_cmd_ent_t *ent, mlxcx_cmd_t *cmd)
 	VERIFY0(rem);
 }
 
+static boolean_t mlxcx_cmd_reclaim(mlxcx_cmd_queue_t *, uint_t);
+
 static uint_t
 mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq)
 {
 	uint_t slot;
 
 	mutex_enter(&cmdq->mcmd_lock);
-	slot = ddi_ffs(cmdq->mcmd_mask);
-	while (slot == 0) {
-		cv_wait(&cmdq->mcmd_cv, &cmdq->mcmd_lock);
-		slot = ddi_ffs(cmdq->mcmd_mask);
+	for (;;) {
+		for (slot = 0; slot < cmdq->mcmd_size; slot++)
+			(void) mlxcx_cmd_reclaim(cmdq, slot);
+
+		if ((slot = ddi_ffs(cmdq->mcmd_mask)) != 0)
+			break;
+
+		(void) cv_timedwait(&cmdq->mcmd_cv, &cmdq->mcmd_lock,
+		    ddi_get_lbolt() + drv_usectohz(mlxcx_cmd_rescan_delay));
 	}
 
 	cmdq->mcmd_mask &= ~(1U << --slot);
 
 	ASSERT3P(cmdq->mcmd_active[slot], ==, NULL);
+	ASSERT3P(cmdq->mcmd_abandoned[slot], ==, NULL);
 
 	mutex_exit(&cmdq->mcmd_lock);
 
 	return (slot);
 }
 
+/*
+ * Free the abandoned commands whose slots hardware has given back. This must
+ * not be called with mcmd_lock held.
+ */
 static void
-mlxcx_cmd_release_slot(mlxcx_cmd_queue_t *cmdq, uint_t slot)
+mlxcx_cmd_reap(mlxcx_t *mlxp)
 {
+	mlxcx_cmd_queue_t *cmdq = &mlxp->mlx_cmd;
+	mlxcx_cmd_abandon_t *mca;
+	list_t reap;
+
+	list_create(&reap, sizeof (mlxcx_cmd_abandon_t),
+	    offsetof(mlxcx_cmd_abandon_t, mca_node));
 	mutex_enter(&cmdq->mcmd_lock);
-	cmdq->mcmd_mask |= 1U << slot;
-	cv_broadcast(&cmdq->mcmd_cv);
+	list_move_tail(&reap, &cmdq->mcmd_reap);
 	mutex_exit(&cmdq->mcmd_lock);
+
+	while ((mca = list_remove_head(&reap)) != NULL)
+		mlxcx_cmd_abandon_free(mlxp, mca);
+	list_destroy(&reap);
 }
 
 static mlxcx_cmd_ent_t *
@@ -931,6 +997,62 @@ mlxcx_cmd_done(mlxcx_cmd_queue_t *cmdq, mlxcx_cmd_t *cmd, uint_t slot)
 	cv_broadcast(&cmdq->mcmd_cv);
 }
 
+/*
+ * The command has timed out but hardware still owns its entry, and may yet
+ * read its input or write its output. Move the token and the mailboxes into
+ * mca, which keeps the slot until hardware gives the entry back, then fail
+ * the command. The caller must hold mcmd_lock.
+ */
+static void
+mlxcx_cmd_abandon(mlxcx_cmd_queue_t *cmdq, mlxcx_cmd_t *cmd, uint_t slot,
+    mlxcx_cmd_abandon_t *mca)
+{
+	ASSERT(mutex_owned(&cmdq->mcmd_lock));
+	ASSERT3P(cmdq->mcmd_active[slot], ==, cmd);
+
+	mca->mca_token = cmd->mlcmd_token;
+	list_create(&mca->mca_mbox_in, sizeof (mlxcx_cmd_mbox_t),
+	    offsetof(mlxcx_cmd_mbox_t, mlbox_node));
+	list_create(&mca->mca_mbox_out, sizeof (mlxcx_cmd_mbox_t),
+	    offsetof(mlxcx_cmd_mbox_t, mlbox_node));
+	list_move_tail(&mca->mca_mbox_in, &cmd->mlcmd_mbox_in);
+	list_move_tail(&mca->mca_mbox_out, &cmd->mlcmd_mbox_out);
+	cmd->mlcmd_token = 0;
+
+	cmdq->mcmd_active[slot] = NULL;
+	cmdq->mcmd_abandoned[slot] = mca;
+	cmdq->mcmd_timeouts++;
+
+	mutex_enter(&cmd->mlcmd_lock);
+	cmd->mlcmd_status = MLXCX_CMD_R_TIMEOUT;
+	cmd->mlcmd_state = MLXCX_CMD_S_ERROR;
+	cv_broadcast(&cmd->mlcmd_cv);
+	mutex_exit(&cmd->mlcmd_lock);
+}
+
+/*
+ * If hardware has given back the entry of an abandoned command, free the
+ * slot and queue the rest for mlxcx_cmd_reap(). The caller must hold
+ * mcmd_lock.
+ */
+static boolean_t
+mlxcx_cmd_reclaim(mlxcx_cmd_queue_t *cmdq, uint_t slot)
+{
+	mlxcx_cmd_abandon_t *mca = cmdq->mcmd_abandoned[slot];
+
+	ASSERT(mutex_owned(&cmdq->mcmd_lock));
+
+	if (mca == NULL || !mlxcx_cmd_returned(cmdq, slot, mca->mca_token))
+		return (B_FALSE);
+
+	cmdq->mcmd_abandoned[slot] = NULL;
+	list_insert_tail(&cmdq->mcmd_reap, mca);
+	cmdq->mcmd_mask |= 1U << slot;
+	cv_broadcast(&cmdq->mcmd_cv);
+
+	return (B_TRUE);
+}
+
 static void
 mlxcx_cmd_taskq(void *arg)
 {
@@ -938,11 +1060,13 @@ mlxcx_cmd_taskq(void *arg)
 	mlxcx_t *mlxp = cmd->mlcmd_mlxp;
 	mlxcx_cmd_queue_t *cmdq = &mlxp->mlx_cmd;
 	mlxcx_cmd_ent_t *ent;
+	mlxcx_cmd_abandon_t *mca;
 	uint_t poll, slot;
 
 	ASSERT3S(cmd->mlcmd_op, !=, 0);
 
 	slot = mlxcx_cmd_reserve_slot(cmdq);
+	mlxcx_cmd_reap(mlxp);
 	ent = mlxcx_cmd_entry(cmdq, slot);
 
 	/*
@@ -980,20 +1104,21 @@ mlxcx_cmd_taskq(void *arg)
 		mutex_exit(&cmdq->mcmd_lock);
 	}
 
-	/*
-	 * The command timed out. Once we broadcast on the CV and drop the
-	 * lock, we must not touch the cmd again.
-	 */
-	mutex_enter(&cmd->mlcmd_lock);
-	cmd->mlcmd_status = MLXCX_CMD_R_TIMEOUT;
-	cmd->mlcmd_state = MLXCX_CMD_S_ERROR;
-	cv_broadcast(&cmd->mlcmd_cv);
-	mutex_exit(&cmd->mlcmd_lock);
+	mca = kmem_zalloc(sizeof (*mca), KM_SLEEP);
+	mutex_enter(&cmdq->mcmd_lock);
+	if (mlxcx_cmd_returned(cmdq, slot, cmd->mlcmd_token)) {
+		mlxcx_cmd_done(cmdq, cmd, slot);
+	} else {
+		mlxcx_cmd_abandon(cmdq, cmd, slot, mca);
+		mca = NULL;
+	}
+	mutex_exit(&cmdq->mcmd_lock);
 
-	mlxcx_fm_ereport(mlxp, DDI_FM_DEVICE_NO_RESPONSE);
-
-	cmdq->mcmd_active[slot] = NULL;
-	mlxcx_cmd_release_slot(cmdq, slot);
+	if (mca != NULL) {
+		kmem_free(mca, sizeof (*mca));
+	} else {
+		mlxcx_fm_ereport(mlxp, DDI_FM_DEVICE_NO_RESPONSE);
+	}
 }
 
 void
@@ -1012,9 +1137,14 @@ mlxcx_cmd_completion(mlxcx_t *mlxp, mlxcx_eventq_ent_t *ent)
 	while ((slot = ddi_ffs(comp_vec)) != 0) {
 		comp_vec &= ~(1U << --slot);
 
-		if (slot >= cmdq->mcmd_size ||
-		    (cmd = cmdq->mcmd_active[slot]) == NULL) {
+		if (slot >= cmdq->mcmd_size) {
 			cmdq->mcmd_stray++;
+			continue;
+		}
+
+		if ((cmd = cmdq->mcmd_active[slot]) == NULL) {
+			if (!mlxcx_cmd_reclaim(cmdq, slot))
+				cmdq->mcmd_stray++;
 			continue;
 		}
 
