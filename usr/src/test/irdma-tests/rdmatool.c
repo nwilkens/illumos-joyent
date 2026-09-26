@@ -950,11 +950,13 @@ host_stats(host_stats_t *hs)
 		} else if (strcmp(ks->ks_module, "unix") == 0 &&
 		    ks->ks_type == KSTAT_TYPE_NAMED &&
 		    (strcmp(ks->ks_name, "rdk_cq") == 0 ||
-		    strncmp(ks->ks_name, "irdma_", 6) == 0)) {
+		    strncmp(ks->ks_name, "irdma_", 6) == 0 ||
+		    strncmp(ks->ks_name, "iwc_", 4) == 0)) {
 			hs->hs_taskq_ns += kval(kc, ks, "totaltime");
 		}
 	}
-	ks = kstat_lookup(kc, "irdma", 0, "ctl");
+	if ((ks = kstat_lookup(kc, "irdma", 0, "ctl")) == NULL)
+		ks = kstat_lookup(kc, "iwcxgbe", 0, "stats");
 	hs->hs_ceq_intrs = kval(kc, ks, "ceq_intrs");
 	hs->hs_aeq_intrs = kval(kc, ks, "aeq_intrs");
 	hs->hs_sq_doorbells = kval(kc, ks, "sq_doorbells");

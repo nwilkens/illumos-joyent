@@ -47,9 +47,19 @@ static uint_t iw_seq;
 static int iw_no_pair;
 static uint16_t iw_last_bound;
 
+/*
+ * Ports rdk_cm has used stay reserved for its TIME_WAIT hold, so each run
+ * starts at a different place in the span.
+ */
 static uint16_t
 iw_port(void)
 {
+	static int started;
+
+	if (!started) {
+		iw_seq = (uint_t)getpid() * 97;
+		started = 1;
+	}
 	return (htons((uint16_t)(o_port + IW_PORT_BASE +
 	    (iw_seq++ % IW_PORT_SPAN))));
 }
