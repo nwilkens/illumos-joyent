@@ -64,6 +64,7 @@ extern "C" {
 /* TCP for iWARP connections. */
 #define	IWC_RCV_WIN		(256 * 1024)
 #define	IWC_SND_WIN		(128 * 1024)
+#define	IWC_CONG		CONG_ALG_TAHOE
 #define	IWC_MPA_TIMEOUT_MS	10000
 #define	IWC_CLOSE_TIMEOUT_MS	10000
 #define	IWC_MAX_ORDIRD		32

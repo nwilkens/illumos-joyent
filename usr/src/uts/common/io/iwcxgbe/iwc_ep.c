@@ -152,11 +152,23 @@ iwc_path_mtu(iwc_ep_t *ep, uint32_t route_mtu)
 	return (mtu);
 }
 
+/*
+ * TCP settings of new connections; iwcxgbe.conf does not exist, so these
+ * are for /etc/system.  The chip holds up to 1023 KB of receive window in
+ * the connection's options.
+ */
+uint32_t iwc_rcv_win = IWC_RCV_WIN;
+uint32_t iwc_snd_win = IWC_SND_WIN;
+uint32_t iwc_cong = IWC_CONG;
+uint32_t iwc_tstamps = 0;
+
 void
 iwc_tcp_opts(iwc_ep_t *ep, uint32_t mtu, t4_rdma_tcp_opts_t *o)
 {
 	bzero(o, sizeof (*o));
-	o->trt_rcv_win = IWC_RCV_WIN;
+	o->trt_rcv_win = MAX(MIN(iwc_rcv_win, 1023 * 1024), 16 * 1024);
+	o->trt_cong = (uint8_t)MIN(iwc_cong, CONG_ALG_HIGHSPEED);
+	o->trt_timestamps = iwc_tstamps != 0;
 	o->trt_mtu_idx = iwc_mtu_idx(ep->ep_iwc, mtu);
 	o->trt_ulp_mode = ULP_MODE_TCPDDP;
 	o->trt_p2p_iss = B_TRUE;
@@ -188,7 +200,7 @@ iwc_flowc(iwc_ep_t *ep)
 	bzero(&f, sizeof (f));
 	f.trf_snd_nxt = ep->ep_snd_seq;
 	f.trf_rcv_nxt = ep->ep_rcv_seq;
-	f.trf_sndbuf = IWC_SND_WIN;
+	f.trf_sndbuf = MAX(MIN(iwc_snd_win, 16U << 20), 16 * 1024);
 	f.trf_mss = ep->ep_emss;
 	f.trf_rcv_scale = MIN(ep->ep_snd_wscale, 14);
 	return (iwc->iwc_ops->tro_flowc(iwc->iwc_peer, ep->ep_tid, &f));
