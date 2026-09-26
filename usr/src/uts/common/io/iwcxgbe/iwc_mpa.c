@@ -54,8 +54,8 @@
 
 #include "iwc_mpa.h"
 
-static const char iwc_mpa_key_req[IWC_MPA_KEY_LEN] = "MPA ID Req Frame";
-static const char iwc_mpa_key_rep[IWC_MPA_KEY_LEN] = "MPA ID Rep Frame";
+static const char iwc_mpa_key_req[] = "MPA ID Req Frame";
+static const char iwc_mpa_key_rep[] = "MPA ID Rep Frame";
 
 static uint16_t
 iwc_mpa_get16(const uint8_t *p)
