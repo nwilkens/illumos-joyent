@@ -27,6 +27,7 @@
 #include "common/common.h"
 #include "common/t4_regs.h"
 #include "cudbg.h"
+#include "t4_ofld.h"
 
 /* helpers */
 static int pci_rw(struct adapter *sc, void *data, int flags, int write);
@@ -60,6 +61,9 @@ t4_ioctl(struct adapter *sc, int cmd, void *data, int mode)
 		break;
 	case T4_IOCTL_LOAD_FW:
 		rc = flash_fw(sc, data, mode);
+		break;
+	case T4_IOCTL_OFLD_TEST:
+		rc = t4_ofld_test_ioctl(sc, data, mode);
 		break;
 	case T4_IOCTL_GET_CUDBG:
 		rc = get_cudbg(sc, data, mode);

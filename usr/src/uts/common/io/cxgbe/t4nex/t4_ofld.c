@@ -558,6 +558,11 @@ t4_ofld_detach(struct adapter *sc)
 	mutex_exit(&of->of_cfg_lock);
 
 	if (ok) {
+		mutex_enter(&of->of_cfg_lock);
+		t4_ofld_test_fini(of);
+		mutex_exit(&of->of_cfg_lock);
+	}
+	if (ok) {
 		mutex_enter(&of->of_lock);
 		ok = of->of_client == NULL;
 		mutex_exit(&of->of_lock);

@@ -331,6 +331,7 @@ typedef struct t4_ofld {
 	t4_ofld_kstats_t	of_kstats;
 	t4_ofld_stats_t		of_stats;
 
+	void			*of_test;	/* t4_ofld_test.c */
 } t4_ofld_t;
 
 #define	T4_OFLD_STAT(of, f)	atomic_inc_64(&(of)->of_stats.f)
@@ -432,6 +433,10 @@ extern void t4_ofld_atid_free(t4_ofld_t *, uint32_t);
 extern int t4_ofld_tpt_write(t4_ofld_t *, uint32_t, const void *, size_t);
 extern void t4_ofld_dma_fini(t4_ofld_t *, boolean_t);
 extern void t4_ofld_dma_close(t4_ofld_t *);
+
+/* t4_ofld_test.c */
+extern int t4_ofld_test_ioctl(struct adapter *, void *, int);
+extern void t4_ofld_test_fini(t4_ofld_t *);
 
 #ifdef __cplusplus
 }

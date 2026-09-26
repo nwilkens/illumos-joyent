@@ -46,11 +46,14 @@
 #include <sys/mac_ether.h>
 #include <sys/vlan.h>
 #include <sys/cpuvar.h>
+#include <sys/policy.h>
+#include <sys/zone.h>
 
 #include "common/common.h"
 #include "common/t4_msg.h"
 #include "common/t4_regs.h"
 #include "common/t4_extra_regs.h"
+#include "t4nex.h"
 #include "t4_ofld.h"
 
 /*
@@ -1332,6 +1335,11 @@ static int
 t4_cb_ioctl(dev_t dev, int cmd, intptr_t d, int mode, cred_t *credp, int *rp)
 {
 	if (crgetuid(credp) != 0) {
+		return (EPERM);
+	}
+	if (cmd == T4_IOCTL_OFLD_TEST &&
+	    (crgetzoneid(credp) != GLOBAL_ZONEID ||
+	    secpolicy_net_config(credp, B_FALSE) != 0)) {
 		return (EPERM);
 	}
 

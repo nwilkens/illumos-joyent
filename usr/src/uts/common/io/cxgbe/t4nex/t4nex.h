@@ -40,6 +40,65 @@ extern "C" {
 #define	T4_IOCTL_DEVLOG		(T4_IOCTL + 6)
 #define	T4_IOCTL_LOAD_FW	(T4_IOCTL + 7)
 #define	T4_IOCTL_GET_CUDBG	(T4_IOCTL + 8)
+#define	T4_IOCTL_OFLD_TEST	(T4_IOCTL + 9)
+
+/*
+ * Offload core test operations (T4_IOCTL_OFLD_TEST).  They need
+ * PRIV_SYS_NET_CONFIG in the global zone and the rdma-enable property.
+ */
+typedef enum t4_ofld_test_op {
+	T4_OFLD_TEST_OPEN = 1,
+	T4_OFLD_TEST_CLOSE,
+	T4_OFLD_TEST_LISTEN,
+	T4_OFLD_TEST_UNLISTEN,
+	T4_OFLD_TEST_CONNECT,
+	T4_OFLD_TEST_SEND,
+	T4_OFLD_TEST_DISCONNECT,
+	T4_OFLD_TEST_ABORT,
+	T4_OFLD_TEST_STATUS
+} t4_ofld_test_op_t;
+
+#define	T4_OFLD_TEST_NCONN	16
+
+typedef struct t4_ofld_test_conn {
+	uint32_t	totc_tid;
+	uint32_t	totc_flags;
+	uint32_t	totc_snd_isn;
+	uint32_t	totc_rcv_isn;
+	uint64_t	totc_rx_bytes;
+	uint64_t	totc_tx_bytes;
+} t4_ofld_test_conn_t;
+
+#define	T4_OFLD_TCF_PASSIVE	0x01
+#define	T4_OFLD_TCF_EST		0x02
+#define	T4_OFLD_TCF_PEER_FIN	0x04
+#define	T4_OFLD_TCF_FIN_SENT	0x08
+#define	T4_OFLD_TCF_FIN_ACKED	0x10
+#define	T4_OFLD_TCF_ABORTED	0x20
+#define	T4_OFLD_TCF_RELEASED	0x40
+
+typedef struct t4_ofld_test {
+	uint32_t	tot_op;
+	uint32_t	tot_port;
+	uint32_t	tot_laddr;	/* IPv4, network order */
+	uint32_t	tot_faddr;
+	uint16_t	tot_lport;	/* network order */
+	uint16_t	tot_fport;
+	uint16_t	tot_vlan;	/* 0xfff: untagged */
+	uint8_t		tot_dmac[6];
+	uint32_t	tot_id;		/* stid or tid, in and out */
+	uint32_t	tot_len;
+	uint32_t	tot_timeout_ms;
+	int32_t		tot_status;	/* CPL status, out */
+	uint32_t	tot_snd_isn;
+	uint32_t	tot_rcv_isn;
+	uint32_t	tot_nconn;
+	uint32_t	tot_accepts;
+	uint32_t	tot_refused;
+	uint32_t	tot_events;
+	uint32_t	tot_pad;	/* same layout for ILP32 and LP64 */
+	t4_ofld_test_conn_t tot_conn[T4_OFLD_TEST_NCONN];
+} t4_ofld_test_t;
 
 enum {
 	T4_CTXT_EGRESS,
