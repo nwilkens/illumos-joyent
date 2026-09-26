@@ -641,6 +641,9 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 
 	if ((tq = rdmat_qp(ts, rr->rr_qp)) == NULL || !tq->tq_connected)
 		return (ENXIO);
+	/* A late completion for the parked MR would count for this run. */
+	if (tq->tq_bmr != NULL)
+		return (EBUSY);
 	timeout = rr->rr_timeout_ms != 0 ? rr->rr_timeout_ms : 10000;
 	if (timeout > RDMAT_MAX_TIMEOUT_MS || rr->rr_count > RDMAT_MAX_COUNT ||
 	    rr->rr_depth > ts->ts_depth || rr->rr_batch > RDMAT_MAX_BATCH ||

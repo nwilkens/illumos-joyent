@@ -552,7 +552,7 @@ rdmat_one_lat(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
  * RDMAT_OP_FRWR binds one MR over the first rr_size bytes of the buffer
  * with REG_MR and unbinds it with LOCAL_INV, on the send queue.  A run
  * that fails with a request posted but not complete leaves the MR in
- * tq_bmr, for teardown to free after the QP.
+ * tq_bmr, for teardown to free after the QP; the QP takes no more runs.
  */
 int
 rdmat_mr_cost(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
@@ -565,12 +565,10 @@ rdmat_mr_cost(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
 	struct rdk_reg_wr reg;
 	struct rdk_send_wr inv;
 	struct rdk_mr *mr = NULL, *m;
-	uint64_t *lat, n, i, sum = 0, off, posted = 0;
+	uint64_t *lat, n, i, sum = 0, off, posted = 0, calls = 0;
 	hrtime_t t0;
 	int ret = 0, r;
 
-	if (tq->tq_bmr != NULL)
-		return (EBUSY);
 	lat = rdmat_lat_alloc(rr, &n);
 	if (frwr) {
 		if ((ret = rdk_alloc_mr(ts->ts_pd, RDK_MR_TYPE_MEM_REG, pages,
@@ -618,13 +616,16 @@ rdmat_mr_cost(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
 			inv.opcode = RDK_WR_LOCAL_INV;
 			inv.send_flags = RDK_SEND_SIGNALED;
 			inv.ex.invalidate_rkey = mr->rkey;
+			calls++;
 			if ((ret = rdk_post_send(tq->tq_qp, &reg.wr,
 			    NULL)) != 0)
 				break;
 			posted++;
 			if ((ret = rdmat_wait(tq, &tq->tq_reg_done, posted,
-			    deadline)) != 0 ||
-			    (ret = rdk_post_send(tq->tq_qp, &inv, NULL)) != 0)
+			    deadline)) != 0)
+				break;
+			calls++;
+			if ((ret = rdk_post_send(tq->tq_qp, &inv, NULL)) != 0)
 				break;
 			posted++;
 			if ((ret = rdmat_wait(tq, &tq->tq_reg_done, posted,
@@ -636,12 +637,13 @@ rdmat_mr_cost(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
 			sum += lat[i];
 		}
 	}
-	if (ret == 0)
-		rdmat_lat_stats(rr, lat, n, sum);
-	tq->tq_posted = tq->tq_post_calls = posted;
 	mutex_enter(&tq->tq_lock);
 	tq->tq_last_ns = gethrtime();
 	mutex_exit(&tq->tq_lock);
+	tq->tq_posted = posted;
+	tq->tq_post_calls = calls;
+	if (ret == 0)
+		rdmat_lat_stats(rr, lat, n, sum);
 out:
 	if (mr != NULL && ret != 0 &&
 	    rdmat_count(tq, &tq->tq_reg_done) < posted) {
