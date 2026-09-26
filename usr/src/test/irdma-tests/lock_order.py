@@ -172,6 +172,22 @@ def main():
         assert "irdma_post_ok(" in body(post, name)
         assert "irdma_healthy(" not in body(post, name)
 
+    # A CQE's QP is checked against the CQ's map under icq_lock, without
+    # the QP table lock; destroy leaves the map before the number is freed.
+    cqe = body(cq, "irdma_osdep_cqe_qp")
+    assert "BT_TEST(icq->icq_qpmap, qp_id)" in cqe
+    assert "irdma_qptable_lock" not in cqe
+    purge = body(cq, "irdma_cq_purge_qp")
+    assert purge.index("mutex_enter(&icq->icq_lock);") < \
+        purge.index("BT_CLEAR(icq->icq_qpmap")
+    qpc = (IRDMA / "irdma_qp.c").read_text(encoding="utf-8")
+    destroy = body(qpc, "irdma_destroy_qp")
+    assert destroy.index("irdma_cq_purge_qp(iqp->iqp_scq, iqp);") < \
+        destroy.index("irdma_qp_free_num(iqp, rqp->qp_num);")
+    create = body(qpc, "irdma_create_qp")
+    assert create.index("irdma->irdma_qp_table[num] = iqp;") < \
+        create.index("irdma_cq_add_qp(iqp->iqp_scq, num);")
+
     # The ice theory statement records the peer locks.
     assert "ir_cfg_lock" in ice and "ir_lock" in ice
     print("PASS: interrupt priority and peer lock ordering")

@@ -610,6 +610,9 @@ irdma_create_qp(struct rdk_qp *rqp, struct rdk_qp_init_attr *init)
 	iqp->iqp_refs = 1;
 	iqp->iqp_in_table = B_TRUE;
 	mutex_exit(&irdma->irdma_qptable_lock);
+	irdma_cq_add_qp(iqp->iqp_scq, num);
+	if (iqp->iqp_rcq != iqp->iqp_scq)
+		irdma_cq_add_qp(iqp->iqp_rcq, num);
 	atomic_inc_32(&irdma->irdma_nqps);
 	return (0);
 

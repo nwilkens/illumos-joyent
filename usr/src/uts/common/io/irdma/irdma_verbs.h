@@ -106,6 +106,8 @@ typedef struct irdma_cq {
 	kcondvar_t		icq_cv;
 	uint64_t		icq_bad_cqes;
 	struct irdma_cq_poll_info icq_cur;
+	ulong_t			*icq_qpmap;	/* QPs on it; icq_lock */
+	size_t			icq_qpmap_size;
 } irdma_cq_t;
 
 /* What the driver keeps for each posted receive. */
@@ -230,6 +232,7 @@ extern void irdma_cq_ceq_dispatch(irdma_cq_t *, boolean_t);
 extern void irdma_cq_resched(struct rdk_cq *);
 extern void irdma_cq_error(irdma_t *, uint32_t);
 extern boolean_t irdma_cq_empty(irdma_cq_t *);
+extern void irdma_cq_add_qp(irdma_cq_t *, uint32_t);
 extern void irdma_cq_purge_qp(irdma_cq_t *, irdma_qp_t *);
 extern void irdma_comp_handler(irdma_cq_t *);
 

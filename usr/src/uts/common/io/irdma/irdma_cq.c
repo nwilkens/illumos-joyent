@@ -12,10 +12,12 @@
  * README.illumos).
  *
  * A CQE names its QP with a pointer and a QP number, both written by the
- * device.  irdma_osdep_cqe_qp() accepts the entry only if the QP table
- * holds a QP at that number, at that address, that uses this CQ.  QP
- * destroy removes the QP from the table and then takes each of its CQ
- * locks, so no poller is still using the QP when it is freed.
+ * device.  irdma_osdep_cqe_qp() accepts the entry only if the QP at that
+ * number is in the CQ's icq_qpmap and the QP table holds it at that address.
+ * A QP enters the map after the table and leaves it when destroy purges it
+ * from the CQ under icq_lock, which the poller holds; its number is freed
+ * only after that.  So a QP in the map cannot be freed under the poller,
+ * which reads the table without the table lock.
  *
  * A receive posted by the driver carries the index of its slot as its work
  * request id; the slot holds the consumer's id and the posted length, and
@@ -24,6 +26,7 @@
 
 #include <sys/types.h>
 #include <sys/sysmacros.h>
+#include <sys/bitmap.h>
 
 #include "irdma_verbs.h"
 
@@ -97,13 +100,11 @@ irdma_osdep_cqe_qp(struct irdma_cq_uk *ukcq, u64 comp_ctx, u32 qp_id)
 	ASSERT(MUTEX_HELD(&icq->icq_lock));
 	if (comp_ctx == 0)
 		return (NULL);
-	if (qp_id < irdma->irdma_max_qp) {
-		mutex_enter(&irdma->irdma_qptable_lock);
-		iqp = irdma->irdma_qp_table[qp_id];
+	if (qp_id < irdma->irdma_max_qp && BT_TEST(icq->icq_qpmap, qp_id)) {
+		iqp = ((irdma_qp_t *volatile *)irdma->irdma_qp_table)[qp_id];
 		if (iqp != NULL && ((uintptr_t)&iqp->iqp_sc != comp_ctx ||
 		    (iqp->iqp_scq != icq && iqp->iqp_rcq != icq)))
 			iqp = NULL;
-		mutex_exit(&irdma->irdma_qptable_lock);
 	}
 	if (iqp == NULL) {
 		icq->icq_bad_cqes++;
@@ -140,6 +141,8 @@ irdma_create_cq(struct rdk_cq *rcq, const struct rdk_cq_init_attr *attr)
 
 	icq->icq_irdma = irdma;
 	icq->icq_ceq = &irdma->irdma_ceqs[attr->comp_vector];
+	icq->icq_qpmap_size = BT_SIZEOFMAP(irdma->irdma_max_qp);
+	icq->icq_qpmap = kmem_zalloc(icq->icq_qpmap_size, KM_SLEEP);
 	icq->icq_num = num;
 	mutex_init(&icq->icq_lock, NULL, MUTEX_DRIVER, NULL);
 	cv_init(&icq->icq_cv, NULL, CV_DRIVER, NULL);
@@ -213,6 +216,7 @@ fail:
 	dma_free_coherent(&irdma->irdma_osdev, icq->icq_mem.size,
 	    icq->icq_mem.va, icq->icq_mem.pa);
 	list_destroy(&icq->icq_gen);
+	kmem_free(icq->icq_qpmap, icq->icq_qpmap_size);
 	cv_destroy(&icq->icq_cv);
 	mutex_destroy(&icq->icq_lock);
 	irdma_free_rsrc(irdma, irdma->irdma_cq_map, num);
@@ -268,6 +272,7 @@ irdma_destroy_cq(struct rdk_cq *rcq)
 	dma_free_coherent(&irdma->irdma_osdev, icq->icq_mem.size,
 	    icq->icq_mem.va, icq->icq_mem.pa);
 	list_destroy(&icq->icq_gen);
+	kmem_free(icq->icq_qpmap, icq->icq_qpmap_size);
 	cv_destroy(&icq->icq_cv);
 	mutex_destroy(&icq->icq_lock);
 	irdma_free_rsrc(irdma, irdma->irdma_cq_map, icq->icq_num);
@@ -414,11 +419,20 @@ irdma_cq_empty(irdma_cq_t *icq)
  * the completions the driver made for it.
  */
 void
+irdma_cq_add_qp(irdma_cq_t *icq, uint32_t qpn)
+{
+	mutex_enter(&icq->icq_lock);
+	BT_SET(icq->icq_qpmap, qpn);
+	mutex_exit(&icq->icq_lock);
+}
+
+void
 irdma_cq_purge_qp(irdma_cq_t *icq, irdma_qp_t *iqp)
 {
 	irdma_cmpl_gen_t *g, *next;
 
 	mutex_enter(&icq->icq_lock);
+	BT_CLEAR(icq->icq_qpmap, iqp->iqp_rdk.qp_num);
 	irdma_uk_clean_cq(&iqp->iqp_sc.qp_uk, &icq->icq_sc.cq_uk);
 	for (g = list_head(&icq->icq_gen); g != NULL; g = next) {
 		next = list_next(&icq->icq_gen, g);
