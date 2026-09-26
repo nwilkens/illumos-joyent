@@ -1531,7 +1531,17 @@ t4_free_iq(struct port_info *pi, t4_sge_iq_t *iq)
 	struct sge_fl *fl = iq->tsi_fl;
 	t4_sge_eq_t *eq = fl != NULL ? &fl->eq : NULL;
 
-	(void) t4_free_iq_dev(iq);
+	/* A queue the firmware kept can still be written: leak its memory. */
+	if (t4_free_iq_dev(iq) != 0) {
+		cxgb_printf(pi->adapter->dip, CE_WARN,
+		    "leaking the memory of ingress queue %u", iq->tsi_cntxt_id);
+		iq->tsi_flags = 0;
+		iq->tsi_iqtype = TIQT_UNINIT;
+		iq->tsi_fl = NULL;
+		if (eq != NULL)
+			eq->tse_flags = 0;
+		return;
+	}
 	if (iq->tsi_flags & IQ_ALLOC_HOST) {
 		(void) free_desc_ring(&iq->tsi_desc_dhdl, &iq->tsi_desc_ahdl);
 		iq->tsi_desc = NULL;
@@ -1884,7 +1894,12 @@ t4_free_eq_dev(struct adapter *sc, t4_sge_eq_t *eq)
 void
 t4_free_eq(struct port_info *pi, t4_sge_eq_t *eq)
 {
-	(void) t4_free_eq_dev(pi->adapter, eq);
+	if (t4_free_eq_dev(pi->adapter, eq) != 0) {
+		cxgb_printf(pi->adapter->dip, CE_WARN,
+		    "leaking the memory of egress queue %u", eq->tse_cntxt_id);
+		bzero(eq, sizeof (*eq));
+		return;
+	}
 	if (eq->tse_flags & EQ_ALLOC_HOST) {
 		(void) free_desc_ring(&eq->tse_ring_dhdl, &eq->tse_ring_ahdl);
 		eq->tse_ring = NULL;

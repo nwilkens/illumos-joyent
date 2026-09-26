@@ -273,6 +273,14 @@ t4_ofld_queues_free_dev(t4_ofld_t *of)
 	if (!ok) {
 		cxgb_printf(of->of_sc->dip, CE_WARN, "offload queues not "
 		    "freed by the firmware; their host memory is leaked");
+		for (uint_t i = 0; i < of->of_nports; i++) {
+			bzero(&of->of_port[i].op_ctrlq,
+			    sizeof (of->of_port[i].op_ctrlq));
+			bzero(&of->of_port[i].op_txq,
+			    sizeof (of->of_port[i].op_txq));
+		}
+		bzero(&of->of_ciq, sizeof (of->of_ciq));
+		bzero(&of->of_rxq, sizeof (of->of_rxq));
 	}
 	return (ok);
 }
