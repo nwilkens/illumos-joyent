@@ -94,14 +94,15 @@ t4_ofld_query(struct adapter *sc, uint_t n, const uint32_t *param,
 
 /*
  * Turn a firmware [start, end] pair into a range.  The range must be
- * non-empty, must not wrap, must end at or below limit, and its start must be
- * aligned to align (a power of two).
+ * non-empty, must end at or below limit, must have a size that fits in 32
+ * bits, and its start must be aligned to align (a power of two).
  */
 static boolean_t
 t4_ofld_range(uint32_t start, uint32_t end, uint64_t limit, uint32_t align,
     t4_rdma_range_t *r)
 {
 	if (end < start || (uint64_t)end + 1 > limit ||
+	    (uint64_t)end - start + 1 > UINT32_MAX ||
 	    (start & (align - 1)) != 0)
 		return (B_FALSE);
 	r->trr_start = start;
