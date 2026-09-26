@@ -929,7 +929,7 @@ mlxcx_cmd_reserve_slot(mlxcx_cmd_queue_t *cmdq, mlxcx_cmd_op_t op,
 		 * rescan period after they timed out, it is not answering.
 		 * Fail now rather than make each caller wait out the timeout.
 		 */
-		if (abandoned != usable) {
+		if ((abandoned & usable) != usable) {
 			stuck = 0;
 		} else if (stuck == 0) {
 			stuck = ddi_get_lbolt() +

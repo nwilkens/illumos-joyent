@@ -149,11 +149,34 @@ dead_firmware(void)
 	}
 }
 
+/* As above, with the page slot held too. */
+static void
+dead_firmware_pages(void)
+{
+	clock_t start;
+
+	model_cmd_low = (2 << 4) | 6;
+	model_attach(B_TRUE);
+	hang = B_TRUE;
+	(void) command();
+	for (int i = 0; i < 3; i++)
+		(void) command_other();
+	for (int i = 0; i < 10; i++) {
+		start = stub_now;
+		if (command_other() || command())
+			stub_fail("command succeeded with every slot held");
+		if (stub_now - start > 2 * 5 * 100)
+			stub_fail("waited %ld ticks for slots hardware holds",
+			    (long)(stub_now - start));
+	}
+}
+
 static const char *const names[] = {
-	"event-hang", "lost-event", "slot-wait", "dead-firmware", NULL
+	"event-hang", "lost-event", "slot-wait", "dead-firmware",
+	"dead-firmware-pages", NULL
 };
 static void (*const funcs[])(void) = {
-	event_hang, lost_event, slot_wait, dead_firmware
+	event_hang, lost_event, slot_wait, dead_firmware, dead_firmware_pages
 };
 
 int
