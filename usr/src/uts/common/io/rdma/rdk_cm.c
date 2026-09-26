@@ -796,7 +796,8 @@ static int
 rdk_cm_param_ok(rdk_cm_id_t *id, const struct rdk_cm_conn_param *p,
     enum rdk_cm_msg msg)
 {
-	if (p == NULL || p->qp == NULL || p->qp->device != id->rci_dev->rcd_dev ||
+	if (p == NULL || p->qp == NULL ||
+	    p->qp->device != id->rci_dev->rcd_dev ||
 	    p->qp->qp_type != RDK_QPT_RC ||
 	    p->timeout_ms > RDK_CM_TIMEOUT_MAX_MS ||
 	    p->private_data_len > rdk_cm_pdata_max(id, msg) ||

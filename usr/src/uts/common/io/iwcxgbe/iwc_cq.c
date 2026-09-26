@@ -537,7 +537,7 @@ iwc_poll_one_qp(iwc_cq_t *cq, iwc_qp_t *qp, t4_cqe_t *hw, boolean_t sw,
 	}
 
 	out->ip_cqe = *hw;
-	/* A signaled completion also completes the unsignaled ones before it. */
+	/* A signaled completion completes the unsignaled ones before it. */
 	if (idx < wq->sq.cidx)
 		wq->sq.in_use -= wq->sq.size + idx - wq->sq.cidx;
 	else

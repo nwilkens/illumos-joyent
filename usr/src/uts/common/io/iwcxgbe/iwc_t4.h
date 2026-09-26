@@ -343,7 +343,7 @@ typedef struct t4_cq {
 	uint32_t	bar2_qid;
 	uint32_t	cqid;
 	uint64_t	bits_type_ts;
-	uint16_t	size;		/* hardware entries, the status page not */
+	uint16_t	size;		/* hardware entries, no status page */
 	uint16_t	cidx;
 	uint16_t	sw_pidx;
 	uint16_t	sw_cidx;

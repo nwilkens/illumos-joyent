@@ -92,7 +92,7 @@ typedef struct rdk_cm_qev {
 typedef struct rdk_cm_resolve {
 	kmutex_t		rs_lock;
 	uint32_t		rs_refs;
-	boolean_t		rs_done;	/* the callback ran or never will */
+	boolean_t		rs_done;	/* callback ran or will not */
 	struct rdk_cm_id	*rs_id;		/* held; NULL once canceled */
 	uint32_t		rs_gen;
 	ip2mac_id_t		rs_ip2mac;
@@ -143,7 +143,7 @@ struct rdk_cm_id {
 	boolean_t		rci_iw_listen;
 	boolean_t		rci_iw_owned;	/* iw_release is owed */
 	boolean_t		rci_iw_gone;	/* no more provider calls */
-	uint32_t		rci_iw_calls;	/* provider operations running */
+	uint32_t		rci_iw_calls;	/* provider calls running */
 
 	rdk_cm_acl_t		*rci_acl;
 	uint32_t		rci_backlog;

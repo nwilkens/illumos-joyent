@@ -320,7 +320,7 @@ iwc_rx_data(iwc_ep_t *ep, mblk_t *mp)
 			iwc_mpa_request(ep, &m);
 		break;
 	default:
-		/* Streaming data outside the MPA exchange ends the connection. */
+		/* Data outside the MPA exchange ends the connection. */
 		if (dlen != 0)
 			iwc_ep_abort_locked(ep, EPROTO);
 		break;

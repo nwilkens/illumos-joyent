@@ -228,7 +228,7 @@ typedef struct t4_rdma_dma {
  */
 typedef struct t4_rdma_cq_res {
 	uint32_t	trcq_cqid;
-	uint32_t	trcq_size;	/* 64B entries, the status page included */
+	uint32_t	trcq_size;	/* 64B entries, status page included */
 	t4_rdma_dma_t	*trcq_mem;
 } t4_rdma_cq_res_t;
 
@@ -237,7 +237,7 @@ typedef struct t4_rdma_qp_res {
 	uint32_t	trqp_rqid;
 	uint32_t	trqp_scqid;
 	uint32_t	trqp_rcqid;
-	uint32_t	trqp_sq_size;	/* 64B entries, the status page included */
+	uint32_t	trqp_sq_size;	/* 64B entries, status page included */
 	uint32_t	trqp_rq_size;
 	t4_rdma_dma_t	*trqp_sq_mem;
 	t4_rdma_dma_t	*trqp_rq_mem;

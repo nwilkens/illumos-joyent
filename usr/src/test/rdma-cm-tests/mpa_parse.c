@@ -255,7 +255,8 @@ fuzz(uint32_t iters)
 		pdata[k] = (uint8_t)rnd();
 	for (i = 0; i < iters; i++) {
 		glen = iwc_mpa_build(good, sizeof (good), rnd() & 1,
-		    (uint8_t)(rnd() & 0xc0), (uint8_t)(1 + (rnd() & 1)), B_FALSE,
+		    (uint8_t)(rnd() & 0xc0), (uint8_t)(1 + (rnd() & 1)),
+		    B_FALSE,
 		    0, 0, IWC_P2P_DISABLED, pdata, rnd() % 200);
 		if (glen == 0)
 			glen = iwc_mpa_build(good, sizeof (good), rnd() & 1,

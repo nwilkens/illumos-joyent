@@ -634,7 +634,8 @@ t_localinv(peer_t *a, peer_t *b)
 	rr.rr_raddr = b->p_setup.rs_qp[0].rqi_addr;
 	rr.rr_rkey = key;
 	rr.rr_rlen = 4096;
-	if (expect_rae(a, b, &rr, "localinv", "read after local invalidate") != 0)
+	if (expect_rae(a, b, &rr, "localinv",
+	    "read after local invalidate") != 0)
 		return;
 	result(1, "localinv", "B invalidated rkey 0x%x locally; A's read "
 	    "refused (%s), A's QP in error", key, rae_how(&rr));
