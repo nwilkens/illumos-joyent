@@ -441,9 +441,16 @@ t4_ofld_orphan_release_locked(t4_ofld_t *of, uint8_t port, uint32_t tid)
 static void
 t4_ofld_refuse_tid(t4_ofld_t *of, uint8_t port, uint16_t rxq, uint32_t tid)
 {
-	if (t4_hwtid_claim(of, tid, TTS_ORPHAN, 0, port, rxq, TEF_EMBRYO,
-	    NULL) != 0) {
-		T4_OFLD_STAT(of, os_cpl_badid);
+	int rc;
+
+	if ((rc = t4_hwtid_claim(of, tid, TTS_ORPHAN, 0, port, rxq,
+	    TEF_EMBRYO, NULL)) != 0) {
+		/* With no memory to track it, one untracked try is all. */
+		if (rc == ENOMEM &&
+		    t4_ofld_send_tid_release(of, port, tid) == 0)
+			T4_OFLD_STAT(of, os_orphan_release);
+		else
+			T4_OFLD_STAT(of, os_cpl_badid);
 		return;
 	}
 	mutex_enter(&of->of_tids.td_lock);
