@@ -248,6 +248,25 @@ def main():
     assert thr.rindex("mutex_exit(&iv->iv_lock);", 0, call) > \
         thr.rindex("mutex_enter(&iv->iv_lock);", 0, call)
 
+    # Vector 0 is past the AEQ before the AEQ memory goes.
+    aeq = body(ctl, "irdma_unstep_aeq")
+    assert aeq.index("irdma->irdma_progress &= ~BIT(IRDMA_STEP_AEQ);") < \
+        aeq.index("irdma_vec_barrier(&irdma->irdma_vecs[0]);") < \
+        aeq.index("dma_free_coherent(")
+
+    # An FRWR run that fails with work posted leaves its MR to teardown,
+    # which frees it after the QP.
+    rdma = REPO / "usr/src/uts/common/io/rdma"
+    bench = (rdma / "rdmat_bench.c").read_text(encoding="utf-8")
+    cost = body(bench, "rdmat_mr_cost")
+    out = cost[cost.index("\nout:"):]
+    assert out.index("tq->tq_bmr = mr;") < out.index("rdk_dereg_mr(mr)")
+    assert "ts->ts_dying" in cost and "t0 >= deadline" in cost
+    run = (rdma / "rdmat_run.c").read_text(encoding="utf-8")
+    down = body(run, "rdmat_teardown")
+    assert down.index("rdk_destroy_qp(tq->tq_qp);") < \
+        down.index("rdk_dereg_mr(tq->tq_bmr);")
+
     # The ice theory statement records the peer locks.
     assert "ir_cfg_lock" in ice and "ir_lock" in ice
     print("PASS: interrupt priority and peer lock ordering")
