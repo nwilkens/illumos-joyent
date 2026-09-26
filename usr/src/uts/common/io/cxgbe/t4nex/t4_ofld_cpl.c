@@ -73,7 +73,7 @@ static const t4_cpl_desc_t t4_cpl_table[NUM_CPL_CMDS] = {
 	TCD(CPL_FW6_MSG, TCC_FW, struct cpl_fw6_msg),
 };
 
-/* ABORT_REQ_RSS statuses that are advice, not an abort. */
+/* Statuses that are advice, not an abort or a reply. */
 static boolean_t
 t4_cpl_neg_advice(uint8_t status)
 {
@@ -536,6 +536,15 @@ t4_ofld_cpl_act_open_rpl(t4_ofld_t *of, t4_rdma_queue_t q, mblk_t *mp)
 	void *arg, *ctx;
 	boolean_t live;
 	uint8_t port;
+
+	/*
+	 * Advice is not a reply: the chip still tries the open, and the ATID
+	 * must not be reused until the reply or ACT_ESTABLISH.
+	 */
+	if (t4_cpl_neg_advice(status)) {
+		freemsg(mp);
+		return;
+	}
 
 	live = t4_ofld_cl_enter(of, &gen, &cl, &arg);
 
