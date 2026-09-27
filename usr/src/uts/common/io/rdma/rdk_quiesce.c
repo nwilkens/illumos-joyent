@@ -117,6 +117,18 @@ rdk_event_upcall(void (*handler)(struct rdk_event *, void *),
 	rdk_cb_exit(old);
 }
 
+void
+rdk_comp_upcall(struct rdk_cq *cq)
+{
+	void *old;
+
+	if (cq->comp_handler == NULL)
+		return;
+	old = rdk_cb_enter(cq);
+	cq->comp_handler(cq, cq->cq_context);
+	rdk_cb_exit(old);
+}
+
 rdk_teardown_t *
 rdk_teardown_alloc(void (*func)(void *), void *arg)
 {
@@ -191,21 +203,16 @@ rdk_teardown_dying(rdk_teardown_t *td)
 void
 rdk_teardown_wait(rdk_teardown_t *td)
 {
-	boolean_t self, pending;
-
-	mutex_enter(&td->rtd_lock);
-	self = td->rtd_runner == curthread;
-	pending = td->rtd_state == RDK_TD_QUEUED ||
-	    td->rtd_state == RDK_TD_RUNNING;
-	mutex_exit(&td->rtd_lock);
-	VERIFY(!self);
-	if (pending)
-		rdk_cb_forbid("rdk_teardown_wait");
-
 	mutex_enter(&td->rtd_lock);
 	while (td->rtd_state == RDK_TD_QUEUED ||
-	    td->rtd_state == RDK_TD_RUNNING)
+	    td->rtd_state == RDK_TD_RUNNING) {
+		if (td->rtd_runner == curthread || rdk_in_callback()) {
+			mutex_exit(&td->rtd_lock);
+			rdk_cb_forbid("rdk_teardown_wait");
+			panic("rdk_teardown_wait() from its own function");
+		}
 		cv_wait(&td->rtd_cv, &td->rtd_lock);
+	}
 	mutex_exit(&td->rtd_lock);
 }
 

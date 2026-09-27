@@ -87,7 +87,7 @@ def main():
             ceq.rindex("mutex_enter(&ic->ic_lock);", 0, call), name
     cq = (IRDMA / "irdma_cq.c").read_text(encoding="utf-8")
     dispatch = body(cq, "irdma_cq_ceq_dispatch")
-    handler = dispatch.index("rcq->comp_handler(rcq, rcq->cq_context);")
+    handler = dispatch.index("rdk_comp_upcall(rcq);")
     assert dispatch.rindex("mutex_exit(&icq->icq_lock);", 0, handler) > \
         dispatch.rindex("mutex_enter(&icq->icq_lock);", 0, handler)
     assert "comp_handler" not in isr

@@ -883,8 +883,9 @@ extern void rdk_cq_poll_end(struct rdk_cq *);
  * has; neither it nor the function may wait for another teardown.
  * rdk_teardown_free() waits too, unless it is called from the function or a
  * callback: the teardown is then freed when the function returns, and
- * nothing may wait for it.  Providers call a QP's or CQ's event handler
- * through rdk_event_upcall().
+ * nothing may wait for it.  Providers call a CQ's comp_handler through
+ * rdk_comp_upcall() and a QP's or CQ's event handler through
+ * rdk_event_upcall().
  */
 typedef struct rdk_teardown rdk_teardown_t;
 
@@ -896,6 +897,7 @@ extern void rdk_teardown_free(rdk_teardown_t *);
 extern boolean_t rdk_in_callback(void);
 extern void rdk_event_upcall(void (*)(struct rdk_event *, void *),
     struct rdk_event *, void *);
+extern void rdk_comp_upcall(struct rdk_cq *);
 
 /*
  * RDMA READ and WRITE between local DMA memory and a peer's keyed memory

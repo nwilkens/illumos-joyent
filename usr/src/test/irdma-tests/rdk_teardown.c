@@ -197,8 +197,7 @@ static void
 flush(struct rdk_cq *cq, struct rdk_cqe *cqe)
 {
 	push(cq, cqe);
-	if (cq->comp_handler != NULL)
-		cq->comp_handler(cq, cq->cq_context);
+	rdk_comp_upcall(cq);
 }
 
 static int
@@ -262,9 +261,7 @@ push(struct rdk_cq *cq, struct rdk_cqe *cqe)
 static void *
 vector(void *arg)
 {
-	struct rdk_cq *cq = arg;
-
-	cq->comp_handler(cq, cq->cq_context);
+	rdk_comp_upcall(arg);
 	return (NULL);
 }
 
@@ -572,6 +569,40 @@ test_upcall(void)
 	CHECK(t6_seen == 1 && !rdk_in_callback());
 }
 
+/* 8: a raw CQ's handler runs marked, and cannot destroy its CQ. */
+static int t8_marked, t8_panics;
+
+static void
+t8_handler(struct rdk_cq *cq, void *arg)
+{
+	jmp_buf jb;
+
+	(void) arg;
+	if (rdk_in_callback())
+		t8_marked++;
+	kenv_panic_jmp = &jb;
+	if (setjmp(jb) == 0)
+		rdk_destroy_cq(cq);
+	else
+		t8_panics++;
+	kenv_panic_jmp = NULL;
+}
+
+static void
+test_raw_handler(void)
+{
+	struct rdk_cq_init_attr ca = { .cqe = 4 };
+	struct rdk_cq *cq;
+	int base = cq_destroys;
+
+	CHECK(rdk_create_cq(&dev, t8_handler, NULL, NULL, &ca, &cq) == 0);
+	rdk_comp_upcall(cq);
+	CHECK(t8_marked == 1 && t8_panics == 1 && cq_destroys == base);
+	CHECK(!rdk_in_callback());
+	rdk_destroy_cq(cq);
+	CHECK(cq_destroys == base + 1);
+}
+
 /* 7: a teardown waited for from thread context, then freed. */
 static void
 t7_fn(void *arg)
@@ -614,6 +645,7 @@ main(int argc, char **argv)
 	test_forbidden();
 	test_upcall();
 	test_wait();
+	test_raw_handler();
 
 	rdk_cq_fini();
 	(void) printf("PASS: teardown from callbacks\n");
