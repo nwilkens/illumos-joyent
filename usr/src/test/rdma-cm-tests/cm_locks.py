@@ -26,8 +26,8 @@ import intr_locks as il  # noqa: E402
 from c_src import calls, functions, strip  # noqa: E402
 
 FILES = ("rdk_cm.c", "rdk_cm_iw.c", "rdk_cm_addr.c", "rdk_cm_listen.c",
-         "rdk_cm_gid.c", "rdk_cm_roce.c", "rdk_cm_roce_rx.c", "rdk_gsi.c",
-         "rdk_verbs.c")
+         "rdk_cm_gid.c", "rdk_cm_roce.c", "rdk_cm_roce_conn.c",
+         "rdk_cm_roce_rx.c", "rdk_gsi.c", "rdk_verbs.c")
 MUTEX_INIT = re.compile(r"mutex_init\s*\(\s*&[^,]*?(\w+)\s*,")
 OUTSIDE = re.compile(r"^(iw_\w+|ct_\w+|rao_\w+|gto_\w+|handler|done|"
                      r"ksocket_\w+|ip2mac\w*|rdk_iw_cm_event|taskq_wait\w*|"

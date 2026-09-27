@@ -63,7 +63,7 @@ THIRDPARTYLICENSE.  Each source's blob ID at that commit is given.
                  struct cma_hdr, CMA_VERSION and the RDMA_PS_TCP service
                  ID; the parser and builder are written for illumos.
 
-    rdk_cm_roce.c, rdk_cm_roce_rx.c, rdk_cm_roce.h
+    rdk_cm_roce.c, rdk_cm_roce_conn.c, rdk_cm_roce_rx.c, rdk_cm_roce.h
                  drivers/infiniband/core/cm.c
                  01bede8ba105535da9025ba75c392e3e9b161306
                  drivers/infiniband/core/cma.c

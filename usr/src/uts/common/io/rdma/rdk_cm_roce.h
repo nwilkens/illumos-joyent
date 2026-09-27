@@ -113,22 +113,31 @@ extern uint64_t rdk_ibcm_hi_tid;
 extern uint_t rdk_cm_roce_resolve_ms;
 extern volatile uint_t rdk_cm_roce_resolving;
 
-/* rdk_cm_roce.c */
+/* rdk_cm_roce_conn.c */
 extern rdk_ibconn_t *rdk_ibconn_alloc(rdk_cm_dev_t *, uint32_t, boolean_t);
 extern void rdk_ibconn_hold(rdk_ibconn_t *);
 extern void rdk_ibconn_rele(rdk_ibconn_t *);
 extern int rdk_ibconn_insert(rdk_ibconn_t *);
 extern boolean_t rdk_ibconn_insert_remote(rdk_ibconn_t *, rdk_ibconn_t **);
+extern void rdk_ibconn_drop_remote(rdk_ibconn_t *);
+extern void rdk_ibconn_unlink(rdk_ibconn_t *);
 extern rdk_ibconn_t *rdk_ibconn_find(uint32_t);
 extern rdk_ibconn_t *rdk_ibconn_find_remote(uint64_t, uint32_t);
 extern rdk_ibconn_t *rdk_ibconn_find_qpn(uint64_t, uint32_t);
-extern boolean_t rdk_ibconn_step(rdk_ibconn_t *, const rdk_ibconn_in_t *);
-extern void rdk_ibconn_input(rdk_ibconn_t *, rdk_ibcm_input_t);
+extern int rdk_cm_qp_attach(rdk_ibconn_t *, struct rdk_qp *);
+extern struct rdk_qp *rdk_cm_qp_lease(rdk_ibconn_t *);
+extern void rdk_cm_qp_unlease(struct rdk_qp *);
+extern void rdk_cm_qp_detach(rdk_ibconn_t *);
+extern timeout_id_t rdk_ibconn_timer_set(rdk_ibconn_t *, uint32_t);
+extern void rdk_ibconn_timer_cancel(rdk_ibconn_t *, timeout_id_t);
 extern void rdk_ibconn_arm(rdk_ibconn_t *, uint32_t);
-extern void rdk_ibconn_unlink(rdk_ibconn_t *);
 extern uint32_t rdk_ibcm_clamp_ms(uint32_t);
 extern rdk_gsi_t *rdk_cm_roce_gsi(rdk_cm_dev_t *, uint32_t);
 extern uint8_t rdk_cm_roce_mtu(struct rdk_device *, uint32_t, uint32_t);
+
+/* rdk_cm_roce.c */
+extern boolean_t rdk_ibconn_step(rdk_ibconn_t *, const rdk_ibconn_in_t *);
+extern void rdk_ibconn_input(rdk_ibconn_t *, rdk_ibcm_input_t);
 extern void rdk_ibcm_msg_init(const rdk_ibconn_t *, rdk_ibcm_msg_t *,
     uint16_t);
 
