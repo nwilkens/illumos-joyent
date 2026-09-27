@@ -319,7 +319,7 @@ rdk_rw_build_mr(struct rdk_rw_ctx *ctx, const ddi_dma_cookie_t *ck,
 	struct rdk_sge *sge;
 	struct rdk_mr *mr;
 	uint64_t moff, glen, gpos;
-	uint_t n;
+	uint_t n, k;
 	int ret;
 
 	while (lp.rp_off >= ck[lp.rp_i].dmac_size) {
@@ -329,7 +329,13 @@ rdk_rw_build_mr(struct rdk_rw_ctx *ctx, const ddi_dma_cookie_t *ck,
 	while (len != 0) {
 		if (ctx->rw_nmr == nmrs)
 			return (ENOBUFS);
-		mr = mrs[ctx->rw_nmr++];
+		mr = mrs[ctx->rw_nmr];
+		/* A lent MR maps one group: its REG reads the MR at post. */
+		for (k = 0; k < ctx->rw_nmr; k++) {
+			if (mrs[k] == mr)
+				return (EINVAL);
+		}
+		ctx->rw_nmr++;
 		rdk_update_fast_reg_key(mr, (uint8_t)rdk_inc_rkey(mr->rkey));
 		n = rdk_rw_group_cookies(ctx, ck, &lp, len);
 		moff = lp.rp_off;
@@ -434,6 +440,8 @@ rdk_rw_init(rdk_rw_ctx_t *ctx, struct rdk_qp *qp, enum rdk_rw_dir dir,
 	if (mr) {
 		if (ctx->rw_lim.rwl_mrs == 0)
 			return (ENOTSUP);
+		if ((mrs == NULL && nmrs != 0) || nmrs > ctx->rw_lim.rwl_mrs)
+			return (EINVAL);
 		for (i = 0; i < nmrs; i++) {
 			if (mrs[i] == NULL || mrs[i]->device != ctx->rw_dev ||
 			    mrs[i]->pd != qp->pd)

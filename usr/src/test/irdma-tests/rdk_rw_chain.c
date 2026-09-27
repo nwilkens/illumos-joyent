@@ -746,6 +746,29 @@ bad_args(void)
 	CHECK(rdk_rw_init(ctx, &qp, RDK_RW_READ, ck, 1, 0, 4096, sg, 1,
 	    bad, 1) == EINVAL);
 	(void) rdk_dereg_mr(bad[0]);
+	/* The MR vector: present, within the limit, each MR once. */
+	CHECK(rdk_rw_init(ctx, &qp, RDK_RW_READ, ck, 1, 0, 4096, sg, 1,
+	    NULL, 1) == EINVAL);
+	CHECK(rdk_alloc_mr(&pd, RDK_MR_TYPE_MEM_REG, 4, &bad[0]) == 0);
+	((struct fake_mr *)bad[0])->fm_cap = 2;
+	{
+		struct rdk_mr *dup[2] = { bad[0], bad[0] };
+		struct rdk_mr *many[64];
+		uint_t k;
+		uint32_t len2 = 3 * PG;
+
+		ck[0].dmac_size = 4 * PG;
+		sg[0].rs_len = len2;
+		CHECK(rdk_rw_init(ctx, &qp, RDK_RW_READ, ck, 1, 0, len2, sg, 1,
+		    dup, 2) == EINVAL);
+		for (k = 0; k < 64; k++)
+			many[k] = bad[0];
+		CHECK(rdk_rw_init(ctx, &qp, RDK_RW_READ, ck, 1, 0, len2, sg, 1,
+		    many, 64) == EINVAL);
+		ck[0].dmac_size = 8192;
+		sg[0].rs_len = 4096;
+	}
+	(void) rdk_dereg_mr(bad[0]);
 	/* No post without a build; a READ takes no chain. */
 	CHECK(rdk_rw_post(ctx, &cqe, NULL) == EINVAL);
 	CHECK(rdk_rw_init(ctx, &qp, RDK_RW_WRITE, ck, 1, 0, 8192, sg, 2,
