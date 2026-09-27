@@ -22,9 +22,10 @@
  *	rdmatool [opts] client host [test...]
  *	rdmatool [opts] bench {loop | host} test [key=value...]
  *
- * Options: -d device, -i local IPv4 (required but for info), -p TCP port,
- * -b buffer MB per QP, -q queue depth, -t seconds per bandwidth run, -w to
- * connect through the rdmak connection manager (iWARP).
+ * Options: -d device, -i local IPv4 (required but for info), -I side B's
+ * IPv4 in a loop (another address of the same port), -p TCP port, -b
+ * buffer MB per QP, -q queue depth, -t seconds per bandwidth run, -w to
+ * connect through the rdmak connection manager (iWARP or RoCE).
  * rdmabench.c describes the benchmark.
  *
  * The client (or loop) side A runs each test against side B, which is a
@@ -40,10 +41,10 @@
  * Each prints PASS or FAIL with its numbers; the exit status is 0 only if
  * all pass.
  *
- * The iWARP tests are in rdmatool_iw.c.
+ * The connection manager tests are in rdmatool_iw.c and rdmatool_rc.c.
  *
  * Build: gcc -m64 -pthread -o rdmatool rdmatool.c rdmabench.c \
- *	rdmatool_iw.c -lkstat -lsocket -lnsl
+ *	rdmatool_iw.c rdmatool_rc.c -lkstat -lsocket -lnsl
  */
 
 #include <sys/types.h>
@@ -90,6 +91,8 @@ int failures;
 uint32_t path_mtu = 1024;
 char *o_server;
 int o_iwarp;
+int o_cm;
+uint32_t o_ip2;
 
 void
 fatal(const char *fmt, ...)
@@ -343,7 +346,7 @@ fresh(peer_t *a, peer_t *b, uint32_t qpt, uint32_t poll)
 		bzero(&p->p_setup, sizeof (p->p_setup));
 		(void) strlcpy(p->p_setup.rs_dev, o_dev,
 		    sizeof (p->p_setup.rs_dev));
-		p->p_setup.rs_ipv4 = o_ip;
+		p->p_setup.rs_ipv4 = p == b && o_ip2 != 0 ? o_ip2 : o_ip;
 		p->p_setup.rs_qpt = qpt;
 		p->p_setup.rs_nqp = 1;
 		p->p_setup.rs_poll = poll;
@@ -360,7 +363,7 @@ fresh(peer_t *a, peer_t *b, uint32_t qpt, uint32_t poll)
 			return (ret);
 		}
 	}
-	if (o_iwarp)
+	if (o_cm)
 		return (iw_pair(a, b));
 	for (i = 0; i < 2; i++) {
 		peer_t *p = ps[i], *o = ps[1 - i];
@@ -1333,7 +1336,7 @@ run_tests(peer_t *a, peer_t *b, int argc, char **argv)
 			t_inflight(a, b);
 		else if (strcmp(t, "tcp") == 0)
 			t_tcp(a, b);
-		else if (iw_test(a, b, t) != 0)
+		else if (iw_test(a, b, t) != 0 && rc_test(a, b, t) != 0)
 			fatal("unknown test %s", t);
 	}
 }
@@ -1486,7 +1489,7 @@ static void
 usage(void)
 {
 	(void) fprintf(stderr, "usage: rdmatool [-w] [-d dev] [-i ipv4] "
-	    "[-p port] [-b MB] [-q depth] [-t secs]\n"
+	    "[-I ipv4] [-p port] [-b MB] [-q depth] [-t secs]\n"
 	    "\t{info | loop [test...] | server | client host [test...] |\n"
 	    "\tbench {loop | host} test [key=value...]}\n");
 	exit(2);
@@ -1498,10 +1501,14 @@ main(int argc, char **argv)
 	peer_t a, b;
 	int c, s;
 
-	while ((c = getopt(argc, argv, "d:i:p:b:q:t:w")) != -1) {
+	while ((c = getopt(argc, argv, "d:i:I:p:b:q:t:w")) != -1) {
 		switch (c) {
 		case 'w':
-			o_iwarp = 1;
+			o_cm = 1;
+			break;
+		case 'I':
+			if (inet_pton(AF_INET, optarg, &o_ip2) != 1)
+				fatal("bad address %s", optarg);
 			break;
 		case 'd':
 			o_dev = optarg;
@@ -1532,6 +1539,7 @@ main(int argc, char **argv)
 		usage();
 	(void) signal(SIGPIPE, SIG_IGN);
 	load_devices();
+	o_iwarp = local_dev.rdi_iwarp != 0;
 
 	if (strcmp(argv[0], "info") == 0) {
 		(void) printf("%s port state %u active MTU %u (link %u) speed "

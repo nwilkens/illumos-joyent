@@ -44,14 +44,14 @@
 #define	IW_STRANGER	"192.0.2.77"
 
 static uint_t iw_seq;
-static int iw_no_pair;
+int iw_no_pair;
 static uint16_t iw_last_bound;
 
 /*
  * Ports rdk_cm has used stay reserved for its TIME_WAIT hold, so each run
  * starts at a different place in the span.
  */
-static uint16_t
+uint16_t
 iw_port(void)
 {
 	static int started;
@@ -64,7 +64,7 @@ iw_port(void)
 	    (iw_seq++ % IW_PORT_SPAN))));
 }
 
-static void
+void
 iw_cm_init(rdmat_cm_t *c, uint32_t op, uint32_t qp)
 {
 	bzero(c, sizeof (*c));
@@ -74,7 +74,7 @@ iw_cm_init(rdmat_cm_t *c, uint32_t op, uint32_t qp)
 }
 
 /* B listens for A; returns B's address in *baddr and the slot in *slot. */
-static int
+int
 iw_listen(peer_t *b, uint16_t port, uint32_t peer, uint32_t flags,
     uint32_t *baddr, uint32_t *slot)
 {
@@ -82,7 +82,7 @@ iw_listen(peer_t *b, uint16_t port, uint32_t peer, uint32_t flags,
 	int ret;
 
 	iw_cm_init(&c, RDMAT_CM_LISTEN, 0);
-	c.rcm_laddr = b->p_sock >= 0 ? 0 : o_ip;
+	c.rcm_laddr = b->p_sock >= 0 ? 0 : o_ip2 != 0 ? o_ip2 : o_ip;
 	c.rcm_lport = port;
 	c.rcm_backlog = 8;
 	c.rcm_npeers = 1;

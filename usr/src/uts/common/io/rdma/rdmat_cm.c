@@ -51,10 +51,17 @@ rdmat_cm_qp_event(rdmat_qp_t *tq, const struct rdk_cm_event *ev)
 	tq->tq_cm_last = ev->event;
 	if (ev->status != 0)
 		tq->tq_cm_status = ev->status;
+	if (ev->event == RDK_CM_EVENT_REJECTED) {
+		tq->tq_cm_reason = ev->reject_reason;
+		tq->tq_cm_rej_len = MIN(ev->param.private_data_len,
+		    RDMAT_CM_REJ_LEN);
+		bcopy(ev->param.private_data, tq->tq_cm_rej,
+		    tq->tq_cm_rej_len);
+	}
 	if (ev->event == RDK_CM_EVENT_ESTABLISHED && tq->tq_cmid != NULL &&
 	    !tq->tq_cm_ok) {
 		/* The active side learns the peer's buffer here. */
-		if (ev->param.private_data_len == sizeof (rdmat_qpinfo_t)) {
+		if (ev->param.private_data_len >= sizeof (rdmat_qpinfo_t)) {
 			bcopy(ev->param.private_data, &tq->tq_peer,
 			    sizeof (tq->tq_peer));
 			tq->tq_cm_ok = B_TRUE;
@@ -100,7 +107,15 @@ rdmat_cm_request(rdmat_listen_t *rl, rdk_cm_id_t *id,
 	mutex_enter(&ts->ts_cm_lock);
 	rl->rl_reqs++;
 	mutex_exit(&ts->ts_cm_lock);
-	if (ev->param.private_data_len != sizeof (rdmat_qpinfo_t))
+	if (rl->rl_reject) {
+		mutex_enter(&ts->ts_cm_lock);
+		rl->rl_rejects++;
+		mutex_exit(&ts->ts_cm_lock);
+		(void) rdk_cm_reject(id, RDMAT_CM_REJ_DATA, RDMAT_CM_REJ_LEN);
+		return (1);
+	}
+	/* RoCE pads the private data to the message's fixed size. */
+	if (ev->param.private_data_len < sizeof (rdmat_qpinfo_t))
 		goto reject;
 
 	bzero(&p, sizeof (p));
@@ -263,8 +278,9 @@ rdmat_cm_listen(rdmat_sess_t *ts, rdmat_cm_t *c)
 
 	if (c->rcm_npeers == 0 || c->rcm_npeers > RDMAT_CM_MAX_PEERS ||
 	    c->rcm_lport == 0 || c->rcm_backlog == 0 ||
-	    (c->rcm_flags & ~RDMAT_CM_AUTO) != 0 ||
-	    ((c->rcm_flags & RDMAT_CM_AUTO) == 0 && c->rcm_qp >= ts->ts_nqp))
+	    (c->rcm_flags & ~(RDMAT_CM_AUTO | RDMAT_CM_REJECT)) != 0 ||
+	    ((c->rcm_flags & (RDMAT_CM_AUTO | RDMAT_CM_REJECT)) == 0 &&
+	    c->rcm_qp >= ts->ts_nqp))
 		return (EINVAL);
 	for (slot = 0; slot < RDMAT_CM_MAX_LISTEN; slot++) {
 		if (ts->ts_listen[slot] == NULL)
@@ -282,6 +298,7 @@ rdmat_cm_listen(rdmat_sess_t *ts, rdmat_cm_t *c)
 	rl->rl_ctx.cc_sess = ts;
 	rl->rl_qp = c->rcm_qp;
 	rl->rl_auto = (c->rcm_flags & RDMAT_CM_AUTO) != 0;
+	rl->rl_reject = (c->rcm_flags & RDMAT_CM_REJECT) != 0;
 	if ((ret = rdk_cm_create_id(ts->ts_cred, rdmat_cm_handler,
 	    &rl->rl_ctx, RDK_PS_TCP, RDK_QPT_RC, &rl->rl_id)) != 0)
 		goto fail;
@@ -380,6 +397,7 @@ rdmat_cm_connect1(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_cm_t *c,
 	struct rdk_cm_route rt;
 	rdmat_qpinfo_t mine;
 	rdk_cm_id_t *id;
+	hrtime_t t0 = gethrtime(), dt;
 	uint32_t done;
 	int ret;
 
@@ -390,6 +408,8 @@ rdmat_cm_connect1(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_cm_t *c,
 	tq->tq_cmid = id;
 	tq->tq_cm_seen = 0;
 	tq->tq_cm_status = 0;
+	tq->tq_cm_reason = 0;
+	tq->tq_cm_rej_len = 0;
 	tq->tq_cm_ok = B_FALSE;
 	mutex_exit(&tq->tq_lock);
 
@@ -442,6 +462,9 @@ rdmat_cm_connect1(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_cm_t *c,
 	ret = rdmat_cm_wait(ts, tq, done, deadline + SEC2NSEC(2));
 	c->rcm_event = tq->tq_cm_last;
 	c->rcm_status = tq->tq_cm_status;
+	c->rcm_reason = tq->tq_cm_reason;
+	c->rcm_rej_len = tq->tq_cm_rej_len;
+	bcopy(tq->tq_cm_rej, c->rcm_rej_data, sizeof (c->rcm_rej_data));
 	if (ret == 0 && (tq->tq_cm_seen &
 	    rdmat_cm_bit(RDK_CM_EVENT_ESTABLISHED)) == 0) {
 		ret = (tq->tq_cm_seen & rdmat_cm_bit(RDK_CM_EVENT_REJECTED)) !=
@@ -449,6 +472,14 @@ rdmat_cm_connect1(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_cm_t *c,
 		    tq->tq_cm_status : ECONNRESET;
 	}
 	mutex_exit(&tq->tq_lock);
+	if (ret == 0) {
+		dt = gethrtime() - t0;
+		c->rcm_conn_ns += (uint64_t)dt;
+		if (c->rcm_conn_min_ns == 0 ||
+		    (uint64_t)dt < c->rcm_conn_min_ns)
+			c->rcm_conn_min_ns = (uint64_t)dt;
+		c->rcm_conn_max_ns = MAX(c->rcm_conn_max_ns, (uint64_t)dt);
+	}
 	return (ret);
 }
 
@@ -479,6 +510,8 @@ rdmat_cm_disconnect(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_cm_t *c,
     hrtime_t deadline)
 {
 	rdk_cm_id_t *id;
+	hrtime_t t0 = gethrtime();
+	uint32_t until;
 	int ret = 0;
 
 	mutex_enter(&tq->tq_lock);
@@ -487,14 +520,16 @@ rdmat_cm_disconnect(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_cm_t *c,
 	if (id == NULL)
 		return (ENOTCONN);
 	(void) rdk_cm_disconnect(id);
+	until = rdmat_cm_bit(RDK_CM_EVENT_TIMEWAIT_EXIT) |
+	    rdmat_cm_bit(RDK_CM_EVENT_DEVICE_REMOVAL);
+	if ((c->rcm_flags & RDMAT_CM_FAST) != 0)
+		until |= rdmat_cm_bit(RDK_CM_EVENT_DISCONNECTED);
 	mutex_enter(&tq->tq_lock);
-	if ((tq->tq_cm_seen & rdmat_cm_bit(RDK_CM_EVENT_ESTABLISHED)) != 0) {
-		ret = rdmat_cm_wait(ts, tq,
-		    rdmat_cm_bit(RDK_CM_EVENT_TIMEWAIT_EXIT) |
-		    rdmat_cm_bit(RDK_CM_EVENT_DEVICE_REMOVAL), deadline);
-	}
+	if ((tq->tq_cm_seen & rdmat_cm_bit(RDK_CM_EVENT_ESTABLISHED)) != 0)
+		ret = rdmat_cm_wait(ts, tq, until, deadline);
 	c->rcm_event = tq->tq_cm_last;
 	mutex_exit(&tq->tq_lock);
+	c->rcm_disc_ns += (uint64_t)(gethrtime() - t0);
 	if (ret == EINTR || ret == ENXIO)
 		return (ret);
 	c->rcm_status = ret;
@@ -509,8 +544,11 @@ rdmat_cm_cycle(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_cm_t *c)
 	hrtime_t t0 = gethrtime(), deadline;
 	int ret = 0;
 
-	if (c->rcm_count == 0 || c->rcm_count > RDMAT_CM_MAX_CYCLES)
+	if (c->rcm_count == 0 || c->rcm_count > RDMAT_CM_MAX_CYCLES ||
+	    (c->rcm_flags & ~RDMAT_CM_FAST) != 0)
 		return (EINVAL);
+	c->rcm_conn_ns = c->rcm_conn_min_ns = c->rcm_conn_max_ns = 0;
+	c->rcm_disc_ns = 0;
 	for (c->rcm_done = 0; c->rcm_done < c->rcm_count; c->rcm_done++) {
 		if (ts->ts_dying)
 			return (ENXIO);
@@ -574,6 +612,7 @@ rdmat_cm(rdmat_sess_t *ts, rdmat_cm_t *c)
 	case RDMAT_CM_CONNECT:
 		if (tq->tq_connected || tq->tq_cmid != NULL)
 			return (EISCONN);
+		c->rcm_conn_ns = c->rcm_conn_min_ns = c->rcm_conn_max_ns = 0;
 		if ((ret = rdmat_cm_connect1(ts, tq, c, deadline)) != 0) {
 			(void) rdmat_cm_reset(ts, tq);
 			return (ret);

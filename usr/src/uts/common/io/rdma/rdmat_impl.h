@@ -81,6 +81,7 @@ typedef struct rdmat_listen {
 	rdk_cm_id_t		*rl_id;
 	uint32_t		rl_qp;		/* QP to accept into */
 	boolean_t		rl_auto;
+	boolean_t		rl_reject;
 	uint32_t		rl_reqs;	/* ts_cm_lock */
 	uint32_t		rl_accepts;
 	uint32_t		rl_rejects;
@@ -141,6 +142,9 @@ typedef struct rdmat_qp {
 	uint32_t		tq_cm_seen;	/* 1 << rdk_cm_event_type */
 	uint32_t		tq_cm_last;
 	int			tq_cm_status;
+	uint32_t		tq_cm_reason;
+	uint16_t		tq_cm_rej_len;
+	uint8_t			tq_cm_rej[RDMAT_CM_REJ_LEN];
 	rdmat_qpinfo_t		tq_peer;
 	boolean_t		tq_cm_ok;	/* the peer's info was valid */
 

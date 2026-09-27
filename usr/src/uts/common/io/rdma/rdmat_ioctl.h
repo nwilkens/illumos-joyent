@@ -68,7 +68,7 @@ typedef struct rdmat_devinfo {
 	uint32_t	rdi_active_mtu;		/* bytes */
 	uint32_t	rdi_phys_mtu;
 	uint8_t		rdi_mac[6];
-	uint16_t	rdi_pad;
+	uint16_t	rdi_iwarp;	/* 1: iWARP, 0: RoCE */
 	uint64_t	rdi_speed;
 	uint32_t	rdi_max_qp;
 	uint32_t	rdi_max_qp_wr;
@@ -264,6 +264,12 @@ typedef enum rdmat_cm_op {
 
 /* rcm_flags */
 #define	RDMAT_CM_AUTO		0x1	/* LISTEN: accept into new QPs */
+#define	RDMAT_CM_REJECT		0x2	/* LISTEN: refuse every request */
+#define	RDMAT_CM_FAST		0x4	/* wait for DISCONNECTED only */
+
+/* The private data a RDMAT_CM_REJECT listener refuses with. */
+#define	RDMAT_CM_REJ_DATA	"rdmat-no"
+#define	RDMAT_CM_REJ_LEN	8
 
 typedef struct rdmat_cm {
 	uint32_t	rcm_op;		/* rdmat_cm_op_t */
@@ -287,9 +293,15 @@ typedef struct rdmat_cm {
 	uint32_t	rcm_rejects;
 	uint32_t	rcm_live;	/* STATUS: automatic QPs alive */
 	uint16_t	rcm_bound;	/* the local port used */
-	uint16_t	rcm_pad;
+	uint16_t	rcm_rej_len;	/* REJECTED: private data bytes */
 	uint64_t	rcm_ns;
 	rdmat_qpinfo_t	rcm_peer;
+	uint32_t	rcm_reason;	/* REJECTED: the transport's code */
+	uint8_t		rcm_rej_data[RDMAT_CM_REJ_LEN];
+	uint64_t	rcm_conn_ns;	/* CONNECT, CYCLE: to ESTABLISHED */
+	uint64_t	rcm_conn_min_ns;
+	uint64_t	rcm_conn_max_ns;
+	uint64_t	rcm_disc_ns;	/* CYCLE: disconnect to its event */
 } rdmat_cm_t;
 
 #ifdef __cplusplus

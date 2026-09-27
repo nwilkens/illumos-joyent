@@ -84,6 +84,8 @@ extern int o_secs;
 extern uint32_t path_mtu;
 extern char *o_server;
 extern int o_iwarp;
+extern int o_cm;
+extern uint32_t o_ip2;
 extern int failures;
 extern uint32_t fresh_b_access;
 extern uint32_t fresh_inline;
@@ -117,5 +119,11 @@ extern int bench_main(peer_t *, peer_t *, int, char **);
 /* rdmatool_iw.c */
 extern int iw_pair(peer_t *, peer_t *);
 extern int iw_test(peer_t *, peer_t *, const char *);
+extern uint16_t iw_port(void);
+extern int iw_listen(peer_t *, uint16_t, uint32_t, uint32_t, uint32_t *,
+    uint32_t *);
+extern void iw_cm_init(rdmat_cm_t *, uint32_t, uint32_t);
+extern int rc_test(peer_t *, peer_t *, const char *);
+extern int iw_no_pair;
 
 #endif /* _RDMATOOL_H */
