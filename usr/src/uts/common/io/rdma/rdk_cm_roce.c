@@ -309,6 +309,10 @@ rdk_ibconn_step(rdk_ibconn_t *c, const rdk_ibconn_in_t *in0)
 			}
 		}
 
+		/* A DREP answers the DREQ's transaction. */
+		if (in.ci_in.ii_input == IBCI_DREQ &&
+		    a.ia_send == IBCM_SEND_DREP && in.ci_msg != NULL)
+			c->ic_tid = in.ci_msg->m_tid;
 		send = B_FALSE;
 		if (a.ia_resend && c->ic_msg_valid) {
 			bcopy(c->ic_msg, buf, sizeof (buf));

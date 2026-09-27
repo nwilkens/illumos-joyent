@@ -549,8 +549,6 @@ rdk_cm_roce_conn_msg(const rdk_gsi_rx_t *rx, const rdk_ibcm_msg_t *m)
 		in.ci_in.ii_input = IBCI_DREQ;
 		ok = ok && c->ic_rid != 0 && m->m_local_id == c->ic_rid &&
 		    m->m_qpn == c->ic_lqpn;
-		if (ok)
-			c->ic_tid = m->m_tid;
 		break;
 	case IBCM_ATTR_DREP:
 		in.ci_in.ii_input = IBCI_DREP;
