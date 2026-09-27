@@ -14,6 +14,7 @@ TESTS = (
     "iwc_cqe.py",
     "iwc_intr.py",
     "mpa_parse.py",
+    "term_codes.py",
     "third_party.py",
 )
 
