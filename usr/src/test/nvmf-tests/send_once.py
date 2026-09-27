@@ -44,7 +44,8 @@ struct nvmf_memdesc;
     text = public.read_text(encoding="utf-8")
     start = text.index("typedef void nvmf_send_complete_t")
     parts.append(text[start:text.index(";", start) + 1] + "\n")
-    for name in ("nvmf_memdesc_type_t", "nvmf_seg_t", "nvmf_memdesc_t"):
+    for name in ("nvmf_memdesc_type_t", "nvmf_seg_t", "nvmf_memdesc_t",
+                 "nvmf_databuf_t"):
         parts.append(typedef(internal, name))
     for name in ("nvmf_send_request", "nvmf_transport_ops", "nvmf_qpair",
                  "nvmf_io_request", "nvmf_capsule"):

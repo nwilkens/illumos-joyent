@@ -157,6 +157,30 @@ typedef struct nvmf_sgl {
 uint8_t	nvmf_sgl_decode(const nvme_sqe_t *sqe, size_t icd_len,
     uint64_t max_len, nvmf_sgl_t *sgl);
 
+/*
+ * A data buffer that a transport made ready for DMA: from its pool, or LU
+ * memory that it mapped.  It holds the transport, not the qpair, so it may
+ * outlive the qpair.
+ */
+typedef struct nvmf_databuf {
+	void			*ndb_addr;	/* pool buffers only */
+	size_t			ndb_len;
+	const ddi_dma_cookie_t	*ndb_cookies;
+	uint_t			ndb_ncookies;
+	void			*ndb_priv;	/* the transport's */
+	struct nvmf_transport	*ndb_transport;	/* the core's */
+} nvmf_databuf_t;
+
+/*
+ * Neither allocation sleeps.  A pool buffer has between min_len and len
+ * bytes.  ENOTSUP means the transport has no such buffers.
+ */
+int	nvmf_alloc_data_buf(struct nvmf_qpair *qp, size_t len, size_t min_len,
+    nvmf_databuf_t *db);
+int	nvmf_map_data_buf(struct nvmf_qpair *qp, const nvmf_seg_t *segs,
+    uint_t nsegs, nvmf_databuf_t *db);
+void	nvmf_free_data_buf(nvmf_databuf_t *db);
+
 /* Data for a controller-to-host transfer, as a transport receives it. */
 struct nvmf_send_request {
 	nvmf_memdesc_t		nsr_mem;
@@ -203,6 +227,17 @@ struct nvmf_transport_ops {
 
 	/* Optional.  NVMF_QP_CAP_* for the qpair; fixed for its life. */
 	uint32_t (*caps)(struct nvmf_qpair *qp);
+
+	/*
+	 * Optional: NVMF_QP_CAP_DATA_BUF needs alloc_data_buf, and
+	 * NVMF_QP_CAP_LU_DBUF needs map_data_buf.  free_data_buf releases
+	 * either kind and may run after free_qpair.
+	 */
+	int (*alloc_data_buf)(struct nvmf_qpair *qp, size_t len,
+	    size_t min_len, nvmf_databuf_t *db);
+	int (*map_data_buf)(struct nvmf_qpair *qp, const nvmf_seg_t *segs,
+	    uint_t nsegs, nvmf_databuf_t *db);
+	void (*free_data_buf)(nvmf_databuf_t *db);
 
 	nvmf_trtype_t trtype;
 	int priority;

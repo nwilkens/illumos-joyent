@@ -136,8 +136,9 @@ boolean_t nvmf_sqhd_valid(struct nvmf_capsule *nc);
  * types the transport accepts in a command capsule.
  */
 #define	NVMF_QP_CAP_UNORDERED_DATA	0x0001	/* data chunks in any order */
-#define	NVMF_QP_CAP_LU_DBUF		0x0002	/* moves LU-supplied dbufs */
+#define	NVMF_QP_CAP_LU_DBUF		0x0002	/* maps LU memory */
 #define	NVMF_QP_CAP_ALWAYS_RESPONSE	0x0004	/* never folds success */
+#define	NVMF_QP_CAP_DATA_BUF		0x0008	/* has a data buffer pool */
 #define	NVMF_QP_CAP_SGL_TRANSPORT	0x0010	/* Transport SGL Data Block */
 #define	NVMF_QP_CAP_SGL_KEYED		0x0020	/* Keyed SGL Data Block */
 #define	NVMF_QP_CAP_SGL_OFFSET		0x0040	/* in-capsule data at offset */

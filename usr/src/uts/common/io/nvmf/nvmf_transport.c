@@ -76,6 +76,7 @@
 struct nvmf_transport {
 	struct nvmf_transport_ops *nt_ops;
 
+	/* Live data buffers count here too; each pins the transport. */
 	volatile uint_t nt_active_qpairs;
 	list_node_t nt_link;
 };
@@ -172,6 +173,22 @@ nvmf_adopt_qpair(struct nvmf_transport_ops *ops, struct nvmf_qpair *qp,
 	return (0);
 }
 
+/*
+ * FreeBSD: if (refcount_release(&nt->nt_active_qpairs)) wakeup(nt);
+ * refcount_release() returns true when the count reaches zero.  Mirror
+ * that with an atomic decrement and broadcast the unload waiter when
+ * the last qpair drains.
+ */
+static void
+nvmf_transport_rele(struct nvmf_transport *nt)
+{
+	if (atomic_dec_uint_nv(&nt->nt_active_qpairs) == 0) {
+		mutex_enter(&nvmf_transports_cv_lock);
+		cv_broadcast(&nvmf_transports_cv);
+		mutex_exit(&nvmf_transports_cv_lock);
+	}
+}
+
 void
 nvmf_free_qpair(struct nvmf_qpair *qp)
 {
@@ -179,18 +196,59 @@ nvmf_free_qpair(struct nvmf_qpair *qp)
 
 	nt = qp->nq_transport;
 	qp->nq_ops->free_qpair(qp);
+	nvmf_transport_rele(nt);
+}
 
-	/*
-	 * FreeBSD: if (refcount_release(&nt->nt_active_qpairs)) wakeup(nt);
-	 * refcount_release() returns true when the count reaches zero.  Mirror
-	 * that with an atomic decrement and broadcast the unload waiter when
-	 * the last qpair drains.
-	 */
-	if (atomic_dec_uint_nv(&nt->nt_active_qpairs) == 0) {
-		mutex_enter(&nvmf_transports_cv_lock);
-		cv_broadcast(&nvmf_transports_cv);
-		mutex_exit(&nvmf_transports_cv_lock);
+int
+nvmf_alloc_data_buf(struct nvmf_qpair *qp, size_t len, size_t min_len,
+    nvmf_databuf_t *db)
+{
+	struct nvmf_transport_ops *ops = qp->nq_ops;
+	int error;
+
+	bzero(db, sizeof (*db));
+	if (ops->alloc_data_buf == NULL || ops->free_data_buf == NULL)
+		return (ENOTSUP);
+	if (min_len > len)
+		return (EINVAL);
+	error = ops->alloc_data_buf(qp, len, min_len, db);
+	if (error != 0)
+		return (error);
+	if (db->ndb_len < min_len || db->ndb_len > len ||
+	    db->ndb_addr == NULL) {
+		ops->free_data_buf(db);
+		return (EINVAL);
 	}
+	atomic_inc_uint(&qp->nq_transport->nt_active_qpairs);
+	db->ndb_transport = qp->nq_transport;
+	return (0);
+}
+
+int
+nvmf_map_data_buf(struct nvmf_qpair *qp, const nvmf_seg_t *segs, uint_t nsegs,
+    nvmf_databuf_t *db)
+{
+	struct nvmf_transport_ops *ops = qp->nq_ops;
+	int error;
+
+	bzero(db, sizeof (*db));
+	if (ops->map_data_buf == NULL || ops->free_data_buf == NULL)
+		return (ENOTSUP);
+	error = ops->map_data_buf(qp, segs, nsegs, db);
+	if (error != 0)
+		return (error);
+	atomic_inc_uint(&qp->nq_transport->nt_active_qpairs);
+	db->ndb_transport = qp->nq_transport;
+	return (0);
+}
+
+void
+nvmf_free_data_buf(nvmf_databuf_t *db)
+{
+	struct nvmf_transport *nt = db->ndb_transport;
+
+	nt->nt_ops->free_data_buf(db);
+	nvmf_transport_rele(nt);
 }
 
 struct nvmf_capsule *

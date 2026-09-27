@@ -21,11 +21,15 @@ typedef void nvmf_qpair_error_t(void *, int);
 typedef void nvmf_capsule_receive_t(void *, struct nvmf_capsule *);
 struct nvmf_send_request;
 typedef struct { uint64_t opaque[2]; } nvme_cqe_t;
+typedef struct { uint64_t dmac_laddress; size_t dmac_size; } ddi_dma_cookie_t;
 int nvlist_lookup_boolean_value(nvlist_t *, const char *, boolean_t *);
-""", struct(internal, "nvmf_transport_ops"),
+""", typedef(internal, "nvmf_seg_t"), typedef(internal, "nvmf_databuf_t"),
+        struct(internal, "nvmf_transport_ops"),
         struct(internal, "nvmf_qpair"), text[start:end]]
     for name in ("nvmf_supported_trtype", "nvmf_allocate_qpair",
-                 "nvmf_adopt_qpair", "nvmf_free_qpair",
+                 "nvmf_adopt_qpair", "nvmf_transport_rele", "nvmf_free_qpair",
+                 "nvmf_alloc_data_buf", "nvmf_map_data_buf",
+                 "nvmf_free_data_buf",
                  "nvmf_transport_register", "nvmf_transport_unregister",
                  "nvmf_qpair_error", "nvmf_capsule_received"):
         src = core if name.startswith("nvmf_") and name not in (

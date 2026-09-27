@@ -176,7 +176,7 @@ static void nvmft_lport_event_handler(stmf_local_port_t *lport, int eventid,
 static scsi_devid_desc_t *nvmft_alloc_scsi_devid_desc(const char *nqn);
 static void nvmft_free_scsi_devid_desc(scsi_devid_desc_t *sdd);
 
-/* dbuf store: a kmem-backed copy buffer used by the TCP transport. */
+/* dbuf store: transport buffers, or kmem copy buffers for TCP. */
 static stmf_data_buf_t *nvmft_dbuf_alloc(scsi_task_t *task, uint32_t size,
     uint32_t *pminsize, uint32_t flags);
 static void nvmft_dbuf_free(stmf_dbuf_store_t *ds, stmf_data_buf_t *dbuf);
@@ -207,7 +207,9 @@ typedef struct nvmft_xfer {
 typedef struct nvmft_dbuf_priv {
 	uint32_t	ndp_magic;
 	uint32_t	ndp_size;
-	void		*ndp_buf;
+	void		*ndp_buf;	/* kmem buffer */
+	boolean_t	ndp_transport;	/* ndp_db is the transport's */
+	nvmf_databuf_t	ndp_db;
 	nvmft_xfer_t	ndp_xfer;
 } nvmft_dbuf_priv_t;
 
@@ -915,6 +917,10 @@ nvmft_post_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 			 */
 			task->task_max_nbufs = (nvmft_qpair_caps(qp) &
 			    NVMF_QP_CAP_UNORDERED_DATA) ? STMF_BUFS_MAX : 1;
+			if (nvmft_qpair_caps(qp) & NVMF_QP_CAP_LU_DBUF) {
+				task->task_additional_flags |=
+				    TASK_AF_ACCEPT_LU_DBUF;
+			}
 			task->task_max_xfer_len = data_len;
 			task->task_1st_xfer_len = data_len;
 
@@ -1087,10 +1093,20 @@ CTASSERT(offsetof(nvmf_seg_t, nsg_addr) ==
 
 /* Describe the db_data_size bytes of a dbuf's sglist as a memdesc. */
 static void
-nvmft_dbuf_to_memdesc(stmf_data_buf_t *dbuf, nvmf_memdesc_t *mem)
+nvmft_dbuf_to_memdesc(stmf_data_buf_t *dbuf, const nvmft_dbuf_priv_t *ndp,
+    nvmf_memdesc_t *mem)
 {
 	bzero(mem, sizeof (*mem));
 	mem->nmd_len = dbuf->db_data_size;
+	if (ndp->ndp_transport) {
+		mem->nmd_type = NVMF_MEMDESC_SGL;
+		mem->nmd_u.nmd_sgl.nmd_segs =
+		    (const nvmf_seg_t *)dbuf->db_sglist;
+		mem->nmd_u.nmd_sgl.nmd_nsegs = dbuf->db_sglist_length;
+		mem->nmd_u.nmd_sgl.nmd_cookies = ndp->ndp_db.ndb_cookies;
+		mem->nmd_u.nmd_sgl.nmd_ncookies = ndp->ndp_db.ndb_ncookies;
+		return;
+	}
 	if (dbuf->db_sglist_length == 1) {
 		mem->nmd_type = NVMF_MEMDESC_VADDR;
 		mem->nmd_u.nmd_vaddr = dbuf->db_sglist[0].seg_addr;
@@ -1344,7 +1360,7 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 	bzero(nx, sizeof (*nx));
 	nx->nx_task = task;
 	nx->nx_dbuf = dbuf;
-	nvmft_dbuf_to_memdesc(dbuf, &mem);
+	nvmft_dbuf_to_memdesc(dbuf, ndp, &mem);
 
 	if (dbuf->db_flags & DB_DIRECTION_TO_RPORT) {
 		/* C2H: send controller data (READ). */
@@ -1869,11 +1885,23 @@ nvmft_free_scsi_devid_desc(scsi_devid_desc_t *sdd)
  * STMF requires every local port to supply a dbuf store; the LU calls
  * stmf_alloc_dbuf() (which dispatches to ds_alloc_data_buf) to obtain a buffer,
  * fills it (WRITE) or has us fill it (READ), and drives the transfer through
- * lport_xfer_data().  For the TCP transport these are plain kmem copy buffers
- * with a single-segment sglist; lport_xfer_data() copies between the sglist and
- * the transport's PDU mblks.  (NVMEOF.md section 8: an RDMA transport would back
- * the same store with registered memory.)
+ * lport_xfer_data().  A port serves every transport, so the store asks the
+ * task's transport for a buffer from its pool, and falls back to kmem (as for
+ * TCP) when the transport has none.  A transport that maps LU memory gets the
+ * LU's buffers through ds_setup_dbuf.
  */
+
+static struct nvmf_qpair *
+nvmft_dbuf_qpair(scsi_task_t *task, uint32_t cap, struct nvmft_qpair **qpp)
+{
+	nvmft_task_priv_t *priv = task->task_port_private;
+
+	if (priv == NULL || priv->ntp_iio != NULL ||
+	    (nvmft_qpair_caps(priv->ntp_qp) & cap) == 0)
+		return (NULL);
+	*qpp = priv->ntp_qp;
+	return (nvmft_qpair_data_hold(priv->ntp_qp));
+}
 
 /* ARGSUSED */
 static stmf_data_buf_t *
@@ -1882,27 +1910,43 @@ nvmft_dbuf_alloc(scsi_task_t *task, uint32_t size, uint32_t *pminsize,
 {
 	stmf_data_buf_t *dbuf;
 	nvmft_dbuf_priv_t *ndp;
-	void *buf;
+	struct nvmft_qpair *qp;
+	struct nvmf_qpair *nq;
+	void *buf = NULL;
+	int error;
 
-	_NOTE(ARGUNUSED(task, pminsize, flags));
+	_NOTE(ARGUNUSED(flags));
 
 	if (size == 0)
 		return (NULL);
 
-	buf = kmem_alloc(size, KM_NOSLEEP);
-	if (buf == NULL)
-		return (NULL);
-
 	dbuf = stmf_alloc(STMF_STRUCT_DATA_BUF, sizeof (nvmft_dbuf_priv_t), 0);
-	if (dbuf == NULL) {
-		kmem_free(buf, size);
+	if (dbuf == NULL)
 		return (NULL);
-	}
-
 	ndp = dbuf->db_port_private;
+
+	nq = nvmft_dbuf_qpair(task, NVMF_QP_CAP_DATA_BUF, &qp);
+	if (nq != NULL) {
+		error = nvmf_alloc_data_buf(nq, size, MIN(*pminsize, size),
+		    &ndp->ndp_db);
+		nvmft_qpair_data_rele(qp, nq);
+		if (error != 0) {
+			stmf_free(dbuf);
+			return (NULL);
+		}
+		ndp->ndp_transport = B_TRUE;
+		buf = ndp->ndp_db.ndb_addr;
+		size = (uint32_t)ndp->ndp_db.ndb_len;
+	} else {
+		buf = kmem_alloc(size, KM_NOSLEEP);
+		if (buf == NULL) {
+			stmf_free(dbuf);
+			return (NULL);
+		}
+		ndp->ndp_buf = buf;
+		ndp->ndp_size = size;
+	}
 	ndp->ndp_magic = NVMFT_DBUF_MAGIC;
-	ndp->ndp_buf = buf;
-	ndp->ndp_size = size;
 
 	dbuf->db_flags = DB_DONT_CACHE;
 	dbuf->db_buf_size = size;
@@ -1921,8 +1965,57 @@ nvmft_dbuf_free(stmf_dbuf_store_t *ds, stmf_data_buf_t *dbuf)
 
 	_NOTE(ARGUNUSED(ds));
 
-	kmem_free(ndp->ndp_buf, ndp->ndp_size);
+	if (ndp->ndp_transport)
+		nvmf_free_data_buf(&ndp->ndp_db);
+	else
+		kmem_free(ndp->ndp_buf, ndp->ndp_size);
 	stmf_free(dbuf);
+}
+
+/* Let the transport map an LU buffer.  sbd leaves db_port_private to us. */
+/* ARGSUSED */
+static stmf_status_t
+nvmft_dbuf_setup(scsi_task_t *task, stmf_data_buf_t *dbuf, uint32_t flags)
+{
+	nvmft_dbuf_priv_t *ndp;
+	struct nvmft_qpair *qp;
+	struct nvmf_qpair *nq;
+	int error;
+
+	_NOTE(ARGUNUSED(flags));
+
+	nq = nvmft_dbuf_qpair(task, NVMF_QP_CAP_LU_DBUF, &qp);
+	if (nq == NULL)
+		return (STMF_FAILURE);
+	ndp = kmem_zalloc(sizeof (*ndp), KM_NOSLEEP);
+	if (ndp == NULL) {
+		nvmft_qpair_data_rele(qp, nq);
+		return (STMF_FAILURE);
+	}
+	error = nvmf_map_data_buf(nq, (const nvmf_seg_t *)dbuf->db_sglist,
+	    dbuf->db_sglist_length, &ndp->ndp_db);
+	nvmft_qpair_data_rele(qp, nq);
+	if (error != 0) {
+		kmem_free(ndp, sizeof (*ndp));
+		return (STMF_FAILURE);
+	}
+	ndp->ndp_magic = NVMFT_DBUF_MAGIC;
+	ndp->ndp_transport = B_TRUE;
+	dbuf->db_port_private = ndp;
+	return (STMF_SUCCESS);
+}
+
+/* ARGSUSED */
+static void
+nvmft_dbuf_teardown(stmf_dbuf_store_t *ds, stmf_data_buf_t *dbuf)
+{
+	nvmft_dbuf_priv_t *ndp = dbuf->db_port_private;
+
+	_NOTE(ARGUNUSED(ds));
+
+	nvmf_free_data_buf(&ndp->ndp_db);
+	kmem_free(ndp, sizeof (*ndp));
+	dbuf->db_port_private = NULL;
 }
 
 static stmf_dbuf_store_t *
@@ -1935,8 +2028,8 @@ nvmft_dbuf_store_create(void)
 		return (NULL);
 	ds->ds_alloc_data_buf = nvmft_dbuf_alloc;
 	ds->ds_free_data_buf = nvmft_dbuf_free;
-	ds->ds_setup_dbuf = NULL;
-	ds->ds_teardown_dbuf = NULL;
+	ds->ds_setup_dbuf = nvmft_dbuf_setup;
+	ds->ds_teardown_dbuf = nvmft_dbuf_teardown;
 	return (ds);
 }
 

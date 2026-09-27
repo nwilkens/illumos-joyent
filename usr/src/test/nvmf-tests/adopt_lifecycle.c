@@ -51,9 +51,43 @@ fake_free(struct nvmf_qpair *qp)
 	free(qp);
 }
 
+static size_t pool_len;
+static unsigned buf_frees;
+
+static int
+fake_alloc_buf(struct nvmf_qpair *qp, size_t len, size_t min_len,
+    nvmf_databuf_t *db)
+{
+	(void) qp;
+	(void) min_len;
+	db->ndb_len = pool_len != 0 ? pool_len : len;
+	db->ndb_addr = malloc(db->ndb_len);
+	return (0);
+}
+
+static int
+fake_map_buf(struct nvmf_qpair *qp, const nvmf_seg_t *segs, uint_t nsegs,
+    nvmf_databuf_t *db)
+{
+	(void) qp;
+	(void) segs;
+	db->ndb_ncookies = nsegs;
+	return (nsegs == 0 ? EINVAL : 0);
+}
+
+static void
+fake_free_buf(nvmf_databuf_t *db)
+{
+	free(db->ndb_addr);
+	buf_frees++;
+}
+
 static struct nvmf_transport_ops ops = {
 	.allocate_qpair = fake_allocate,
 	.free_qpair = fake_free,
+	.alloc_data_buf = fake_alloc_buf,
+	.map_data_buf = fake_map_buf,
+	.free_data_buf = fake_free_buf,
 	.trtype = NVMF_TRTYPE_RDMA,
 };
 
@@ -143,6 +177,51 @@ lifecycle(void)
 	assert(frees == 3);
 }
 
+/*
+ * Data buffers pin the transport like qpairs do and may outlive the qpair
+ * they came from.  A transport that returns too small a buffer loses it.
+ */
+static void
+data_buffers(void)
+{
+	nvmf_seg_t seg = { 512, NULL };
+	nvmf_databuf_t pool, lu, bad;
+	struct nvmf_qpair *qp;
+
+	assert(nvmf_transport_register(&ops) == 0);
+	qp = adopt(&ops, B_FALSE, 0);
+	assert(nvmf_alloc_data_buf(qp, 4096, 512, &pool) == 0);
+	assert(pool.ndb_len == 4096 && pool.ndb_transport != NULL);
+	assert(nvmf_map_data_buf(qp, &seg, 1, &lu) == 0);
+	assert(nvmf_map_data_buf(qp, &seg, 0, &bad) == EINVAL);
+	assert(nvmf_alloc_data_buf(qp, 512, 4096, &bad) == EINVAL);
+	pool_len = 100;
+	assert(nvmf_alloc_data_buf(qp, 4096, 512, &bad) == EINVAL);
+	assert(buf_frees == 1);
+	pool_len = 8192;
+	assert(nvmf_alloc_data_buf(qp, 4096, 512, &bad) == EINVAL);
+	assert(buf_frees == 2);
+	pool_len = 0;
+	assert(active() == 3);
+
+	nvmf_free_qpair(qp);
+	assert(nvmf_transport_unregister(&ops) == EBUSY);
+	nvmf_free_data_buf(&pool);
+	assert(nvmf_transport_unregister(&ops) == EBUSY);
+	nvmf_free_data_buf(&lu);
+	assert(buf_frees == 4);
+	assert(nvmf_transport_unregister(&ops) == 0);
+
+	/* A transport without a pool says so. */
+	stranger.allocate_qpair = fake_allocate;
+	assert(nvmf_transport_register(&stranger) == 0);
+	qp = adopt(&stranger, B_FALSE, 0);
+	assert(nvmf_alloc_data_buf(qp, 4096, 512, &bad) == ENOTSUP);
+	assert(nvmf_map_data_buf(qp, &seg, 1, &bad) == ENOTSUP);
+	nvmf_free_qpair(qp);
+	assert(nvmf_transport_unregister(&stranger) == 0);
+}
+
 static volatile int stop;
 
 static void *
@@ -213,6 +292,7 @@ main(void)
 	cv_init(&nvmf_transports_cv, NULL, CV_DRIVER, NULL);
 
 	lifecycle();
+	data_buffers();
 	unload_race();
 	printf("adopt lifecycle passed (%u qpairs freed)\n", frees);
 	return (0);
