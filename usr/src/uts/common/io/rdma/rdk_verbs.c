@@ -852,12 +852,17 @@ rdk_drain_wait(struct rdk_qp *qp, struct rdk_cq *cq, rdk_drain_cqe_t *d,
 	return (done);
 }
 
+/* A QP still in RESET holds no work; ERR is not a valid state from there. */
 static int
 rdk_drain_to_err(struct rdk_qp *qp, const char *what)
 {
+	struct rdk_qp_init_attr init;
 	struct rdk_qp_attr attr;
 	int ret;
 
+	if (rdk_query_qp(qp, &attr, RDK_QP_STATE, &init) == 0 &&
+	    attr.qp_state == RDK_QPS_RESET)
+		return (ENOENT);
 	bzero(&attr, sizeof (attr));
 	attr.qp_state = RDK_QPS_ERR;
 	if ((ret = rdk_modify_qp(qp, &attr, RDK_QP_STATE)) != 0) {

@@ -924,8 +924,6 @@ rdk_inc_rkey(uint32_t rkey)
  *	resolve_addr	ADDR_RESOLVED or ADDR_ERROR
  *	resolve_route	ROUTE_RESOLVED or ROUTE_ERROR
  *	connect		ESTABLISHED, REJECTED, UNREACHABLE or CONNECT_ERROR
- *			(CONNECT_RESPONSE instead of ESTABLISHED when the
- *			consumer drives the QP itself, RoCE only)
  *	accept		ESTABLISHED or CONNECT_ERROR
  *
  * An ID that saw ESTABLISHED later sees exactly one DISCONNECTED, and after
@@ -945,8 +943,9 @@ rdk_inc_rkey(uint32_t rkey)
  * listener is held for the call and cannot be destroyed from it.
  *
  * The consumer may destroy its QP at any time; destroying the QP of a live
- * connection aborts the connection.  The framework passes the QP to the
- * transport at connect and accept and does not use it afterwards.
+ * connection aborts the connection.  The transport moves the QP to RTS at
+ * connect and accept, and to the error state when the connection ends; the
+ * consumer does not modify it in between.
  *
  * Private data is copied on entry and on delivery; an event's pointers are
  * valid only during the handler call.  Timeouts are in milliseconds; 0
