@@ -2135,7 +2135,7 @@ IWCXGBE_OBJS =	iwc.o iwc_cm.o iwc_cm_ops.o iwc_cq.o iwc_ep.o iwc_mem.o \
 		iwc_mpa.o iwc_qp.o
 
 RDMAK_OBJS =	rdk_device.o rdk_verbs.o rdk_cq.o rdk_cm.o rdk_cm_iw.o \
-		rdk_cm_addr.o
+		rdk_cm_addr.o rdk_quiesce.o
 
 #
 #	rdmat: the rdmak test client

@@ -1065,8 +1065,7 @@ iwc_qp_async(iwc_t *iwc, const t4_cqe_t *cqe)
 		ev.event = RDK_EVENT_QP_FATAL;
 		break;
 	}
-	if (qp->qp_rdk.event_handler != NULL)
-		qp->qp_rdk.event_handler(&ev, qp->qp_rdk.qp_context);
+	rdk_event_upcall(qp->qp_rdk.event_handler, &ev, qp->qp_rdk.qp_context);
 
 	mutex_enter(&qp->qp_lock);
 	ep = qp->qp_ep;

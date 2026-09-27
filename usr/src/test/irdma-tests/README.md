@@ -50,6 +50,20 @@ root with Python 3.9+ and a C99 compiler.
   still in use; a run with the irdma taint not passed on must fail.  It
   also checks that iwcxgbe taints on every destroy the adapter did not
   confirm.
+- `rdk_teardown.py`: builds the whole of `rdk_quiesce.c`, `rdk_cq.c` and
+  `rdk_verbs.c` against `rdk_kenv.h` (the kernel calls it needs, on POSIX
+  threads) and a fake provider.  A done() that frees its own CQ, from a
+  vector thread or a direct poll, returns and the CQ goes on the teardown
+  taskq; a done() that frees a CQ whose poller is busy in another thread
+  does not wait for it; a teardown started twice from a callback runs once,
+  outside callbacks, drains and destroys, and frees itself; from a callback
+  the destroys, drains and `rdk_teardown_wait()` panic and
+  `rdk_dereg_mr()` returns EDEADLK.  A build whose free waits in the
+  callback must deadlock (caught by an alarm).
+- `rdk_locks.py`: no function of the rdmak completion, teardown or RDMA
+  READ/WRITE code reaches a consumer callback, a provider operation or a
+  wait while it holds a lock it initializes; a done() moved under the
+  poller lock must be reported.
 - `cstyle.py`: `cstyle -pP` over the driver, rdmak and the tests.
 
 ## On hardware

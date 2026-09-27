@@ -145,6 +145,13 @@ rdk_obj_rele(struct rdk_device *dev)
 	dev->rd_priv->rdp_nobjs--;
 }
 
+/* rdk_teardown.py covers callbacks; these calls come from thread context. */
+static boolean_t
+rdk_in_callback(void)
+{
+	return (B_FALSE);
+}
+
 /* irdma */
 #include "quar_flags.h"
 

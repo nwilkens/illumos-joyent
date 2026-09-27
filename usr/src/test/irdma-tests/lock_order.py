@@ -202,11 +202,12 @@ def main():
 
     # A moderation delay is cancelled, waiting for one in progress, before
     # the CQ is freed; the delay hands the poller back with no poller lock.
-    free = body(rdk, "rdk_free_cq")
+    free = body(rdk, "rdk_free_cq_task")
     assert free.index("untimeout_generic(tid, 0);") < \
         free.index("rdk_cq_wait_idle(cp);") < free.rindex("rdk_destroy_cq(cq);")
-    assert free.index("cp->rcp_dying = B_TRUE;") < \
-        free.index("untimeout_generic(tid, 0);")
+    start = body(rdk, "rdk_free_cq")
+    assert start.index("cp->rcp_dying = B_TRUE;") < \
+        start.index("rdk_free_cq_task(cq);")
     fire = body(rdk, "rdk_cq_mod_fire")
     call = fire.index("resched(cq);")
     assert fire.rindex("mutex_exit(&cp->rcp_lock);", 0, call) > \

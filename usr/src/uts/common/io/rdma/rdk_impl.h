@@ -78,6 +78,14 @@ extern int rdk_cq_init(void);
 extern void rdk_cq_fini(void);
 extern void rdk_cq_barrier(struct rdk_cq *);
 
+/* rdk_quiesce.c */
+extern taskq_t *rdk_td_taskq;
+extern int rdk_quiesce_init(void);
+extern void rdk_quiesce_fini(void);
+extern void *rdk_cb_enter(void *);
+extern void rdk_cb_exit(void *);
+extern void rdk_cb_forbid(const char *);
+
 #ifdef __cplusplus
 }
 #endif

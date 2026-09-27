@@ -381,15 +381,18 @@ rdk_dispatch_event(const struct rdk_event *ev)
 	struct rdk_device_priv *p = ev->device->rd_priv;
 	struct rdk_event_handler *h;
 	struct rdk_event copy;
+	void *old;
 
 	if (p == NULL)
 		return;
 	rw_enter(&p->rdp_ev_lock, RW_READER);
+	old = rdk_cb_enter(&copy);
 	for (h = list_head(&p->rdp_handlers); h != NULL;
 	    h = list_next(&p->rdp_handlers, h)) {
 		copy = *ev;
 		h->handler(h, &copy);
 	}
+	rdk_cb_exit(old);
 	rw_exit(&p->rdp_ev_lock);
 }
 

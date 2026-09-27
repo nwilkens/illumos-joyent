@@ -848,6 +848,37 @@ extern int rdk_cq_poll(struct rdk_cq *, int);
 extern void rdk_cq_poll_end(struct rdk_cq *);
 
 /*
+ * Teardown from a callback (rdk_quiesce.c).  A done() function or an event
+ * handler must not drain or destroy the objects it serves: a destroy waits
+ * for the callbacks, and the rest of a batch may still name the objects.
+ * From a callback, rdk_destroy_qp(), rdk_destroy_cq() and the drains panic,
+ * rdk_dereg_mr() returns EDEADLK and keeps the MR, and rdk_free_cq()
+ * finishes in another thread once the callbacks are done.
+ *
+ * A callback instead marks its objects dying and calls rdk_teardown_start(),
+ * which runs the teardown's function once in a framework thread that runs
+ * no callbacks; there the function may drain and destroy the QP, MRs and
+ * CQs and free the memory they reached.  rdk_teardown_start() takes any
+ * context that can take an adaptive mutex, and returns B_TRUE for the call
+ * that started the teardown.  rdk_teardown_wait() returns once the function
+ * has; neither it nor the function may wait for another teardown.
+ * rdk_teardown_free() waits too, unless it is called from the function or a
+ * callback: the teardown is then freed when the function returns, and
+ * nothing may wait for it.  Providers call a QP's or CQ's event handler
+ * through rdk_event_upcall().
+ */
+typedef struct rdk_teardown rdk_teardown_t;
+
+extern rdk_teardown_t *rdk_teardown_alloc(void (*)(void *), void *);
+extern boolean_t rdk_teardown_start(rdk_teardown_t *);
+extern boolean_t rdk_teardown_dying(rdk_teardown_t *);
+extern void rdk_teardown_wait(rdk_teardown_t *);
+extern void rdk_teardown_free(rdk_teardown_t *);
+extern boolean_t rdk_in_callback(void);
+extern void rdk_event_upcall(void (*)(struct rdk_event *, void *),
+    struct rdk_event *, void *);
+
+/*
  * The data path goes straight to the provider.
  */
 static inline int

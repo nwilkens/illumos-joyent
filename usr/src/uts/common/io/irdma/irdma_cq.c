@@ -418,7 +418,8 @@ irdma_cq_error(irdma_t *irdma, uint32_t cq_id)
 		ev.device = icq->icq_rdk.device;
 		ev.event = RDK_EVENT_CQ_ERR;
 		ev.element.cq = &icq->icq_rdk;
-		icq->icq_rdk.event_handler(&ev, icq->icq_rdk.cq_context);
+		rdk_event_upcall(icq->icq_rdk.event_handler, &ev,
+		    icq->icq_rdk.cq_context);
 	}
 	irdma_cq_rele(icq);
 }
