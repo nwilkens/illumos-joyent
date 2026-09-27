@@ -897,24 +897,16 @@ nvmft_post_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 			task->task_flags |= TF_ATTR_SIMPLE_QUEUE;
 
 			/*
-			 * The Fabrics transport consumes a command's data as one
-			 * logically contiguous, in-order byte stream:
-			 * nvmf_send_controller_data() (C2H) requires each chunk's
-			 * offset to be sequential over the whole command and only
-			 * stamps the LAST_PDU / implicit-SUCCESS flag on the chunk
-			 * that ends the transfer.  FreeBSD's CTL hands the controller
-			 * the entire transfer in a single memdesc; stmf_sbd, left to
-			 * itself, would split a READ into up to task_max_nbufs
-			 * concurrent dbufs completed out of order.
-			 *
-			 * Force a single in-flight dbuf so sbd issues the data
-			 * sequentially at advancing db_relative_offset and marks
-			 * DB_SEND_STATUS_GOOD only on the final chunk.
-			 * task_max_xfer_len / task_1st_xfer_len are pinned to the
-			 * full transfer length so the LU prefers one buffer for the
-			 * whole command where its own sl_max_xfer_len permits.
+			 * NVMe/TCP needs a command's data as one in-order byte
+			 * stream: C2H offsets must be sequential, and only the
+			 * chunk that ends the transfer carries LAST_PDU and the
+			 * implicit SUCCESS.  Unless the transport takes chunks
+			 * in any order, allow one dbuf in flight so sbd issues
+			 * the data at advancing offsets.  The transfer lengths
+			 * are pinned so the LU prefers one buffer per command.
 			 */
-			task->task_max_nbufs = 1;
+			task->task_max_nbufs = (nvmft_qpair_caps(qp) &
+			    NVMF_QP_CAP_UNORDERED_DATA) ? STMF_BUFS_MAX : 1;
 			task->task_max_xfer_len = data_len;
 			task->task_1st_xfer_len = data_len;
 
@@ -1131,6 +1123,8 @@ nvmft_xfer_finish(nvmft_xfer_t *nx)
 
 	switch (nx->nx_status) {
 	case NVMF_SUCCESS_SENT:
+		ASSERT(nx->nx_final || !(nvmft_qpair_caps(priv->ntp_qp) &
+		    NVMF_QP_CAP_ALWAYS_RESPONSE));
 		/*
 		 * The response is on the wire, either our final_cqe or success
 		 * folded into the data (the TCP SUCCESS flag).  If the LU put
@@ -1189,11 +1183,8 @@ nvmft_datamove_in_cb(void *arg, size_t xfered, int error)
  * nvmf_receive_controller_data() (H2C).  Both complete asynchronously.  When
  * the LU puts good status in the dbuf, the transport also sends the response.
  *
- * For C2H the transport requires each chunk's db_relative_offset to be
- * sequential and contiguous over the whole command, and only folds the implicit
- * SUCCESS into the chunk that ends the transfer.  nvmft_dispatch_command() pins
- * task_max_nbufs = 1 so STMF/sbd hand us exactly one in-flight dbuf at a time at
- * an advancing offset, satisfying that contract.
+ * Without NVMF_QP_CAP_UNORDERED_DATA, nvmft_post_command() allows one dbuf
+ * in flight, so C2H chunks arrive at advancing offsets.
  */
 static stmf_status_t
 nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,

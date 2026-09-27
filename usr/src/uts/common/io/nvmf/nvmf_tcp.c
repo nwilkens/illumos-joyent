@@ -2143,6 +2143,13 @@ tcp_max_xfer_size(struct nvmf_qpair *nq)
 	return (0);
 }
 
+/* ARGSUSED */
+static uint32_t
+tcp_caps(struct nvmf_qpair *nq)
+{
+	return (NVMF_QP_CAP_SGL_TRANSPORT | NVMF_QP_CAP_SGL_OFFSET);
+}
+
 static struct nvmf_capsule *
 tcp_allocate_capsule(struct nvmf_qpair *nq, int how)
 {
@@ -2445,6 +2452,7 @@ static struct nvmf_transport_ops tcp_ops = {
 	.capsule_data_len = tcp_capsule_data_len,
 	.receive_controller_data = tcp_receive_controller_data,
 	.send_controller_data = tcp_send_controller_data,
+	.caps = tcp_caps,
 	.trtype = NVMF_TRTYPE_TCP,
 	.priority = 0,
 };

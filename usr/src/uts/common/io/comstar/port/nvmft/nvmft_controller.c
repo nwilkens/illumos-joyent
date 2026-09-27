@@ -217,6 +217,9 @@ nvmft_update_cdata(nvmft_controller_t *ctrlr)
 	 * expressed in 16-byte units (see nvmft_subr.c).  nvmft_max_ioccsz()
 	 * returns the limit in bytes.
 	 */
+	nvmft_init_sgls(&ctrlr->ctrlr_cdata,
+	    nvmft_qpair_caps(ctrlr->ctrlr_admin));
+
 	val = nvmft_max_ioccsz(ctrlr->ctrlr_admin);
 	if (val == 0)
 		return;

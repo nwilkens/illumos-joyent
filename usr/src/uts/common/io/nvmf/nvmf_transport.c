@@ -298,6 +298,14 @@ nvmf_max_xfer_size(struct nvmf_qpair *qp)
 }
 
 uint32_t
+nvmf_qpair_caps(struct nvmf_qpair *qp)
+{
+	if (qp->nq_ops->caps == NULL)
+		return (0);
+	return (qp->nq_ops->caps(qp));
+}
+
+uint32_t
 nvmf_max_ioccsz(struct nvmf_qpair *qp)
 {
 	return (qp->nq_ops->max_ioccsz(qp));

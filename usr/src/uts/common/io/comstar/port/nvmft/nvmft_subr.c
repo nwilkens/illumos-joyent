@@ -259,6 +259,15 @@ _nvmf_validate_cc(uint32_t max_io_qsize, uint64_t cap, uint32_t old_cc,
 	return (B_TRUE);
 }
 
+/* Advertise the SGL descriptor types that the transport accepts. */
+void
+nvmft_init_sgls(nvme_identify_ctrl_t *cdata, uint32_t caps)
+{
+	cdata->id_sgls.sgl_tport = (caps & NVMF_QP_CAP_SGL_TRANSPORT) != 0;
+	cdata->id_sgls.sgl_keyed = (caps & NVMF_QP_CAP_SGL_KEYED) != 0;
+	cdata->id_sgls.sgl_offset = (caps & NVMF_QP_CAP_SGL_OFFSET) != 0;
+}
+
 void
 nvmf_controller_serial(char *buf, size_t len, ulong_t hostid)
 {

@@ -195,6 +195,13 @@ stmf_data_xfer_done(scsi_task_t *task, stmf_data_buf_t *dbuf, uint32_t iof)
 	last_status = dbuf->db_xfer_status;
 }
 
+uint32_t
+nvmft_qpair_caps(struct nvmft_qpair *q)
+{
+	(void) q;
+	return (0);
+}
+
 void
 nvmft_command_completed(struct nvmft_qpair *q, struct nvmf_capsule *nc)
 {

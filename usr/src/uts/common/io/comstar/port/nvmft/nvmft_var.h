@@ -355,6 +355,7 @@ struct nvmft_qpair *nvmft_qpair_init(nvmf_trtype_t trtype,
 int	nvmft_adopt_qpair(struct nvmf_transport_ops *ops,
 	    struct nvmf_qpair *nq, uint16_t qid, uint16_t sqsize);
 nvmf_trtype_t nvmft_qpair_trtype(struct nvmft_qpair *qp);
+uint32_t nvmft_qpair_caps(struct nvmft_qpair *qp);
 void	nvmft_qpair_shutdown(struct nvmft_qpair *qp);
 void	nvmft_qpair_destroy(struct nvmft_qpair *qp);
 nvmft_controller_t *nvmft_qpair_ctrlr(struct nvmft_qpair *qp);
@@ -394,6 +395,7 @@ boolean_t nvmft_connect_data_valid(const nvmf_fabric_connect_cmd_t *cmd,
 uint64_t _nvmf_controller_cap(uint32_t max_io_qsize, uint8_t enable_timeout);
 boolean_t _nvmf_validate_cc(uint32_t max_io_qsize, uint64_t cap,
 	    uint32_t old_cc, uint32_t new_cc);
+void	nvmft_init_sgls(nvme_identify_ctrl_t *cdata, uint32_t caps);
 void	nvmf_controller_serial(char *buf, size_t len, ulong_t hostid);
 void	nvmf_strpad(char *dst, const char *src, size_t len);
 void	_nvmf_init_io_controller_data(uint16_t cntlid, uint32_t max_io_qsize,

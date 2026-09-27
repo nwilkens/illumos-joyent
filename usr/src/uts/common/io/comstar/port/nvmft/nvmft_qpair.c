@@ -100,6 +100,7 @@ struct nvmft_qpair {
 	uint16_t		qp_sqhd;
 	volatile uint_t		qp_refs;	/* internal refs on qp_qp */
 	nvmf_trtype_t		qp_trtype;
+	uint32_t		qp_caps;
 
 	kmutex_t		qp_lock;
 	volatile nvmft_qp_state_t qp_state;
@@ -306,6 +307,7 @@ nvmft_qpair_init(nvmf_trtype_t trtype, const nvlist_t *params, uint16_t qid,
 		return (NULL);
 	}
 
+	qp->qp_caps = nvmf_qpair_caps(qp->qp_qp);
 	qp->qp_refs = 1;
 	return (qp);
 }
@@ -352,6 +354,7 @@ nvmft_adopt_qpair(struct nvmf_transport_ops *ops, struct nvmf_qpair *nq,
 
 	qp->qp_qp = nq;
 	qp->qp_refs = 1;
+	qp->qp_caps = ops->caps != NULL ? ops->caps(nq) : 0;
 	error = nvmf_adopt_qpair(ops, nq, B_TRUE, qp->qp_admin,
 	    nvmft_qpair_error, qp, nvmft_receive_capsule, qp);
 	if (error != 0)
@@ -363,6 +366,12 @@ nvmf_trtype_t
 nvmft_qpair_trtype(struct nvmft_qpair *qp)
 {
 	return (qp->qp_trtype);
+}
+
+uint32_t
+nvmft_qpair_caps(struct nvmft_qpair *qp)
+{
+	return (qp->qp_caps);
 }
 
 static void

@@ -201,6 +201,9 @@ struct nvmf_transport_ops {
 	    uint32_t data_offset, const struct nvmf_send_request *req,
 	    const nvme_cqe_t *final_cqe);
 
+	/* Optional.  NVMF_QP_CAP_* for the qpair; fixed for its life. */
+	uint32_t (*caps)(struct nvmf_qpair *qp);
+
 	nvmf_trtype_t trtype;
 	int priority;
 };

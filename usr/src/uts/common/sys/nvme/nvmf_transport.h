@@ -131,6 +131,19 @@ void	*nvmf_capsule_sqe(struct nvmf_capsule *nc);
 void	*nvmf_capsule_cqe(struct nvmf_capsule *nc);
 boolean_t nvmf_sqhd_valid(struct nvmf_capsule *nc);
 
+/*
+ * Transport capabilities of a qpair.  The SGL bits name the SGL1 descriptor
+ * types the transport accepts in a command capsule.
+ */
+#define	NVMF_QP_CAP_UNORDERED_DATA	0x0001	/* data chunks in any order */
+#define	NVMF_QP_CAP_LU_DBUF		0x0002	/* moves LU-supplied dbufs */
+#define	NVMF_QP_CAP_ALWAYS_RESPONSE	0x0004	/* never folds success */
+#define	NVMF_QP_CAP_SGL_TRANSPORT	0x0010	/* Transport SGL Data Block */
+#define	NVMF_QP_CAP_SGL_KEYED		0x0020	/* Keyed SGL Data Block */
+#define	NVMF_QP_CAP_SGL_OFFSET		0x0040	/* in-capsule data at offset */
+
+uint32_t nvmf_qpair_caps(struct nvmf_qpair *qp);
+
 /* Host-specific APIs. */
 
 /*

@@ -73,8 +73,12 @@ struct nvmft_qpair;
 struct nvmft_internal_io;
 void stmf_data_xfer_done(scsi_task_t *, stmf_data_buf_t *, uint32_t);
 void nvmft_command_completed(struct nvmft_qpair *, struct nvmf_capsule *);
+uint32_t nvmft_qpair_caps(struct nvmft_qpair *);
 #define	atomic_or_uint_nv(p, v)	__atomic_or_fetch((p), (v), __ATOMIC_SEQ_CST)
 """)
+    for line in public.read_text(encoding="utf-8").splitlines():
+        if line.startswith("#define\tNVMF_QP_CAP_"):
+            parts.append(line + "\n")
     for name in ("NVMFT_XFER_SUBMITTED", "NVMFT_XFER_COMPLETED"):
         parts.append(define(stmf, name))
     for name in ("nvmft_task_priv_t", "nvmft_xfer_t"):
