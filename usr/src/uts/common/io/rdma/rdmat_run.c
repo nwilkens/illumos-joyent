@@ -44,20 +44,7 @@
 /* Completions a busy poll handles at once. */
 #define	RDMAT_SPIN_BUDGET	64
 
-static uint8_t
-rdmat_pattern(uint64_t seed, uint64_t off)
-{
-	uint64_t x = seed ^ ((off >> 3) * 0x9e3779b97f4a7c15ULL);
-
-	x ^= x >> 33;
-	x *= 0xff51afd7ed558ccdULL;
-	x ^= x >> 33;
-	x *= 0xc4ceb9fe1a85ec53ULL;
-	x ^= x >> 33;
-	return ((uint8_t)(x >> ((off & 7) * 8)));
-}
-
-static rdmat_qp_t *
+rdmat_qp_t *
 rdmat_qp(rdmat_sess_t *ts, uint32_t idx)
 {
 	if (idx >= ts->ts_nqp)
@@ -345,9 +332,9 @@ rdmat_qp_make(rdmat_sess_t *ts, rdmat_qp_t *tq)
 	init.qp_context = tq;
 	init.send_cq = tq->tq_scq;
 	init.recv_cq = tq->tq_rcq;
-	init.cap.max_send_wr = ts->ts_depth + 4;
+	init.cap.max_send_wr = ts->ts_sq_depth;
 	init.cap.max_recv_wr = ts->ts_depth + 1;
-	init.cap.max_send_sge = 1;
+	init.cap.max_send_sge = ts->ts_max_sge;
 	init.cap.max_recv_sge = 1;
 	init.cap.max_inline_data = ts->ts_inline;
 	init.sq_sig_type = RDK_SIGNAL_REQ_WR;
@@ -423,6 +410,9 @@ rdmat_setup(rdmat_sess_t *ts, rdmat_setup_t *rs)
 	    rs->rs_depth == 0 || rs->rs_depth > RDMAT_MAX_DEPTH ||
 	    rs->rs_depth + 4 > (uint32_t)dev->rd_attr.max_qp_wr ||
 	    rs->rs_inline > dev->rd_attr.max_inline_data ||
+	    rs->rs_max_sge > (uint32_t)dev->rd_attr.max_send_sge ||
+	    (rs->rs_sq_depth != 0 && (rs->rs_sq_depth < rs->rs_depth + 4 ||
+	    rs->rs_sq_depth > (uint32_t)dev->rd_attr.max_qp_wr)) ||
 	    rs->rs_comp_vector >= dev->rd_num_comp_vectors ||
 	    ((rs->rs_mod_count != 0 || rs->rs_mod_us != 0) &&
 	    rs->rs_poll != RDMAT_POLL_TASKQ) ||
@@ -436,6 +426,9 @@ rdmat_setup(rdmat_sess_t *ts, rdmat_setup_t *rs)
 	ts->ts_poll = rs->rs_poll;
 	ts->ts_depth = rs->rs_depth;
 	ts->ts_inline = rs->rs_inline;
+	ts->ts_max_sge = MAX(rs->rs_max_sge, 1);
+	ts->ts_sq_depth = rs->rs_sq_depth != 0 ? rs->rs_sq_depth :
+	    rs->rs_depth + 4;
 	ts->ts_comp_vector = rs->rs_comp_vector;
 	ts->ts_mod_count = rs->rs_mod_count;
 	ts->ts_mod_us = rs->rs_mod_us;
@@ -697,13 +690,14 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 	uint64_t posted = 0, len;
 	uint32_t timeout, op = rr->rr_op;
 	boolean_t rw = op == RDMAT_OP_WRITE || op == RDMAT_OP_READ ||
-	    op == RDMAT_OP_WRITE_PING || op == RDMAT_OP_WRITE_PONG;
+	    op == RDMAT_OP_WRITE_PING || op == RDMAT_OP_WRITE_PONG ||
+	    op == RDMAT_OP_RW;
 	int ret;
 
 	if ((tq = rdmat_qp(ts, rr->rr_qp)) == NULL || !tq->tq_connected)
 		return (ENXIO);
-	/* A late completion for the parked MR would count for this run. */
-	if (tq->tq_bmr != NULL)
+	/* A late completion for parked work would count for this run. */
+	if (tq->tq_bmr != NULL || tq->tq_rw != NULL)
 		return (EBUSY);
 	timeout = rr->rr_timeout_ms != 0 ? rr->rr_timeout_ms : 10000;
 	if (timeout > RDMAT_MAX_TIMEOUT_MS || rr->rr_count > RDMAT_MAX_COUNT ||
@@ -791,6 +785,9 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 	case RDMAT_OP_FRWR:
 		ret = rdmat_mr_cost(ts, tq, rr, deadline);
 		break;
+	case RDMAT_OP_RW:
+		ret = rdmat_rw_run(ts, tq, rr, deadline);
+		break;
 	case RDMAT_OP_POST_RECV:
 		ret = rr->rr_count > ts->ts_depth ? EINVAL :
 		    rdmat_post_recvs(ts, tq, rr, rr->rr_count, &posted);
@@ -863,47 +860,6 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 }
 
 int
-rdmat_buf(rdmat_sess_t *ts, rdmat_buf_t *rb)
-{
-	rdmat_qp_t *tq;
-	hrtime_t t0 = gethrtime();
-	uint64_t i, off;
-	uint8_t *p;
-
-	if ((tq = rdmat_qp(ts, rb->rb_qp)) == NULL ||
-	    rb->rb_offset > tq->tq_len ||
-	    rb->rb_len > tq->tq_len - rb->rb_offset)
-		return (EINVAL);
-	rb->rb_mismatch = -1;
-	for (i = 0; i < rb->rb_len; i++) {
-		off = rb->rb_offset + i;
-		p = (uint8_t *)tq->tq_chunks[off / RDMAT_CHUNK].rdb_va +
-		    (off % RDMAT_CHUNK);
-		switch (rb->rb_op) {
-		case RDMAT_BUF_FILL:
-			*p = rdmat_pattern(rb->rb_seed,
-			    rb->rb_pattern_base + i);
-			break;
-		case RDMAT_BUF_ZERO:
-			*p = 0;
-			break;
-		case RDMAT_BUF_VERIFY:
-			if (*p != rdmat_pattern(rb->rb_seed,
-			    rb->rb_pattern_base + i)) {
-				rb->rb_mismatch = (int64_t)off;
-				rb->rb_ns = (uint64_t)(gethrtime() - t0);
-				return (0);
-			}
-			break;
-		default:
-			return (EINVAL);
-		}
-	}
-	rb->rb_ns = (uint64_t)(gethrtime() - t0);
-	return (0);
-}
-
-int
 rdmat_query(rdmat_sess_t *ts, rdmat_query_t *rq)
 {
 	struct rdk_qp_attr qa;
@@ -942,6 +898,8 @@ rdmat_teardown(rdmat_sess_t *ts, boolean_t removing)
 			rdk_destroy_qp(tq->tq_qp);
 			tq->tq_qp = NULL;
 		}
+		rdmat_rw_free(tq->tq_rw);
+		tq->tq_rw = NULL;
 		if (tq->tq_ah != NULL) {
 			rdk_destroy_ah(tq->tq_ah);
 			tq->tq_ah = NULL;

@@ -265,7 +265,8 @@ def main():
     assert "ts->ts_dying" in cost and "t0 >= deadline" in cost
     run = (rdma / "rdmat_run.c").read_text(encoding="utf-8")
     runf = body(run, "rdmat_run")
-    assert runf.index("if (tq->tq_bmr != NULL)") < runf.index("switch (op)")
+    assert runf.index("if (tq->tq_bmr != NULL || tq->tq_rw != NULL)") < \
+        runf.index("switch (op)")
     down = body(run, "rdmat_teardown")
     assert down.index("rdk_destroy_qp(tq->tq_qp);") < \
         down.index("rdk_dereg_mr(tq->tq_bmr);")

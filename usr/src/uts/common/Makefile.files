@@ -2140,7 +2140,8 @@ RDMAK_OBJS =	rdk_device.o rdk_verbs.o rdk_cq.o rdk_cm.o rdk_cm_iw.o \
 #
 #	rdmat: the rdmak test client
 #
-RDMAT_OBJS =	rdmat.o rdmat_run.o rdmat_bench.o rdmat_cm.o
+RDMAT_OBJS =	rdmat.o rdmat_run.o rdmat_bench.o rdmat_cm.o rdmat_rw.o \
+		rdmat_buf.o
 
 #
 #	Solarflare 1/10/40GbE NIC driver module

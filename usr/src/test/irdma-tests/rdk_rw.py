@@ -3,9 +3,13 @@
 the peer, and check that the model catches a LOCAL_INV without its fence
 and a registration wider than the transfer."""
 
+import re
 import sys
 
+from irdma_test import REPO, body
 from rdk_host import HostFailure, run
+
+RDMA = REPO / "usr/src/uts/common/io/rdma"
 
 FILES = ("rdk_quiesce.c", "rdk_cq.c", "rdk_verbs.c", "rdk_rw.c")
 MUTATIONS = (
@@ -19,7 +23,24 @@ MUTATIONS = (
 )
 
 
+def rdmat_checks():
+    """rdmat keeps a run's contexts and MRs while the QP may complete them."""
+    run_c = (RDMA / "rdmat_run.c").read_text(encoding="utf-8")
+    rw_c = (RDMA / "rdmat_rw.c").read_text(encoding="utf-8")
+    teardown = body(run_c, "rdmat_teardown")
+    assert teardown.index("rdk_destroy_qp(tq->tq_qp);") < \
+        teardown.index("rdmat_rw_free(tq->tq_rw);")
+    assert "tq->tq_bmr != NULL || tq->tq_rw != NULL" in body(run_c,
+                                                           "rdmat_run")
+    rwrun = body(rw_c, "rdmat_rw_run")
+    assert re.search(r"ret2 = tq->tq_send_done < tq->tq_posted;[\s\S]*"
+                     r"tq->tq_rw = rw;", rwrun)
+    post = body(rw_c, "rdmat_rw_post")
+    assert post.index("tq->tq_posted++;") < post.index("rdk_rw_post(")
+
+
 def main():
+    rdmat_checks()
     count = sys.argv[1] if len(sys.argv) > 1 else "20000"
     try:
         print(run("rdk_rw_chain.c", FILES, args=(count,), timeout=600),

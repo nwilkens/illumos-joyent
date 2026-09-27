@@ -131,6 +131,7 @@ rdmat_devices(intptr_t arg, int mode)
 	struct rdk_port_attr pa;
 	rdmat_devinfo_t *di;
 	rdmat_dev_t *td;
+	uint32_t v;
 	int ret = 0;
 
 	out = kmem_zalloc(sizeof (*out), KM_SLEEP);
@@ -156,6 +157,15 @@ rdmat_devices(intptr_t arg, int mode)
 		di->rdi_max_mr_pages = dev->rd_attr.max_fast_reg_page_list_len;
 		di->rdi_max_inline = dev->rd_attr.max_inline_data;
 		di->rdi_comp_vectors = dev->rd_num_comp_vectors;
+		di->rdi_max_sge_rd = (uint32_t)dev->rd_attr.max_sge_rd;
+		di->rdi_kcaps = (uint32_t)dev->rd_attr.kernel_cap_flags;
+		for (v = 0; v < RDMAT_MAX_VECS; v++) {
+			struct rdk_vector_info vi;
+
+			(void) rdk_vector_info(dev, v, &vi);
+			di->rdi_vec_lgrp[v] = vi.rvi_lgrp;
+			di->rdi_vec_cpu[v] = vi.rvi_cpu;
+		}
 	}
 	mutex_exit(&rdmat_lock);
 	if (ddi_copyout(out, (void *)arg, sizeof (*out), mode) != 0)

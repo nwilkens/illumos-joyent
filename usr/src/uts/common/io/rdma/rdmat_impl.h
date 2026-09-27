@@ -55,6 +55,7 @@ typedef struct rdmat_dev {
 
 struct rdmat_sess;
 struct rdmat_qp;
+struct rdmat_rw;
 
 /* What an rdk_cm handler's context points at. */
 typedef enum rdmat_cmkind {
@@ -104,6 +105,7 @@ typedef struct rdmat_qp {
 	struct rdk_mr		*tq_lmr;	/* local write */
 	struct rdk_mr		*tq_rmr;	/* what the peer may reach */
 	struct rdk_mr		*tq_bmr;	/* see rdmat_mr_cost() */
+	struct rdmat_rw		*tq_rw;		/* see rdmat_rw.c */
 	boolean_t		tq_lmr_bound;
 	boolean_t		tq_rmr_bound;
 	uint32_t		tq_rkey_next;	/* rkey of the next REG */
@@ -176,6 +178,8 @@ typedef struct rdmat_sess {
 	uint32_t		ts_poll;
 	uint32_t		ts_depth;
 	uint32_t		ts_inline;
+	uint32_t		ts_max_sge;
+	uint32_t		ts_sq_depth;
 	uint32_t		ts_comp_vector;
 	uint16_t		ts_mod_count;
 	uint16_t		ts_mod_us;
@@ -200,6 +204,7 @@ extern void rdmat_teardown(rdmat_sess_t *, boolean_t);
 extern int rdmat_qp_make(rdmat_sess_t *, rdmat_qp_t *);
 extern int rdmat_qp_register(rdmat_qp_t *);
 extern void rdmat_qp_info(rdmat_qp_t *, rdmat_qpinfo_t *);
+extern rdmat_qp_t *rdmat_qp(rdmat_sess_t *, uint32_t);
 
 /* rdmat_cm.c */
 extern int rdmat_cm(rdmat_sess_t *, rdmat_cm_t *);
@@ -223,6 +228,11 @@ extern int rdmat_one_lat(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
     hrtime_t);
 extern int rdmat_mr_cost(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
     hrtime_t);
+
+/* rdmat_rw.c */
+extern int rdmat_rw_run(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
+    hrtime_t);
+extern void rdmat_rw_free(struct rdmat_rw *);
 
 #ifdef __cplusplus
 }

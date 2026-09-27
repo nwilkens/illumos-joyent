@@ -35,15 +35,16 @@
  * seeded pattern and checks every byte at the destination in the kernel.
  *
  * Tests: send write read frwr localinv badkey zerokey bounds access
- * qpaccess ud pingpong bw inflight, and tcp for a TCP baseline between two
- * hosts.
+ * qpaccess ud pingpong bw inflight rwshapes rwsend, and rwstream and tcp
+ * (a TCP baseline between two hosts) when named.
  * Each prints PASS or FAIL with its numbers; the exit status is 0 only if
  * all pass.
  *
- * The iWARP tests are in rdmatool_iw.c.
+ * The iWARP tests are in rdmatool_iw.c and the rdk_rw tests in
+ * rdmatool_rw.c.
  *
  * Build: gcc -m64 -pthread -o rdmatool rdmatool.c rdmabench.c \
- *	rdmatool_iw.c -lkstat -lsocket -lnsl
+ *	rdmatool_iw.c rdmatool_rw.c -lkstat -lsocket -lnsl
  */
 
 #include <sys/types.h>
@@ -319,6 +320,9 @@ uint32_t fresh_b_access;
 /* The inline size and completion vector of the next fresh() QPs. */
 uint32_t fresh_inline;
 uint32_t fresh_vector;
+/* The send SGEs and send queue depth of the next fresh() QPs; 0: default. */
+uint32_t fresh_max_sge;
+uint32_t fresh_sq_depth;
 /* The CQ moderation of the next fresh() sessions. */
 uint16_t fresh_mod_count;
 uint16_t fresh_mod_us;
@@ -353,6 +357,8 @@ fresh(peer_t *a, peer_t *b, uint32_t qpt, uint32_t poll)
 		p->p_setup.rs_comp_vector = fresh_vector;
 		p->p_setup.rs_mod_count = fresh_mod_count;
 		p->p_setup.rs_mod_us = fresh_mod_us;
+		p->p_setup.rs_max_sge = fresh_max_sge;
+		p->p_setup.rs_sq_depth = fresh_sq_depth;
 		/* The server supplies its own device and address. */
 		if ((ret = pio(p, RDMAT_IOC_SETUP, &p->p_setup)) != 0) {
 			(void) fprintf(stderr, "%s: setup: %s\n", p->p_name,
@@ -1295,7 +1301,7 @@ run_tests(peer_t *a, peer_t *b, int argc, char **argv)
 {
 	static const char *all[] = { "send", "write", "read", "frwr",
 	    "localinv", "badkey", "zerokey", "bounds", "access", "qpaccess",
-	    "ud", "pingpong", "bw", "inflight", NULL };
+	    "ud", "pingpong", "bw", "inflight", "rwshapes", "rwsend", NULL };
 	const char **list = (const char **)argv;
 	int i, n = argc;
 
@@ -1333,6 +1339,8 @@ run_tests(peer_t *a, peer_t *b, int argc, char **argv)
 			t_inflight(a, b);
 		else if (strcmp(t, "tcp") == 0)
 			t_tcp(a, b);
+		else if (rw_test(a, b, t) == 0)
+			continue;
 		else if (iw_test(a, b, t) != 0)
 			fatal("unknown test %s", t);
 	}
@@ -1546,6 +1554,16 @@ main(int argc, char **argv)
 		    local_dev.rdi_mac[5], local_dev.rdi_max_qp,
 		    local_dev.rdi_max_qp_wr, local_dev.rdi_max_sge,
 		    local_dev.rdi_max_mr_pages, local_dev.rdi_comp_vectors);
+		(void) printf("max READ SGE %u, inline %u, READ_WITH_INV %s, "
+		    "vectors (lgroup/CPU):", local_dev.rdi_max_sge_rd,
+		    local_dev.rdi_max_inline,
+		    (local_dev.rdi_kcaps & 0x2) != 0 ? "yes" : "no");
+		for (c = 0; c < (int)local_dev.rdi_comp_vectors &&
+		    c < RDMAT_MAX_VECS; c++) {
+			(void) printf(" %d/%d", local_dev.rdi_vec_lgrp[c],
+			    local_dev.rdi_vec_cpu[c]);
+		}
+		(void) printf("\n");
 		return (0);
 	}
 	if (o_ip == 0)

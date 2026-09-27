@@ -105,7 +105,8 @@ enabled for the LAN.
 `rdma_verbs.sh` runs the verbs tests on hardware with irdma, rdmak and
 rdmat installed; `rdmatool.c` drives rdmat:
 
-    gcc -m64 -pthread -o rdmatool rdmatool.c rdmabench.c -lkstat -lsocket -lnsl
+    gcc -m64 -pthread -o rdmatool rdmatool.c rdmabench.c rdmatool_iw.c \
+        rdmatool_rw.c -lkstat -lsocket -lnsl
     rdma_verbs.sh -i <local_ip> [-p <peer_ip>] [-s <server_ip>] [tests]
 
 On one host it runs the rdmatool suite between two sessions (SEND/RECV,
@@ -114,7 +115,11 @@ invalidate, rejection of a bad or zero rkey, an out-of-bounds address and
 missing MR or QP rights, latency, bandwidth with CPU per GB, and teardown with work
 in flight), the same traffic with pings to the peer, irdma detached with a
 stream in flight, a PF reset (DEBUG ice `_reset`) with a stream in flight,
-and an interrupt resource management trim with a stream in flight.  With
+and an interrupt resource management trim with a stream in flight.
+Tests 8 and 9 run the rdk_rw tests of `rdmatool_rw.c` (every cookie
+layout and remote split through WRITE, READ and FRWR READ, a WRITE with
+its SEND_WITH_INV response chained, an FRWR READ stream) and a PF reset
+with that stream in flight.  With
 `-s` it runs the suite and a TCP baseline (`rdmatool ... client <server>
 tcp`) against `rdmatool -i <ip> server` on the other host.
 
