@@ -32,12 +32,24 @@ HOLDER_ONLY = (IO / "irdma", IO / "rdma")
 
 
 def header(text):
-    """The first comment block, with the leading stars taken off."""
-    m = re.match(r"\s*/\*(.*?)\*/", text, re.S)
-    if m is None:
-        return ""
-    return "\n".join(re.sub(r"^\s*\*?\s?", "", ln) for ln in
-                     m.group(1).splitlines())
+    """Every comment before the first line of code, with the comment
+    marks taken off: SPDX lines and a separate copyright block count."""
+    out, rest = [], text
+    while True:
+        rest = rest.lstrip()
+        if rest.startswith("//"):
+            line, _, rest = rest.partition("\n")
+            out.append(line[2:].strip())
+        elif rest.startswith("/*"):
+            end = rest.find("*/")
+            if end < 0:
+                break
+            out.extend(re.sub(r"^\s*\*?\s?", "", ln) for ln in
+                       rest[2:end].splitlines())
+            rest = rest[end + 2:]
+        else:
+            break
+    return "\n".join(out)
 
 
 def holders(text):
@@ -163,6 +175,17 @@ def main():
         stray.unlink()
     if not any("iwc_stray_test.c" in f for f in found):
         print("missed an OpenIB file no license names")
+        return 1
+    # An SPDX line comment with the copyright in a second comment.
+    try:
+        stray.write_text("// SPDX-License-Identifier: GPL-2.0 OR "
+                         "Linux-OpenIB\n/*\n * Copyright (c) 2020 Nobody\n"
+                         " */\nint iwc_stray;\n", encoding="utf-8")
+        _, found = check(files + [(IO / "iwcxgbe", stray)], manifests)
+    finally:
+        stray.unlink()
+    if not any("iwc_stray_test.c" in f and "Nobody" in f for f in found):
+        print("missed a notice in a second leading comment")
         return 1
     print(f"PASS: OpenIB files covered by "
           f"{', '.join(str(u.relative_to(REPO)) for u in sorted(used))}")
