@@ -11,6 +11,9 @@ import sys
 TESTS = (
     "acl_units.py",
     "cm_locks.py",
+    "gid_table.py",
+    "ibcm_fsm.py",
+    "ibcm_parse.py",
     "iwc_cqe.py",
     "iwc_intr.py",
     "mpa_parse.py",

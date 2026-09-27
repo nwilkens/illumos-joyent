@@ -15,6 +15,7 @@ CXGBE_TESTS = REPO / "usr/src/test/cxgbe-tests"
 
 # illumos has boolean_t in <sys/types.h>; other hosts need it here.
 COMPAT = """#include <sys/types.h>
+#include <stdint.h>
 #if !defined(__sun) && !defined(__illumos__)
 typedef enum { B_FALSE = 0, B_TRUE = 1 } boolean_t;
 #endif
