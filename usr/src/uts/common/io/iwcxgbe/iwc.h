@@ -376,6 +376,8 @@ extern int iwc_qp_close(iwc_qp_t *, iwc_ep_t *);
 extern void iwc_qp_error(iwc_qp_t *, iwc_ep_t *);
 extern void iwc_qp_async(iwc_t *, const t4_cqe_t *);
 extern void iwc_term_codes(const t4_cqe_t *, uint8_t *, uint8_t *);
+extern size_t iwc_sq_bytes(iwc_t *, uint32_t, size_t *);
+extern uint32_t iwc_max_qp_wr(iwc_t *);
 
 /* iwc_ep.c */
 extern iwc_ep_t *iwc_ep_alloc(iwc_t *, iwc_dev_t *);

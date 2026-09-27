@@ -218,6 +218,9 @@ typedef struct t4_rdma_flowc {
  * aligned as asked.  A buffer freed while the device may still write to it is
  * kept by t4nex until the adapter is quiesced.
  */
+/* The largest buffer tro_dma_alloc gives. */
+#define	T4_RDMA_DMA_MAX_LEN	(4 * 1024 * 1024)
+
 typedef struct t4_rdma_dma {
 	caddr_t		trd_va;
 	uint64_t	trd_pa;

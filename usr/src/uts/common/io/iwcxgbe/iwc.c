@@ -131,7 +131,7 @@ iwc_query_device(struct rdk_device *rdev, struct rdk_device_attr *a)
 	a->max_mr_size = UINT32_MAX;
 	a->page_size_cap = T4_PAGESIZE_MASK;
 	a->max_qp = (int)(iwc->iwc_qid_n / 2);
-	a->max_qp_wr = IWC_MAX_QP_WR;
+	a->max_qp_wr = (int)iwc_max_qp_wr(iwc);
 	a->device_cap_flags = RDK_DEVICE_MEM_MGT_EXTENSIONS;
 	a->kernel_cap_flags = RDK_KCAP_LOCAL_DMA_LKEY;
 	a->local_dma_lkey = 0;

@@ -76,6 +76,36 @@ iwc_pow2(uint32_t v)
 	return (p);
 }
 
+/*
+ * The SQ memory of sqsize slots: the ring and its status page, then with
+ * DSGL registration a page list area of T4_MAX_FR_DSGL per slot, at *pbl.
+ */
+size_t
+iwc_sq_bytes(iwc_t *iwc, uint32_t sqsize, size_t *pbl)
+{
+	size_t b = P2ROUNDUP((size_t)sqsize * T4_SQ_NUM_BYTES +
+	    iwc->iwc_info.tri_eq_spg_len * T4_EQ_ENTRY_SIZE + 128, 64);
+
+	*pbl = 0;
+	if (iwc->iwc_info.tri_vres.trv_memwrite_dsgl) {
+		*pbl = b;
+		b += (size_t)sqsize * T4_MAX_FR_DSGL;
+	}
+	return (P2ROUNDUP(b, PAGESIZE));
+}
+
+/* The most work requests a queue takes: its memory must fit one buffer. */
+uint32_t
+iwc_max_qp_wr(iwc_t *iwc)
+{
+	uint32_t n = IWC_MAX_QP_WR;
+	size_t pbl;
+
+	while (n > 8 && iwc_sq_bytes(iwc, n + 1, &pbl) > T4_RDMA_DMA_MAX_LEN)
+		n--;
+	return (n);
+}
+
 int
 iwc_create_qp(struct rdk_qp *rqp, struct rdk_qp_init_attr *init)
 {
@@ -92,8 +122,8 @@ iwc_create_qp(struct rdk_qp *rqp, struct rdk_qp_init_attr *init)
 
 	if (init->qp_type != RDK_QPT_RC || init->create_flags != 0 ||
 	    init->cap.max_send_wr == 0 || init->cap.max_recv_wr == 0 ||
-	    init->cap.max_send_wr > IWC_MAX_QP_WR ||
-	    init->cap.max_recv_wr > IWC_MAX_QP_WR ||
+	    init->cap.max_send_wr > iwc_max_qp_wr(iwc) ||
+	    init->cap.max_recv_wr > iwc_max_qp_wr(iwc) ||
 	    init->cap.max_send_sge > MIN(T4_MAX_SEND_SGE, T4_MAX_WRITE_SGE) ||
 	    init->cap.max_recv_sge > T4_MAX_RECV_SGE ||
 	    init->cap.max_inline_data != 0)
@@ -114,13 +144,7 @@ iwc_create_qp(struct rdk_qp *rqp, struct rdk_qp_init_attr *init)
 	wq->rq.size = (uint16_t)rqsize;
 	wq->sq.flush_cidx = -1;
 	wq->rq.msn = 1;
-	sqbytes = P2ROUNDUP((size_t)sqsize * T4_SQ_NUM_BYTES +
-	    spg * T4_EQ_ENTRY_SIZE + 128, 64);
-	if (iwc->iwc_info.tri_vres.trv_memwrite_dsgl) {
-		qp->qp_pbl_off = sqbytes;
-		sqbytes += (size_t)sqsize * T4_MAX_FR_DSGL;
-	}
-	sqbytes = P2ROUNDUP(sqbytes, PAGESIZE);
+	sqbytes = iwc_sq_bytes(iwc, sqsize, &qp->qp_pbl_off);
 	rqbytes = P2ROUNDUP((size_t)rqsize * T4_RQ_NUM_BYTES +
 	    spg * T4_EQ_ENTRY_SIZE, PAGESIZE);
 

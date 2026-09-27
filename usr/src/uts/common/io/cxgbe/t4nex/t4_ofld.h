@@ -83,7 +83,7 @@ extern "C" {
 
 /* Child DMA memory bounds. */
 #define	T4_OFLD_DMA_MAX_ALIGN	(2 * 1024 * 1024)
-#define	T4_OFLD_DMA_MAX_LEN	(4 * 1024 * 1024)
+#define	T4_OFLD_DMA_MAX_LEN	T4_RDMA_DMA_MAX_LEN
 #define	T4_OFLD_DMA_LIMIT	(1ULL * 1024 * 1024 * 1024)
 
 typedef enum t4_tid_kind {
