@@ -38,6 +38,10 @@ def check(text):
     if not re.search(r"!sw && !iwc_hw_cqe_ok\(hw\)", one):
         bad.append("iwc_poll_one() does not refuse driver bits from "
                    "hardware")
+    poll = bodies.get("iwc_poll_cq", "")
+    if not re.search(r"IWC_POLL_SKIP\s*&&\s*rcq->comp_handler != NULL",
+                     poll):
+        bad.append("iwc_poll_cq() may stop a direct poll short")
     flush = bodies.get("iwc_flush_hw_cq", "")
     if "iwc_hw_cqe_ok(hw)" not in flush:
         bad.append("iwc_flush_hw_cq() does not refuse driver bits from "

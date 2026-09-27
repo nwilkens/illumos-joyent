@@ -698,12 +698,15 @@ iwc_poll_cq(struct rdk_cq *rcq, int n, struct rdk_wc *wc)
 	while (done < n) {
 		ret = iwc_poll_one(cq, &wc[done]);
 		/*
-		 * Entries that complete nothing are bounded too, so that a
-		 * CQ the chip keeps filling with them cannot hold the caller;
-		 * a short return makes rdmak arm, look again and yield.
+		 * For a CQ with a completion handler, entries that complete
+		 * nothing are bounded too, so that a CQ the chip keeps filling
+		 * with them cannot hold the vector; a short return makes rdmak
+		 * arm, see the entries and go around or yield.  A directly
+		 * polled CQ is never armed, so its poll goes on to the end.
 		 */
 		if (ret == EAGAIN) {
-			if (++skipped >= IWC_POLL_SKIP)
+			if (++skipped >= IWC_POLL_SKIP &&
+			    rcq->comp_handler != NULL)
 				break;
 			continue;
 		}
