@@ -566,13 +566,13 @@ rdk_cm_arp_task(void *arg)
 	uint32_t gen;
 	int err;
 
+	/* The answer takes over the resolver's hold on the owner. */
 	mutex_enter(&rp->rp_lock);
 	owner = rp->rp_arg;
+	rp->rp_arg = NULL;
 	ops = rp->rp_ops;
 	gen = rp->rp_gen;
 	err = rp->rp_err;
-	if (owner != NULL)
-		ops->rao_hold(owner);
 	mutex_exit(&rp->rp_lock);
 	if (owner != NULL) {
 		ops->rao_done(owner, gen, err, rp->rp_mac);

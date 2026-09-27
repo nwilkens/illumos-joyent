@@ -439,6 +439,7 @@ rdk_cm_gid_retry(void *arg)
 	rdk_cm_gid_kick();
 }
 
+/* Passes until no event is left; IP's event thread never waits on one. */
 static void
 rdk_cm_gid_task(void *arg)
 {
@@ -450,14 +451,15 @@ rdk_cm_gid_task(void *arg)
 		rdk_cm_gid_dirty = B_FALSE;
 		mutex_exit(&rdk_cm_gid_kick_lock);
 		rdk_cm_gid_pass();
+		mutex_enter(&rdk_cm_gid_lock);
+		retry = rdk_gidtab_retry_needed(rdk_cm_gidtab);
+		mutex_exit(&rdk_cm_gid_lock);
 		mutex_enter(&rdk_cm_gid_kick_lock);
-	}
-	mutex_enter(&rdk_cm_gid_lock);
-	retry = rdk_gidtab_retry_needed(rdk_cm_gidtab);
-	mutex_exit(&rdk_cm_gid_lock);
-	if (retry && !rdk_cm_gid_stop && rdk_cm_gid_timer == 0) {
-		rdk_cm_gid_timer = timeout(rdk_cm_gid_retry, NULL,
-		    drv_usectohz((clock_t)rdk_cm_gid_retry_ms * MILLISEC));
+		if (retry && !rdk_cm_gid_stop && rdk_cm_gid_timer == 0) {
+			rdk_cm_gid_timer = timeout(rdk_cm_gid_retry, NULL,
+			    drv_usectohz((clock_t)rdk_cm_gid_retry_ms *
+			    MILLISEC));
+		}
 	}
 	rdk_cm_gid_running = B_FALSE;
 	cv_broadcast(&rdk_cm_gid_cv);

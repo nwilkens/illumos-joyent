@@ -138,7 +138,7 @@ typedef struct rdk_cm_qev {
 /*
  * A next-hop resolution.  The owner holds one reference and gives it back
  * with rdk_cm_arp_cancel(); the answer holds the other and calls rao_done
- * at most once, with its own hold on rp_arg.
+ * at most once.  rp_arg is held until the answer or the cancel takes it.
  */
 typedef struct rdk_cm_arp_ops {
 	void	(*rao_done)(void *, uint32_t, int, const uint8_t *);
