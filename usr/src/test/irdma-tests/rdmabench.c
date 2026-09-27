@@ -198,6 +198,8 @@ idle_rates(void)
 	    (double)(a1.hs_now_ns - a0.hs_now_ns);
 	idle_intr_a = (double)(a1.hs_intr_ns - a0.hs_intr_ns) /
 	    (double)(a1.hs_now_ns - a0.hs_now_ns);
+	if (remote && b1.hs_now_ns <= b0.hs_now_ns)
+		fatal("the peer's CPU counters are not available");
 	if (remote) {
 		idle_busy_b = (double)(b1.hs_busy_ns - b0.hs_busy_ns) /
 		    (double)(b1.hs_now_ns - b0.hs_now_ns);
@@ -592,8 +594,11 @@ bench_one(const bconf_t *c)
 	}
 	t1 = now_ns();
 	host_stats(&a1);
-	if (remote)
+	if (remote) {
 		peer_stats(c->c_qps, &b1);
+		if (b1.hs_now_ns <= b0.hs_now_ns)
+			fatal("the peer's CPU counters are not available");
+	}
 	report(c, t1 - t0, remote ? b1.hs_now_ns - b0.hs_now_ns : 0, &a0,
 	    &a1, &b0, &b1);
 }
