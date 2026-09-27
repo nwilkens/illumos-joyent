@@ -363,8 +363,10 @@ rdmat_qp_create(rdmat_sess_t *ts, rdmat_qp_t *tq, uint64_t len)
 
 	pc = ts->ts_poll == RDMAT_POLL_TASKQ ? RDK_POLL_TASKQ :
 	    RDK_POLL_DIRECT;
-	if ((ret = rdk_alloc_cq(dev, tq, (int)ts->ts_depth * 2 + 8,
-	    (int)ts->ts_comp_vector, pc, &tq->tq_scq)) != 0)
+	/* A QP in error flushes every request on its send queue. */
+	if ((ret = rdk_alloc_cq(dev, tq, (int)MAX(ts->ts_depth * 2,
+	    ts->ts_sq_depth) + 8, (int)ts->ts_comp_vector, pc,
+	    &tq->tq_scq)) != 0)
 		return (ret);
 	if ((ret = rdk_alloc_cq(dev, tq, (int)ts->ts_depth + 8,
 	    (int)ts->ts_comp_vector, pc, &tq->tq_rcq)) != 0)

@@ -185,9 +185,10 @@ rdmat_rw_slots(rdmat_sess_t *ts, rdmat_run_t *rr, struct rdmat_rw *rw)
 		return (ret);
 	rr->rr_rw_limit_wrs = l.rwl_wrs;
 	rr->rr_rw_limit_mrs = l.rwl_mrs;
-	/* Every transfer in flight, and its SEND, fit the send queue. */
-	if ((uint64_t)rr->rr_depth * (l.rwl_wrs + 1) > ts->ts_sq_depth ||
-	    l.rwl_mrs > RDMAT_RW_MAX_CK)
+	/* Every transfer in flight, its SEND and a drain fit the queue. */
+	if ((uint64_t)rr->rr_depth * (l.rwl_wrs +
+	    ((rr->rr_rw_flags & RDMAT_RW_SEND) != 0 ? 1 : 0)) + 1 >
+	    ts->ts_sq_depth || l.rwl_mrs > RDMAT_RW_MAX_CK)
 		return (ENOSPC);
 
 	rw->rw_nslots = rr->rr_depth;
@@ -288,7 +289,9 @@ rdmat_rw_run(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
 	    RDMAT_RW_SEND | RDMAT_RW_SEND_INV)) != 0 ||
 	    ((rr->rr_rw_flags & RDMAT_RW_SEND) != 0 &&
 	    ((rr->rr_rw_flags & RDMAT_RW_READ) != 0 ||
-	    tq->tq_len < RDMAT_RW_SEND_LEN)))
+	    tq->tq_len < RDMAT_RW_SEND_LEN)) ||
+	    (rr->rr_rw_flags & (RDMAT_RW_SEND | RDMAT_RW_SEND_INV)) ==
+	    RDMAT_RW_SEND_INV)
 		return (EINVAL);
 	rw = kmem_zalloc(sizeof (*rw), KM_SLEEP);
 	rw->rw_tq = tq;

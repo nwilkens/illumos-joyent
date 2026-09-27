@@ -46,6 +46,9 @@ rdmat_buf(rdmat_sess_t *ts, rdmat_buf_t *rb)
 	uint64_t i, off, span;
 	uint8_t *p;
 
+	if (rb->rb_op != RDMAT_BUF_FILL && rb->rb_op != RDMAT_BUF_VERIFY &&
+	    rb->rb_op != RDMAT_BUF_ZERO && rb->rb_op != RDMAT_BUF_VERIFY_ZERO)
+		return (EINVAL);
 	if ((tq = rdmat_qp(ts, rb->rb_qp)) == NULL ||
 	    rb->rb_offset > tq->tq_len || rb->rb_len > tq->tq_len ||
 	    (rb->rb_frag != 0 && rb->rb_stride < rb->rb_frag))
