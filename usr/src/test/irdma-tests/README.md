@@ -66,6 +66,19 @@ root with Python 3.9+ and a C99 compiler.
   vector's lgroup and interrupt CPU, while iwcxgbe reports one READ sink
   SGE, no READ_WITH_INV and no inline data, and refuses a send marked
   inline.
+- `rdk_rw.py`: builds `rdk_rw.c` with the page walk of `rdk_verbs.c`
+  against a fake provider and runs each posted chain on a model of the
+  device and the peer, for 20,000 random transfer shapes and the page and
+  page-list edges (cookie layout, offset, length, remote segments, SGE and
+  READ SGE limits, MR sizes, iWARP, READ_WITH_INV, `RDK_RW_F_MR`).  The
+  bytes must land only where they belong, each registration must cover
+  exactly the bytes its READs write with a rotated key and only
+  LOCAL_WRITE (and REMOTE_WRITE on iWARP), every MR must be invalid at the
+  end, a LOCAL_INV must be fenced, only the last request (and a chained
+  SEND) is signaled, and the transfer fits `rdk_rw_limits()`.  Bad
+  arguments, a missing or foreign MR, a double post and SEND_WITH_INV
+  selection are checked too; builds without the fence, the cut of the
+  last cookie or the key rotation must fail.
 - `rdk_locks.py`: no function of the rdmak completion, teardown or RDMA
   READ/WRITE code reaches a consumer callback, a provider operation or a
   wait while it holds a lock it initializes; a done() moved under the

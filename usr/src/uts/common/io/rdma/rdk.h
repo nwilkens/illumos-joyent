@@ -898,6 +898,79 @@ extern void rdk_event_upcall(void (*)(struct rdk_event *, void *),
     struct rdk_event *, void *);
 
 /*
+ * RDMA READ and WRITE between local DMA memory and a peer's keyed memory
+ * (rdk_rw.c).  A context holds one transfer on an RC QP: the local memory
+ * as DMA cookies, an offset and a length, and the peer's memory as keyed
+ * segments whose lengths add up to the same length.  rdk_rw_init() builds
+ * the work requests and rdk_rw_post() posts them in one call, only the last
+ * one signaled, followed by the caller's chain (a WRITE's response SEND).
+ *
+ * A READ sink the device reaches only through an MR (on iWARP, or with
+ * RDK_RW_F_MR) is registered part by part from the MRs the caller lends:
+ * each registration covers exactly the bytes of its READs, with a new key,
+ * LOCAL_WRITE and on iWARP REMOTE_WRITE, and is invalidated after them by
+ * READ_WITH_INV or else by a fenced LOCAL_INV.  The MRs are free again once
+ * the transfer completes successfully.
+ *
+ * Each work request carries the caller's cqe, and done() runs once on
+ * success.  After an error it may run more than once, and a failed post may
+ * leave part of the chain queued: the caller then moves the QP to the error
+ * state and drains it before it reuses the memory, and deregisters the MRs
+ * instead of reusing them if the drain fails.
+ *
+ * rdk_rw_limits() gives the most send queue entries and MRs one transfer
+ * within the attributes takes: a queue of depth d needs d times rwl_wrs
+ * plus its responses, plus one entry for the drain.  rdk_rw_send_inv()
+ * turns a response SEND into SEND_WITH_INV for the peer's key when the
+ * transfer used a single key and the device can.
+ */
+typedef struct rdk_rw_ctx rdk_rw_ctx_t;
+
+enum rdk_rw_dir {
+	RDK_RW_WRITE = 1,	/* local to remote */
+	RDK_RW_READ		/* remote to local */
+};
+
+#define	RDK_RW_F_MR		0x1	/* a READ sink always gets an MR */
+#define	RDK_RW_MAX_LEN		(1U << 30)
+#define	RDK_RW_MAX_SEGS		16
+
+struct rdk_rw_seg {
+	uint64_t	rs_addr;
+	uint32_t	rs_len;
+	uint32_t	rs_key;
+};
+
+struct rdk_rw_attr {
+	uint32_t	rwa_flags;
+	uint32_t	rwa_max_sge;	/* the QP's cap.max_send_sge */
+	uint32_t	rwa_mr_pages;	/* of each MR lent; 0 for none */
+	uint32_t	rwa_max_cookies;
+	uint32_t	rwa_max_segs;
+	uint32_t	rwa_max_len;
+};
+
+struct rdk_rw_limits {
+	uint32_t	rwl_wrs;
+	uint32_t	rwl_mrs;
+	uint32_t	rwl_sges;
+};
+
+extern int rdk_rw_limits(struct rdk_device *, const struct rdk_rw_attr *,
+    struct rdk_rw_limits *);
+extern int rdk_rw_ctx_alloc(struct rdk_device *, const struct rdk_rw_attr *,
+    rdk_rw_ctx_t **);
+extern void rdk_rw_ctx_free(rdk_rw_ctx_t *);
+extern int rdk_rw_init(rdk_rw_ctx_t *, struct rdk_qp *, enum rdk_rw_dir,
+    const ddi_dma_cookie_t *, uint_t, uint64_t, uint32_t,
+    const struct rdk_rw_seg *, uint_t, struct rdk_mr *const *, uint_t);
+extern int rdk_rw_post(rdk_rw_ctx_t *, struct rdk_cqe *,
+    struct rdk_send_wr *);
+extern uint_t rdk_rw_nwr(const rdk_rw_ctx_t *);
+extern uint_t rdk_rw_nmr(const rdk_rw_ctx_t *);
+extern boolean_t rdk_rw_send_inv(const rdk_rw_ctx_t *, struct rdk_send_wr *);
+
+/*
  * The data path goes straight to the provider.
  */
 static inline int

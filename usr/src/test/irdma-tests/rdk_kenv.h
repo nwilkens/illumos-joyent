@@ -59,6 +59,7 @@ typedef uintptr_t callout_id_t;
 #define	B_FALSE		0
 #define	B_TRUE		1
 #define	ETHERADDRL	6
+#define	PAGESIZE	4096
 #define	KM_SLEEP	0
 #define	KM_NOSLEEP	1
 #define	MUTEX_DRIVER	0

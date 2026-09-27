@@ -18,6 +18,7 @@ TESTS = (
     "lock_order.py",
     "rdk_caps.py",
     "rdk_locks.py",
+    "rdk_rw.py",
     "rdk_teardown.py",
     "rdk_verbs.py",
 )
