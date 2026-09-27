@@ -99,6 +99,13 @@ typedef struct nvmft_task_priv {
 	struct nvmf_capsule	*ntp_nc;
 	struct nvmft_qpair	*ntp_qp;
 	boolean_t		ntp_success_sent;
+	/*
+	 * Transfers the transport holds for this task.  STMF frees the dbufs
+	 * of an aborted task, so an abort waits for these to drain.
+	 */
+	kmutex_t		ntp_lock;
+	uint_t			ntp_xfers;
+	boolean_t		ntp_aborting;
 	/* Command payload length, charged against ctrlr_pending_bytes. */
 	uint32_t		ntp_data_len;
 	/*
@@ -890,6 +897,7 @@ nvmft_post_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 		    16 /* cdb_length */, 0);
 		if (task != NULL) {
 			priv = kmem_zalloc(sizeof (*priv), KM_SLEEP);
+			mutex_init(&priv->ntp_lock, NULL, MUTEX_DRIVER, NULL);
 			priv->ntp_nc = nc;
 			priv->ntp_qp = qp;
 			priv->ntp_data_len = data_len;
@@ -1093,6 +1101,43 @@ nvmft_dbuf_to_memdesc(stmf_data_buf_t *dbuf, nvmf_memdesc_t *mem)
 	mem->nmd_u.nmd_sgl.nmd_nsegs = dbuf->db_sglist_length;
 }
 
+/* Count a transfer the transport is about to hold, unless we are aborting. */
+static boolean_t
+nvmft_xfer_begin(nvmft_task_priv_t *priv)
+{
+	boolean_t ok;
+
+	mutex_enter(&priv->ntp_lock);
+	ok = !priv->ntp_aborting;
+	if (ok)
+		priv->ntp_xfers++;
+	mutex_exit(&priv->ntp_lock);
+	return (ok);
+}
+
+/*
+ * The transport is done with a transfer.  Returns B_FALSE if the task is being
+ * aborted: STMF must then not see the dbuf back, and the abort is retried.
+ */
+static boolean_t
+nvmft_xfer_end(scsi_task_t *task)
+{
+	nvmft_task_priv_t *priv = task->task_port_private;
+	boolean_t aborting;
+
+	mutex_enter(&priv->ntp_lock);
+	ASSERT3U(priv->ntp_xfers, >, 0);
+	priv->ntp_xfers--;
+	aborting = priv->ntp_aborting;
+	mutex_exit(&priv->ntp_lock);
+	if (aborting) {
+		stmf_abort(STMF_REQUEUE_TASK_ABORT_LPORT, task, STMF_ABORTED,
+		    NULL);
+		return (B_FALSE);
+	}
+	return (B_TRUE);
+}
+
 static boolean_t
 nvmft_xfer_arrive(nvmft_xfer_t *nx, uint_t who)
 {
@@ -1113,6 +1158,9 @@ nvmft_xfer_finish(nvmft_xfer_t *nx)
 	stmf_data_buf_t *dbuf = nx->nx_dbuf;
 	nvmft_task_priv_t *priv = task->task_port_private;
 	uint32_t iof = 0;
+
+	if (!nvmft_xfer_end(task))
+		return;
 
 	if (!nx->nx_to_rport) {
 		dbuf->db_xfer_status = (nx->nx_status == 0) ? STMF_SUCCESS :
@@ -1288,6 +1336,10 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 		ret = STMF_FAILURE;
 		goto done;
 	}
+	if (!nvmft_xfer_begin(priv)) {
+		ret = STMF_ABORTED;
+		goto done;
+	}
 	nx = &ndp->ndp_xfer;
 	bzero(nx, sizeof (*nx));
 	nx->nx_task = task;
@@ -1314,12 +1366,13 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 			priv->ntp_success_sent = B_TRUE;
 			dbuf->db_xfer_status = STMF_FAILURE;
 			xfer_iof = STMF_IOF_LPORT_DONE;
-			do_xfer_done = B_TRUE;
+			do_xfer_done = nvmft_xfer_end(task);
 			ret = STMF_SUCCESS;
 			goto done;
 		}
 		if (error != 0) {
-			ret = STMF_ALLOC_FAILURE;
+			ret = nvmft_xfer_end(task) ? STMF_ALLOC_FAILURE :
+			    STMF_ABORTED;
 			goto done;
 		}
 	} else {
@@ -1330,7 +1383,8 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 		if (error != 0) {
 			(void) nvmft_printf(nvmft_qpair_ctrlr(qp),
 			    "Failed to request capsule data: 0x%x\n", error);
-			ret = STMF_FAILURE;
+			ret = nvmft_xfer_end(task) ? STMF_FAILURE :
+			    STMF_ABORTED;
 			goto done;
 		}
 	}
@@ -1601,7 +1655,9 @@ nvmft_lport_task_free(scsi_task_t *task)
 	d = nvmft_admit_one_deferred(ctrlr);
 	mutex_exit(&ctrlr->ctrlr_lock);
 
+	ASSERT0(priv->ntp_xfers);
 	task->task_port_private = NULL;
+	mutex_destroy(&priv->ntp_lock);
 	kmem_free(priv, sizeof (*priv));
 
 	if (d != NULL) {
@@ -1612,19 +1668,13 @@ nvmft_lport_task_free(scsi_task_t *task)
 
 /*
  * STMF asks us to abort a task.  For STMF_LPORT_ABORT_TASK, arg is the
- * scsi_task_t.  Cancel any in-flight transport data transfer; the transport
- * invokes our receive completion callback with an error, which fails the dbuf
- * back to STMF.  STMF then frees the task through lport_task_free, which frees
- * the capsule.  (FreeBSD: nvmf_abort_capsule_data.)
+ * scsi_task_t.  While the transport still holds a transfer into one of the
+ * task's dbufs we return STMF_BUSY, because STMF frees the dbufs of an aborted
+ * task; the transfer's completion asks STMF to retry the abort.
  *
- * Locking / lifecycle: STMF guarantees the task referenced by arg stays valid
- * for the duration of this call and serialises abort against lport_task_free,
- * so task_port_private (priv) and priv->ntp_nc cannot be freed underneath us
- * here.  We still guard both against NULL for the pre-translation / already-
- * completed windows.  nvmf_abort_capsule_data() is a no-op when no H2C receive
- * is outstanding (its io_len is 0), so it is safe to call unconditionally for a
- * task that has a capsule; we rely on that rather than tracking outstanding-xfer
- * state in the task private.
+ * STMF keeps the task valid for the duration of this call and serialises abort
+ * against lport_task_free.  nvmf_abort_capsule_data() is a no-op when no H2C
+ * receive is outstanding.
  */
 /* ARGSUSED */
 static stmf_status_t
@@ -1633,6 +1683,7 @@ nvmft_lport_abort(stmf_local_port_t *lport, int abort_cmd, void *arg,
 {
 	scsi_task_t *task = arg;
 	nvmft_task_priv_t *priv;
+	boolean_t busy;
 
 	_NOTE(ARGUNUSED(lport, flags));
 
@@ -1664,7 +1715,11 @@ nvmft_lport_abort(stmf_local_port_t *lport, int abort_cmd, void *arg,
 	if (priv->ntp_nc != NULL)
 		nvmf_abort_capsule_data(priv->ntp_nc, ECANCELED);
 
-	return (STMF_ABORT_SUCCESS);
+	mutex_enter(&priv->ntp_lock);
+	priv->ntp_aborting = B_TRUE;
+	busy = (priv->ntp_xfers != 0);
+	mutex_exit(&priv->ntp_lock);
+	return (busy ? STMF_BUSY : STMF_ABORT_SUCCESS);
 }
 
 /* ARGSUSED */

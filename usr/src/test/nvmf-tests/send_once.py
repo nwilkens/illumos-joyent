@@ -64,6 +64,16 @@ typedef uint64_t stmf_status_t;
 #define	DB_SEND_STATUS_GOOD	0x0004
 #define	STMF_IOF_LPORT_DONE	0x0002
 typedef struct scsi_task { void *task_port_private; } scsi_task_t;
+typedef struct stmf_local_port stmf_local_port_t;
+#define	STMF_ABORTED	(STMF_FAILURE | 5)
+#define	STMF_BUSY	((uint64_t)0x2000000000000000)
+#define	STMF_ABORT_SUCCESS	((uint64_t)0x3000000000000000)
+#define	STMF_LPORT_ABORT_TASK	0x40
+#define	STMF_REQUEUE_TASK_ABORT_LPORT	2
+#define	STATUS_CHECK	0x02
+#define	ASSERT0(x)	assert((x) == 0)
+void stmf_abort(int, scsi_task_t *, stmf_status_t, void *);
+void nvmf_abort_capsule_data(struct nvmf_capsule *, int);
 typedef struct stmf_data_buf {
 	uint16_t db_flags;
 	stmf_status_t db_xfer_status;
@@ -81,10 +91,11 @@ uint32_t nvmft_qpair_caps(struct nvmft_qpair *);
             parts.append(line + "\n")
     for name in ("NVMFT_XFER_SUBMITTED", "NVMFT_XFER_COMPLETED"):
         parts.append(define(stmf, name))
-    for name in ("nvmft_task_priv_t", "nvmft_xfer_t"):
+    for name in ("nvmft_task_priv_t", "nvmft_internal_io_t", "nvmft_xfer_t"):
         parts.append(typedef(stmf, name))
-    for name in ("nvmft_xfer_arrive", "nvmft_xfer_finish",
-                 "nvmft_datamove_out_cb", "nvmft_datamove_in_cb"):
+    for name in ("nvmft_xfer_begin", "nvmft_xfer_end", "nvmft_xfer_arrive",
+                 "nvmft_xfer_finish", "nvmft_datamove_out_cb",
+                 "nvmft_datamove_in_cb", "nvmft_lport_abort"):
         parts.append(function(stmf, name))
     run_c(TESTDIR / "send_once.c", {"send.h": "\n".join(parts)})
 
