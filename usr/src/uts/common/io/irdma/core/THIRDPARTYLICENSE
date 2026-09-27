@@ -9,7 +9,12 @@ parent directory that ../README.illumos lists are adapted from the same
 driver and are used under the same license; the rest of the illumos
 adaptation is licensed under the CDDL.
 
+Copyright (c) 2015 - 2019 Intel Corporation
+Copyright (c) 2015 - 2020 Intel Corporation
+Copyright (c) 2015 - 2021 Intel Corporation
 Copyright (c) 2015 - 2024 Intel Corporation
+Copyright (c) 2016 - 2021 Intel Corporation
+Copyright (c) 2017 - 2021 Intel Corporation
 
 Linux-OpenIB License
 

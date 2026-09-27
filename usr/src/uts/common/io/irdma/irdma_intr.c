@@ -316,7 +316,8 @@ irdma_vec_idle(irdma_vec_t *iv)
 	irdma_t *irdma = iv->iv_irdma;
 	struct irdma_sc_dev *dev = &irdma->irdma_sc;
 	irdma_ceq_t *ic;
-	uint32_t ctl;
+	boolean_t pending;
+	uint32_t ctl = 0;
 
 	ASSERT(MUTEX_HELD(&iv->iv_lock));
 	while (!iv->iv_exit && !iv->iv_resched && iv->iv_cpu == iv->iv_bound &&
@@ -332,14 +333,20 @@ irdma_vec_idle(irdma_vec_t *iv)
 		    iv->iv_owed || iv->iv_resched || iv->iv_exit ||
 		    iv->iv_off || iv->iv_ceq != ic)
 			continue;
+		/* Busy, so that irdma_vec_barrier() waits before ic goes. */
+		iv->iv_busy = B_TRUE;
 		mutex_exit(&iv->iv_lock);
-		if (!irdma_vec_pending(iv, ic)) {
-			mutex_enter(&iv->iv_lock);
-			continue;
+		pending = irdma_vec_pending(iv, ic);
+		if (pending) {
+			ctl = readl(dev->hw_regs[IRDMA_GLINT_DYN_CTL] +
+			    irdma_hw_vec(irdma, iv->iv_idx));
 		}
-		ctl = readl(dev->hw_regs[IRDMA_GLINT_DYN_CTL] +
-		    irdma_hw_vec(irdma, iv->iv_idx));
 		mutex_enter(&iv->iv_lock);
+		iv->iv_busy = B_FALSE;
+		iv->iv_passes++;
+		cv_broadcast(&iv->iv_cv);
+		if (!pending)
+			continue;
 		iv->iv_rescues++;
 		if ((ctl & IRDMA_GLINT_DYN_CTL_INTENA) != 0)
 			iv->iv_rescues_on++;

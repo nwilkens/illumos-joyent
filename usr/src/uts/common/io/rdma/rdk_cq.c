@@ -167,8 +167,8 @@ rdk_cq_mod_fire(void *arg)
 	void (*resched)(struct rdk_cq *) = cq->device->rd_ops->cq_resched;
 
 	mutex_enter(&cp->rcp_lock);
-	cp->rcp_mod_pending = B_FALSE;
 	if (cp->rcp_dying || !cp->rcp_deferred || cp->rcp_in_tq) {
+		cp->rcp_mod_pending = B_FALSE;
 		mutex_exit(&cp->rcp_lock);
 		return;
 	}
@@ -179,6 +179,13 @@ rdk_cq_mod_fire(void *arg)
 	else
 		taskq_dispatch_ent(rdk_cq_taskq, rdk_cq_task, cq, 0,
 		    &cp->rcp_ent);
+	/*
+	 * No new delay replaces rcp_mod_tid until here, so rdk_free_cq()
+	 * waits for this call.
+	 */
+	mutex_enter(&cp->rcp_lock);
+	cp->rcp_mod_pending = B_FALSE;
+	mutex_exit(&cp->rcp_lock);
 }
 
 /*

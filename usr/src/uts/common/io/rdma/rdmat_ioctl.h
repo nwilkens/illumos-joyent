@@ -156,7 +156,9 @@ typedef enum rdmat_op {
 	RDMAT_OP_LOCAL_INV,	/* invalidate the buffer MR */
 	RDMAT_OP_RECV_STREAM,	/* receive count, keeping depth posted */
 	RDMAT_OP_WRITE_PING,	/* write, wait for the peer's write; count */
-	RDMAT_OP_WRITE_PONG	/* wait for the peer's write, write back */
+	RDMAT_OP_WRITE_PONG,	/* wait for the peer's write, write back */
+	RDMAT_OP_MR_ALLOC,	/* allocate and free an MR of size; count */
+	RDMAT_OP_FRWR		/* REG_MR then LOCAL_INV over size; count */
 } rdmat_op_t;
 
 /*
