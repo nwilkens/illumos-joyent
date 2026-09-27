@@ -24,6 +24,15 @@ THIRDPARTYLICENSE.  Each source's blob ID at that commit is given.
                  3b7bd99813e9526ead3f9fb124835a0b17e4d2a6, "(GPL-2.0 WITH
                  Linux-syscall-note) OR Linux-OpenIB").  Names carry the
                  rdk_ prefix; the ops vector and prototypes are illumos.
+                 include/rdma/ib_addr.h
+                 811a0f11d0dbe049aa156f46ac8a9f883be43c31
+                 include/rdma/ib_pack.h
+                 8266fab826a713cf511891a157dd16fa73c119c3
+                 "SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB"
+                 rdk_roce_mtu() and RDK_ROCE_HDR_ROOM, from iboe_get_mtu()
+                 and the header sizes it subtracts.  FreeBSD's
+                 iboe_get_mtu() subtracts 80 bytes (no UDP, XRCETH or
+                 ICRC); the Linux 96 is kept.
 
     rdk_verbs.c  drivers/infiniband/core/verbs.c
                  3a5f81402d2f8b3243fb69a103400bc437bf1354

@@ -7,6 +7,8 @@
  * Copyright (c) 2004 Voltaire Corporation.  All rights reserved.
  * Copyright (c) 2005 Sun Microsystems, Inc. All rights reserved.
  * Copyright (c) 2005, 2006, 2007 Cisco Systems.  All rights reserved.
+ * Copyright (c) 2005 Voltaire Inc.  All rights reserved.
+ * Copyright (c) 2005 Intel Corporation.  All rights reserved.
  */
 
 /*
@@ -133,6 +135,22 @@ rdk_mtu_int_to_enum(int mtu)
 	else if (mtu >= 512)
 		return (RDK_MTU_512);
 	return (RDK_MTU_256);
+}
+
+/*
+ * The headers a RoCE packet adds around its payload: the GRH (or an IP
+ * header), UDP, BTH, the largest extended headers (XRCETH and AtomicETH)
+ * and the ICRC.  A VLAN tag does not count against the link MTU.
+ */
+#define	RDK_ROCE_HDR_ROOM	(40 + 8 + 12 + 4 + 28 + 4)
+
+/* The largest path MTU that fits a link MTU, or 0 if none does. */
+static inline enum rdk_mtu
+rdk_roce_mtu(int link_mtu)
+{
+	if (link_mtu - RDK_ROCE_HDR_ROOM < 256)
+		return ((enum rdk_mtu)0);
+	return (rdk_mtu_int_to_enum(link_mtu - RDK_ROCE_HDR_ROOM));
 }
 
 enum rdk_port_state {

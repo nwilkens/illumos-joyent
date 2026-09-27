@@ -144,8 +144,8 @@ rdmat_devices(intptr_t arg, int mode)
 		    sizeof (di->rdi_name));
 		if (rdk_query_port(dev, 1, &pa) == 0) {
 			di->rdi_port_state = pa.state;
-			di->rdi_active_mtu =
-			    (uint32_t)rdk_mtu_enum_to_int(pa.active_mtu);
+			di->rdi_active_mtu = (uint32_t)MAX(
+			    rdk_mtu_enum_to_int(pa.active_mtu), 0);
 			di->rdi_phys_mtu = pa.phys_mtu;
 			bcopy(pa.mac, di->rdi_mac, sizeof (di->rdi_mac));
 			di->rdi_speed = pa.speed;

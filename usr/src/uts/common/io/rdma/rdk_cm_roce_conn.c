@@ -107,19 +107,15 @@ rdk_cm_roce_gsi(rdk_cm_dev_t *cd, uint32_t port)
 	return (g);
 }
 
-/*
- * The RoCE path MTU for an IP MTU: the IP, UDP, BTH, largest extended
- * header and ICRC take 96 bytes (Linux iboe_get_mtu()).  0 if none fits.
- */
+/* The RoCE path MTU for an IP MTU, within the port's; 0 if none fits. */
 uint8_t
 rdk_cm_roce_mtu(struct rdk_device *dev, uint32_t port, uint32_t ip_mtu)
 {
 	struct rdk_port_attr pa;
 	enum rdk_mtu m;
 
-	if (ip_mtu < 256 + 96)
+	if ((m = rdk_roce_mtu((int)MIN(ip_mtu, INT_MAX))) == 0)
 		return (0);
-	m = rdk_mtu_int_to_enum((int)(ip_mtu - 96));
 	if (rdk_query_port(dev, port, &pa) == 0 && pa.active_mtu != 0 &&
 	    m > pa.active_mtu)
 		m = pa.active_mtu;
