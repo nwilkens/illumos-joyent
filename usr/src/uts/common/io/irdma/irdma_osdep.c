@@ -20,6 +20,7 @@
 
 #include <sys/varargs.h>
 #include <sys/cpuvar.h>
+#include <sys/cpu.h>
 
 #include "irdma_impl.h"
 
@@ -365,13 +366,26 @@ irdma_osdep_regs_fini(void)
 	mutex_destroy(&irdma_regs_lock);
 }
 
+/*
+ * Readers spin while the generation is odd, so a writer must not be
+ * preempted between irdma_regs_begin() and irdma_regs_end().
+ */
 static void
-irdma_regs_change(void)
+irdma_regs_begin(void)
+{
+	ASSERT(MUTEX_HELD(&irdma_regs_lock));
+	kpreempt_disable();
+	irdma_regs_gen++;
+	membar_producer();
+}
+
+static void
+irdma_regs_end(void)
 {
 	ASSERT(MUTEX_HELD(&irdma_regs_lock));
 	membar_producer();
 	irdma_regs_gen++;
-	membar_producer();
+	kpreempt_enable();
 }
 
 boolean_t
@@ -382,11 +396,11 @@ irdma_osdep_regs_add(caddr_t base, size_t len, ddi_acc_handle_t h)
 	mutex_enter(&irdma_regs_lock);
 	for (i = 0; i < IRDMA_REGS_MAX; i++) {
 		if (irdma_regs[i].irm_base == NULL) {
-			irdma_regs_change();
+			irdma_regs_begin();
 			irdma_regs[i].irm_base = base;
 			irdma_regs[i].irm_len = len;
 			irdma_regs[i].irm_handle = h;
-			irdma_regs_change();
+			irdma_regs_end();
 			break;
 		}
 	}
@@ -404,11 +418,11 @@ irdma_osdep_regs_dbs(caddr_t base, caddr_t sqdb, caddr_t cqarm,
 	mutex_enter(&irdma_regs_lock);
 	for (i = 0; i < IRDMA_REGS_MAX; i++) {
 		if (irdma_regs[i].irm_base == base) {
-			irdma_regs_change();
+			irdma_regs_begin();
 			irdma_regs[i].irm_sqdb = sqdb;
 			irdma_regs[i].irm_cqarm = cqarm;
 			irdma_regs[i].irm_stats = stats;
-			irdma_regs_change();
+			irdma_regs_end();
 		}
 	}
 	mutex_exit(&irdma_regs_lock);
@@ -422,9 +436,9 @@ irdma_osdep_regs_remove(caddr_t base)
 	mutex_enter(&irdma_regs_lock);
 	for (i = 0; i < IRDMA_REGS_MAX; i++) {
 		if (irdma_regs[i].irm_base == base) {
-			irdma_regs_change();
+			irdma_regs_begin();
 			bzero(&irdma_regs[i], sizeof (irdma_regs[i]));
-			irdma_regs_change();
+			irdma_regs_end();
 		}
 	}
 	mutex_exit(&irdma_regs_lock);
@@ -443,7 +457,7 @@ irdma_regs_find(const volatile void *addr, irdma_regmap_t *rm)
 		return (B_FALSE);
 	do {
 		while (((gen = irdma_regs_gen) & 1) != 0)
-			;
+			SMT_PAUSE();
 		membar_consumer();
 		found = B_FALSE;
 		for (i = 0; i < IRDMA_REGS_MAX; i++) {

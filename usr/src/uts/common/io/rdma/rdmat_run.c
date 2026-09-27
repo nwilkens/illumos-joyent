@@ -702,6 +702,9 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 
 	if ((tq = rdmat_qp(ts, rr->rr_qp)) == NULL || !tq->tq_connected)
 		return (ENXIO);
+	/* A late completion for the parked MR would count for this run. */
+	if (tq->tq_bmr != NULL)
+		return (EBUSY);
 	timeout = rr->rr_timeout_ms != 0 ? rr->rr_timeout_ms : 10000;
 	if (timeout > RDMAT_MAX_TIMEOUT_MS || rr->rr_count > RDMAT_MAX_COUNT ||
 	    rr->rr_depth > ts->ts_depth || rr->rr_batch > RDMAT_MAX_BATCH ||
@@ -720,6 +723,9 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 		rr->rr_depth = 1;
 	if (rr->rr_batch == 0)
 		rr->rr_batch = 1;
+	/* A batch the queue cannot hold is never posted. */
+	if (rr->rr_batch > rr->rr_depth)
+		return (EINVAL);
 	/* The remote window is walked in rr_size steps. */
 	if (rw && rr->rr_size == 0)
 		return (EINVAL);
@@ -738,6 +744,12 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 	if (op == RDMAT_OP_WRITE_PING || op == RDMAT_OP_WRITE_PONG)
 		len = 2 * P2ROUNDUP(len, 64);
 	if (rr->rr_offset >= tq->tq_len || len > tq->tq_len - rr->rr_offset)
+		return (EINVAL);
+	if ((op == RDMAT_OP_MR_ALLOC || op == RDMAT_OP_FRWR) &&
+	    (rr->rr_size == 0 || (rr->rr_size % PAGESIZE) != 0 ||
+	    rr->rr_offset != 0 || rr->rr_count == 0 ||
+	    rr->rr_size / PAGESIZE >
+	    ts->ts_dev->rd_attr.max_fast_reg_page_list_len))
 		return (EINVAL);
 	if (ts->ts_qpt == RDMAT_QPT_UD && op != RDMAT_OP_SEND &&
 	    op != RDMAT_OP_POST_RECV && op != RDMAT_OP_WAIT_RECV &&
@@ -774,6 +786,10 @@ rdmat_run(rdmat_sess_t *ts, rdmat_run_t *rr)
 	case RDMAT_OP_WRITE_PING:
 	case RDMAT_OP_WRITE_PONG:
 		ret = rdmat_write_pingpong(ts, tq, rr, deadline);
+		break;
+	case RDMAT_OP_MR_ALLOC:
+	case RDMAT_OP_FRWR:
+		ret = rdmat_mr_cost(ts, tq, rr, deadline);
 		break;
 	case RDMAT_OP_POST_RECV:
 		ret = rr->rr_count > ts->ts_depth ? EINVAL :
@@ -937,6 +953,10 @@ rdmat_teardown(rdmat_sess_t *ts, boolean_t removing)
 		if (tq->tq_rmr != NULL) {
 			(void) rdk_dereg_mr(tq->tq_rmr);
 			tq->tq_rmr = NULL;
+		}
+		if (tq->tq_bmr != NULL) {
+			(void) rdk_dereg_mr(tq->tq_bmr);
+			tq->tq_bmr = NULL;
 		}
 		if (tq->tq_scq != NULL) {
 			rdk_free_cq(tq->tq_scq);

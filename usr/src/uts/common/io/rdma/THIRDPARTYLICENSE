@@ -6,6 +6,8 @@ is offered under the choice of the GNU General Public License version 2 or the
 OpenIB.org BSD license.  They are used here under the OpenIB.org BSD license,
 reproduced below.  The rest of this directory is licensed under the CDDL.
 
+rdk.h:
+
 Copyright (c) 2004 Mellanox Technologies Ltd.  All rights reserved.
 Copyright (c) 2004 Infinicon Corporation.  All rights reserved.
 Copyright (c) 2004, 2020 Intel Corporation.  All rights reserved.
@@ -13,6 +15,16 @@ Copyright (c) 2004 Topspin Corporation.  All rights reserved.
 Copyright (c) 2004 Voltaire Corporation.  All rights reserved.
 Copyright (c) 2005 Sun Microsystems, Inc. All rights reserved.
 Copyright (c) 2005, 2006, 2007 Cisco Systems.  All rights reserved.
+
+rdk_verbs.c:
+
+Copyright (c) 2004 Mellanox Technologies Ltd.  All rights reserved.
+Copyright (c) 2004 Infinicon Corporation.  All rights reserved.
+Copyright (c) 2004 Intel Corporation.  All rights reserved.
+Copyright (c) 2004 Topspin Corporation.  All rights reserved.
+Copyright (c) 2004 Voltaire Corporation.  All rights reserved.
+Copyright (c) 2005 Sun Microsystems, Inc. All rights reserved.
+Copyright (c) 2005, 2006 Cisco Systems.  All rights reserved.
 
 OpenIB.org BSD license
 

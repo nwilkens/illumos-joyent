@@ -1190,6 +1190,9 @@ irdma_unstep_aeq(irdma_t *irdma)
 	int ret = -EIO;
 
 	dev->irq_ops->irdma_cfg_aeq(dev, irdma_hw_vec(irdma, 0), false);
+	/* Vector 0 reads the AEQ only while this step is up. */
+	irdma->irdma_progress &= ~BIT(IRDMA_STEP_AEQ);
+	irdma_vec_barrier(&irdma->irdma_vecs[0]);
 
 	if (irdma_hw_ok(irdma)) {
 		irdma->irdma_aeq.size = 0;

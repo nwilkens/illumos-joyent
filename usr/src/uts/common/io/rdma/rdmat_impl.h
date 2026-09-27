@@ -103,6 +103,7 @@ typedef struct rdmat_qp {
 	ddi_dma_cookie_t	*tq_cookies;
 	struct rdk_mr		*tq_lmr;	/* local write */
 	struct rdk_mr		*tq_rmr;	/* what the peer may reach */
+	struct rdk_mr		*tq_bmr;	/* see rdmat_mr_cost() */
 	boolean_t		tq_lmr_bound;
 	boolean_t		tq_rmr_bound;
 	uint32_t		tq_rkey_next;	/* rkey of the next REG */
@@ -219,6 +220,8 @@ extern int rdmat_pingpong(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
 extern int rdmat_write_pingpong(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
     hrtime_t);
 extern int rdmat_one_lat(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
+    hrtime_t);
+extern int rdmat_mr_cost(rdmat_sess_t *, rdmat_qp_t *, rdmat_run_t *,
     hrtime_t);
 
 #ifdef __cplusplus

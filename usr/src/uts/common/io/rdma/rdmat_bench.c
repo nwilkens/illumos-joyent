@@ -173,8 +173,13 @@ rdmat_swr(rdmat_sess_t *ts, rdmat_qp_t *tq, const rdmat_run_t *rr,
 		return (EINVAL);
 	}
 	if ((rr->rr_flags & RDMAT_F_INLINE) != 0 &&
-	    wr->opcode != RDK_WR_RDMA_READ)
+	    wr->opcode != RDK_WR_RDMA_READ) {
+		/* The provider copies inline data from a kernel address. */
+		if ((off % RDMAT_CHUNK) + rr->rr_size > RDMAT_CHUNK)
+			return (EINVAL);
+		sw->sw_sge.addr = (uint64_t)(uintptr_t)rdmat_byte(tq, off);
 		wr->send_flags |= RDK_SEND_INLINE;
+	}
 	if (ts->ts_qpt == RDMAT_QPT_UD) {
 		sw->sw_ud.ah = tq->tq_ah;
 		sw->sw_ud.remote_qpn = tq->tq_rqpn;
@@ -537,6 +542,118 @@ rdmat_one_lat(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
 	}
 	if (ret == 0)
 		rdmat_lat_stats(rr, lat, n, sum);
+	rdmat_lat_free(lat, n);
+	return (ret);
+}
+
+/*
+ * The cost of memory registration, per cycle.  RDMAT_OP_MR_ALLOC allocates
+ * and frees an MR for rr_size bytes, which takes two control commands.
+ * RDMAT_OP_FRWR binds one MR over the first rr_size bytes of the buffer
+ * with REG_MR and unbinds it with LOCAL_INV, on the send queue.  A run
+ * that fails with a request posted but not complete leaves the MR in
+ * tq_bmr, for teardown to free after the QP; the QP takes no more runs.
+ */
+int
+rdmat_mr_cost(rdmat_sess_t *ts, rdmat_qp_t *tq, rdmat_run_t *rr,
+    hrtime_t deadline)
+{
+	uint32_t pages = rr->rr_size / PAGESIZE;
+	uint_t nc = (rr->rr_size + RDMAT_CHUNK - 1) / RDMAT_CHUNK, k;
+	boolean_t frwr = rr->rr_op == RDMAT_OP_FRWR;
+	ddi_dma_cookie_t *ck = NULL;
+	struct rdk_reg_wr reg;
+	struct rdk_send_wr inv;
+	struct rdk_mr *mr = NULL, *m;
+	uint64_t *lat, n, i, sum = 0, off, posted = 0, calls = 0;
+	hrtime_t t0;
+	int ret = 0, r;
+
+	lat = rdmat_lat_alloc(rr, &n);
+	if (frwr) {
+		if ((ret = rdk_alloc_mr(ts->ts_pd, RDK_MR_TYPE_MEM_REG, pages,
+		    &mr)) != 0)
+			goto out;
+		ck = kmem_alloc(sizeof (*ck) * nc, KM_SLEEP);
+		for (k = 0; k < nc; k++) {
+			ck[k] = tq->tq_cookies[k];
+			ck[k].dmac_size = MIN(RDMAT_CHUNK,
+			    rr->rr_size - k * RDMAT_CHUNK);
+		}
+	}
+	for (i = 0; i < rr->rr_count; i++) {
+		t0 = gethrtime();
+		if (ts->ts_dying) {
+			ret = ENXIO;
+			break;
+		}
+		if (t0 >= deadline) {
+			ret = ETIMEDOUT;
+			break;
+		}
+		if (!frwr) {
+			if ((ret = rdk_alloc_mr(ts->ts_pd, RDK_MR_TYPE_MEM_REG,
+			    pages, &m)) != 0 || (ret = rdk_dereg_mr(m)) != 0)
+				break;
+		} else {
+			rdk_update_fast_reg_key(mr, (uint8_t)(mr->rkey + 1));
+			off = 0;
+			if (rdk_map_mr_sg(mr, ck, nc, &off, PAGESIZE) !=
+			    (int)nc || mr->length != rr->rr_size) {
+				ret = EIO;
+				break;
+			}
+			bzero(&reg, sizeof (reg));
+			reg.wr.wr_cqe = &tq->tq_reg_cqe;
+			reg.wr.opcode = RDK_WR_REG_MR;
+			reg.wr.send_flags = RDK_SEND_SIGNALED;
+			reg.mr = mr;
+			reg.key = mr->rkey;
+			reg.access = RDK_ACCESS_LOCAL_WRITE |
+			    RDK_ACCESS_REMOTE_WRITE | RDK_ACCESS_REMOTE_READ;
+			bzero(&inv, sizeof (inv));
+			inv.wr_cqe = &tq->tq_reg_cqe;
+			inv.opcode = RDK_WR_LOCAL_INV;
+			inv.send_flags = RDK_SEND_SIGNALED;
+			inv.ex.invalidate_rkey = mr->rkey;
+			calls++;
+			if ((ret = rdk_post_send(tq->tq_qp, &reg.wr,
+			    NULL)) != 0)
+				break;
+			posted++;
+			if ((ret = rdmat_wait(tq, &tq->tq_reg_done, posted,
+			    deadline)) != 0)
+				break;
+			calls++;
+			if ((ret = rdk_post_send(tq->tq_qp, &inv, NULL)) != 0)
+				break;
+			posted++;
+			if ((ret = rdmat_wait(tq, &tq->tq_reg_done, posted,
+			    deadline)) != 0)
+				break;
+		}
+		if (i < n) {
+			lat[i] = (uint64_t)(gethrtime() - t0);
+			sum += lat[i];
+		}
+	}
+	mutex_enter(&tq->tq_lock);
+	tq->tq_last_ns = gethrtime();
+	mutex_exit(&tq->tq_lock);
+	tq->tq_posted = posted;
+	tq->tq_post_calls = calls;
+	if (ret == 0)
+		rdmat_lat_stats(rr, lat, n, sum);
+out:
+	if (mr != NULL && ret != 0 &&
+	    rdmat_count(tq, &tq->tq_reg_done) < posted) {
+		tq->tq_bmr = mr;
+		mr = NULL;
+	}
+	if (mr != NULL && (r = rdk_dereg_mr(mr)) != 0 && ret == 0)
+		ret = r;
+	if (ck != NULL)
+		kmem_free(ck, sizeof (*ck) * nc);
 	rdmat_lat_free(lat, n);
 	return (ret);
 }
