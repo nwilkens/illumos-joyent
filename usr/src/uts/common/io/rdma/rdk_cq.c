@@ -122,15 +122,16 @@ rdk_cq_process(struct rdk_cq *cq, struct rdk_wc *wcs, int budget)
 	boolean_t dying;
 	void *old;
 
+	/* A direct poll has only rcp_runner to keep rdk_free_cq() waiting. */
+	mutex_enter(&cp->rcp_lock);
+	cp->rcp_runner = curthread;
+	mutex_exit(&cp->rcp_lock);
 	for (;;) {
 		want = RDK_CQ_BATCH;
 		if (budget >= 0)
 			want = MIN(want, budget - done);
 		if (want <= 0)
 			break;
-		mutex_enter(&cp->rcp_lock);
-		cp->rcp_runner = curthread;
-		mutex_exit(&cp->rcp_lock);
 		n = rdk_poll_cq(cq, want, wcs);
 		old = rdk_cb_enter(cq);
 		for (i = 0; i < n; i++) {
@@ -141,17 +142,20 @@ rdk_cq_process(struct rdk_cq *cq, struct rdk_wc *wcs, int budget)
 		}
 		rdk_cb_exit(old);
 		mutex_enter(&cp->rcp_lock);
-		cp->rcp_runner = NULL;
 		cp->rcp_batches++;
 		dying = cp->rcp_dying;
 		cv_broadcast(&cp->rcp_cv);
 		mutex_exit(&cp->rcp_lock);
 		if (n > 0)
 			done += n;
-		/* A done() that freed the CQ may let it go once we unlock. */
 		if (n < want || dying)
 			break;
 	}
+	/* A done() that freed the CQ may let it go once we unlock. */
+	mutex_enter(&cp->rcp_lock);
+	cp->rcp_runner = NULL;
+	cv_broadcast(&cp->rcp_cv);
+	mutex_exit(&cp->rcp_lock);
 	return (done);
 }
 
