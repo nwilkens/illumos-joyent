@@ -353,6 +353,67 @@ nvmf_send_controller_data(struct nvmf_capsule *nc, uint32_t data_offset,
 	    len));
 }
 
+/*
+ * send_controller_data_io for a transport that has only the mblk op.  The op
+ * runs to completion here, so the callback runs before this returns.
+ */
+static int
+nvmf_send_data_sync(struct nvmf_capsule *nc, uint32_t data_offset,
+    const struct nvmf_send_request *req, const nvme_cqe_t *final_cqe)
+{
+	struct nvmf_capsule *rc;
+	nvme_cqe_t cqe;
+	mblk_t *mp;
+	uint_t status;
+
+	mp = allocb(req->nsr_len, BPRI_MED);
+	if (mp == NULL)
+		return (ENOMEM);
+	nvmf_memdesc_copyout(&req->nsr_mem, 0, mp->b_wptr, req->nsr_len);
+	mp->b_wptr += req->nsr_len;
+	status = nvmf_send_controller_data(nc, data_offset, mp, req->nsr_len);
+
+	if (final_cqe != NULL && status != NVMF_SUCCESS_SENT) {
+		cqe = *final_cqe;
+		if (status != NVME_CQE_SC_GEN_SUCCESS) {
+			/* NVMF_MORE: the SGL is longer than the data. */
+			if (status == NVMF_MORE)
+				status = NVME_CQE_SC_GEN_INV_DSGL_LEN;
+			cqe.cqe_sf.sf_sct = NVME_CQE_SCT_GENERIC;
+			cqe.cqe_sf.sf_sc = (uint8_t)status;
+		}
+		rc = nvmf_allocate_response(nc->nc_qpair, &cqe, KM_SLEEP);
+		(void) nvmf_transmit_capsule(rc);
+		nvmf_free_capsule(rc);
+		if (status == NVME_CQE_SC_GEN_SUCCESS)
+			status = NVMF_SUCCESS_SENT;
+	}
+
+	req->nsr_complete(req->nsr_complete_arg, status);
+	return (0);
+}
+
+int
+nvmf_send_controller_data_io(struct nvmf_capsule *nc, uint32_t data_offset,
+    struct nvmf_memdesc *mem, size_t len, const void *final_cqe,
+    nvmf_send_complete_t *complete_cb, void *cb_arg)
+{
+	struct nvmf_transport_ops *ops = nc->nc_qpair->nq_ops;
+	struct nvmf_send_request req;
+
+	if (len > mem->nmd_len)
+		return (EINVAL);
+	req.nsr_mem = *mem;
+	req.nsr_len = len;
+	req.nsr_complete = complete_cb;
+	req.nsr_complete_arg = cb_arg;
+	if (ops->send_controller_data_io != NULL) {
+		return (ops->send_controller_data_io(nc, data_offset, &req,
+		    final_cqe));
+	}
+	return (nvmf_send_data_sync(nc, data_offset, &req, final_cqe));
+}
+
 static void
 nvmf_memdesc_copy(const nvmf_memdesc_t *md, size_t off, uint8_t *buf,
     size_t len, boolean_t in)

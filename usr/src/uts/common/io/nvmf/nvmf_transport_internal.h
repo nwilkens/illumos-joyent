@@ -157,6 +157,14 @@ typedef struct nvmf_sgl {
 uint8_t	nvmf_sgl_decode(const nvme_sqe_t *sqe, size_t icd_len,
     uint64_t max_len, nvmf_sgl_t *sgl);
 
+/* Data for a controller-to-host transfer, as a transport receives it. */
+struct nvmf_send_request {
+	nvmf_memdesc_t		nsr_mem;
+	size_t			nsr_len;
+	nvmf_send_complete_t	*nsr_complete;
+	void			*nsr_complete_arg;
+};
+
 struct nvmf_transport_ops {
 	/* Queue pair management. */
 	struct nvmf_qpair *(*allocate_qpair)(boolean_t controller,
@@ -182,6 +190,16 @@ struct nvmf_transport_ops {
 	    uint32_t data_offset, struct nvmf_io_request *io);
 	uint_t (*send_controller_data)(struct nvmf_capsule *nc,
 	    uint32_t data_offset, mblk_t *mp, size_t len);
+
+	/*
+	 * Optional.  Send data and, if final_cqe is not NULL, the response
+	 * after it; see nvmf_send_controller_data_io().  The transport copies
+	 * *req and *final_cqe.  Without this op the core copies the data into
+	 * an mblk and calls send_controller_data().
+	 */
+	int (*send_controller_data_io)(struct nvmf_capsule *nc,
+	    uint32_t data_offset, const struct nvmf_send_request *req,
+	    const nvme_cqe_t *final_cqe);
 
 	nvmf_trtype_t trtype;
 	int priority;

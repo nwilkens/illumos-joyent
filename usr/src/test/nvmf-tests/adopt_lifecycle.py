@@ -19,6 +19,8 @@ struct nvmf_capsule;
 struct nvmf_io_request;
 typedef void nvmf_qpair_error_t(void *, int);
 typedef void nvmf_capsule_receive_t(void *, struct nvmf_capsule *);
+struct nvmf_send_request;
+typedef struct { uint64_t opaque[2]; } nvme_cqe_t;
 int nvlist_lookup_boolean_value(nvlist_t *, const char *, boolean_t *);
 """, struct(internal, "nvmf_transport_ops"),
         struct(internal, "nvmf_qpair"), text[start:end]]

@@ -366,6 +366,8 @@ void	nvmft_qpair_data_rele(struct nvmft_qpair *qp, struct nvmf_qpair *nq);
 void	nvmft_command_completed(struct nvmft_qpair *qp,
 	    struct nvmf_capsule *nc);
 int	nvmft_send_response(struct nvmft_qpair *qp, const void *cqe);
+void	nvmft_prepare_response(struct nvmft_qpair *qp, void *cqe);
+int	nvmft_transmit_response(struct nvmft_qpair *qp, const void *cqe);
 void	nvmft_init_cqe(void *cqe, struct nvmf_capsule *nc, uint16_t status);
 int	nvmft_send_error(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 	    uint8_t sc_type, uint8_t sc_status);

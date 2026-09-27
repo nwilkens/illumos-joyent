@@ -62,6 +62,7 @@
 #include <sys/ddi.h>
 #include <sys/sunddi.h>
 #include <sys/stream.h>
+#include <sys/atomic.h>
 #include <sys/scsi/scsi.h>
 #include <sys/scsi/generic/commands.h>
 #include <sys/scsi/generic/status.h>
@@ -176,13 +177,32 @@ static stmf_dbuf_store_t *nvmft_dbuf_store_create(void);
 static void nvmft_dbuf_store_destroy(stmf_dbuf_store_t *ds);
 
 /*
- * Per-transfer state for an in-flight WRITE (H2C) datamove.  The transport
- * receive callback runs asynchronously and uses this to complete the dbuf.
+ * State of the transfer in flight on one dbuf.  The thread that submits it and
+ * the transport completion race; whichever arrives second finishes it, so the
+ * submitter has dropped its qpair reference before STMF can free the task.
  */
+#define	NVMFT_XFER_SUBMITTED	0x1
+#define	NVMFT_XFER_COMPLETED	0x2
+
 typedef struct nvmft_xfer {
 	scsi_task_t	*nx_task;
 	stmf_data_buf_t	*nx_dbuf;
+	volatile uint_t	nx_state;
+	uint_t		nx_status;
+	boolean_t	nx_to_rport;
+	boolean_t	nx_final;	/* the transport sends the response */
+	nvme_cqe_t	nx_cqe;
 } nvmft_xfer_t;
+
+/* Per-dbuf private state of the dbuf store. */
+#define	NVMFT_DBUF_MAGIC	0x6e766474	/* "nvdt" */
+
+typedef struct nvmft_dbuf_priv {
+	uint32_t	ndp_magic;
+	uint32_t	ndp_size;
+	void		*ndp_buf;
+	nvmft_xfer_t	ndp_xfer;
+} nvmft_dbuf_priv_t;
 
 /*
  * ============================================================================
@@ -1059,37 +1079,6 @@ nvmft_terminate_commands(nvmft_controller_t *ctrlr)
  * ============================================================================
  */
 
-/*
- * Build an mblk chain holding the db_data_size bytes of dbuf's sglist, for
- * transmission to the host (C2H / READ).  The bytes are copied out of the
- * sglist buffers, mirroring FreeBSD nvmft_copy_data(); the dbuf's storage is
- * left intact and reclaimed by stmf_data_xfer_done().
- */
-static mblk_t *
-nvmft_dbuf_to_mblk(stmf_data_buf_t *dbuf)
-{
-	mblk_t *mp;
-	uint8_t *dst;
-	uint32_t resid = dbuf->db_data_size;
-	uint16_t i;
-
-	mp = allocb(resid, BPRI_MED);
-	if (mp == NULL)
-		return (NULL);
-	dst = mp->b_wptr;
-	for (i = 0; i < dbuf->db_sglist_length && resid != 0; i++) {
-		uint32_t todo = dbuf->db_sglist[i].seg_length;
-
-		if (todo > resid)
-			todo = resid;
-		bcopy(dbuf->db_sglist[i].seg_addr, dst, todo);
-		dst += todo;
-		resid -= todo;
-	}
-	mp->b_wptr = dst;
-	return (mp);
-}
-
 CTASSERT(sizeof (nvmf_seg_t) == sizeof (stmf_sglist_ent_t));
 CTASSERT(offsetof(nvmf_seg_t, nsg_len) ==
     offsetof(stmf_sglist_ent_t, seg_length));
@@ -1112,40 +1101,93 @@ nvmft_dbuf_to_memdesc(stmf_data_buf_t *dbuf, nvmf_memdesc_t *mem)
 	mem->nmd_u.nmd_sgl.nmd_nsegs = dbuf->db_sglist_length;
 }
 
-/*
- * Transport receive completion for an H2C (WRITE) datamove.  Runs from the
- * transport (possibly before nvmf_receive_controller_data() returns).  Mirrors
- * FreeBSD nvmft_datamove_out_cb(): translate the error, free the wrapping
- * resources, and hand the dbuf back to STMF.
- */
+static boolean_t
+nvmft_xfer_arrive(nvmft_xfer_t *nx, uint_t who)
+{
+	uint_t both = NVMFT_XFER_SUBMITTED | NVMFT_XFER_COMPLETED;
+
+	membar_producer();
+	if (atomic_or_uint_nv(&nx->nx_state, who) != both)
+		return (B_FALSE);
+	membar_consumer();
+	return (B_TRUE);
+}
+
+/* Hand the dbuf back to STMF.  (FreeBSD: nvmft_datamove_*_cb.) */
+static void
+nvmft_xfer_finish(nvmft_xfer_t *nx)
+{
+	scsi_task_t *task = nx->nx_task;
+	stmf_data_buf_t *dbuf = nx->nx_dbuf;
+	nvmft_task_priv_t *priv = task->task_port_private;
+	uint32_t iof = 0;
+
+	if (!nx->nx_to_rport) {
+		dbuf->db_xfer_status = (nx->nx_status == 0) ? STMF_SUCCESS :
+		    STMF_FAILURE;
+		stmf_data_xfer_done(task, dbuf, 0);
+		return;
+	}
+
+	switch (nx->nx_status) {
+	case NVMF_SUCCESS_SENT:
+		/*
+		 * The response is on the wire, either our final_cqe or success
+		 * folded into the data (the TCP SUCCESS flag).  If the LU put
+		 * status in this dbuf it calls stmf_task_lu_done(), which needs
+		 * the port to have released the task already.
+		 */
+		if (!nx->nx_final)
+			nvmft_command_completed(priv->ntp_qp, priv->ntp_nc);
+		priv->ntp_success_sent = B_TRUE;
+		dbuf->db_xfer_status = STMF_SUCCESS;
+		if (dbuf->db_flags & DB_SEND_STATUS_GOOD)
+			iof = STMF_IOF_LPORT_DONE;
+		break;
+	case NVME_CQE_SC_GEN_SUCCESS:
+	case NVMF_MORE:
+		ASSERT(!nx->nx_final);
+		dbuf->db_xfer_status = STMF_SUCCESS;
+		break;
+	default:
+		dbuf->db_xfer_status = STMF_FAILURE;
+		if (nx->nx_final) {
+			priv->ntp_success_sent = B_TRUE;
+			iof = STMF_IOF_LPORT_DONE;
+		}
+		break;
+	}
+	stmf_data_xfer_done(task, dbuf, iof);
+}
+
+static void
+nvmft_datamove_out_cb(void *arg, uint_t status)
+{
+	nvmft_xfer_t *nx = arg;
+
+	nx->nx_status = status;
+	if (nvmft_xfer_arrive(nx, NVMFT_XFER_COMPLETED))
+		nvmft_xfer_finish(nx);
+}
+
 static void
 nvmft_datamove_in_cb(void *arg, size_t xfered, int error)
 {
 	nvmft_xfer_t *nx = arg;
-	scsi_task_t *task = nx->nx_task;
-	stmf_data_buf_t *dbuf = nx->nx_dbuf;
 
-	kmem_free(nx, sizeof (*nx));
-
-	if (error != 0) {
-		dbuf->db_xfer_status = STMF_FAILURE;
-	} else {
-		VERIFY3U(xfered, ==, dbuf->db_data_size);
-		dbuf->db_xfer_status = STMF_SUCCESS;
-	}
-	stmf_data_xfer_done(task, dbuf, 0);
+	if (error == 0 && xfered != nx->nx_dbuf->db_data_size)
+		error = EIO;
+	nx->nx_status = (uint_t)error;
+	if (nvmft_xfer_arrive(nx, NVMFT_XFER_COMPLETED))
+		nvmft_xfer_finish(nx);
 }
 
 /*
  * STMF calls lport_xfer_data() to move one dbuf either to (C2H, READ) or from
- * (H2C, WRITE) the remote host.  We translate the dbuf's sglist into an mblk
- * chain / memdesc and hand it to the transport's send/receive controller-data
- * API.
- *
- * Modeled on srpt_stp_xfer_data(), but instead of posting RDMA work requests we
- * drive nvmf_send_controller_data() (C2H) or nvmf_receive_controller_data()
- * (H2C).  Over TCP this copies between the dbuf and socket mblks; over RDMA
- * (Phase 4) the same seam becomes an RDMA WRITE/READ (NVMEOF.md 7.1 / 8).
+ * (H2C, WRITE) the remote host.  We describe the dbuf's sglist as a memdesc
+ * and hand it to nvmf_send_controller_data_io() (C2H) or
+ * nvmf_receive_controller_data() (H2C).  Both complete asynchronously.  When
+ * the LU puts good status in the dbuf, the transport also sends the response.
  *
  * For C2H the transport requires each chunk's db_relative_offset to be
  * sequential and contiguous over the whole command, and only folds the implicit
@@ -1161,9 +1203,13 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 	struct nvmf_capsule *nc;
 	struct nvmft_qpair *qp;
 	struct nvmf_qpair *nq;
+	nvmft_dbuf_priv_t *ndp;
+	nvmft_xfer_t *nx = NULL;
+	nvmf_memdesc_t mem;
 	stmf_status_t ret;
-	boolean_t do_xfer_done = B_FALSE;
+	boolean_t do_xfer_done = B_FALSE, submitted = B_FALSE;
 	uint32_t xfer_iof = 0;
+	int error;
 
 	_NOTE(ARGUNUSED(ioflags));
 
@@ -1234,11 +1280,10 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 	 * shut down, fail the dbuf back to STMF (iof=0, as in the synchronous
 	 * failure path below) so STMF completes the task -- via abort or
 	 * lport_send_status(), which finds the qpair gone -- instead of touching a
-	 * freed qpair.  An H2C receive only needs the reference to span
-	 * registering the transfer: its async completion (nvmft_datamove_in_cb)
-	 * touches no qpair state, and freeing the qpair aborts any still-registered
-	 * receive (tcp_free_qpair -> nvmf_complete_io_request), which is what lets
-	 * the controller drain.
+	 * freed qpair.  The reference only needs to span submitting the
+	 * transfer: its completion touches no transport state, and freeing the
+	 * qpair completes any transfer still registered (tcp_free_qpair ->
+	 * nvmf_complete_io_request), which is what lets the controller drain.
 	 */
 	nq = nvmft_qpair_data_hold(qp);
 	if (nq == NULL) {
@@ -1247,110 +1292,59 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 		return (STMF_SUCCESS);
 	}
 
+	ndp = dbuf->db_port_private;
+	if (ndp == NULL || ndp->ndp_magic != NVMFT_DBUF_MAGIC) {
+		ret = STMF_FAILURE;
+		goto done;
+	}
+	nx = &ndp->ndp_xfer;
+	bzero(nx, sizeof (*nx));
+	nx->nx_task = task;
+	nx->nx_dbuf = dbuf;
+	nvmft_dbuf_to_memdesc(dbuf, &mem);
+
 	if (dbuf->db_flags & DB_DIRECTION_TO_RPORT) {
 		/* C2H: send controller data (READ). */
-		mblk_t *mp;
-		uint_t status;
-
-		mp = nvmft_dbuf_to_mblk(dbuf);
-		if (mp == NULL) {
+		nx->nx_to_rport = B_TRUE;
+		nx->nx_final = (dbuf->db_flags & DB_SEND_STATUS_GOOD) != 0;
+		if (nx->nx_final) {
+			nvmft_init_cqe(&nx->nx_cqe, nc, 0);
+			nvmft_prepare_response(qp, &nx->nx_cqe);
+		}
+		error = nvmf_send_controller_data_io(nc,
+		    dbuf->db_relative_offset, &mem, dbuf->db_data_size,
+		    nx->nx_final ? &nx->nx_cqe : NULL, nvmft_datamove_out_cb,
+		    nx);
+		if (error != 0 && nx->nx_final) {
+			/* The response is ours to send after all. */
+			nx->nx_cqe.cqe_sf.sf_sct = NVME_CQE_SCT_GENERIC;
+			nx->nx_cqe.cqe_sf.sf_sc = NVME_CQE_SC_GEN_DATA_XFR_ERR;
+			(void) nvmft_transmit_response(qp, &nx->nx_cqe);
+			priv->ntp_success_sent = B_TRUE;
+			dbuf->db_xfer_status = STMF_FAILURE;
+			xfer_iof = STMF_IOF_LPORT_DONE;
+			do_xfer_done = B_TRUE;
+			ret = STMF_SUCCESS;
+			goto done;
+		}
+		if (error != 0) {
 			ret = STMF_ALLOC_FAILURE;
 			goto done;
 		}
-
-		status = nvmf_send_controller_data(nc,
-		    dbuf->db_relative_offset, mp, dbuf->db_data_size);
-		switch (status) {
-		case NVMF_SUCCESS_SENT:
-			/*
-			 * The transport sent an implicit success CQE (e.g. the
-			 * TCP SUCCESS flag) folded into the final C2H PDU; no
-			 * response capsule is needed for this command.
-			 */
-			priv->ntp_success_sent = B_TRUE;
-			nvmft_command_completed(qp, nc);
-			dbuf->db_xfer_status = STMF_SUCCESS;
-			/*
-			 * If the LU collapsed status into this final (zero-copy)
-			 * data buffer it will call stmf_task_lu_done(), which
-			 * panics if the port has not already released the task.
-			 * Complete with STMF_IOF_LPORT_DONE so STMF clears
-			 * ITASK_KNOWN_TO_TGT_PORT before the LU finishes.
-			 */
-			if (dbuf->db_flags & DB_SEND_STATUS_GOOD) {
-				xfer_iof = STMF_IOF_LPORT_DONE;
-				do_xfer_done = B_TRUE;
-				ret = STMF_SUCCESS;
-				goto done;
-			}
-			break;
-		case NVME_CQE_SC_GEN_SUCCESS:
-			/*
-			 * Final chunk delivered, but the transport did NOT fold
-			 * an implicit success CQE -- the host negotiated SQ flow
-			 * control.  When stmf_sbd collapses status into the
-			 * final (zero-copy) data buffer it calls
-			 * stmf_task_lu_done() rather than lport_send_status(),
-			 * so the completion would never reach the host and the
-			 * READ would hang.  Emit the CQE here in that case;
-			 * otherwise lport_send_status() emits it.
-			 */
-			dbuf->db_xfer_status = STMF_SUCCESS;
-			if (dbuf->db_flags & DB_SEND_STATUS_GOOD) {
-				nvme_cqe_t cpl;
-				const nvme_sqe_t *scmd = nvmf_capsule_sqe(nc);
-
-				(void) bzero(&cpl, sizeof (cpl));
-				cpl.cqe_cid = scmd->sqe_cid;
-				cpl.cqe_sf.sf_sct = NVME_CQE_SCT_GENERIC;
-				cpl.cqe_sf.sf_sc = NVME_CQE_SC_GEN_SUCCESS;
-				priv->ntp_success_sent = B_TRUE;
-				(void) nvmft_send_response(qp, &cpl);
-				xfer_iof = STMF_IOF_LPORT_DONE;
-				do_xfer_done = B_TRUE;
-				ret = STMF_SUCCESS;
-				goto done;
-			}
-			break;
-		case NVMF_MORE:
-			dbuf->db_xfer_status = STMF_SUCCESS;
-			break;
-		default:
-			dbuf->db_xfer_status = STMF_FAILURE;
-			break;
-		}
-		/*
-		 * nvmf_send_controller_data() consumed the mblk chain.  The
-		 * transfer is complete synchronously for the send path.
-		 */
-		do_xfer_done = B_TRUE;
-		ret = STMF_SUCCESS;
-		goto done;
 	} else {
 		/* H2C: receive controller data (WRITE). */
-		nvmft_xfer_t *nx;
-		nvmf_memdesc_t mem;
-		int error;
-
-		nvmft_dbuf_to_memdesc(dbuf, &mem);
-		nx = kmem_zalloc(sizeof (*nx), KM_SLEEP);
-		nx->nx_task = task;
-		nx->nx_dbuf = dbuf;
-
 		error = nvmf_receive_controller_data(nc,
 		    dbuf->db_relative_offset, &mem, dbuf->db_data_size,
 		    nvmft_datamove_in_cb, nx);
 		if (error != 0) {
-			kmem_free(nx, sizeof (*nx));
 			(void) nvmft_printf(nvmft_qpair_ctrlr(qp),
 			    "Failed to request capsule data: 0x%x\n", error);
 			ret = STMF_FAILURE;
 			goto done;
 		}
-		/* Completion is asynchronous via nvmft_datamove_in_cb(). */
-		ret = STMF_SUCCESS;
-		goto done;
 	}
+	submitted = B_TRUE;
+	ret = STMF_SUCCESS;
 
 done:
 	/*
@@ -1363,6 +1357,8 @@ done:
 	 * still alive.
 	 */
 	nvmft_qpair_data_rele(qp, nq);
+	if (submitted && nvmft_xfer_arrive(nx, NVMFT_XFER_SUBMITTED))
+		nvmft_xfer_finish(nx);
 	if (do_xfer_done)
 		stmf_data_xfer_done(task, dbuf, xfer_iof);
 	return (ret);
@@ -1833,12 +1829,6 @@ nvmft_free_scsi_devid_desc(scsi_devid_desc_t *sdd)
  * the same store with registered memory.)
  */
 
-/* Per-dbuf private state: remembers the kmem buffer to free. */
-typedef struct nvmft_dbuf_priv {
-	void		*ndp_buf;
-	uint32_t	ndp_size;
-} nvmft_dbuf_priv_t;
-
 /* ARGSUSED */
 static stmf_data_buf_t *
 nvmft_dbuf_alloc(scsi_task_t *task, uint32_t size, uint32_t *pminsize,
@@ -1864,6 +1854,7 @@ nvmft_dbuf_alloc(scsi_task_t *task, uint32_t size, uint32_t *pminsize,
 	}
 
 	ndp = dbuf->db_port_private;
+	ndp->ndp_magic = NVMFT_DBUF_MAGIC;
 	ndp->ndp_buf = buf;
 	ndp->ndp_size = size;
 

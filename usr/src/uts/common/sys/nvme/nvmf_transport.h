@@ -204,6 +204,27 @@ uint_t	nvmf_send_controller_data(struct nvmf_capsule *nc,
 #define	NVMF_SUCCESS_SENT	0x100
 #define	NVMF_MORE		0x101
 
+/*
+ * Completion of nvmf_send_controller_data_io().  The status is one of the
+ * values nvmf_send_controller_data() returns.
+ */
+typedef void nvmf_send_complete_t(void *, uint_t);
+
+/*
+ * Asynchronous form of nvmf_send_controller_data().  If this returns 0, the
+ * callback runs exactly once, possibly before this returns.  If it returns an
+ * error, nothing was sent and the callback does not run.
+ *
+ * If final_cqe is not NULL, the data is the last of the command and the
+ * transport also sends the response: final_cqe after the data, or an error
+ * response with the same CID and SQHD if the data could not be sent.  The
+ * caller must not send another response, and the callback reports
+ * NVMF_SUCCESS_SENT or the error.
+ */
+int	nvmf_send_controller_data_io(struct nvmf_capsule *nc,
+    uint32_t data_offset, struct nvmf_memdesc *mem, size_t len,
+    const void *final_cqe, nvmf_send_complete_t *complete_cb, void *cb_arg);
+
 /* Helper APIs for nvlists used in ioctls. */
 
 /*

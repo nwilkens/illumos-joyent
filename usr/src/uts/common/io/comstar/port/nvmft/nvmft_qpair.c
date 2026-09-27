@@ -588,8 +588,21 @@ nvmft_max_ioccsz(struct nvmft_qpair *qp)
 	return (nvmf_max_ioccsz(qp->qp_qp));
 }
 
+/* Called with qp_lock held. */
+static void
+nvmft_stamp_sqhd(struct nvmft_qpair *qp, nvme_cqe_t *cpl)
+{
+	ASSERT(MUTEX_HELD(&qp->qp_lock));
+	if (qp->qp_sq_flow_control) {
+		qp->qp_sqhd = (qp->qp_sqhd + 1) % qp->qp_qsize;
+		cpl->cqe_sqhd = LE_16(qp->qp_sqhd);
+	} else {
+		cpl->cqe_sqhd = 0;
+	}
+}
+
 static int
-_nvmft_send_response(struct nvmft_qpair *qp, const void *cqe)
+nvmft_transmit_cqe(struct nvmft_qpair *qp, const void *cqe, boolean_t stamp)
 {
 	nvme_cqe_t cpl;
 	struct nvmf_qpair *nq;
@@ -605,14 +618,8 @@ _nvmft_send_response(struct nvmft_qpair *qp, const void *cqe)
 		return (ENOTCONN);
 	}
 	qp->qp_refs++;
-
-	/* Set SQHD. */
-	if (qp->qp_sq_flow_control) {
-		qp->qp_sqhd = (qp->qp_sqhd + 1) % qp->qp_qsize;
-		cpl.cqe_sqhd = LE_16(qp->qp_sqhd);
-	} else {
-		cpl.cqe_sqhd = 0;
-	}
+	if (stamp)
+		nvmft_stamp_sqhd(qp, &cpl);
 	mutex_exit(&qp->qp_lock);
 
 	rc = nvmf_allocate_response(nq, &cpl, KM_SLEEP);
@@ -625,6 +632,35 @@ _nvmft_send_response(struct nvmft_qpair *qp, const void *cqe)
 	if (free_it)
 		nvmf_free_qpair(nq);
 	return (error);
+}
+
+static int
+_nvmft_send_response(struct nvmft_qpair *qp, const void *cqe)
+{
+	return (nvmft_transmit_cqe(qp, cqe, B_TRUE));
+}
+
+/*
+ * Retire the CID of a response and stamp its SQHD, for a response that the
+ * transport sends after the command's data.  The caller must send it once,
+ * with nvmft_transmit_response() if the transport did not take it.
+ */
+void
+nvmft_prepare_response(struct nvmft_qpair *qp, void *cqe)
+{
+	nvme_cqe_t *cpl = cqe;
+
+	mutex_enter(&qp->qp_lock);
+	ASSERT(BT_TEST(qp->qp_cids, cpl->cqe_cid));
+	BT_CLEAR(qp->qp_cids, cpl->cqe_cid);
+	nvmft_stamp_sqhd(qp, cpl);
+	mutex_exit(&qp->qp_lock);
+}
+
+int
+nvmft_transmit_response(struct nvmft_qpair *qp, const void *cqe)
+{
+	return (nvmft_transmit_cqe(qp, cqe, B_FALSE));
 }
 
 /*
