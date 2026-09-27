@@ -273,6 +273,18 @@ irdma_gid_ip(const rdk_gid_t *gid, uint32_t *ip)
 }
 
 /*
+ * The EUI-64 of the port's MAC, as Linux irdma makes the node and system
+ * image GUIDs (addrconf_addr_eui48()); the IB CM tells peers apart by it.
+ */
+static uint64_t
+irdma_node_guid(const uint8_t *mac)
+{
+	return ((uint64_t)(mac[0] ^ 2) << 56 | (uint64_t)mac[1] << 48 |
+	    (uint64_t)mac[2] << 40 | 0xfffeULL << 24 |
+	    (uint64_t)mac[3] << 16 | (uint64_t)mac[4] << 8 | mac[5]);
+}
+
+/*
  * The device and port.
  */
 static int
@@ -286,11 +298,7 @@ irdma_query_device(struct rdk_device *rdev, struct rdk_device_attr *a)
 	bzero(a, sizeof (*a));
 	a->fw_ver = (FIELD_GET(IRDMA_FW_VER_MAJOR, fw) << 32) |
 	    FIELD_GET(IRDMA_FW_VER_MINOR, fw);
-	/* EUI-64 from the MAC, as Linux does for the system image GUID. */
-	a->sys_image_guid = ((uint64_t)(mac[0] ^ 2) << 56) |
-	    ((uint64_t)mac[1] << 48) | ((uint64_t)mac[2] << 40) |
-	    (0xfffeULL << 24) | ((uint64_t)mac[3] << 16) |
-	    ((uint64_t)mac[4] << 8) | mac[5];
+	a->sys_image_guid = irdma_node_guid(mac);
 	a->max_mr_size = hw->max_mr_size;
 	a->page_size_cap = PAGESIZE;
 	a->vendor_id = 0x8086;
@@ -705,7 +713,7 @@ irdma_verbs_register(irdma_t *irdma)
 	rdev->rd_dip = irdma->irdma_dip;
 	rdev->rd_ops = &irdma_rdk_ops;
 	rdev->rd_phys_port_cnt = 1;
-	rdev->rd_node_guid = 0;
+	rdev->rd_node_guid = irdma_node_guid(irdma->irdma_info.iri_mac);
 	rdev->rd_num_comp_vectors = irdma->irdma_nceqs;
 	if ((ret = rdk_register_device(rdev)) != 0) {
 		irdma_error(irdma, "failed to register with rdmak: %d", ret);
