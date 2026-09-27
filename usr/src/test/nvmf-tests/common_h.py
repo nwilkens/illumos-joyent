@@ -98,4 +98,7 @@ static inline void list_remove(list_t *l, void *o) {
 	a->next->prev = a->prev; a->next = a->prev = NULL; }
 static inline void *list_remove_head(list_t *l) { void *o = list_head(l);
 	if (o != NULL) list_remove(l, o); return (o); }
+static inline void list_move_tail(list_t *dst, list_t *src) {
+	void *o; while ((o = list_remove_head(src)) != NULL)
+	list_insert_tail(dst, o); }
 """

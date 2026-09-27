@@ -271,6 +271,8 @@ struct nvmf_io_request {
 	void	*io_complete_arg;
 };
 
+#define	NVMF_CAPSULE_CONSUMER_WORDS	12
+
 /*
  * Fabrics Command and Response Capsules.  The Fabrics host
  * (initiator) and controller (target) drivers work with capsules that
@@ -294,7 +296,12 @@ struct nvmf_capsule {
 
 	boolean_t	nc_send_data;
 	struct nvmf_io_request nc_data;
+
+	/* Per-command state of the consumer, so it need not allocate. */
+	uint64_t	nc_consumer[NVMF_CAPSULE_CONSUMER_WORDS];
 };
+
+#define	NVMF_CAPSULE_CONSUMER(nc)	((void *)(nc)->nc_consumer)
 
 /*
  * Register a qpair that the transport created in the kernel, as the handoff

@@ -98,6 +98,7 @@
 typedef struct nvmft_task_priv {
 	struct nvmf_capsule	*ntp_nc;
 	struct nvmft_qpair	*ntp_qp;
+	list_node_t		ntp_link;	/* ctrlr_deferred */
 	boolean_t		ntp_success_sent;
 	/*
 	 * Transfers the transport holds for this task.  STMF frees the dbufs
@@ -147,16 +148,37 @@ uint_t nvmft_max_pending_commands = 8192;
 uint64_t nvmft_max_pending_bytes = 1024ULL * 1024 * 1024;	/* 1 GiB */
 
 /*
- * A command deferred by the in-flight cap above.  Holds just enough to post the
- * STMF task later: the Fabrics capsule and the qpair it arrived on.  Queued on
- * nvmft_controller_t.ctrlr_deferred under ctrlr_lock.
+ * A host command's task private lives in its capsule, so the receive path does
+ * not allocate.  Commands deferred by the in-flight cap above wait on
+ * ctrlr_deferred, linked through ntp_link.
  */
-typedef struct nvmft_deferred_cmd {
-	list_node_t		ndc_link;
-	struct nvmft_qpair	*ndc_qp;
-	struct nvmf_capsule	*ndc_nc;
-	uint32_t		ndc_data_len;
-} nvmft_deferred_cmd_t;
+CTASSERT(sizeof (nvmft_task_priv_t) <=
+    sizeof (((struct nvmf_capsule *)0)->nc_consumer));
+
+static nvmft_task_priv_t *
+nvmft_task_priv_init(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
+    uint32_t data_len)
+{
+	nvmft_task_priv_t *priv = NVMF_CAPSULE_CONSUMER(nc);
+
+	bzero(priv, sizeof (*priv));
+	priv->ntp_nc = nc;
+	priv->ntp_qp = qp;
+	priv->ntp_data_len = data_len;
+	mutex_init(&priv->ntp_lock, NULL, MUTEX_DRIVER, NULL);
+	return (priv);
+}
+
+/* Free a host command's capsule, and with it the task private. */
+static void
+nvmft_task_priv_free(nvmft_task_priv_t *priv)
+{
+	struct nvmf_capsule *nc = priv->ntp_nc;
+
+	ASSERT0(priv->ntp_xfers);
+	mutex_destroy(&priv->ntp_lock);
+	nvmf_free_capsule(nc);
+}
 
 /* lport ops (modeled on srpt_stp.c). */
 static stmf_status_t nvmft_lport_xfer_data(scsi_task_t *task,
@@ -800,17 +822,17 @@ nvmft_should_defer(nvmft_controller_t *ctrlr, uint32_t data_len)
  * posts the returned command (via nvmft_post_command) after dropping the lock.
  * Returns NULL when the queue is empty or still over a cap.
  */
-static nvmft_deferred_cmd_t *
+static nvmft_task_priv_t *
 nvmft_admit_one_deferred(nvmft_controller_t *ctrlr)
 {
-	nvmft_deferred_cmd_t *d;
+	nvmft_task_priv_t *d;
 
 	ASSERT(MUTEX_HELD(&ctrlr->ctrlr_lock));
 
 	if (ctrlr->ctrlr_deferred_commands == 0)
 		return (NULL);
 	d = list_head(&ctrlr->ctrlr_deferred);
-	if (nvmft_should_defer(ctrlr, d->ndc_data_len))
+	if (nvmft_should_defer(ctrlr, d->ntp_data_len))
 		return (NULL);
 
 	list_remove(&ctrlr->ctrlr_deferred, d);
@@ -818,7 +840,7 @@ nvmft_admit_one_deferred(nvmft_controller_t *ctrlr)
 	if (ctrlr->ctrlr_pending_commands == 0)
 		ctrlr->ctrlr_start_busy = gethrtime();
 	ctrlr->ctrlr_pending_commands++;
-	ctrlr->ctrlr_pending_bytes += d->ndc_data_len;
+	ctrlr->ctrlr_pending_bytes += d->ntp_data_len;
 	return (d);
 }
 
@@ -826,8 +848,8 @@ nvmft_admit_one_deferred(nvmft_controller_t *ctrlr)
 void
 nvmft_deferred_init(nvmft_controller_t *ctrlr)
 {
-	list_create(&ctrlr->ctrlr_deferred, sizeof (nvmft_deferred_cmd_t),
-	    offsetof(nvmft_deferred_cmd_t, ndc_link));
+	list_create(&ctrlr->ctrlr_deferred, sizeof (nvmft_task_priv_t),
+	    offsetof(nvmft_task_priv_t, ntp_link));
 }
 
 /*
@@ -841,20 +863,18 @@ void
 nvmft_deferred_drain(nvmft_controller_t *ctrlr)
 {
 	list_t drain;
-	nvmft_deferred_cmd_t *d;
+	nvmft_task_priv_t *d;
 
-	list_create(&drain, sizeof (nvmft_deferred_cmd_t),
-	    offsetof(nvmft_deferred_cmd_t, ndc_link));
+	list_create(&drain, sizeof (nvmft_task_priv_t),
+	    offsetof(nvmft_task_priv_t, ntp_link));
 
 	mutex_enter(&ctrlr->ctrlr_lock);
 	list_move_tail(&drain, &ctrlr->ctrlr_deferred);
 	ctrlr->ctrlr_deferred_commands = 0;
 	mutex_exit(&ctrlr->ctrlr_lock);
 
-	while ((d = list_remove_head(&drain)) != NULL) {
-		nvmf_free_capsule(d->ndc_nc);
-		kmem_free(d, sizeof (*d));
-	}
+	while ((d = list_remove_head(&drain)) != NULL)
+		nvmft_task_priv_free(d);
 	list_destroy(&drain);
 }
 
@@ -873,17 +893,17 @@ nvmft_deferred_fini(nvmft_controller_t *ctrlr)
  * never recursively), so the deferred queue cannot stall on a failed post.
  */
 static void
-nvmft_post_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
-    uint32_t data_len)
+nvmft_post_command(nvmft_task_priv_t *priv)
 {
-	nvmft_controller_t *ctrlr = nvmft_qpair_ctrlr(qp);
+	nvmft_controller_t *ctrlr = nvmft_qpair_ctrlr(priv->ntp_qp);
 	nvmft_port_t *np = ctrlr->ctrlr_np;
 
 	for (;;) {
+		struct nvmft_qpair *qp = priv->ntp_qp;
+		struct nvmf_capsule *nc = priv->ntp_nc;
+		uint32_t data_len = priv->ntp_data_len;
 		const nvme_sqe_t *cmd = nvmf_capsule_sqe(nc);
 		scsi_task_t *task;
-		nvmft_task_priv_t *priv;
-		nvmft_deferred_cmd_t *d;
 		uint8_t lun[8];
 
 		/*
@@ -898,11 +918,6 @@ nvmft_post_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 		task = stmf_task_alloc(np->np_lport, ctrlr->ctrlr_session, lun,
 		    16 /* cdb_length */, 0);
 		if (task != NULL) {
-			priv = kmem_zalloc(sizeof (*priv), KM_SLEEP);
-			mutex_init(&priv->ntp_lock, NULL, MUTEX_DRIVER, NULL);
-			priv->ntp_nc = nc;
-			priv->ntp_qp = qp;
-			priv->ntp_data_len = data_len;
 			task->task_port_private = priv;
 			task->task_flags |= TF_ATTR_SIMPLE_QUEUE;
 
@@ -944,7 +959,7 @@ nvmft_post_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 		 */
 		(void) nvmft_send_generic_error(qp, nc,
 		    NVME_CQE_SC_GEN_INTERNAL_ERR);
-		nvmf_free_capsule(nc);
+		nvmft_task_priv_free(priv);
 
 		mutex_enter(&ctrlr->ctrlr_lock);
 		ASSERT3U(ctrlr->ctrlr_pending_commands, >, 0);
@@ -952,15 +967,11 @@ nvmft_post_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 		ctrlr->ctrlr_pending_bytes -= data_len;
 		if (ctrlr->ctrlr_pending_commands == 0)
 			cv_signal(&ctrlr->ctrlr_pending_cv);
-		d = nvmft_admit_one_deferred(ctrlr);
+		priv = nvmft_admit_one_deferred(ctrlr);
 		mutex_exit(&ctrlr->ctrlr_lock);
 
-		if (d == NULL)
+		if (priv == NULL)
 			return;
-		qp = d->ndc_qp;
-		nc = d->ndc_nc;
-		data_len = d->ndc_data_len;
-		kmem_free(d, sizeof (*d));
 	}
 }
 
@@ -975,6 +986,7 @@ nvmft_dispatch_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 {
 	nvmft_controller_t *ctrlr = nvmft_qpair_ctrlr(qp);
 	const nvme_sqe_t *cmd = nvmf_capsule_sqe(nc);
+	nvmft_task_priv_t *priv;
 	uint32_t data_len;
 
 	_NOTE(ARGUNUSED(admin));
@@ -1016,6 +1028,7 @@ nvmft_dispatch_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 	}
 
 	data_len = (uint32_t)nvmf_capsule_data_len(nc);
+	priv = nvmft_task_priv_init(qp, nc, data_len);
 
 	mutex_enter(&ctrlr->ctrlr_lock);
 	if (nvmft_should_defer(ctrlr, data_len)) {
@@ -1027,25 +1040,9 @@ nvmft_dispatch_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 		 * out of SQ credits and paces itself; nvmft_lport_task_free()
 		 * re-dispatches it when a slot frees.
 		 */
-		nvmft_deferred_cmd_t *d = kmem_alloc(sizeof (*d), KM_NOSLEEP);
-		if (d != NULL) {
-			d->ndc_qp = qp;
-			d->ndc_nc = nc;
-			d->ndc_data_len = data_len;
-			list_insert_tail(&ctrlr->ctrlr_deferred, d);
-			ctrlr->ctrlr_deferred_commands++;
-			mutex_exit(&ctrlr->ctrlr_lock);
-			return;
-		}
-		/*
-		 * Out of memory to even queue it.  Fall back to the transient
-		 * Namespace Not Ready refusal (DNR=0) rather than dropping the
-		 * command silently.
-		 */
+		list_insert_tail(&ctrlr->ctrlr_deferred, priv);
+		ctrlr->ctrlr_deferred_commands++;
 		mutex_exit(&ctrlr->ctrlr_lock);
-		(void) nvmft_send_generic_error(qp, nc,
-		    NVME_CQE_SC_GEN_NVM_NS_NOTRDY);
-		nvmf_free_capsule(nc);
 		return;
 	}
 	if (ctrlr->ctrlr_pending_commands == 0)
@@ -1054,7 +1051,7 @@ nvmft_dispatch_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
 	ctrlr->ctrlr_pending_bytes += data_len;
 	mutex_exit(&ctrlr->ctrlr_lock);
 
-	nvmft_post_command(qp, nc, data_len);
+	nvmft_post_command(priv);
 }
 
 void
@@ -1638,7 +1635,8 @@ nvmft_lport_task_free(scsi_task_t *task)
 {
 	nvmft_task_priv_t *priv = task->task_port_private;
 	nvmft_controller_t *ctrlr;
-	nvmft_deferred_cmd_t *d;
+	nvmft_task_priv_t *d;
+	uint32_t data_len;
 
 	if (priv == NULL)
 		return;
@@ -1655,13 +1653,14 @@ nvmft_lport_task_free(scsi_task_t *task)
 	}
 
 	ctrlr = nvmft_qpair_ctrlr(priv->ntp_qp);
-	if (priv->ntp_nc != NULL)
-		nvmf_free_capsule(priv->ntp_nc);
+	data_len = priv->ntp_data_len;
+	task->task_port_private = NULL;
+	nvmft_task_priv_free(priv);
 
 	mutex_enter(&ctrlr->ctrlr_lock);
 	ASSERT3U(ctrlr->ctrlr_pending_commands, >, 0);
 	ctrlr->ctrlr_pending_commands--;
-	ctrlr->ctrlr_pending_bytes -= priv->ntp_data_len;
+	ctrlr->ctrlr_pending_bytes -= data_len;
 	if (ctrlr->ctrlr_pending_commands == 0) {
 		ctrlr->ctrlr_busy_total +=
 		    gethrtime() - ctrlr->ctrlr_start_busy;
@@ -1671,15 +1670,8 @@ nvmft_lport_task_free(scsi_task_t *task)
 	d = nvmft_admit_one_deferred(ctrlr);
 	mutex_exit(&ctrlr->ctrlr_lock);
 
-	ASSERT0(priv->ntp_xfers);
-	task->task_port_private = NULL;
-	mutex_destroy(&priv->ntp_lock);
-	kmem_free(priv, sizeof (*priv));
-
-	if (d != NULL) {
-		nvmft_post_command(d->ndc_qp, d->ndc_nc, d->ndc_data_len);
-		kmem_free(d, sizeof (*d));
-	}
+	if (d != NULL)
+		nvmft_post_command(d);
 }
 
 /*

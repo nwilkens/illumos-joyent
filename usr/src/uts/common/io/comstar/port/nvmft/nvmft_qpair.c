@@ -233,10 +233,12 @@ nvmft_receive_capsule(void *arg, struct nvmf_capsule *nc)
 	BT_SET(qp->qp_cids, cmd->sqe_cid);
 	mutex_exit(&qp->qp_lock);
 
-	if (qp->qp_admin)
-		nvmft_handle_admin_command(ctrlr, nc);
-	else
+	if (!qp->qp_admin)
 		nvmft_handle_io_command(qp, qp->qp_qid, nc);
+	else if (qp->qp_caps & NVMF_QP_CAP_NOSLEEP_RECEIVE)
+		nvmft_queue_admin_command(ctrlr, nc);
+	else
+		nvmft_handle_admin_command(ctrlr, nc);
 }
 
 static struct nvmft_qpair *
@@ -617,7 +619,7 @@ nvmft_transmit_cqe(struct nvmft_qpair *qp, const void *cqe, boolean_t stamp)
 	struct nvmf_qpair *nq;
 	struct nvmf_capsule *rc;
 	boolean_t free_it;
-	int error;
+	int error, kmflag;
 
 	(void) memcpy(&cpl, cqe, sizeof (cpl));
 	mutex_enter(&qp->qp_lock);
@@ -631,9 +633,15 @@ nvmft_transmit_cqe(struct nvmft_qpair *qp, const void *cqe, boolean_t stamp)
 		nvmft_stamp_sqhd(qp, &cpl);
 	mutex_exit(&qp->qp_lock);
 
-	rc = nvmf_allocate_response(nq, &cpl, KM_SLEEP);
-	error = nvmf_transmit_capsule(rc);
-	nvmf_free_capsule(rc);
+	kmflag = (qp->qp_caps & NVMF_QP_CAP_NOSLEEP_RECEIVE) ? KM_NOSLEEP :
+	    KM_SLEEP;
+	rc = nvmf_allocate_response(nq, &cpl, kmflag);
+	if (rc != NULL) {
+		error = nvmf_transmit_capsule(rc);
+		nvmf_free_capsule(rc);
+	} else {
+		error = ENOMEM;
+	}
 
 	mutex_enter(&qp->qp_lock);
 	free_it = (--qp->qp_refs == 0);

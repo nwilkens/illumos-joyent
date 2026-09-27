@@ -144,7 +144,14 @@ _init(void)
 	 */
 	nvmft_global->ns_taskq = taskq_create("nvmft", 1, minclsyspri, 1,
 	    INT_MAX, 0);
-	if (nvmft_global->ns_taskq == NULL) {
+	nvmft_global->ns_admin_taskq = taskq_create("nvmft_admin", 4,
+	    minclsyspri, 4, INT_MAX, 0);
+	if (nvmft_global->ns_taskq == NULL ||
+	    nvmft_global->ns_admin_taskq == NULL) {
+		if (nvmft_global->ns_taskq != NULL)
+			taskq_destroy(nvmft_global->ns_taskq);
+		if (nvmft_global->ns_admin_taskq != NULL)
+			taskq_destroy(nvmft_global->ns_admin_taskq);
 		list_destroy(&nvmft_global->ns_ports);
 		mutex_destroy(&nvmft_global->ns_lock);
 		kmem_free(nvmft_global, sizeof (nvmft_softc_t));
@@ -154,6 +161,7 @@ _init(void)
 
 	status = mod_install(&nvmft_modlinkage);
 	if (status != DDI_SUCCESS) {
+		taskq_destroy(nvmft_global->ns_admin_taskq);
 		taskq_destroy(nvmft_global->ns_taskq);
 		list_destroy(&nvmft_global->ns_ports);
 		mutex_destroy(&nvmft_global->ns_lock);
@@ -192,6 +200,7 @@ _fini(void)
 		return (status);
 	}
 
+	taskq_destroy(nvmft_global->ns_admin_taskq);
 	taskq_destroy(nvmft_global->ns_taskq);
 	list_destroy(&nvmft_global->ns_ports);
 	mutex_destroy(&nvmft_global->ns_lock);

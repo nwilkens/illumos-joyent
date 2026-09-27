@@ -92,6 +92,15 @@
  */
 #define	NVMFT_AER_NS_ATTRIBUTE	(1u << 8)
 
+/* An admin command waiting for ns_admin_taskq, kept in its capsule. */
+typedef struct nvmft_admin_cmd {
+	list_node_t		nac_link;
+	struct nvmf_capsule	*nac_nc;
+} nvmft_admin_cmd_t;
+
+CTASSERT(sizeof (nvmft_admin_cmd_t) <=
+    sizeof (((struct nvmf_capsule *)0)->nc_consumer));
+
 static void	nvmft_controller_shutdown(void *arg);
 static void	nvmft_controller_terminate(void *arg);
 static void	nvmft_controller_terminate_timeout(void *arg);
@@ -128,6 +137,9 @@ nvmft_controller_alloc(nvmft_port_t *np, uint16_t cntlid,
 	ctrlr->ctrlr_np = np;
 	mutex_init(&ctrlr->ctrlr_lock, NULL, MUTEX_DRIVER, NULL);
 	cv_init(&ctrlr->ctrlr_pending_cv, NULL, CV_DRIVER, NULL);
+	cv_init(&ctrlr->ctrlr_admin_cv, NULL, CV_DRIVER, NULL);
+	list_create(&ctrlr->ctrlr_admin_cmds, sizeof (nvmft_admin_cmd_t),
+	    offsetof(nvmft_admin_cmd_t, nac_link));
 	nvmft_deferred_init(ctrlr);
 
 	ctrlr->ctrlr_cdata = np->np_cdata;
@@ -153,6 +165,8 @@ nvmft_controller_alloc(nvmft_port_t *np, uint16_t cntlid,
 		kmem_free(ctrlr->ctrlr_changed_ns,
 		    sizeof (*ctrlr->ctrlr_changed_ns));
 		nvmft_deferred_fini(ctrlr);
+		list_destroy(&ctrlr->ctrlr_admin_cmds);
+		cv_destroy(&ctrlr->ctrlr_admin_cv);
 		cv_destroy(&ctrlr->ctrlr_pending_cv);
 		mutex_destroy(&ctrlr->ctrlr_lock);
 		kmem_free(ctrlr, sizeof (*ctrlr));
@@ -168,10 +182,72 @@ nvmft_controller_free(nvmft_controller_t *ctrlr)
 	ASSERT3P(ctrlr->ctrlr_io_qpairs, ==, NULL);
 	nvmft_session_deregister(ctrlr);
 	nvmft_deferred_fini(ctrlr);
+	list_destroy(&ctrlr->ctrlr_admin_cmds);
+	cv_destroy(&ctrlr->ctrlr_admin_cv);
 	cv_destroy(&ctrlr->ctrlr_pending_cv);
 	mutex_destroy(&ctrlr->ctrlr_lock);
 	kmem_free(ctrlr->ctrlr_changed_ns, sizeof (*ctrlr->ctrlr_changed_ns));
 	kmem_free(ctrlr, sizeof (*ctrlr));
+}
+
+static void
+nvmft_admin_task(void *arg)
+{
+	nvmft_controller_t *ctrlr = arg;
+	nvmft_admin_cmd_t *ac;
+
+	mutex_enter(&ctrlr->ctrlr_lock);
+	while ((ac = list_remove_head(&ctrlr->ctrlr_admin_cmds)) != NULL) {
+		mutex_exit(&ctrlr->ctrlr_lock);
+		nvmft_handle_admin_command(ctrlr, ac->nac_nc);
+		mutex_enter(&ctrlr->ctrlr_lock);
+	}
+	ctrlr->ctrlr_admin_running = B_FALSE;
+	cv_broadcast(&ctrlr->ctrlr_admin_cv);
+	mutex_exit(&ctrlr->ctrlr_lock);
+}
+
+/* Run an admin command on ns_admin_taskq; this does not block. */
+void
+nvmft_queue_admin_command(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc)
+{
+	nvmft_admin_cmd_t *ac = NVMF_CAPSULE_CONSUMER(nc);
+
+	ac->nac_nc = nc;
+	mutex_enter(&ctrlr->ctrlr_lock);
+	if (ctrlr->ctrlr_admin_stopped) {
+		mutex_exit(&ctrlr->ctrlr_lock);
+		nvmf_free_capsule(nc);
+		return;
+	}
+	list_insert_tail(&ctrlr->ctrlr_admin_cmds, ac);
+	if (!ctrlr->ctrlr_admin_running) {
+		ctrlr->ctrlr_admin_running = B_TRUE;
+		taskq_dispatch_ent(nvmft_global->ns_admin_taskq,
+		    nvmft_admin_task, ctrlr, 0, &ctrlr->ctrlr_admin_task);
+	}
+	mutex_exit(&ctrlr->ctrlr_lock);
+}
+
+/* Discard queued admin commands and wait out the one running. */
+static void
+nvmft_admin_stop(nvmft_controller_t *ctrlr)
+{
+	nvmft_admin_cmd_t *ac;
+	list_t drain;
+
+	list_create(&drain, sizeof (nvmft_admin_cmd_t),
+	    offsetof(nvmft_admin_cmd_t, nac_link));
+	mutex_enter(&ctrlr->ctrlr_lock);
+	ctrlr->ctrlr_admin_stopped = B_TRUE;
+	list_move_tail(&drain, &ctrlr->ctrlr_admin_cmds);
+	while (ctrlr->ctrlr_admin_running)
+		cv_wait(&ctrlr->ctrlr_admin_cv, &ctrlr->ctrlr_lock);
+	mutex_exit(&ctrlr->ctrlr_lock);
+
+	while ((ac = list_remove_head(&drain)) != NULL)
+		nvmf_free_capsule(ac->nac_nc);
+	list_destroy(&drain);
 }
 
 static void
@@ -619,6 +695,7 @@ nvmft_controller_terminate(void *arg)
 	ctrlr->ctrlr_shutdown = B_TRUE;
 	mutex_exit(&ctrlr->ctrlr_lock);
 
+	nvmft_admin_stop(ctrlr);
 	nvmft_qpair_destroy(ctrlr->ctrlr_admin);
 
 	/* Remove the association (CNTLID). */

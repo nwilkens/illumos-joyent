@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 TESTS = (
+    "admin_queue.py",
     "adopt_lifecycle.py",
     "connect_checks.py",
     "identify_sgls.py",

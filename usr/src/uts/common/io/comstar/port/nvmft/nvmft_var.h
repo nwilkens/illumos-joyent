@@ -204,14 +204,15 @@ typedef struct nvmft_controller {
 	kcondvar_t		ctrlr_pending_cv;
 
 	/*
-	 * Writeback backpressure: commands that arrive while ctrlr_pending_commands
-	 * is at the in-flight cap are queued here (nvmft_deferred_cmd_t) instead of
-	 * posted to STMF, and re-dispatched as in-flight commands complete.  This
-	 * bounds the commands concurrently in flight so a fast writeback-cached
-	 * initiator cannot overrun the backing store's drain rate; the initiator
-	 * paces itself via SQ-credit backpressure (the host maps any non-zero CQE to
-	 * EIO and will not retry).  Guarded by ctrlr_lock; drained on controller
-	 * shutdown before the qpairs are freed.
+	 * Writeback backpressure: commands that arrive while
+	 * ctrlr_pending_commands is at the in-flight cap wait here instead of
+	 * going to STMF, and are re-dispatched as in-flight commands complete.
+	 * This bounds the commands concurrently in flight so a fast
+	 * writeback-cached initiator cannot overrun the backing store's drain
+	 * rate; the initiator paces itself via SQ-credit backpressure (the host
+	 * maps any non-zero CQE to EIO and will not retry).  Guarded by
+	 * ctrlr_lock; drained on controller shutdown before the qpairs are
+	 * freed.
 	 */
 	list_t			ctrlr_deferred;
 	uint32_t		ctrlr_deferred_commands;
@@ -241,6 +242,16 @@ typedef struct nvmft_controller {
 	 */
 	taskq_ent_t		ctrlr_shutdown_task;
 	taskq_ent_t		ctrlr_terminate_task;
+
+	/*
+	 * Admin commands from a transport whose receive path must not block
+	 * run on ns_admin_taskq, in order.  Guarded by ctrlr_lock.
+	 */
+	list_t			ctrlr_admin_cmds;
+	boolean_t		ctrlr_admin_running;
+	boolean_t		ctrlr_admin_stopped;
+	kcondvar_t		ctrlr_admin_cv;
+	taskq_ent_t		ctrlr_admin_task;
 	timeout_id_t		ctrlr_terminate_timer;
 	/*
 	 * Set under ctrlr_lock while a terminate is queued or running, so the
@@ -262,6 +273,7 @@ typedef struct nvmft_softc {
 
 	/* Worker taskq for controller shutdown/terminate work. */
 	taskq_t			*ns_taskq;
+	taskq_t			*ns_admin_taskq;
 
 	kmutex_t		ns_lock;	/* protects the fields below */
 	list_t			ns_ports;	/* nvmft_port list */
@@ -330,6 +342,8 @@ void	nvmft_controller_error(nvmft_controller_t *ctrlr,
 	    struct nvmft_qpair *qp, int error);
 void	nvmft_controller_lun_changed(nvmft_controller_t *ctrlr, int lun_id);
 void	nvmft_handle_admin_command(nvmft_controller_t *ctrlr,
+	    struct nvmf_capsule *nc);
+void	nvmft_queue_admin_command(nvmft_controller_t *ctrlr,
 	    struct nvmf_capsule *nc);
 void	nvmft_handle_io_command(struct nvmft_qpair *qp, uint16_t qid,
 	    struct nvmf_capsule *nc);

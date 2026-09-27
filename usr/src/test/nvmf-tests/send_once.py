@@ -47,6 +47,7 @@ struct nvmf_memdesc;
     for name in ("nvmf_memdesc_type_t", "nvmf_seg_t", "nvmf_memdesc_t",
                  "nvmf_databuf_t"):
         parts.append(typedef(internal, name))
+    parts.append(define(internal, "NVMF_CAPSULE_CONSUMER_WORDS"))
     for name in ("nvmf_send_request", "nvmf_transport_ops", "nvmf_qpair",
                  "nvmf_io_request", "nvmf_capsule"):
         parts.append(struct(internal, name))
