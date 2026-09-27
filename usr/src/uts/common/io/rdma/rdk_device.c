@@ -612,8 +612,9 @@ rdk_gid_withdraw(struct rdk_device *dev, uint32_t port, uint16_t index,
 	mutex_exit(&p->rdp_lock);
 }
 
-const struct rdk_gid_attr *
-rdk_get_gid_attr(struct rdk_device *dev, uint32_t port, uint16_t index)
+static const struct rdk_gid_attr *
+rdk_gid_attr_hold(struct rdk_device *dev, uint32_t port, uint16_t index,
+    boolean_t live)
 {
 	struct rdk_device_priv *p = dev->rd_priv;
 	rdk_gid_ent_t *e;
@@ -624,12 +625,19 @@ rdk_get_gid_attr(struct rdk_device *dev, uint32_t port, uint16_t index)
 
 	mutex_enter(&p->rdp_lock);
 	e = &p->rdp_gids[index];
-	if (e->rge_valid && e->rge_attr.port_num == port) {
+	if (e->rge_valid && e->rge_attr.port_num == port &&
+	    !(live && e->rge_withdrawn)) {
 		e->rge_refs++;
 		attr = &e->rge_attr;
 	}
 	mutex_exit(&p->rdp_lock);
 	return (attr);
+}
+
+const struct rdk_gid_attr *
+rdk_get_gid_attr(struct rdk_device *dev, uint32_t port, uint16_t index)
+{
+	return (rdk_gid_attr_hold(dev, port, index, B_FALSE));
 }
 
 void
@@ -652,6 +660,7 @@ rdk_put_gid_attr(const struct rdk_gid_attr *attr)
 /*
  * Fill in the source GID of an address for the provider and check the
  * parts the framework understands.  The caller holds the new reference.
+ * A withdrawn GID gets no new user, so that its slot can be deleted.
  */
 int
 rdk_resolve_ah_attr(struct rdk_device *dev, struct rdk_ah_attr *ah)
@@ -666,7 +675,8 @@ rdk_resolve_ah_attr(struct rdk_device *dev, struct rdk_ah_attr *ah)
 	    (ah->grh.flow_label & ~0xfffffU) != 0)
 		return (EINVAL);
 
-	sgid = rdk_get_gid_attr(dev, ah->port_num, ah->grh.sgid_index);
+	sgid = rdk_gid_attr_hold(dev, ah->port_num, ah->grh.sgid_index,
+	    B_TRUE);
 	if (sgid == NULL)
 		return (ENOENT);
 	ah->grh.sgid_attr = sgid;

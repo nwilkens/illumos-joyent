@@ -284,9 +284,11 @@ rdk_gsi_ah_get(rdk_gsi_t *g, const rdk_gsi_path_t *p, rdk_gsi_ah_t **ap)
 {
 	struct rdk_ah_attr attr;
 	rdk_gsi_ah_t *a, *n;
+	uint64_t gen;
 	int ret;
 
 	mutex_enter(&g->rg_lock);
+	gen = g->rg_withdraw_gen;
 	for (a = list_head(&g->rg_ahs); a != NULL;
 	    a = list_next(&g->rg_ahs, a)) {
 		if (rdk_gsi_ah_match(a, p)) {
@@ -324,6 +326,9 @@ rdk_gsi_ah_get(rdk_gsi_t *g, const rdk_gsi_path_t *p, rdk_gsi_ah_t **ap)
 	n->ga_refs = 1;
 	n->ga_cached = B_TRUE;
 	mutex_enter(&g->rg_lock);
+	/* A withdrawal while the AH was made may have missed it. */
+	if (g->rg_withdraw_gen != gen)
+		n->ga_stale = B_TRUE;
 	g->rg_stats.gst_ah_create.value.ui64++;
 	list_insert_tail(&g->rg_ahs, n);
 	g->rg_nah++;
@@ -360,6 +365,7 @@ rdk_gsi_gid_withdrawn(rdk_gsi_t *g, uint16_t idx)
 	rdk_gsi_ah_t *a;
 
 	mutex_enter(&g->rg_lock);
+	g->rg_withdraw_gen++;
 	for (a = list_head(&g->rg_ahs); a != NULL;
 	    a = list_next(&g->rg_ahs, a)) {
 		if (a->ga_sgid_index == idx)

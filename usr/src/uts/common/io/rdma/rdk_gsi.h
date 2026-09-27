@@ -114,6 +114,7 @@ typedef struct rdk_gsi {
 	list_t			rg_ahs;
 	uint32_t		rg_nah;
 	uint32_t		rg_ah_max;
+	uint64_t		rg_withdraw_gen;	/* GID withdrawals */
 	boolean_t		rg_dying;
 	uint32_t		rg_refs;
 	uint32_t		rg_rx_out;	/* MADs being handled */
