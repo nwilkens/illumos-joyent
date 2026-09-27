@@ -25,8 +25,9 @@
  * remove callback, and then waits until the count reaches zero, so the
  * provider tears down only after every consumer is gone.
  *
- * GID tables are static for now: a privileged kernel consumer adds the
- * entries.  An entry that a QP or AH refers to cannot be deleted.
+ * The CM fills the GID tables from the host's addresses (rdk_cm_gid.c); a
+ * privileged kernel consumer may add entries too.  An entry that a QP or
+ * AH refers to cannot be deleted.
  */
 
 #include <sys/types.h>
@@ -477,6 +478,7 @@ rdk_add_gid(struct rdk_device *dev, uint32_t port, const rdk_gid_t *gid,
 		    e->rge_attr.vlan_id == vlan &&
 		    bcmp(e->rge_attr.mac, mac, ETHERADDRL) == 0) {
 			e->rge_owners++;
+			e->rge_withdrawn = B_FALSE;
 			*indexp = e->rge_attr.index;
 			mutex_exit(&p->rdp_lock);
 			mutex_exit(&p->rdp_gid_lock);
@@ -505,6 +507,7 @@ rdk_add_gid(struct rdk_device *dev, uint32_t port, const rdk_gid_t *gid,
 		mutex_enter(&p->rdp_lock);
 		e->rge_refs = 0;
 		e->rge_owners = 1;
+		e->rge_withdrawn = B_FALSE;
 		e->rge_valid = B_TRUE;
 		mutex_exit(&p->rdp_lock);
 		*indexp = e->rge_attr.index;
@@ -560,6 +563,53 @@ rdk_query_gid(struct rdk_device *dev, uint32_t port, uint16_t index,
 	*gid = attr->gid;
 	rdk_put_gid_attr(attr);
 	return (0);
+}
+
+/*
+ * The port's entry for the GID and VLAN, held, unless it is withdrawn: the
+ * address it stands for is gone and the entry waits to be deleted.
+ */
+const struct rdk_gid_attr *
+rdk_find_gid(struct rdk_device *dev, uint32_t port, const rdk_gid_t *gid,
+    uint16_t vlan)
+{
+	struct rdk_device_priv *p = dev->rd_priv;
+	const struct rdk_gid_attr *attr = NULL;
+	rdk_gid_ent_t *e;
+	uint_t i;
+
+	if (!rdk_port_valid(dev, port))
+		return (NULL);
+	mutex_enter(&p->rdp_lock);
+	for (i = 0; i < RDK_GID_TABLE_LEN; i++) {
+		e = &p->rdp_gids[i];
+		if (e->rge_valid && !e->rge_withdrawn &&
+		    e->rge_attr.port_num == port &&
+		    e->rge_attr.vlan_id == vlan &&
+		    bcmp(&e->rge_attr.gid, gid, sizeof (*gid)) == 0) {
+			e->rge_refs++;
+			attr = &e->rge_attr;
+			break;
+		}
+	}
+	mutex_exit(&p->rdp_lock);
+	return (attr);
+}
+
+void
+rdk_gid_withdraw(struct rdk_device *dev, uint32_t port, uint16_t index,
+    boolean_t on)
+{
+	struct rdk_device_priv *p = dev->rd_priv;
+	rdk_gid_ent_t *e;
+
+	if (!rdk_port_valid(dev, port) || index >= RDK_GID_TABLE_LEN)
+		return;
+	mutex_enter(&p->rdp_lock);
+	e = &p->rdp_gids[index];
+	if (e->rge_valid && e->rge_attr.port_num == port)
+		e->rge_withdrawn = on;
+	mutex_exit(&p->rdp_lock);
 }
 
 const struct rdk_gid_attr *

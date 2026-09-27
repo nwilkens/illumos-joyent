@@ -1,10 +1,11 @@
-DO NOT TRANSLATE OR LOCALIZE.
-
-rdk.h and rdk_verbs.c in this directory are derived from the Linux kernel
-(include/rdma/ib_verbs.h and drivers/infiniband/core/verbs.c), where each file
-is offered under the choice of the GNU General Public License version 2 or the
-OpenIB.org BSD license.  They are used here under the OpenIB.org BSD license,
-reproduced below.  The rest of this directory is licensed under the CDDL.
+rdk.h, rdk_verbs.c, rdk_ibcm_fsm.c, rdk_ibcm_fsm.h, rdk_ibcm_msg.c,
+rdk_ibcm_msg.h, rdk_cm_roce.c, rdk_cm_roce.h and rdk_cm_roce_rx.c in this
+directory are derived from the Linux kernel (include/rdma/ib_verbs.h,
+include/rdma/ibta_vol1_c12.h, drivers/infiniband/core/verbs.c, cm.c,
+cm_msgs.h and cma.c), where each file is offered under the choice of the
+GNU General Public License version 2 or the OpenIB.org BSD license.  They
+are used here under the OpenIB.org BSD license, reproduced below.  The rest
+of this directory is licensed under the CDDL.
 
 rdk.h:
 
@@ -25,6 +26,46 @@ Copyright (c) 2004 Topspin Corporation.  All rights reserved.
 Copyright (c) 2004 Voltaire Corporation.  All rights reserved.
 Copyright (c) 2005 Sun Microsystems, Inc. All rights reserved.
 Copyright (c) 2005, 2006 Cisco Systems.  All rights reserved.
+
+rdk_ibcm_fsm.c and rdk_ibcm_fsm.h (from cm.c):
+
+Copyright (c) 2004-2007 Intel Corporation.  All rights reserved.
+Copyright (c) 2004 Topspin Corporation.  All rights reserved.
+Copyright (c) 2004, 2005 Voltaire Corporation.  All rights reserved.
+Copyright (c) 2005 Sun Microsystems, Inc. All rights reserved.
+Copyright (c) 2019, Mellanox Technologies inc.  All rights reserved.
+
+rdk_ibcm_msg.c and rdk_ibcm_msg.h (from ibta_vol1_c12.h, cm_msgs.h and
+cma.c):
+
+Copyright (c) 2020, Mellanox Technologies inc. All rights reserved.
+Copyright (c) 2004, 2011 Intel Corporation.  All rights reserved.
+Copyright (c) 2004 Topspin Corporation.  All rights reserved.
+Copyright (c) 2004 Voltaire Corporation.  All rights reserved.
+Copyright (c) 2019, Mellanox Technologies inc.  All rights reserved.
+Copyright (c) 2005 Voltaire Inc.  All rights reserved.
+Copyright (c) 2002-2005, Network Appliance, Inc. All rights reserved.
+Copyright (c) 1999-2019, Mellanox Technologies, Inc. All rights reserved.
+Copyright (c) 2005-2006 Intel Corporation.  All rights reserved.
+
+rdk_cm_roce.c and rdk_cm_roce_rx.c (from cm.c and cma.c):
+
+Copyright (c) 2004-2007 Intel Corporation.  All rights reserved.
+Copyright (c) 2004 Topspin Corporation.  All rights reserved.
+Copyright (c) 2004, 2005 Voltaire Corporation.  All rights reserved.
+Copyright (c) 2005 Sun Microsystems, Inc. All rights reserved.
+Copyright (c) 2019, Mellanox Technologies inc.  All rights reserved.
+Copyright (c) 2005 Voltaire Inc.  All rights reserved.
+Copyright (c) 2002-2005, Network Appliance, Inc. All rights reserved.
+Copyright (c) 1999-2019, Mellanox Technologies, Inc. All rights reserved.
+Copyright (c) 2005-2006 Intel Corporation.  All rights reserved.
+
+rdk_cm_roce.h (from cma.c):
+
+Copyright (c) 2005 Voltaire Inc.  All rights reserved.
+Copyright (c) 2002-2005, Network Appliance, Inc. All rights reserved.
+Copyright (c) 1999-2019, Mellanox Technologies, Inc. All rights reserved.
+Copyright (c) 2005-2006 Intel Corporation.  All rights reserved.
 
 OpenIB.org BSD license
 

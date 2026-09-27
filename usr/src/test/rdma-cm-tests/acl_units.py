@@ -59,8 +59,8 @@ def main():
         re.search(r"typedef struct rdk_cm_acl rdk_cm_acl_t;\n", rdk).group(),
         re.search(r"struct rdk_cm_acl \{.*?\};\n", impl, re.DOTALL).group(),
         function_source(RDMA / "rdk_cm_addr.c", "rdk_cm_unicast"),
-        function_source(RDMA / "rdk_cm.c", "rdk_cm_acl_create"),
-        function_source(RDMA / "rdk_cm.c", "rdk_cm_acl_allows"),
+        function_source(RDMA / "rdk_cm_listen.c", "rdk_cm_acl_create"),
+        function_source(RDMA / "rdk_cm_listen.c", "rdk_cm_acl_allows"),
     ]
     try:
         out, mode = run_c([TESTDIR / "acl_units.c"],

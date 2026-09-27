@@ -53,6 +53,7 @@
 #include <sys/atomic.h>
 
 #include "rdk_impl.h"
+#include "rdk_cm_impl.h"
 
 static const char *const rdk_wc_status_names[] = {
 	[RDK_WC_SUCCESS] = "success",
@@ -447,7 +448,13 @@ rdk_create_qp(struct rdk_pd *pd, struct rdk_qp_init_attr *init,
 	qp->qp_context = init->qp_context;
 	qp->qp_type = init->qp_type;
 	qp->port = init->port_num != 0 ? init->port_num : 1;
+	mutex_init(&qp->mod_lock, NULL, MUTEX_DRIVER, NULL);
+	mutex_init(&qp->cm_lock, NULL, MUTEX_DRIVER, NULL);
+	cv_init(&qp->cm_cv, NULL, CV_DRIVER, NULL);
 	if ((ret = dev->rd_ops->create_qp(qp, init)) != 0) {
+		cv_destroy(&qp->cm_cv);
+		mutex_destroy(&qp->cm_lock);
+		mutex_destroy(&qp->mod_lock);
 		kmem_free(qp, dev->rd_ops->size_qp);
 		rdk_obj_rele(dev);
 		return (ret);
@@ -481,8 +488,9 @@ rdk_modify_qp(struct rdk_qp *qp, struct rdk_qp_attr *attr, int mask)
 			return (ret);
 	}
 
+	/* The GID the device's AV uses must be the one the QP holds. */
+	mutex_enter(&qp->mod_lock);
 	ret = dev->rd_ops->modify_qp(qp, attr, mask);
-
 	if ((mask & RDK_QP_AV) != 0) {
 		if (ret == 0) {
 			old = qp->av_sgid_attr;
@@ -493,6 +501,7 @@ rdk_modify_qp(struct rdk_qp *qp, struct rdk_qp_attr *attr, int mask)
 		}
 		attr->ah_attr.grh.sgid_attr = NULL;
 	}
+	mutex_exit(&qp->mod_lock);
 	return (ret);
 }
 
@@ -510,6 +519,7 @@ rdk_destroy_qp(struct rdk_qp *qp)
 {
 	struct rdk_device *dev = qp->device;
 
+	rdk_cm_roce_qp_gone(qp);
 	dev->rd_ops->destroy_qp(qp);
 	rdk_cq_barrier(qp->send_cq);
 	if (qp->recv_cq != qp->send_cq)
@@ -519,6 +529,9 @@ rdk_destroy_qp(struct rdk_qp *qp)
 	atomic_dec_32(&qp->pd->usecnt);
 	atomic_dec_32(&qp->send_cq->usecnt);
 	atomic_dec_32(&qp->recv_cq->usecnt);
+	cv_destroy(&qp->cm_cv);
+	mutex_destroy(&qp->cm_lock);
+	mutex_destroy(&qp->mod_lock);
 	kmem_free(qp, dev->rd_ops->size_qp);
 	rdk_obj_rele(dev);
 }

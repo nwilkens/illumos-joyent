@@ -188,6 +188,7 @@ struct rdk_device_attr {
 	uint32_t	max_inline_data;
 	uint16_t	max_pkeys;
 	uint32_t	local_dma_lkey;
+	uint8_t		local_ca_ack_delay;	/* IB time: 4.096 us x 2^n */
 };
 
 enum rdk_event_type {
@@ -605,6 +606,12 @@ struct rdk_qp {
 	enum rdk_qp_type	qp_type;
 	const struct rdk_gid_attr *av_sgid_attr;	/* framework */
 	void			*drain_orphans;		/* framework */
+	kmutex_t		mod_lock;		/* framework */
+	kmutex_t		cm_lock;		/* framework */
+	kcondvar_t		cm_cv;			/* framework */
+	void			*cm_link;		/* framework */
+	uint32_t		cm_leases;		/* framework */
+	boolean_t		cm_dying;		/* framework */
 };
 
 struct rdk_mr {
@@ -703,7 +710,7 @@ struct rdk_device {
 	dev_info_t			*rd_dip;
 	const struct rdk_device_ops	*rd_ops;
 	uint32_t			rd_phys_port_cnt;
-	uint64_t			rd_node_guid;
+	uint64_t			rd_node_guid;	/* host order */
 	/* A CQ's comp_vector is below this; 0 is taken as 1. */
 	uint32_t			rd_num_comp_vectors;
 

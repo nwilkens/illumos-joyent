@@ -20,7 +20,8 @@
  * Every event goes through the ID's queue and is delivered by one task at a
  * time, in order.  An operation records itself in rci_op with a generation;
  * whichever of the transport, a timer, a cancel or a removal ends it first
- * queues its one event, and the others find rci_op cleared.
+ * queues its one event, and the others find rci_op cleared.  The transport
+ * of the ID's device (rdk_cm_iw.c or rdk_cm_roce.c) runs the connection.
  */
 
 #include <sys/types.h>
@@ -40,6 +41,7 @@ kmutex_t rdk_cm_lock;
 list_t rdk_cm_devs;
 list_t rdk_cm_ids;
 taskq_t *rdk_cm_taskq;
+kcondvar_t rdk_cm_dev_cv;
 static uint_t rdk_cm_tsd;
 
 /* How long connect and route resolution wait by default. */
@@ -47,6 +49,9 @@ uint_t rdk_cm_connect_ms = 30000;
 uint_t rdk_cm_max_pending = 4096;
 uint_t rdk_cm_max_conns = 4096;
 static uint_t rdk_cm_conns;	/* rdk_cm_lock */
+
+/* How often a wait for a transport's final event warns. */
+#define	RDK_CM_WAIT_WARN_SEC	10
 
 static void rdk_cm_task(void *);
 static void rdk_cm_destroy_common(rdk_cm_id_t *, boolean_t);
@@ -120,7 +125,7 @@ rdk_cm_rele(rdk_cm_id_t *id)
 		rdk_cm_free(id);
 }
 
-static rdk_cm_id_t *
+rdk_cm_id_t *
 rdk_cm_alloc(cred_t *cr, rdk_cm_handler_t handler, void *ctx,
     enum rdk_qp_type qpt)
 {
@@ -219,6 +224,12 @@ rdk_cm_queue(rdk_cm_id_t *id, enum rdk_cm_event_type ev, int status,
 	mutex_exit(&id->rci_lock);
 }
 
+static const rdk_cm_tport_t *
+rdk_cm_tp(rdk_cm_id_t *id)
+{
+	return (id->rci_dev != NULL ? id->rci_dev->rcd_tp : NULL);
+}
+
 /* The ID whose handler this thread runs, and that ID's listener. */
 typedef struct rdk_cm_cur {
 	rdk_cm_id_t	*cc_id;
@@ -240,6 +251,8 @@ rdk_cm_in_handler(rdk_cm_id_t *id)
 static void
 rdk_cm_refuse(rdk_cm_id_t *id)
 {
+	const rdk_cm_tport_t *tp = rdk_cm_tp(id);
+
 	mutex_enter(&id->rci_lock);
 	if (id->rci_decided) {
 		mutex_exit(&id->rci_lock);
@@ -247,7 +260,8 @@ rdk_cm_refuse(rdk_cm_id_t *id)
 	}
 	id->rci_decided = B_TRUE;
 	mutex_exit(&id->rci_lock);
-	(void) rdk_cm_iw_reject(id, NULL, 0);
+	if (tp != NULL)
+		(void) tp->ct_reject(id, NULL, 0);
 }
 
 static void
@@ -350,13 +364,29 @@ rdk_cm_admit_release(rdk_cm_id_t *id)
 	id->rci_admit = NULL;
 	mutex_exit(&id->rci_lock);
 	if (admit != NULL)
-		rdk_iw_cm_unadmit(admit);
+		rdk_cm_unadmit(admit);
+}
+
+/* Wait until the transport has let go of the ID. */
+static void
+rdk_cm_wait_final(rdk_cm_id_t *id)
+{
+	mutex_enter(&id->rci_lock);
+	while (id->rci_tp_ref) {
+		if (cv_reltimedwait(&id->rci_cv, &id->rci_lock,
+		    SEC_TO_TICK(RDK_CM_WAIT_WARN_SEC), TR_SEC) == -1 &&
+		    id->rci_tp_ref) {
+			cmn_err(CE_WARN, "!rdk_cm: waiting for the transport "
+			    "to release a connection");
+		}
+	}
+	mutex_exit(&id->rci_lock);
 }
 
 static void
 rdk_cm_destroy_common(rdk_cm_id_t *id, boolean_t from_task)
 {
-	rdk_cm_state_t state;
+	const rdk_cm_tport_t *tp = rdk_cm_tp(id);
 	rdk_cm_qev_t *q;
 	boolean_t listening, undecided;
 
@@ -369,22 +399,23 @@ rdk_cm_destroy_common(rdk_cm_id_t *id, boolean_t from_task)
 		while (id->rci_queued)
 			cv_wait(&id->rci_cv, &id->rci_lock);
 	}
-	state = id->rci_state;
-	listening = id->rci_iw_listen;
-	undecided = state == RCS_REQ && !id->rci_decided;
+	listening = id->rci_state == RCS_LISTEN;
+	undecided = id->rci_state == RCS_REQ && !id->rci_decided;
 	if (undecided)
 		id->rci_decided = B_TRUE;
 	mutex_exit(&id->rci_lock);
 
 	rdk_cm_disarm(id);
 	rdk_cm_resolve_cancel(id);
-	if (listening)
-		rdk_cm_iw_unlisten(id);
-	if (undecided)
-		(void) rdk_cm_iw_reject(id, NULL, 0);
-	rdk_cm_iw_disconnect(id, B_TRUE);
-	rdk_cm_iw_wait_final(id);
-	rdk_cm_iw_release(id);
+	if (tp != NULL) {
+		if (listening)
+			tp->ct_unlisten(id);
+		if (undecided)
+			(void) tp->ct_reject(id, NULL, 0);
+		tp->ct_disconnect(id, B_TRUE);
+		rdk_cm_wait_final(id);
+		tp->ct_release(id);
+	}
 	rdk_cm_admit_release(id);
 
 	mutex_enter(&rdk_cm_lock);
@@ -431,10 +462,12 @@ rdk_cm_sin(const struct sockaddr *sa, const struct sockaddr_in **sinp)
 	return (0);
 }
 
-/* Bind the ID to its device and reservation.  rci_lock is not held. */
+/*
+ * Bind the ID to its path's device and to the reservation; the ID takes
+ * both references.  rci_lock is not held.
+ */
 static int
-rdk_cm_bind_dev(rdk_cm_id_t *id, rdk_cm_dev_t *cd, uint32_t port,
-    uint_t ifindex, rdk_cm_resv_t *resv, const struct rdk_cm_route *rt,
+rdk_cm_bind_dev(rdk_cm_id_t *id, const rdk_cm_path_t *p, rdk_cm_resv_t *resv,
     rdk_cm_state_t from, rdk_cm_state_t to)
 {
 	mutex_enter(&id->rci_lock);
@@ -442,15 +475,18 @@ rdk_cm_bind_dev(rdk_cm_id_t *id, rdk_cm_dev_t *cd, uint32_t port,
 		mutex_exit(&id->rci_lock);
 		return (EINVAL);
 	}
-	id->rci_dev = cd;
-	id->rci_port = port;
-	id->rci_ifindex = ifindex;
+	id->rci_dev = p->cp_dev;
+	id->rci_port = p->cp_port;
+	id->rci_ifindex = p->cp_ifindex;
+	id->rci_nexthop = p->cp_nexthop;
+	id->rci_local = p->cp_local;
+	id->rci_ttl = p->cp_ttl;
 	id->rci_resv = resv;
-	id->rci_route = *rt;
+	rdk_cm_path_fill(p, &id->rci_route);
 	id->rci_route.rcr_src.sin_port = resv->rr_addr.sin_port;
 	id->rci_iw.iw_laddr = id->rci_route.rcr_src;
-	id->rci_iw.iw_port = port;
-	id->rci_iw.iw_mtu = rt->rcr_mtu;
+	id->rci_iw.iw_port = p->cp_port;
+	id->rci_iw.iw_mtu = p->cp_mtu;
 	id->rci_state = to;
 	mutex_exit(&id->rci_lock);
 	return (0);
@@ -460,29 +496,25 @@ int
 rdk_cm_bind_addr(rdk_cm_id_t *id, const struct sockaddr *sa)
 {
 	const struct sockaddr_in *sin;
-	struct rdk_cm_route rt;
 	rdk_cm_resv_t *resv;
-	rdk_cm_dev_t *cd;
-	uint32_t port;
-	uint_t ifindex;
+	rdk_cm_path_t p;
 	int ret;
 
 	if ((ret = rdk_cm_sin(sa, &sin)) != 0)
 		return (ret);
 	if (!rdk_cm_unicast(sin->sin_addr.s_addr))
 		return (EADDRNOTAVAIL);
-	bzero(&rt, sizeof (rt));
-	if ((ret = rdk_cm_local_dev(id->rci_cred, sin->sin_addr.s_addr, &cd,
-	    &port, &ifindex, &rt)) != 0)
+	if ((ret = rdk_cm_local_dev(id->rci_cred, sin->sin_addr.s_addr,
+	    &p)) != 0)
 		return (ret);
-	if ((ret = rdk_cm_resv_get(id->rci_cred, sin, &resv)) != 0) {
-		rdk_cm_dev_rele(cd);
+	if ((ret = rdk_cm_resv_get(p.cp_dev, id->rci_cred, sin,
+	    &resv)) != 0) {
+		rdk_cm_dev_rele(p.cp_dev);
 		return (ret);
 	}
-	if ((ret = rdk_cm_bind_dev(id, cd, port, ifindex, resv, &rt, RCS_IDLE,
-	    RCS_BOUND)) != 0) {
+	if ((ret = rdk_cm_bind_dev(id, &p, resv, RCS_IDLE, RCS_BOUND)) != 0) {
 		rdk_cm_resv_rele(resv);
-		rdk_cm_dev_rele(cd);
+		rdk_cm_dev_rele(p.cp_dev);
 	}
 	return (ret);
 }
@@ -504,12 +536,9 @@ rdk_cm_resolve_addr(rdk_cm_id_t *id, const struct sockaddr *src,
 {
 	const struct sockaddr_in *ssin = NULL, *dsin;
 	struct sockaddr_in local;
-	struct rdk_cm_route rt;
 	rdk_cm_resv_t *resv;
-	rdk_cm_dev_t *cd;
-	ipaddr_t srcaddr = INADDR_ANY, nh;
-	uint32_t port;
-	uint_t ifindex;
+	rdk_cm_path_t p;
+	ipaddr_t srcaddr = INADDR_ANY;
 	int ret;
 
 	if (ms > RDK_CM_TIMEOUT_MAX_MS)
@@ -534,28 +563,27 @@ rdk_cm_resolve_addr(rdk_cm_id_t *id, const struct sockaddr *src,
 	id->rci_state = RCS_ADDR_QUERY;
 	mutex_exit(&id->rci_lock);
 
-	bzero(&rt, sizeof (rt));
-	ret = rdk_cm_route_lookup(id->rci_cred, dsin->sin_addr.s_addr,
-	    &srcaddr, &cd, &port, &ifindex, &rt, &nh);
+	ret = rdk_cm_route_lookup(id->rci_cred, dsin->sin_addr.s_addr, srcaddr,
+	    &p);
 	if (ret == 0) {
 		bzero(&local, sizeof (local));
 		local.sin_family = AF_INET;
-		local.sin_addr.s_addr = srcaddr;
+		local.sin_addr.s_addr = p.cp_src;
 		local.sin_port = ssin != NULL ? ssin->sin_port : 0;
-		if ((ret = rdk_cm_resv_get(id->rci_cred, &local, &resv)) != 0)
-			rdk_cm_dev_rele(cd);
+		if ((ret = rdk_cm_resv_get(p.cp_dev, id->rci_cred, &local,
+		    &resv)) != 0)
+			rdk_cm_dev_rele(p.cp_dev);
 	}
 	if (ret == 0) {
-		rt.rcr_dst = *dsin;
-		if ((ret = rdk_cm_bind_dev(id, cd, port, ifindex, resv, &rt,
-		    RCS_ADDR_QUERY, RCS_ADDR_RESOLVED)) != 0) {
+		if ((ret = rdk_cm_bind_dev(id, &p, resv, RCS_ADDR_QUERY,
+		    RCS_ADDR_RESOLVED)) != 0) {
 			rdk_cm_resv_rele(resv);
-			rdk_cm_dev_rele(cd);
+			rdk_cm_dev_rele(p.cp_dev);
 			return (ret);
 		}
 		mutex_enter(&id->rci_lock);
+		id->rci_route.rcr_dst = *dsin;
 		id->rci_iw.iw_raddr = *dsin;
-		id->rci_nexthop = nh;
 		mutex_exit(&id->rci_lock);
 		rdk_cm_queue(id, RDK_CM_EVENT_ADDR_RESOLVED, 0, NULL, 0);
 		return (0);
@@ -572,6 +600,7 @@ static void
 rdk_cm_timer_task(void *arg)
 {
 	rdk_cm_id_t *id = arg;
+	const rdk_cm_tport_t *tp = rdk_cm_tp(id);
 	rdk_cm_op_t op;
 	boolean_t abort = B_FALSE, route = B_FALSE;
 
@@ -594,8 +623,8 @@ rdk_cm_timer_task(void *arg)
 	mutex_exit(&id->rci_lock);
 	if (route)
 		rdk_cm_resolve_cancel(id);
-	if (abort)
-		rdk_cm_iw_disconnect(id, B_TRUE);
+	if (abort && tp != NULL)
+		tp->ct_disconnect(id, B_TRUE);
 	rdk_cm_rele(id);
 }
 
@@ -647,11 +676,36 @@ rdk_cm_disarm(rdk_cm_id_t *id)
 		rdk_cm_rele(id);
 }
 
+static void
+rdk_cm_arp_hold(void *arg)
+{
+	rdk_cm_hold(arg);
+}
+
+static void
+rdk_cm_arp_rele(void *arg)
+{
+	rdk_cm_rele(arg);
+}
+
+static const rdk_cm_arp_ops_t rdk_cm_id_arp_ops = {
+	.rao_done = rdk_cm_route_done,
+	.rao_hold = rdk_cm_arp_hold,
+	.rao_rele = rdk_cm_arp_rele
+};
+
+/*
+ * Route resolution looks the path up again, so the route, source, device
+ * and MTU are those of now, and then resolves the next hop.
+ */
 int
 rdk_cm_resolve_route(rdk_cm_id_t *id, uint32_t ms)
 {
-	ipaddr_t dst;
+	rdk_cm_arp_t *rp = NULL, *old;
+	rdk_cm_path_t p;
+	ipaddr_t dst, src;
 	uint32_t gen;
+	int ret;
 
 	if (ms > RDK_CM_TIMEOUT_MAX_MS)
 		return (EINVAL);
@@ -665,17 +719,54 @@ rdk_cm_resolve_route(rdk_cm_id_t *id, uint32_t ms)
 	id->rci_op = RCO_ROUTE;
 	gen = ++id->rci_opgen;
 	id->rci_canceled = B_FALSE;
-	dst = id->rci_nexthop;
+	dst = id->rci_route.rcr_dst.sin_addr.s_addr;
+	src = id->rci_route.rcr_src.sin_addr.s_addr;
 	rdk_cm_arm(id, rdk_cm_timeout(ms, rdk_cm_connect_ms));
 	mutex_exit(&id->rci_lock);
 
-	return (rdk_cm_nexthop(id, dst, gen));
+	ret = rdk_cm_route_lookup(id->rci_cred, dst, src, &p);
+	if (ret == 0) {
+		mutex_enter(&id->rci_lock);
+		if (p.cp_dev != id->rci_dev || p.cp_port != id->rci_port ||
+		    p.cp_ifindex != id->rci_ifindex) {
+			ret = ENETUNREACH;
+		} else {
+			id->rci_nexthop = p.cp_nexthop;
+			id->rci_local = p.cp_local;
+			id->rci_ttl = p.cp_ttl;
+			id->rci_route.rcr_mtu = p.cp_mtu;
+			id->rci_iw.iw_mtu = p.cp_mtu;
+		}
+		mutex_exit(&id->rci_lock);
+		rdk_cm_dev_rele(p.cp_dev);
+	}
+	if (ret != 0) {
+		rdk_cm_route_done(id, gen, ret, NULL);
+		return (0);
+	}
+	if (p.cp_local) {
+		rdk_cm_route_done(id, gen, 0, p.cp_smac);
+		return (0);
+	}
+	(void) rdk_cm_arp_start(crgetzoneid(id->rci_cred), p.cp_ifindex,
+	    p.cp_nexthop, &rdk_cm_id_arp_ops, id, gen, &rp);
+	mutex_enter(&id->rci_lock);
+	old = id->rci_resolve;
+	if (id->rci_destroying) {
+		old = rp;
+	} else {
+		id->rci_resolve = rp;
+	}
+	mutex_exit(&id->rci_lock);
+	rdk_cm_arp_cancel(old);
+	return (0);
 }
 
-/* The neighbor answered, or failed; rdk_cm_addr.c calls this. */
+/* The next hop answered, or the route failed. */
 void
-rdk_cm_route_done(rdk_cm_id_t *id, uint32_t gen, int err, const uint8_t *mac)
+rdk_cm_route_done(void *arg, uint32_t gen, int err, const uint8_t *mac)
 {
+	rdk_cm_id_t *id = arg;
 	boolean_t ended;
 
 	mutex_enter(&id->rci_lock);
@@ -695,101 +786,6 @@ rdk_cm_route_done(rdk_cm_id_t *id, uint32_t gen, int err, const uint8_t *mac)
 	mutex_exit(&id->rci_lock);
 	if (ended)
 		rdk_cm_disarm(id);
-}
-
-int
-rdk_cm_acl_create(const struct sockaddr_in *peers, uint32_t n,
-    rdk_cm_acl_t **aclp)
-{
-	rdk_cm_acl_t *acl;
-	uint32_t i, j;
-	ipaddr_t a;
-
-	*aclp = NULL;
-	if (peers == NULL || n == 0 || n > RDK_CM_ACL_MAX)
-		return (EINVAL);
-	acl = kmem_zalloc(sizeof (*acl) + n * sizeof (ipaddr_t), KM_SLEEP);
-	for (i = 0; i < n; i++) {
-		if (peers[i].sin_family != AF_INET ||
-		    !rdk_cm_unicast(peers[i].sin_addr.s_addr)) {
-			kmem_free(acl, sizeof (*acl) + n * sizeof (ipaddr_t));
-			return (EINVAL);
-		}
-		/* Insertion sort by host order value; n is small. */
-		a = peers[i].sin_addr.s_addr;
-		for (j = acl->rca_n; j > 0 &&
-		    ntohl(acl->rca_addr[j - 1]) > ntohl(a); j--)
-			acl->rca_addr[j] = acl->rca_addr[j - 1];
-		acl->rca_addr[j] = a;
-		acl->rca_n++;
-	}
-	acl->rca_refs = 1;
-	*aclp = acl;
-	return (0);
-}
-
-void
-rdk_cm_acl_hold(rdk_cm_acl_t *acl)
-{
-	atomic_inc_32(&acl->rca_refs);
-}
-
-void
-rdk_cm_acl_rele(rdk_cm_acl_t *acl)
-{
-	if (acl != NULL && atomic_dec_32_nv(&acl->rca_refs) == 0) {
-		kmem_free(acl, sizeof (*acl) +
-		    acl->rca_n * sizeof (ipaddr_t));
-	}
-}
-
-boolean_t
-rdk_cm_acl_allows(const rdk_cm_acl_t *acl, ipaddr_t peer)
-{
-	uint32_t lo = 0, hi = acl->rca_n, mid;
-	const uint32_t want = ntohl(peer);
-
-	while (lo < hi) {
-		mid = lo + (hi - lo) / 2;
-		if (ntohl(acl->rca_addr[mid]) == want)
-			return (B_TRUE);
-		if (ntohl(acl->rca_addr[mid]) < want)
-			lo = mid + 1;
-		else
-			hi = mid;
-	}
-	return (B_FALSE);
-}
-
-int
-rdk_cm_listen(rdk_cm_id_t *id, int backlog, rdk_cm_acl_t *acl)
-{
-	int ret;
-
-	if (acl == NULL || backlog <= 0 || backlog > RDK_CM_BACKLOG_MAX)
-		return (EINVAL);
-	mutex_enter(&id->rci_lock);
-	if (id->rci_destroying || id->rci_state != RCS_BOUND ||
-	    id->rci_dev == NULL || id->rci_resv->rr_addr.sin_port == 0 ||
-	    id->rci_dev->rcd_iw == NULL) {
-		mutex_exit(&id->rci_lock);
-		return (EINVAL);
-	}
-	rdk_cm_acl_hold(acl);
-	id->rci_acl = acl;
-	id->rci_backlog = (uint32_t)backlog;
-	id->rci_state = RCS_LISTEN;
-	mutex_exit(&id->rci_lock);
-
-	rdk_cm_resv_used(id->rci_resv);
-	if ((ret = rdk_cm_iw_listen(id)) != 0) {
-		mutex_enter(&id->rci_lock);
-		id->rci_state = RCS_BOUND;
-		id->rci_acl = NULL;
-		mutex_exit(&id->rci_lock);
-		rdk_cm_acl_rele(acl);
-	}
-	return (ret);
 }
 
 static int
@@ -829,18 +825,35 @@ rdk_cm_conn_unquota(void)
 	mutex_exit(&rdk_cm_lock);
 }
 
+/*
+ * The transport let go of the ID after its final event: give back the
+ * connection quota and wake a destroy.  The ID may be freed as soon as
+ * rci_lock is dropped here.
+ */
+void
+rdk_cm_final(rdk_cm_id_t *id)
+{
+	rdk_cm_conn_unquota();
+	mutex_enter(&id->rci_lock);
+	id->rci_tp_ref = B_FALSE;
+	cv_broadcast(&id->rci_cv);
+	mutex_exit(&id->rci_lock);
+}
+
 int
 rdk_cm_connect(rdk_cm_id_t *id, const struct rdk_cm_conn_param *p)
 {
+	const rdk_cm_tport_t *tp;
 	uint32_t gen;
 	int ret;
 
 	mutex_enter(&id->rci_lock);
 	if (id->rci_destroying || id->rci_state != RCS_ROUTE_RESOLVED ||
-	    id->rci_op != RCO_NONE || id->rci_dev->rcd_iw == NULL) {
+	    id->rci_op != RCO_NONE || id->rci_dev == NULL) {
 		mutex_exit(&id->rci_lock);
 		return (EINVAL);
 	}
+	tp = id->rci_dev->rcd_tp;
 	mutex_exit(&id->rci_lock);
 	if ((ret = rdk_cm_param_ok(id, p, RDK_CM_MSG_REQ)) != 0)
 		return (ret);
@@ -860,7 +873,7 @@ rdk_cm_connect(rdk_cm_id_t *id, const struct rdk_cm_conn_param *p)
 	mutex_exit(&id->rci_lock);
 
 	rdk_cm_resv_used(id->rci_resv);
-	if ((ret = rdk_cm_iw_connect(id, p)) != 0) {
+	if ((ret = tp->ct_connect(id, p)) != 0) {
 		mutex_enter(&id->rci_lock);
 		(void) rdk_cm_op_end_locked(id, RCO_CONNECT, gen);
 		id->rci_state = RCS_ROUTE_RESOLVED;
@@ -879,6 +892,7 @@ rdk_cm_connect(rdk_cm_id_t *id, const struct rdk_cm_conn_param *p)
 int
 rdk_cm_accept(rdk_cm_id_t *id, const struct rdk_cm_conn_param *p)
 {
+	const rdk_cm_tport_t *tp;
 	uint32_t gen;
 	int ret;
 
@@ -888,6 +902,7 @@ rdk_cm_accept(rdk_cm_id_t *id, const struct rdk_cm_conn_param *p)
 		mutex_exit(&id->rci_lock);
 		return (EINVAL);
 	}
+	tp = id->rci_dev->rcd_tp;
 	mutex_exit(&id->rci_lock);
 	if ((ret = rdk_cm_param_ok(id, p, RDK_CM_MSG_REP)) != 0)
 		return (ret);
@@ -908,8 +923,8 @@ rdk_cm_accept(rdk_cm_id_t *id, const struct rdk_cm_conn_param *p)
 	mutex_exit(&id->rci_lock);
 
 	rdk_cm_admit_release(id);
-	if ((ret = rdk_cm_iw_accept(id, p)) != 0) {
-		/* The provider refused the connection; nothing is live. */
+	if ((ret = tp->ct_accept(id, p)) != 0) {
+		/* The transport refused the connection; nothing is live. */
 		mutex_enter(&id->rci_lock);
 		(void) rdk_cm_op_end_locked(id, RCO_ACCEPT, gen);
 		id->rci_state = RCS_DONE;
@@ -922,6 +937,7 @@ rdk_cm_accept(rdk_cm_id_t *id, const struct rdk_cm_conn_param *p)
 int
 rdk_cm_reject(rdk_cm_id_t *id, const void *pdata, uint16_t len)
 {
+	const rdk_cm_tport_t *tp;
 	int ret;
 
 	mutex_enter(&id->rci_lock);
@@ -930,15 +946,20 @@ rdk_cm_reject(rdk_cm_id_t *id, const void *pdata, uint16_t len)
 		mutex_exit(&id->rci_lock);
 		return (EINVAL);
 	}
+	mutex_exit(&id->rci_lock);
 	if (len > rdk_cm_pdata_max(id, RDK_CM_MSG_REJ) ||
-	    (len != 0 && pdata == NULL)) {
+	    (len != 0 && pdata == NULL))
+		return (EINVAL);
+	mutex_enter(&id->rci_lock);
+	if (id->rci_destroying || id->rci_decided) {
 		mutex_exit(&id->rci_lock);
 		return (EINVAL);
 	}
 	id->rci_decided = B_TRUE;
 	id->rci_state = RCS_DONE;
+	tp = id->rci_dev->rcd_tp;
 	mutex_exit(&id->rci_lock);
-	ret = rdk_cm_iw_reject(id, pdata, len);
+	ret = tp->ct_reject(id, pdata, len);
 	rdk_cm_admit_release(id);
 	return (ret);
 }
@@ -946,20 +967,24 @@ rdk_cm_reject(rdk_cm_id_t *id, const void *pdata, uint16_t len)
 int
 rdk_cm_disconnect(rdk_cm_id_t *id)
 {
+	const rdk_cm_tport_t *tp;
+
 	mutex_enter(&id->rci_lock);
 	if (id->rci_destroying || (id->rci_state != RCS_ESTABLISHED &&
 	    id->rci_state != RCS_DISCONNECT)) {
 		mutex_exit(&id->rci_lock);
 		return (EINVAL);
 	}
+	tp = id->rci_dev->rcd_tp;
 	mutex_exit(&id->rci_lock);
-	rdk_cm_iw_disconnect(id, B_FALSE);
+	tp->ct_disconnect(id, B_FALSE);
 	return (0);
 }
 
 int
 rdk_cm_cancel(rdk_cm_id_t *id)
 {
+	const rdk_cm_tport_t *tp;
 	rdk_cm_op_t op;
 
 	mutex_enter(&id->rci_lock);
@@ -980,19 +1005,20 @@ rdk_cm_cancel(rdk_cm_id_t *id)
 	}
 	id->rci_canceled = B_TRUE;
 	id->rci_cancel_err = ECANCELED;
+	tp = id->rci_dev->rcd_tp;
 	mutex_exit(&id->rci_lock);
-	rdk_cm_iw_disconnect(id, B_TRUE);
+	tp->ct_disconnect(id, B_TRUE);
 	return (0);
 }
 
 /*
- * The transport ended a connect or accept, or the connection.  Called by
- * rdk_cm_iw.c with the event already mapped; queues what the consumer is
- * owed.  final: the provider let go of the ID.
+ * The transport ended a connect or accept, or the connection; queues what
+ * the consumer is owed.  reason is the transport's reject code.
  */
 void
-rdk_cm_conn_event(rdk_cm_id_t *id, enum rdk_iw_event_type type, int status,
-    const void *pdata, uint16_t len, uint32_t ird, uint32_t ord)
+rdk_cm_conn_event(rdk_cm_id_t *id, rdk_cm_tev_t type, int status,
+    uint32_t reason, const void *pdata, uint16_t len, uint32_t ird,
+    uint32_t ord)
 {
 	rdk_cm_qev_t *q = NULL, *q2 = NULL;
 	enum rdk_cm_event_type ev;
@@ -1001,8 +1027,8 @@ rdk_cm_conn_event(rdk_cm_id_t *id, enum rdk_iw_event_type type, int status,
 
 	mutex_enter(&id->rci_lock);
 	switch (type) {
-	case RDK_IW_EVENT_CONNECT_REPLY:
-	case RDK_IW_EVENT_ESTABLISHED:
+	case RCT_REPLY:
+	case RCT_ESTABLISHED:
 		if (id->rci_op != RCO_CONNECT && id->rci_op != RCO_ACCEPT)
 			break;
 		disarm = B_TRUE;
@@ -1034,16 +1060,17 @@ rdk_cm_conn_event(rdk_cm_id_t *id, enum rdk_iw_event_type type, int status,
 			ev = RDK_CM_EVENT_CONNECT_ERROR;
 		}
 		q = rdk_cm_qev_alloc(ev, status, pdata, len);
+		q->q_ev.reject_reason = reason;
 		id->rci_state = RCS_DONE;
 		break;
-	case RDK_IW_EVENT_DISCONNECT:
+	case RCT_DISCONNECT:
 		if (id->rci_state != RCS_ESTABLISHED)
 			break;
 		q = rdk_cm_qev_alloc(RDK_CM_EVENT_DISCONNECTED, status, NULL,
 		    0);
 		id->rci_state = RCS_DISCONNECT;
 		break;
-	case RDK_IW_EVENT_CLOSE:
+	case RCT_CLOSE:
 		if (id->rci_op == RCO_CONNECT || id->rci_op == RCO_ACCEPT) {
 			disarm = B_TRUE;
 			id->rci_op = RCO_NONE;
@@ -1111,14 +1138,14 @@ rdk_cm_route(rdk_cm_id_t *id, struct rdk_cm_route *rt)
 uint16_t
 rdk_cm_pdata_max(rdk_cm_id_t *id, enum rdk_cm_msg msg)
 {
-	uint16_t max = 0;
+	rdk_cm_dev_t *cd;
 
-	_NOTE(ARGUNUSED(msg));
 	mutex_enter(&id->rci_lock);
-	if (id->rci_dev != NULL && id->rci_dev->rcd_iw != NULL)
-		max = MIN(id->rci_dev->rcd_iw->iw_max_pdata, RDK_CM_PDATA_MAX);
+	cd = id->rci_dev;
 	mutex_exit(&id->rci_lock);
-	return (max);
+	if (cd == NULL)
+		return (0);
+	return (MIN(cd->rcd_tp->ct_pdata_max(cd, msg), RDK_CM_PDATA_MAX));
 }
 
 /* An address on the interface changed; the IDs bound to it are told. */
@@ -1141,114 +1168,44 @@ rdk_cm_addr_change(uint_t ifindex)
 	mutex_exit(&rdk_cm_lock);
 }
 
-/*
- * Devices.  rdk_cm is a client of every device: removal tells each ID on
- * the device and waits until the consumers have destroyed them.
- */
-static int
-rdk_cm_client_add(struct rdk_device *dev)
-{
-	uint8_t mac[RDK_CM_MAX_PORTS][ETHERADDRL];
-	struct rdk_port_attr pa;
-	rdk_cm_dev_t *cd;
-	uint32_t n, i;
-
-	n = MIN(dev->rd_phys_port_cnt, RDK_CM_MAX_PORTS);
-	for (i = 0; i < n; i++) {
-		if (rdk_query_port(dev, i + 1, &pa) != 0)
-			bzero(pa.mac, ETHERADDRL);
-		bcopy(pa.mac, mac[i], ETHERADDRL);
-	}
-	mutex_enter(&rdk_cm_lock);
-	for (cd = list_head(&rdk_cm_devs); cd != NULL;
-	    cd = list_next(&rdk_cm_devs, cd)) {
-		if (cd->rcd_dev == dev) {
-			cd->rcd_nports = n;
-			bcopy(mac, cd->rcd_mac, sizeof (mac));
-			cd->rcd_added = B_TRUE;
-			break;
-		}
-	}
-	mutex_exit(&rdk_cm_lock);
-	return (0);
-}
-
-static void
-rdk_cm_client_remove(struct rdk_device *dev, void *arg)
-{
-	rdk_cm_dev_t *cd;
-	rdk_cm_id_t *id;
-	uint_t waited = 0;
-
-	_NOTE(ARGUNUSED(arg));
-	mutex_enter(&rdk_cm_lock);
-	for (cd = list_head(&rdk_cm_devs); cd != NULL;
-	    cd = list_next(&rdk_cm_devs, cd)) {
-		if (cd->rcd_dev == dev)
-			break;
-	}
-	if (cd == NULL) {
-		mutex_exit(&rdk_cm_lock);
-		return;
-	}
-	cd->rcd_removing = B_TRUE;
-	for (id = list_head(&rdk_cm_ids); id != NULL;
-	    id = list_next(&rdk_cm_ids, id)) {
-		mutex_enter(&id->rci_lock);
-		if (id->rci_dev == cd && !id->rci_removal) {
-			id->rci_removal = B_TRUE;
-			id->rci_op = RCO_NONE;
-			rdk_cm_queue_locked(id, rdk_cm_qev_alloc(
-			    RDK_CM_EVENT_DEVICE_REMOVAL, 0, NULL, 0));
-		}
-		mutex_exit(&id->rci_lock);
-	}
-	while (cd->rcd_ids != 0) {
-		mutex_exit(&rdk_cm_lock);
-		delay(drv_usectohz(100 * MILLISEC));
-		if (++waited % 100 == 0) {
-			dev_err(dev->rd_dip, CE_WARN, "!waiting for %u RDMA CM "
-			    "IDs to be destroyed", cd->rcd_ids);
-		}
-		mutex_enter(&rdk_cm_lock);
-	}
-	cd->rcd_added = B_FALSE;
-	mutex_exit(&rdk_cm_lock);
-}
-
-static struct rdk_client rdk_cm_client = {
-	.name = "rdk_cm",
-	.add = rdk_cm_client_add,
-	.remove = rdk_cm_client_remove
-};
-
 int
 rdk_cm_init(void)
 {
 	int ret;
 
 	mutex_init(&rdk_cm_lock, NULL, MUTEX_DRIVER, NULL);
+	cv_init(&rdk_cm_dev_cv, NULL, CV_DRIVER, NULL);
 	list_create(&rdk_cm_devs, sizeof (rdk_cm_dev_t),
 	    offsetof(rdk_cm_dev_t, rcd_node));
 	list_create(&rdk_cm_ids, sizeof (rdk_cm_id_t),
 	    offsetof(rdk_cm_id_t, rci_node));
 	tsd_create(&rdk_cm_tsd, NULL);
-	rdk_cm_iw_init();
 	rdk_cm_taskq = taskq_create("rdk_cm", MAX(MIN(ncpus, 16), 4),
 	    minclsyspri, 4, INT_MAX, TASKQ_PREPOPULATE);
 	if ((ret = rdk_cm_addr_init()) != 0)
 		goto fail;
-	if ((ret = rdk_register_client(&rdk_cm_client)) != 0) {
+	if ((ret = rdk_cm_roce_init()) != 0) {
+		(void) rdk_cm_addr_fini();
+		goto fail;
+	}
+	if ((ret = rdk_cm_gid_init()) != 0) {
+		(void) rdk_cm_roce_fini();
+		(void) rdk_cm_addr_fini();
+		goto fail;
+	}
+	if ((ret = rdk_cm_client_init()) != 0) {
+		rdk_cm_gid_fini();
+		(void) rdk_cm_roce_fini();
 		(void) rdk_cm_addr_fini();
 		goto fail;
 	}
 	return (0);
 fail:
 	taskq_destroy(rdk_cm_taskq);
-	rdk_cm_iw_fini();
 	tsd_destroy(&rdk_cm_tsd);
 	list_destroy(&rdk_cm_ids);
 	list_destroy(&rdk_cm_devs);
+	cv_destroy(&rdk_cm_dev_cv);
 	mutex_destroy(&rdk_cm_lock);
 	return (ret);
 }
@@ -1264,14 +1221,19 @@ rdk_cm_fini(void)
 		return (EBUSY);
 	}
 	mutex_exit(&rdk_cm_lock);
-	if ((ret = rdk_cm_addr_fini()) != 0)
+	if ((ret = rdk_cm_roce_fini()) != 0)
 		return (ret);
-	rdk_unregister_client(&rdk_cm_client);
+	if ((ret = rdk_cm_addr_fini()) != 0) {
+		VERIFY0(rdk_cm_roce_init());
+		return (ret);
+	}
+	rdk_cm_client_fini();
+	rdk_cm_gid_fini();
 	taskq_destroy(rdk_cm_taskq);
-	rdk_cm_iw_fini();
 	tsd_destroy(&rdk_cm_tsd);
 	list_destroy(&rdk_cm_ids);
 	list_destroy(&rdk_cm_devs);
+	cv_destroy(&rdk_cm_dev_cv);
 	mutex_destroy(&rdk_cm_lock);
 	return (0);
 }

@@ -10,9 +10,10 @@
 #
 
 rdmak, the kernel RDMA verbs framework, follows the Linux kernel verbs
-programming model.  Two files are derived from Linux v6.18-rc2-10-g552c50713f27,
-commit 552c50713f273b494ac6c77052032a49bc9255e2, and are used under the
-OpenIB.org BSD license that both offer; see THIRDPARTYLICENSE.
+programming model.  The files below are derived from Linux
+v6.18-rc2-10-g552c50713f27, commit 552c50713f273b494ac6c77052032a49bc9255e2,
+and are used under the OpenIB.org BSD license that each source offers; see
+THIRDPARTYLICENSE.  Each source's blob ID at that commit is given.
 
     rdk.h        include/rdma/ib_verbs.h
                  6139223e92e4c2f26686595279836af20a261da5
@@ -33,7 +34,59 @@ OpenIB.org BSD license that both offer; see THIRDPARTYLICENSE.
                  cookies instead of a scatterlist) and the drain functions
                  (from __ib_drain_sq() and __ib_drain_rq()).
 
-rdk_device.c, rdk_cq.c and rdk_impl.h are written for illumos under the CDDL.
+    rdk_ibcm_fsm.c, rdk_ibcm_fsm.h
+                 drivers/infiniband/core/cm.c
+                 01bede8ba105535da9025ba75c392e3e9b161306
+                 "SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB"
+                 The IB CM connection states (enum ib_cm_state) and the
+                 answer to each message in each state: cm_req_handler(),
+                 cm_dup_req_handler(), cm_rep_handler(),
+                 cm_dup_rep_handler(), cm_rtu_handler(), cm_rej_handler(),
+                 cm_mra_handler(), cm_dreq_handler(), cm_drep_handler(),
+                 cm_destroy_id(), cm_process_send_error(),
+                 cm_enter_timewait(), cm_convert_to_ms() and
+                 cm_ack_timeout().  The state machine does no I/O.
+
+    rdk_ibcm_msg.c, rdk_ibcm_msg.h
+                 include/rdma/ibta_vol1_c12.h
+                 960c86bec76c8da7a1db5e8b4a9aa6bf239bdb20
+                 "SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB"
+                 The field offsets and widths of REQ, MRA, REJ, REP, RTU,
+                 DREQ and DREP (IBTA vol 1 tables 106 to 113).
+                 drivers/infiniband/core/cm_msgs.h
+                 8462de7ca26ebadcbdeae43a9b1be517bfb00763
+                 "SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB"
+                 The CM class version, attribute IDs and message codes.
+                 drivers/infiniband/core/cma.c
+                 5b2d3ae3f9fce85baa71214242658d12f3b87460
+                 "SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB"
+                 struct cma_hdr, CMA_VERSION and the RDMA_PS_TCP service
+                 ID; the parser and builder are written for illumos.
+
+    rdk_cm_roce.c, rdk_cm_roce_rx.c, rdk_cm_roce.h
+                 drivers/infiniband/core/cm.c
+                 01bede8ba105535da9025ba75c392e3e9b161306
+                 drivers/infiniband/core/cma.c
+                 5b2d3ae3f9fce85baa71214242658d12f3b87460
+                 The REQ and REP contents (cm_format_req(), cm_format_rep(),
+                 cma_connect_ib(), cma_accept_ib()), the QP attributes of
+                 each transition (cm_init_qp_init_attr(),
+                 cm_init_qp_rtr_attr(), cm_init_qp_rts_attr()), the
+                 duplicate and stale checks (cm_match_req(),
+                 cm_insert_remote_id(), cm_insert_remote_qpn()), the
+                 stateless replies (cm_issue_rej(), cm_issue_drep()) and the
+                 cma.c constants CMA_CM_RESPONSE_TIMEOUT, CMA_MAX_CM_RETRIES
+                 and CMA_IBOE_PACKET_LIFETIME.  The tables, locking, timers,
+                 QP leases, address binding and passive path resolution are
+                 written for illumos.
+
+rdk_device.c, rdk_cq.c, rdk_impl.h, rdk_cm.c, rdk_cm_listen.c, rdk_cm_iw.c,
+rdk_cm_addr.c, rdk_cm_gid.c, rdk_cm_gidtab.c, rdk_cm_gidtab.h, rdk_gsi.c,
+rdk_gsi.h and rdk_cm_impl.h are written for illumos under the CDDL.  The GID
+table from IP events (Linux roce_gid_mgmt.c) and address resolution (Linux
+addr.c) are native, as the design requires, and take no code from Linux or
+FreeBSD.  rdk_gsi.c is a GSI agent for the CM class only and takes no code
+from Linux mad.c.
 rdk_cq.c is not derived from Linux drivers/infiniband/core/cq.c, which is
 GPL-2.0 only, nor from FreeBSD's ib_cq.c, which was taken from it.
 

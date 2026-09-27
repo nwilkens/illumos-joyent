@@ -14,18 +14,23 @@
  */
 
 /*
- * The connection manager's view of the IP stack: exclusive TCP port
- * reservations, routes and next hops, and address changes.
+ * The connection manager's view of the IP stack: port reservations, routes
+ * and next hops.
  *
  * An offloading RNIC takes every segment of the ports it serves before the
  * host sees them, so a port it uses must belong to nobody else in the host
- * stack.  Each reservation is a kernel TCP socket in the ID's netstack,
- * bound with SO_EXCLBIND and without SO_REUSEADDR: while it exists no other
- * socket can bind the port on that address or the wildcard, and a port the
- * host already uses cannot be reserved.  The socket never listens, so a
- * segment for the port that reaches the host gets a reset.  After the chip
- * has used the port the socket stays for the TIME_WAIT interval once the
- * last connection is gone.
+ * stack.  Each iWARP reservation is a kernel TCP socket in the ID's
+ * netstack, bound with SO_EXCLBIND and without SO_REUSEADDR: while it
+ * exists no other socket can bind the port on that address or the
+ * wildcard, and a port the host already uses cannot be reserved.  The
+ * socket never listens, so a segment for the port that reaches the host
+ * gets a reset.  After the chip has used the port the socket stays for the
+ * TIME_WAIT interval once the last connection is gone.
+ *
+ * RoCE ports are only numbers in the IB CM service ID, which the host TCP
+ * stack never sees, so RoCE has its own port space, as the Linux RDMA CM
+ * does: an (address, port) pair belongs to one ID and the children of its
+ * listener.
  */
 
 #include <sys/types.h>
@@ -34,31 +39,32 @@
 #include <sys/socket.h>
 #include <sys/ksocket.h>
 #include <sys/zone.h>
-#include <sys/neti.h>
-#include <sys/hook.h>
-#include <sys/hook_event.h>
+#include <sys/random.h>
 #include <netinet/in.h>
 #include <net/if_dl.h>
 #include <inet/ip.h>
 #include <inet/ip_if.h>
 #include <inet/ip_ire.h>
 #include <inet/ip2mac.h>
+#include <inet/tunables.h>
 
 #include "rdk_impl.h"
 #include "rdk_cm_impl.h"
 
 uint_t rdk_cm_timewait_ms = 60000;
 
+/* The ephemeral range of the RoCE port space (Linux's ip_local_port_range). */
+uint_t rdk_cm_roce_port_lo = 32768;
+uint_t rdk_cm_roce_port_hi = 60999;
+
 static kmutex_t rdk_cm_resv_lock;
 static list_t rdk_cm_tw;		/* reservations in TIME_WAIT */
+static avl_tree_t rdk_cm_roce_ports;
 static timeout_id_t rdk_cm_tw_timer;
 static boolean_t rdk_cm_tw_stop;
 static taskq_ent_t rdk_cm_tw_ent;
 static boolean_t rdk_cm_tw_busy;
 static volatile uint_t rdk_cm_ip2mac_out;
-
-static net_handle_t rdk_cm_neti;
-static hook_t *rdk_cm_nic_hook;
 
 boolean_t
 rdk_cm_unicast(ipaddr_t a)
@@ -66,7 +72,24 @@ rdk_cm_unicast(ipaddr_t a)
 	const uint32_t h = ntohl(a);
 
 	return (a != INADDR_ANY && a != INADDR_BROADCAST && !CLASSD(a) &&
-	    (h >> 24) != IN_LOOPBACKNET && (h >> 24) != 0);
+	    (h >> 24) != IN_LOOPBACKNET && (h >> 24) != 0 &&
+	    (h >> 28) != 0xf);
+}
+
+static int
+rdk_cm_port_cmp(const void *a, const void *b)
+{
+	const rdk_cm_resv_t *ra = a, *rb = b;
+	uint32_t x = ntohl(ra->rr_addr.sin_addr.s_addr);
+	uint32_t y = ntohl(rb->rr_addr.sin_addr.s_addr);
+
+	if (x != y)
+		return (x < y ? -1 : 1);
+	x = ntohs(ra->rr_addr.sin_port);
+	y = ntohs(rb->rr_addr.sin_port);
+	if (x != y)
+		return (x < y ? -1 : 1);
+	return (0);
 }
 
 static void
@@ -76,8 +99,8 @@ rdk_cm_resv_close(rdk_cm_resv_t *rr)
 	kmem_free(rr, sizeof (*rr));
 }
 
-int
-rdk_cm_resv_get(cred_t *cr, const struct sockaddr_in *want,
+static int
+rdk_cm_tcp_resv_get(cred_t *cr, const struct sockaddr_in *want,
     rdk_cm_resv_t **rrp)
 {
 	struct sockaddr_in sin, got;
@@ -86,9 +109,6 @@ rdk_cm_resv_get(cred_t *cr, const struct sockaddr_in *want,
 	ksocket_t ks;
 	int one = 1, ret;
 
-	*rrp = NULL;
-	if (!rdk_cm_unicast(want->sin_addr.s_addr))
-		return (EADDRNOTAVAIL);
 	if ((ret = ksocket_socket(&ks, AF_INET, SOCK_STREAM, IPPROTO_TCP,
 	    KSOCKET_SLEEP, cr)) != 0)
 		return (ret);
@@ -122,6 +142,66 @@ rdk_cm_resv_get(cred_t *cr, const struct sockaddr_in *want,
 	return (0);
 }
 
+/* A port of the RoCE space: the one asked for, or a free ephemeral one. */
+static int
+rdk_cm_roce_resv_get(const struct sockaddr_in *want, rdk_cm_resv_t **rrp)
+{
+	rdk_cm_resv_t *rr;
+	uint32_t lo = rdk_cm_roce_port_lo, hi = rdk_cm_roce_port_hi;
+	uint32_t span, start, i;
+	avl_index_t where;
+
+	rr = kmem_zalloc(sizeof (*rr), KM_SLEEP);
+	rr->rr_addr.sin_family = AF_INET;
+	rr->rr_addr.sin_addr = want->sin_addr;
+	rr->rr_refs = 1;
+
+	mutex_enter(&rdk_cm_resv_lock);
+	if (want->sin_port != 0) {
+		rr->rr_addr.sin_port = want->sin_port;
+		if (avl_find(&rdk_cm_roce_ports, rr, &where) != NULL) {
+			mutex_exit(&rdk_cm_resv_lock);
+			kmem_free(rr, sizeof (*rr));
+			return (EADDRINUSE);
+		}
+		avl_insert(&rdk_cm_roce_ports, rr, where);
+		mutex_exit(&rdk_cm_resv_lock);
+		*rrp = rr;
+		return (0);
+	}
+	if (lo == 0 || hi > UINT16_MAX || lo > hi) {
+		lo = 32768;
+		hi = 60999;
+	}
+	span = hi - lo + 1;
+	(void) random_get_pseudo_bytes((uint8_t *)&start, sizeof (start));
+	for (i = 0; i < span; i++) {
+		rr->rr_addr.sin_port = htons((uint16_t)(lo + (start + i) %
+		    span));
+		if (avl_find(&rdk_cm_roce_ports, rr, &where) == NULL) {
+			avl_insert(&rdk_cm_roce_ports, rr, where);
+			mutex_exit(&rdk_cm_resv_lock);
+			*rrp = rr;
+			return (0);
+		}
+	}
+	mutex_exit(&rdk_cm_resv_lock);
+	kmem_free(rr, sizeof (*rr));
+	return (EADDRNOTAVAIL);
+}
+
+int
+rdk_cm_resv_get(rdk_cm_dev_t *cd, cred_t *cr, const struct sockaddr_in *want,
+    rdk_cm_resv_t **rrp)
+{
+	*rrp = NULL;
+	if (!rdk_cm_unicast(want->sin_addr.s_addr))
+		return (EADDRNOTAVAIL);
+	if (cd->rcd_roce)
+		return (rdk_cm_roce_resv_get(want, rrp));
+	return (rdk_cm_tcp_resv_get(cr, want, rrp));
+}
+
 void
 rdk_cm_resv_hold(rdk_cm_resv_t *rr)
 {
@@ -138,6 +218,57 @@ rdk_cm_resv_used(rdk_cm_resv_t *rr)
 	mutex_enter(&rdk_cm_resv_lock);
 	rr->rr_used = B_TRUE;
 	mutex_exit(&rdk_cm_resv_lock);
+}
+
+/* Make the ID the RoCE listener of its reservation. */
+int
+rdk_cm_resv_listen(rdk_cm_resv_t *rr, rdk_cm_id_t *id)
+{
+	int ret = 0;
+
+	mutex_enter(&rdk_cm_resv_lock);
+	if (rr->rr_ks != NULL || rr->rr_listener != NULL)
+		ret = EADDRINUSE;
+	else
+		rr->rr_listener = id;
+	mutex_exit(&rdk_cm_resv_lock);
+	if (ret == 0)
+		rdk_cm_hold(id);
+	return (ret);
+}
+
+void
+rdk_cm_resv_unlisten(rdk_cm_resv_t *rr, rdk_cm_id_t *id)
+{
+	boolean_t mine;
+
+	mutex_enter(&rdk_cm_resv_lock);
+	mine = rr->rr_listener == id;
+	if (mine)
+		rr->rr_listener = NULL;
+	mutex_exit(&rdk_cm_resv_lock);
+	if (mine)
+		rdk_cm_rele(id);
+}
+
+/* The listener for a RoCE request to (addr, port), held. */
+rdk_cm_id_t *
+rdk_cm_roce_listener(ipaddr_t addr, uint16_t port)
+{
+	rdk_cm_resv_t key, *rr;
+	rdk_cm_id_t *id = NULL;
+
+	bzero(&key, sizeof (key));
+	key.rr_addr.sin_addr.s_addr = addr;
+	key.rr_addr.sin_port = port;
+	mutex_enter(&rdk_cm_resv_lock);
+	if ((rr = avl_find(&rdk_cm_roce_ports, &key, NULL)) != NULL &&
+	    rr->rr_listener != NULL) {
+		id = rr->rr_listener;
+		rdk_cm_hold(id);
+	}
+	mutex_exit(&rdk_cm_resv_lock);
+	return (id);
 }
 
 static void rdk_cm_tw_arm(void);
@@ -197,9 +328,9 @@ rdk_cm_tw_arm(void)
 }
 
 /*
- * Drop a reference.  The last one closes the socket now if the chip never
- * used the port, and after the TIME_WAIT interval otherwise.  Thread
- * context.
+ * Drop a reference.  The last one frees a RoCE port at once; it closes a
+ * host socket now if the chip never used the port, and after the TIME_WAIT
+ * interval otherwise.  Thread context.
  */
 void
 rdk_cm_resv_rele(rdk_cm_resv_t *rr)
@@ -210,6 +341,13 @@ rdk_cm_resv_rele(rdk_cm_resv_t *rr)
 	VERIFY3U(rr->rr_refs, >, 0);
 	if (--rr->rr_refs != 0) {
 		mutex_exit(&rdk_cm_resv_lock);
+		return;
+	}
+	if (rr->rr_ks == NULL) {
+		VERIFY3P(rr->rr_listener, ==, NULL);
+		avl_remove(&rdk_cm_roce_ports, rr);
+		mutex_exit(&rdk_cm_resv_lock);
+		kmem_free(rr, sizeof (*rr));
 		return;
 	}
 	now = !rr->rr_used || rdk_cm_timewait_ms == 0;
@@ -224,131 +362,145 @@ rdk_cm_resv_rele(rdk_cm_resv_t *rr)
 }
 
 /*
- * The device port whose MAC is the interface's, with a hold on the device.
- * Untagged interfaces of the port only.
+ * The device port an interface sits on, with a hold on the device, from
+ * the interface table.  Tagged interfaces are refused for now.
  */
 static int
-rdk_cm_dev_by_ill(const ill_t *ill, rdk_cm_dev_t **cdp, uint32_t *portp)
+rdk_cm_if_path(uint_t ifindex, rdk_cm_path_t *p)
 {
-	rdk_cm_dev_t *cd;
-	uint32_t i;
+	uint8_t mac[ETHERADDRL];
+	uint16_t vlan;
+	int ret;
 
-	if (ill->ill_phys_addr_length != ETHERADDRL ||
-	    ill->ill_phys_addr == NULL)
+	if ((ret = rdk_cm_if_get(ifindex, mac, &vlan)) != 0)
+		return (ret == ENOTSUP ? ENOTSUP : EADDRNOTAVAIL);
+	if (vlan != RDK_VLAN_NONE)
+		return (ENOTSUP);
+	if ((ret = rdk_cm_dev_by_mac(mac, &p->cp_dev, &p->cp_port)) != 0)
 		return (EADDRNOTAVAIL);
-	mutex_enter(&rdk_cm_lock);
-	for (cd = list_head(&rdk_cm_devs); cd != NULL;
-	    cd = list_next(&rdk_cm_devs, cd)) {
-		if (!cd->rcd_added || cd->rcd_removing || cd->rcd_iw == NULL)
-			continue;
-		for (i = 0; i < cd->rcd_nports; i++) {
-			if (bcmp(cd->rcd_mac[i], ill->ill_phys_addr,
-			    ETHERADDRL) == 0) {
-				cd->rcd_ids++;
-				mutex_exit(&rdk_cm_lock);
-				*cdp = cd;
-				*portp = i + 1;
-				return (0);
-			}
-		}
-	}
-	mutex_exit(&rdk_cm_lock);
-	return (EADDRNOTAVAIL);
-}
-
-static boolean_t
-rdk_cm_ill_ok(const ill_t *ill)
-{
-	return (!ill->ill_isv6 && !IS_LOOPBACK(ill) && !IS_VNI(ill) &&
-	    !IS_IPMP(ill) && !IS_UNDER_IPMP(ill));
+	p->cp_ifindex = ifindex;
+	p->cp_vlan = vlan;
+	bcopy(mac, p->cp_smac, ETHERADDRL);
+	return (0);
 }
 
 static void
-rdk_cm_route_fill(const ill_t *ill, ipaddr_t src, uint32_t port,
-    struct rdk_cm_route *rt)
+rdk_cm_path_rele(rdk_cm_path_t *p)
+{
+	if (p->cp_dev != NULL) {
+		rdk_cm_dev_rele(p->cp_dev);
+		p->cp_dev = NULL;
+	}
+}
+
+void
+rdk_cm_path_fill(const rdk_cm_path_t *p, struct rdk_cm_route *rt)
 {
 	rt->rcr_src.sin_family = AF_INET;
-	rt->rcr_src.sin_addr.s_addr = src;
-	rt->rcr_port = port;
-	bcopy(ill->ill_phys_addr, rt->rcr_smac, ETHERADDRL);
-	rt->rcr_vlan = RDK_VLAN_NONE;
-	rt->rcr_mtu = ill->ill_mtu;
+	rt->rcr_src.sin_addr.s_addr = p->cp_src;
+	rt->rcr_port = p->cp_port;
+	bcopy(p->cp_smac, rt->rcr_smac, ETHERADDRL);
+	rt->rcr_vlan = p->cp_vlan;
+	rt->rcr_mtu = p->cp_mtu;
 }
 
 /* The device of an address the host has up on one of its interfaces. */
 int
-rdk_cm_local_dev(cred_t *cr, ipaddr_t addr, rdk_cm_dev_t **cdp,
-    uint32_t *portp, uint_t *ifindexp, struct rdk_cm_route *rt)
+rdk_cm_local_dev(cred_t *cr, ipaddr_t addr, rdk_cm_path_t *p)
 {
 	netstack_t *ns;
-	ip_stack_t *ipst;
 	ipif_t *ipif;
-	ill_t *ill;
+	uint_t ifindex;
+	uint32_t mtu;
 	int ret;
 
+	bzero(p, sizeof (*p));
 	if ((ns = netstack_find_by_cred(cr)) == NULL)
 		return (ENXIO);
-	ipst = ns->netstack_ip;
-	ipif = ipif_lookup_addr_nondup(addr, NULL, crgetzoneid(cr), ipst);
+	ipif = ipif_lookup_addr_nondup(addr, NULL, crgetzoneid(cr),
+	    ns->netstack_ip);
 	if (ipif == NULL) {
 		netstack_rele(ns);
 		return (EADDRNOTAVAIL);
 	}
-	ill = ipif->ipif_ill;
-	if (!rdk_cm_ill_ok(ill)) {
-		ret = EADDRNOTAVAIL;
-	} else if ((ret = rdk_cm_dev_by_ill(ill, cdp, portp)) == 0) {
-		*ifindexp = ill->ill_phyint->phyint_ifindex;
-		rdk_cm_route_fill(ill, addr, *portp, rt);
-	}
+	ifindex = ipif->ipif_ill->ill_phyint->phyint_ifindex;
+	mtu = ipif->ipif_ill->ill_mtu;
 	ipif_refrele(ipif);
 	netstack_rele(ns);
-	return (ret);
+	if ((ret = rdk_cm_if_path(ifindex, p)) != 0)
+		return (ret);
+	p->cp_src = addr;
+	p->cp_mtu = mtu;
+	return (0);
 }
 
 /*
- * The egress interface, device and next hop toward dst.  *srcp in:
- * INADDR_ANY to pick the source, or an address up on the egress interface.
+ * The path toward dst: egress interface and device, source address, next
+ * hop and MTU.  src is INADDR_ANY to pick the source, or an address up on
+ * the egress interface.  A destination the host itself has, on a RoCE
+ * device port, is reached through the device's loopback.
  */
 int
-rdk_cm_route_lookup(cred_t *cr, ipaddr_t dst, ipaddr_t *srcp,
-    rdk_cm_dev_t **cdp, uint32_t *portp, uint_t *ifindexp,
-    struct rdk_cm_route *rt, ipaddr_t *nhp)
+rdk_cm_route_lookup(cred_t *cr, ipaddr_t dst, ipaddr_t src, rdk_cm_path_t *p)
 {
 	const zoneid_t zoneid = crgetzoneid(cr);
-	ipaddr_t setsrc = INADDR_ANY, src;
+	ipaddr_t setsrc = INADDR_ANY;
 	netstack_t *ns;
 	ip_stack_t *ipst;
 	ire_t *ire;
 	ill_t *ill = NULL;
 	ipif_t *ipif;
+	uint_t ifindex;
+	boolean_t local;
 	int ret = 0;
 
+	bzero(p, sizeof (*p));
 	if ((ns = netstack_find_by_cred(cr)) == NULL)
 		return (ENXIO);
 	ipst = ns->netstack_ip;
 	ire = ire_route_recursive_v4(dst, 0, NULL, zoneid, NULL,
 	    MATCH_IRE_DSTONLY, IRR_ALLOCATE, 0, ipst, &setsrc, NULL, NULL);
+	if (ire == NULL) {
+		netstack_rele(ns);
+		return (ENETUNREACH);
+	}
+	local = (ire->ire_type & IRE_LOCAL) != 0;
 	if ((ire->ire_flags & (RTF_REJECT | RTF_BLACKHOLE)) != 0 ||
-	    (ire->ire_type & (IRE_LOCAL | IRE_LOOPBACK | IRE_BROADCAST |
-	    IRE_MULTICAST)) != 0 || (ill = ire_nexthop_ill(ire)) == NULL) {
+	    (ire->ire_type & (IRE_LOOPBACK | IRE_BROADCAST |
+	    IRE_MULTICAST)) != 0) {
 		ret = ENETUNREACH;
 		goto out;
 	}
-	if (!rdk_cm_ill_ok(ill)) {
+	if (local) {
+		ipif = ipif_lookup_addr_nondup(dst, NULL, zoneid, ipst);
+		if (ipif != NULL) {
+			ill = ipif->ipif_ill;
+			ill_refhold(ill);
+			ipif_refrele(ipif);
+		}
+	} else {
+		ill = ire_nexthop_ill(ire);
+	}
+	if (ill == NULL || IS_LOOPBACK(ill) || IS_IPMP(ill) ||
+	    IS_UNDER_IPMP(ill) || ill->ill_isv6) {
 		ret = ENETUNREACH;
 		goto out;
 	}
-	src = *srcp;
+	ifindex = ill->ill_phyint->phyint_ifindex;
 	if (src == INADDR_ANY) {
-		if (ip_select_source_v4(ill, setsrc, dst, INADDR_ANY, zoneid,
-		    ipst, &src, NULL, NULL) != 0 || !rdk_cm_unicast(src)) {
+		if (local) {
+			src = dst;
+		} else if (ip_select_source_v4(ill, setsrc, dst, INADDR_ANY,
+		    zoneid, ipst, &src, NULL, NULL) != 0 ||
+		    !rdk_cm_unicast(src)) {
 			ret = EADDRNOTAVAIL;
 			goto out;
 		}
 	} else {
-		ipif = ipif_lookup_addr_nondup(src, ill, zoneid, ipst);
-		if (ipif == NULL || ipif->ipif_ill != ill) {
+		ipif = ipif_lookup_addr_nondup(src, local ? NULL : ill, zoneid,
+		    ipst);
+		if (ipif == NULL ||
+		    ipif->ipif_ill->ill_phyint->phyint_ifindex != ifindex) {
 			if (ipif != NULL)
 				ipif_refrele(ipif);
 			ret = EADDRNOTAVAIL;
@@ -356,15 +508,23 @@ rdk_cm_route_lookup(cred_t *cr, ipaddr_t dst, ipaddr_t *srcp,
 		}
 		ipif_refrele(ipif);
 	}
-	if ((ret = rdk_cm_dev_by_ill(ill, cdp, portp)) != 0)
+	if ((ret = rdk_cm_if_path(ifindex, p)) != 0) {
+		ret = ret == ENOTSUP ? ENOTSUP : ENETUNREACH;
 		goto out;
-	*srcp = src;
-	*ifindexp = ill->ill_phyint->phyint_ifindex;
-	*nhp = (ire->ire_type & IRE_OFFLINK) != 0 ? ire->ire_gateway_addr :
-	    dst;
-	rdk_cm_route_fill(ill, src, *portp, rt);
+	}
+	if (local && !p->cp_dev->rcd_roce) {
+		rdk_cm_path_rele(p);
+		ret = ENETUNREACH;
+		goto out;
+	}
+	p->cp_src = src;
+	p->cp_local = local;
+	p->cp_nexthop = local || (ire->ire_type & IRE_OFFLINK) == 0 ? dst :
+	    ire->ire_gateway_addr;
+	p->cp_mtu = ill->ill_mtu;
 	if (ire->ire_metrics.iulp_mtu != 0)
-		rt->rcr_mtu = MIN(rt->rcr_mtu, ire->ire_metrics.iulp_mtu);
+		p->cp_mtu = MIN(p->cp_mtu, ire->ire_metrics.iulp_mtu);
+	p->cp_ttl = (uint8_t)MIN(ipst->ips_ip_def_ttl, UINT8_MAX);
 out:
 	if (ill != NULL)
 		ill_refrele(ill);
@@ -373,45 +533,52 @@ out:
 	return (ret);
 }
 
+/*
+ * Next-hop resolution through IP's resolver.
+ */
 static void
-rdk_cm_rs_rele(rdk_cm_resolve_t *rs)
+rdk_cm_arp_rele(rdk_cm_arp_t *rp)
 {
-	rdk_cm_id_t *id;
+	const rdk_cm_arp_ops_t *ops;
+	void *arg;
 	boolean_t last;
 
-	mutex_enter(&rs->rs_lock);
-	VERIFY3U(rs->rs_refs, >, 0);
-	last = --rs->rs_refs == 0;
-	id = rs->rs_id;
-	mutex_exit(&rs->rs_lock);
+	mutex_enter(&rp->rp_lock);
+	VERIFY3U(rp->rp_refs, >, 0);
+	last = --rp->rp_refs == 0;
+	arg = rp->rp_arg;
+	ops = rp->rp_ops;
+	mutex_exit(&rp->rp_lock);
 	if (!last)
 		return;
-	mutex_destroy(&rs->rs_lock);
-	kmem_free(rs, sizeof (*rs));
-	if (id != NULL)
-		rdk_cm_rele(id);
+	mutex_destroy(&rp->rp_lock);
+	kmem_free(rp, sizeof (*rp));
+	if (arg != NULL)
+		ops->rao_rele(arg);
 }
 
 static void
-rdk_cm_rs_task(void *arg)
+rdk_cm_arp_task(void *arg)
 {
-	rdk_cm_resolve_t *rs = arg;
-	rdk_cm_id_t *id;
+	rdk_cm_arp_t *rp = arg;
+	const rdk_cm_arp_ops_t *ops;
+	void *owner;
 	uint32_t gen;
 	int err;
 
-	mutex_enter(&rs->rs_lock);
-	id = rs->rs_id;
-	gen = rs->rs_gen;
-	err = rs->rs_err;
-	if (id != NULL)
-		rdk_cm_hold(id);
-	mutex_exit(&rs->rs_lock);
-	if (id != NULL) {
-		rdk_cm_route_done(id, gen, err, rs->rs_mac);
-		rdk_cm_rele(id);
+	mutex_enter(&rp->rp_lock);
+	owner = rp->rp_arg;
+	ops = rp->rp_ops;
+	gen = rp->rp_gen;
+	err = rp->rp_err;
+	if (owner != NULL)
+		ops->rao_hold(owner);
+	mutex_exit(&rp->rp_lock);
+	if (owner != NULL) {
+		ops->rao_done(owner, gen, err, rp->rp_mac);
+		ops->rao_rele(owner);
 	}
-	rdk_cm_rs_rele(rs);
+	rdk_cm_arp_rele(rp);
 	atomic_dec_uint(&rdk_cm_ip2mac_out);
 }
 
@@ -432,129 +599,135 @@ rdk_cm_ip2mac_result(const ip2mac_t *ip2m, uint8_t *mac)
 static void
 rdk_cm_ip2mac_cb(ip2mac_t *ip2m, void *arg)
 {
-	rdk_cm_resolve_t *rs = arg;
+	rdk_cm_arp_t *rp = arg;
 
-	mutex_enter(&rs->rs_lock);
-	rs->rs_done = B_TRUE;
-	rs->rs_err = rdk_cm_ip2mac_result(ip2m, rs->rs_mac);
-	mutex_exit(&rs->rs_lock);
-	taskq_dispatch_ent(rdk_cm_taskq, rdk_cm_rs_task, rs, 0,
-	    &rs->rs_tqent);
+	mutex_enter(&rp->rp_lock);
+	rp->rp_done = B_TRUE;
+	rp->rp_err = rdk_cm_ip2mac_result(ip2m, rp->rp_mac);
+	mutex_exit(&rp->rp_lock);
+	taskq_dispatch_ent(rdk_cm_taskq, rdk_cm_arp_task, rp, 0,
+	    &rp->rp_tqent);
 }
 
 /*
- * Resolve the next hop's MAC for a route operation of generation gen.
- * The answer ends the operation through rdk_cm_route_done().
+ * Resolve the MAC of the next hop nh on the interface.  The answer calls
+ * rao_done(arg, gen, err, mac), perhaps before this returns; the caller
+ * must not hold the locks rao_done takes.  *rpp is the owner's reference.
  */
 int
-rdk_cm_nexthop(rdk_cm_id_t *id, ipaddr_t nh, uint32_t gen)
+rdk_cm_arp_start(zoneid_t zone, uint_t ifindex, ipaddr_t nh,
+    const rdk_cm_arp_ops_t *ops, void *arg, uint32_t gen, rdk_cm_arp_t **rpp)
 {
-	rdk_cm_resolve_t *rs;
+	rdk_cm_arp_t *rp;
 	ip2mac_t ip2m;
 	struct sockaddr_in *sin;
 	ip2mac_id_t mid;
 	uint8_t mac[ETHERADDRL];
 	int err;
 
-	rs = kmem_zalloc(sizeof (*rs), KM_SLEEP);
-	mutex_init(&rs->rs_lock, NULL, MUTEX_DRIVER, NULL);
-	rs->rs_refs = 2;	/* this call and the callback */
-	rs->rs_gen = gen;
-	rdk_cm_hold(id);
-	rs->rs_id = id;
+	rp = kmem_zalloc(sizeof (*rp), KM_SLEEP);
+	mutex_init(&rp->rp_lock, NULL, MUTEX_DRIVER, NULL);
+	rp->rp_refs = 2;	/* the owner and the answer */
+	rp->rp_gen = gen;
+	rp->rp_zone = zone;
+	rp->rp_ops = ops;
+	ops->rao_hold(arg);
+	rp->rp_arg = arg;
+	*rpp = rp;
 
 	bzero(&ip2m, sizeof (ip2m));
 	sin = (struct sockaddr_in *)&ip2m.ip2mac_pa;
 	sin->sin_family = AF_INET;
 	sin->sin_addr.s_addr = nh;
-	mutex_enter(&id->rci_lock);
-	ip2m.ip2mac_ifindex = id->rci_ifindex;
-	id->rci_resolve = rs;
-	rs->rs_refs++;		/* rci_resolve */
-	mutex_exit(&id->rci_lock);
+	ip2m.ip2mac_ifindex = ifindex;
 
 	atomic_inc_uint(&rdk_cm_ip2mac_out);
-	mid = ip2mac(IP2MAC_RESOLVE, &ip2m, rdk_cm_ip2mac_cb, rs,
-	    crgetzoneid(id->rci_cred));
+	mid = ip2mac(IP2MAC_RESOLVE, &ip2m, rdk_cm_ip2mac_cb, rp, zone);
 	if (ip2m.ip2mac_err == EINPROGRESS && mid != NULL) {
-		mutex_enter(&rs->rs_lock);
-		rs->rs_ip2mac = mid;
-		mutex_exit(&rs->rs_lock);
-		rdk_cm_rs_rele(rs);
+		mutex_enter(&rp->rp_lock);
+		rp->rp_ip2mac = mid;
+		mutex_exit(&rp->rp_lock);
 		return (0);
 	}
 
 	/* Answered at once: the callback will not run. */
 	atomic_dec_uint(&rdk_cm_ip2mac_out);
-	mutex_enter(&rs->rs_lock);
-	rs->rs_done = B_TRUE;
-	mutex_exit(&rs->rs_lock);
-	rdk_cm_rs_rele(rs);
+	mutex_enter(&rp->rp_lock);
+	rp->rp_done = B_TRUE;
+	mutex_exit(&rp->rp_lock);
 	err = rdk_cm_ip2mac_result(&ip2m, mac);
-	rdk_cm_route_done(id, gen, err, mac);
-	rdk_cm_resolve_cancel(id);
-	rdk_cm_rs_rele(rs);
+	ops->rao_done(arg, gen, err, mac);
+	rdk_cm_arp_rele(rp);
 	return (0);
 }
 
-/* Stop waiting for the resolver; a late answer is dropped. */
-void
-rdk_cm_resolve_cancel(rdk_cm_id_t *id)
+/*
+ * The next hop's MAC if the neighbor cache has it now; never starts a
+ * resolution, so a packet from an unknown sender cannot make the host ARP.
+ */
+int
+rdk_cm_nexthop_lookup(zoneid_t zone, uint_t ifindex, ipaddr_t nh,
+    uint8_t *mac)
 {
-	rdk_cm_resolve_t *rs;
+	ip2mac_t ip2m;
+	struct sockaddr_in *sin;
+
+	bzero(&ip2m, sizeof (ip2m));
+	sin = (struct sockaddr_in *)&ip2m.ip2mac_pa;
+	sin->sin_family = AF_INET;
+	sin->sin_addr.s_addr = nh;
+	ip2m.ip2mac_ifindex = ifindex;
+	(void) ip2mac(IP2MAC_LOOKUP, &ip2m, NULL, NULL, zone);
+	return (rdk_cm_ip2mac_result(&ip2m, mac));
+}
+
+/* Give back the owner's reference; a later answer is dropped. */
+void
+rdk_cm_arp_cancel(rdk_cm_arp_t *rp)
+{
+	const rdk_cm_arp_ops_t *ops;
 	ip2mac_id_t mid = NULL;
-	rdk_cm_id_t *held;
+	void *held;
 	boolean_t cb_ref = B_FALSE;
 
-	mutex_enter(&id->rci_lock);
-	rs = id->rci_resolve;
-	id->rci_resolve = NULL;
-	mutex_exit(&id->rci_lock);
-	if (rs == NULL)
+	if (rp == NULL)
 		return;
-
-	mutex_enter(&rs->rs_lock);
-	held = rs->rs_id;
-	rs->rs_id = NULL;
-	if (!rs->rs_done)
-		mid = rs->rs_ip2mac;
-	mutex_exit(&rs->rs_lock);
+	mutex_enter(&rp->rp_lock);
+	held = rp->rp_arg;
+	ops = rp->rp_ops;
+	rp->rp_arg = NULL;
+	if (!rp->rp_done)
+		mid = rp->rp_ip2mac;
+	mutex_exit(&rp->rp_lock);
 	if (held != NULL)
-		rdk_cm_rele(held);
+		ops->rao_rele(held);
 
-	if (mid != NULL && ip2mac_cancel(mid, crgetzoneid(id->rci_cred)) == 0) {
-		mutex_enter(&rs->rs_lock);
-		if (!rs->rs_done) {
-			rs->rs_done = B_TRUE;
+	if (mid != NULL && ip2mac_cancel(mid, rp->rp_zone) == 0) {
+		mutex_enter(&rp->rp_lock);
+		if (!rp->rp_done) {
+			rp->rp_done = B_TRUE;
 			cb_ref = B_TRUE;
 		}
-		mutex_exit(&rs->rs_lock);
+		mutex_exit(&rp->rp_lock);
 	}
 	if (cb_ref) {
 		atomic_dec_uint(&rdk_cm_ip2mac_out);
-		rdk_cm_rs_rele(rs);
+		rdk_cm_arp_rele(rp);
 	}
-	rdk_cm_rs_rele(rs);
+	rdk_cm_arp_rele(rp);
 }
 
-/* IP reports interface and address changes in its event taskq. */
-static int
-rdk_cm_nic_event(hook_event_token_t tok, hook_data_t data, void *arg)
+/* Stop the ID's route resolution; a late answer is dropped. */
+void
+rdk_cm_resolve_cancel(rdk_cm_id_t *id)
 {
-	hook_nic_event_t *ne = (hook_nic_event_t *)data;
+	rdk_cm_arp_t *rp;
 
-	_NOTE(ARGUNUSED(tok, arg));
-	switch (ne->hne_event) {
-	case NE_ADDRESS_CHANGE:
-	case NE_LIF_DOWN:
-	case NE_DOWN:
-	case NE_UNPLUMB:
-		rdk_cm_addr_change((uint_t)ne->hne_nic);
-		break;
-	default:
-		break;
-	}
-	return (0);
+	mutex_enter(&id->rci_lock);
+	rp = id->rci_resolve;
+	id->rci_resolve = NULL;
+	mutex_exit(&id->rci_lock);
+	rdk_cm_arp_cancel(rp);
 }
 
 int
@@ -563,28 +736,19 @@ rdk_cm_addr_init(void)
 	mutex_init(&rdk_cm_resv_lock, NULL, MUTEX_DRIVER, NULL);
 	list_create(&rdk_cm_tw, sizeof (rdk_cm_resv_t),
 	    offsetof(rdk_cm_resv_t, rr_node));
-
-	rdk_cm_neti = net_protocol_lookup(net_zoneidtonetid(GLOBAL_ZONEID),
-	    NHF_INET);
-	if (rdk_cm_neti != NULL) {
-		HOOK_INIT(rdk_cm_nic_hook, rdk_cm_nic_event, "rdmak_cm",
-		    NULL);
-		if (net_hook_register(rdk_cm_neti, NH_NIC_EVENTS,
-		    rdk_cm_nic_hook) != 0) {
-			hook_free(rdk_cm_nic_hook);
-			rdk_cm_nic_hook = NULL;
-		}
-	}
+	avl_create(&rdk_cm_roce_ports, rdk_cm_port_cmp, sizeof (rdk_cm_resv_t),
+	    offsetof(rdk_cm_resv_t, rr_avl));
+	rdk_cm_tw_stop = B_FALSE;
 	return (0);
 }
 
-/* EBUSY while a reservation waits out TIME_WAIT or IP may call back. */
+/* EBUSY while a reservation is held or waits, or IP may call back. */
 int
 rdk_cm_addr_fini(void)
 {
 	mutex_enter(&rdk_cm_resv_lock);
 	if (!list_is_empty(&rdk_cm_tw) || rdk_cm_tw_busy ||
-	    rdk_cm_ip2mac_out != 0) {
+	    rdk_cm_ip2mac_out != 0 || avl_numnodes(&rdk_cm_roce_ports) != 0) {
 		mutex_exit(&rdk_cm_resv_lock);
 		return (EBUSY);
 	}
@@ -592,17 +756,7 @@ rdk_cm_addr_fini(void)
 	mutex_exit(&rdk_cm_resv_lock);
 	if (rdk_cm_tw_timer != 0)
 		(void) untimeout(rdk_cm_tw_timer);
-
-	if (rdk_cm_nic_hook != NULL) {
-		(void) net_hook_unregister(rdk_cm_neti, NH_NIC_EVENTS,
-		    rdk_cm_nic_hook);
-		hook_free(rdk_cm_nic_hook);
-		rdk_cm_nic_hook = NULL;
-	}
-	if (rdk_cm_neti != NULL) {
-		(void) net_protocol_release(rdk_cm_neti);
-		rdk_cm_neti = NULL;
-	}
+	avl_destroy(&rdk_cm_roce_ports);
 	list_destroy(&rdk_cm_tw);
 	mutex_destroy(&rdk_cm_resv_lock);
 	return (0);
