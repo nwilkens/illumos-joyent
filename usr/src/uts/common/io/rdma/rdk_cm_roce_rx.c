@@ -43,7 +43,8 @@
 uint_t rdk_cm_roce_max_resolving = 256;
 /*
  * Bounds on the REP retransmissions a requester asks for: the interval,
- * and all of them together (Linux defaults take 4096 ms and 65.5 s).
+ * which also bounds an MRA's wait, and all of them together (Linux
+ * defaults take 4096 ms and 65.5 s).
  */
 uint_t rdk_ibcm_passive_resp_max_ms = 8192;
 uint_t rdk_ibcm_passive_max_ms = 70000;
@@ -295,6 +296,7 @@ rdk_ibconn_from_req(rdk_ibconn_t *c, const rdk_ibcm_msg_t *m,
 	    (uint8_t)(tries > 0 ? tries - 1 : 0), resp,
 	    rdk_ibcm_time_ms(c->ic_ack_timeout),
 	    rdk_ibcm_time_ms(c->ic_ack_timeout));
+	c->ic_fsm.f_mra_max_ms = rdk_ibcm_passive_resp_max_ms;
 }
 
 /*

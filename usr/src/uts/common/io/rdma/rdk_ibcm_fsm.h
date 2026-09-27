@@ -131,6 +131,7 @@ typedef struct rdk_ibcm_fsm {
 	uint32_t		f_resp_ms;	/* retransmit interval */
 	uint32_t		f_tw_ms;	/* timewait */
 	uint32_t		f_life_ms;	/* packet lifetime */
+	uint32_t		f_mra_max_ms;	/* 0: an MRA is not capped */
 } rdk_ibcm_fsm_t;
 
 typedef struct rdk_ibcm_in {

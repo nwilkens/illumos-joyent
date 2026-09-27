@@ -338,6 +338,8 @@ rdk_ibcm_fsm_step(rdk_ibcm_fsm_t *f, const rdk_ibcm_in_t *in,
 
 	case IBCI_MRA:			/* cm_mra_handler() */
 		ms = rdk_ibcm_time_ms(in->ii_mra_timeout) + f->f_life_ms;
+		if (f->f_mra_max_ms != 0 && ms > f->f_mra_max_ms)
+			ms = f->f_mra_max_ms;
 		if (s == IBCS_REQ_SENT &&
 		    in->ii_mra_msg == IBCM_MSG_RESPONSE_REQ) {
 			f->f_state = IBCS_MRA_REQ_RCVD;

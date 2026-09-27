@@ -269,6 +269,13 @@ t_mra(void)
 	step(&m, IBCI_RTU, 0, 0, 0);
 	CHECK(m.a.ia_ev == IBCE_NONE);
 
+	/* A capped MRA waits no longer than the cap. */
+	start(&m, B_FALSE, 2);
+	m.f.f_mra_max_ms = 200;
+	step(&m, IBCI_ACCEPT, 0, 0, 0);
+	step(&m, IBCI_MRA, 0, IBCM_MSG_RESPONSE_REP, 31);
+	CHECK(m.f.f_state == IBCS_MRA_REP_RCVD && m.timer == 200);
+
 	CHECK(rdk_ibcm_ack_timeout(15, 16) == 17);
 	CHECK(rdk_ibcm_ack_timeout(17, 16) == 18);
 	CHECK(rdk_ibcm_ack_timeout(20, 16) == 20);

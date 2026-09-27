@@ -22,6 +22,8 @@ MUTATIONS = (
      "\t\tif (s != IBCS_REP_SENT && s != IBCS_MRA_REP_RCVD)\n\t\t\tbreak;\n"),
     ("\t\trdk_ibcm_ev(f, a, IBCE_CLOSE, 0, B_TRUE);\n\t\tbreak;\n"
      "\tcase IBCS_IDLE:", "\t\tbreak;\n\tcase IBCS_IDLE:"),
+    ("\t\tif (f->f_mra_max_ms != 0 && ms > f->f_mra_max_ms)\n"
+     "\t\t\tms = f->f_mra_max_ms;\n", ""),
     ("\tf->f_max_retries = max_retries > 15 ? 15 : max_retries;\n",
      "\tf->f_max_retries = max_retries;\n"),
 )
