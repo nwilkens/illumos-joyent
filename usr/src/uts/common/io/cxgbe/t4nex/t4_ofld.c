@@ -385,13 +385,13 @@ t4_ofld_kstat_update(kstat_t *ksp, int rw)
 	mutex_enter(&of->of_dma_lock);
 	k->ok_dma_bytes.value.ui64 = of->of_dma_bytes;
 	k->ok_quar_bytes.value.ui64 = of->of_quar_bytes;
+	mutex_exit(&of->of_dma_lock);
 
 	t4_tp_get_tcp_stats(of->of_sc, &v4, NULL, B_TRUE);
 	k->ok_tcp_out_rsts.value.ui64 = v4.tcp_out_rsts;
 	k->ok_tcp_in_segs.value.ui64 = v4.tcp_in_segs;
 	k->ok_tcp_out_segs.value.ui64 = v4.tcp_out_segs;
 	k->ok_tcp_retrans_segs.value.ui64 = v4.tcp_retrans_segs;
-	mutex_exit(&of->of_dma_lock);
 	return (0);
 }
 
