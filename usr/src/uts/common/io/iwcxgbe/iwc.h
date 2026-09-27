@@ -246,6 +246,7 @@ struct iwc {
 	t4_rdma_info_t		iwc_info;
 	boolean_t		iwc_open;
 	volatile boolean_t	iwc_fatal;
+	volatile boolean_t	iwc_tainted;	/* iwc_taint() */
 	uint32_t		iwc_ndev;
 	iwc_dev_t		iwc_dev[T4_RDMA_MAX_PORTS];
 
@@ -320,6 +321,7 @@ iwc_of(struct rdk_device *d)
 
 /* iwc.c */
 extern void iwc_warn(iwc_t *, const char *, ...);
+extern void iwc_taint(iwc_t *);
 extern int iwc_qid_alloc(iwc_t *, uint32_t *);
 extern void iwc_qid_free(iwc_t *, uint32_t);
 extern iwc_qp_t *iwc_qp_get(iwc_t *, uint32_t);

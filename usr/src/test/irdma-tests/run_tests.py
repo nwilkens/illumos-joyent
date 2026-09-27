@@ -11,6 +11,7 @@ TESTS = (
     "cqe_checks.py",
     "cqp_requests.py",
     "cstyle.py",
+    "dma_quarantine.py",
     "fpm_checks.py",
     "ice_qsets.py",
     "license_notices.py",

@@ -652,6 +652,8 @@ rdk_dereg_mr(struct rdk_mr *mr)
 	int ret;
 
 	ret = dev->rd_ops->dereg_mr(mr);
+	if (ret == EIO)
+		rdk_device_taint(dev);
 	atomic_dec_32(&pd->usecnt);
 	rdk_obj_rele(dev);
 	return (ret);

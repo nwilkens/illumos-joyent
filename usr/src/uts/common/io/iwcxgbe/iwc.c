@@ -46,6 +46,18 @@ iwc_warn(iwc_t *iwc, const char *fmt, ...)
 }
 
 /*
+ * The adapter may still reach memory that a destroy should have released.
+ * Buffers freed from now on wait for a reset, which on T6 means a detach.
+ */
+void
+iwc_taint(iwc_t *iwc)
+{
+	iwc->iwc_tainted = B_TRUE;
+	for (uint32_t i = 0; i < iwc->iwc_ndev; i++)
+		rdk_device_taint(&iwc->iwc_dev[i].d_rdk);
+}
+
+/*
  * Queue IDs: QPs and CQs share the vres QP range.  Each QP takes two, its
  * SQ ID being the QP number.
  */
@@ -256,6 +268,7 @@ iwc_event(void *arg, const t4_rdma_event_t *ev)
 		break;
 	case T4_RDMA_EV_FATAL:
 		iwc->iwc_fatal = B_TRUE;
+		iwc_taint(iwc);
 		iwc_warn(iwc, "the adapter stopped; RDMA is down");
 		for (uint32_t i = 0; i < iwc->iwc_ndev; i++) {
 			if (!iwc->iwc_dev[i].d_registered)

@@ -35,6 +35,7 @@
 #include <sys/sysmacros.h>
 #include <sys/byteorder.h>
 #include <sys/disp.h>
+#include <sys/atomic.h>
 #include <netinet/in.h>
 
 #include "rdk_impl.h"
@@ -291,6 +292,12 @@ rdk_unregister_device(struct rdk_device *dev)
 			    "objects to be destroyed",
 			    (u_longlong_t)p->rdp_nobjs);
 		}
+	}
+	if (p->rdp_leaked != 0) {
+		dev_err(dev->rd_dip, CE_WARN, "!%s: leaked %llu buffers "
+		    "(%llu bytes) the device may still reach", dev->rd_name,
+		    (u_longlong_t)p->rdp_leaked,
+		    (u_longlong_t)p->rdp_leaked_bytes);
 	}
 	mutex_exit(&p->rdp_lock);
 	mutex_exit(&rdk_reg_lock);
@@ -648,6 +655,41 @@ rdk_dma_buf_free(struct rdk_device *dev, rdk_dma_buf_t *buf)
 	dev->rd_ops->dma_free(dev, buf);
 	bzero(buf, sizeof (*buf));
 	rdk_obj_rele(dev);
+}
+
+/* Any context: providers taint from their error paths. */
+void
+rdk_device_taint(struct rdk_device *dev)
+{
+	atomic_or_32(&dev->rd_tainted, 1);
+}
+
+boolean_t
+rdk_device_tainted(const struct rdk_device *dev)
+{
+	return (dev->rd_tainted != 0);
+}
+
+boolean_t
+rdk_dma_release(struct rdk_device *dev, void (*release)(void *), void *arg,
+    size_t len)
+{
+	struct rdk_device_priv *p = dev->rd_priv;
+	boolean_t first;
+
+	if (!rdk_device_tainted(dev)) {
+		release(arg);
+		return (B_TRUE);
+	}
+	mutex_enter(&p->rdp_lock);
+	first = p->rdp_leaked++ == 0;
+	p->rdp_leaked_bytes += len;
+	mutex_exit(&p->rdp_lock);
+	if (first) {
+		dev_err(dev->rd_dip, CE_WARN, "!%s may still reach memory it "
+		    "was given; leaking it", dev->rd_name);
+	}
+	return (B_FALSE);
 }
 
 /*

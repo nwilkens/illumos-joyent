@@ -43,6 +43,13 @@ root with Python 3.9+ and a C99 compiler.
   out-of-range attributes, states and types, and the DMA page walk against
   offsets, gaps, a full page list and a cookie that wraps the address
   space.
+- `dma_quarantine.py`: runs the rdmak DMA quarantine with the irdma
+  consumer free: a healthy device frees at once, a reset in progress holds
+  without tainting, a failed deregistration or an irdma taint makes rdmak
+  leak what `rdk_dma_release()` is given and irdma hand buffers to ice as
+  still in use; a run with the irdma taint not passed on must fail.  It
+  also checks that iwcxgbe taints on every destroy the adapter did not
+  confirm.
 - `cstyle.py`: `cstyle -pP` over the driver, rdmak and the tests.
 
 ## On hardware

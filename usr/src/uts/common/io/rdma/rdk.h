@@ -710,6 +710,7 @@ struct rdk_device {
 	/* Set by the framework. */
 	struct rdk_device_attr		rd_attr;
 	struct rdk_device_priv		*rd_priv;
+	volatile uint32_t		rd_tainted;	/* rdk_device_taint() */
 };
 
 /*
@@ -753,6 +754,28 @@ extern boolean_t rdk_gid_to_ipv4(const rdk_gid_t *, ipaddr_t *);
 
 extern int rdk_dma_buf_alloc(struct rdk_device *, size_t, rdk_dma_buf_t *);
 extern void rdk_dma_buf_free(struct rdk_device *, rdk_dma_buf_t *);
+
+/*
+ * DMA quarantine.  Memory the device may still reach does not go back to
+ * the system: it is freed once the provider has confirmed the destroy of
+ * every object that reaches it, or once the device has been reset, and is
+ * leaked otherwise.
+ *
+ * A provider that cannot confirm a destroy or a deregistration calls
+ * rdk_device_taint() before the operation returns; the device stays tainted
+ * until it is unregistered.  The provider then keeps every buffer given to
+ * rdk_dma_buf_free() until the device is reset, and rdk_dma_release()
+ * leaks what it is given.  rdk_dereg_mr() returning EIO taints the device.
+ *
+ * A consumer frees memory only after it has destroyed every QP and MR that
+ * can reach it.  Memory it mapped for the device itself goes back through
+ * rdk_dma_release(), which calls release(arg) at once on a device that is
+ * not tainted and returns B_TRUE, and otherwise leaks it and returns B_FALSE.
+ */
+extern void rdk_device_taint(struct rdk_device *);
+extern boolean_t rdk_device_tainted(const struct rdk_device *);
+extern boolean_t rdk_dma_release(struct rdk_device *, void (*)(void *),
+    void *, size_t);
 
 /*
  * rdk_verbs.c

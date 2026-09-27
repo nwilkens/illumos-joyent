@@ -280,6 +280,7 @@ iwc_alloc_mr(struct rdk_pd *rpd, enum rdk_mr_type type, uint32_t max,
 		/* The entry may be half written; keep the STag out of use. */
 		iwc_warn(iwc, "TPT write for STag 0x%x failed: %d",
 		    mr->mr_stag, ret);
+		iwc_taint(iwc);
 		leak = B_TRUE;
 		goto fail;
 	}
@@ -342,6 +343,7 @@ iwc_dereg_mr(struct rdk_mr *rmr)
 	} else {
 		iwc_warn(iwc, "STag 0x%x not invalidated: %d; leaking it",
 		    mr->mr_stag, ret);
+		iwc_taint(iwc);
 		ret = EIO;
 	}
 	kmem_free(mr->mr_pages, mr->mr_max * sizeof (uint64_t));
@@ -374,7 +376,8 @@ void
 iwc_dma_free(struct rdk_device *rdev, rdk_dma_buf_t *buf)
 {
 	iwc_t *iwc = iwc_of(rdev);
+	boolean_t quiesced = !iwc->iwc_fatal && !iwc->iwc_tainted &&
+	    !rdk_device_tainted(rdev);
 
-	iwc->iwc_ops->tro_dma_free(iwc->iwc_peer, buf->rdb_priv,
-	    !iwc->iwc_fatal);
+	iwc->iwc_ops->tro_dma_free(iwc->iwc_peer, buf->rdb_priv, quiesced);
 }

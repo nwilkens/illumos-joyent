@@ -53,6 +53,8 @@ struct rdk_device_priv {
 	kcondvar_t		rdp_cv;
 	boolean_t		rdp_dying;
 	uint64_t		rdp_nobjs;
+	uint64_t		rdp_leaked;		/* rdk_dma_release() */
+	uint64_t		rdp_leaked_bytes;
 	list_t			rdp_cdata;
 	krwlock_t		rdp_ev_lock;
 	list_t			rdp_handlers;

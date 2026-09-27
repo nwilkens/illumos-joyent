@@ -17,8 +17,9 @@
  * it as an rkey.  There is no other all-memory registration.
  *
  * A destroy that cannot issue its control command (the device is being
- * reset or has failed) taints the function; every DMA buffer freed after
- * that goes to ice's quarantine until the reset completes.  That includes
+ * reset or has failed) taints the function and its rdmak device; every DMA
+ * buffer freed after that goes to ice's quarantine until the reset
+ * completes.  That includes
  * consumer buffers from rdk_dma_buf_alloc(), which come from ice too.  A
  * tainted function issues no more verbs commands and reuses no resource
  * number; a command that fails on a healthy one also asks for a reset.
@@ -705,6 +706,9 @@ irdma_verbs_register(irdma_t *irdma)
 	rdev->rd_phys_port_cnt = 1;
 	rdev->rd_node_guid = 0;
 	rdev->rd_num_comp_vectors = irdma->irdma_nceqs;
+	/* The bzero may have lost a taint from another thread. */
+	if ((irdma->irdma_flags & IRDMA_F_TAINTED) != 0)
+		rdk_device_taint(rdev);
 	if ((ret = rdk_register_device(rdev)) != 0) {
 		irdma_error(irdma, "failed to register with rdmak: %d", ret);
 		return (ret);

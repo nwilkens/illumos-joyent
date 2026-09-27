@@ -435,6 +435,7 @@ iwc_destroy_qp(struct rdk_qp *rqp)
 	} else {
 		/* The firmware may still own the queues and the RQT. */
 		IWC_STAT(iwc, is_quar);
+		iwc_taint(iwc);
 	}
 	kmem_free(wq->sq.sw_sq, wq->sq.size * sizeof (t4_swsqe_t));
 	kmem_free(wq->rq.sw_rq, wq->rq.size * sizeof (t4_swrqe_t));
