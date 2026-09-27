@@ -236,10 +236,7 @@ nvmft_handoff_admin_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
     const nvlist_t *params, const nvmf_fabric_connect_cmd_t *cmd,
     const nvmf_fabric_connect_data_t *data)
 {
-	nvmft_controller_t *ctrlr;
 	struct nvmft_qpair *qp;
-	uint32_t kato;
-	id_t cntlid;
 
 	if (cmd->nfcc_qid != LE_16(0))
 		return (EINVAL);
@@ -250,6 +247,22 @@ nvmft_handoff_admin_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
 		    (int)sizeof (data->nfcd_hostnqn), data->nfcd_hostnqn);
 		return (ENXIO);
 	}
+
+	return (nvmft_connect_admin_queue(np, qp, cmd, data));
+}
+
+/*
+ * Create the association for a new admin queue.  On failure this destroys qp,
+ * after sending a Connect error where the handoff path did.
+ */
+int
+nvmft_connect_admin_queue(nvmft_port_t *np, struct nvmft_qpair *qp,
+    const nvmf_fabric_connect_cmd_t *cmd,
+    const nvmf_fabric_connect_data_t *data)
+{
+	nvmft_controller_t *ctrlr;
+	uint32_t kato;
+	id_t cntlid;
 
 	mutex_enter(&np->np_lock);
 	cntlid = id_alloc_nosleep(np->np_ids);
@@ -291,7 +304,7 @@ nvmft_handoff_admin_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
 	(void) nvmft_printf(ctrlr, "associated with %.*s\n",
 	    (int)sizeof (data->nfcd_hostnqn), data->nfcd_hostnqn);
 	ctrlr->ctrlr_admin = qp;
-	ctrlr->ctrlr_trtype = trtype;
+	ctrlr->ctrlr_trtype = nvmft_qpair_trtype(qp);
 	nvmft_update_cdata(ctrlr);
 
 	/*
@@ -325,15 +338,13 @@ nvmft_handoff_io_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
     const nvlist_t *params, const nvmf_fabric_connect_cmd_t *cmd,
     const nvmf_fabric_connect_data_t *data)
 {
-	nvmft_controller_t *ctrlr;
 	struct nvmft_qpair *qp;
 	char name[16];
-	uint16_t cntlid, qid;
+	uint16_t qid;
 
 	qid = LE_16(cmd->nfcc_qid);
 	if (qid == 0)
 		return (EINVAL);
-	cntlid = LE_16(data->nfcd_cntlid);
 
 	(void) snprintf(name, sizeof (name), "I/O queue %u", qid);
 	qp = nvmft_qpair_init(trtype, params, qid, name);
@@ -342,6 +353,24 @@ nvmft_handoff_io_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
 		    (int)sizeof (data->nfcd_hostnqn), data->nfcd_hostnqn);
 		return (ENXIO);
 	}
+
+	return (nvmft_connect_io_queue(np, qp, cmd, data));
+}
+
+/*
+ * Attach a new I/O queue to its association.  On failure this destroys qp,
+ * after sending a Connect error.
+ */
+int
+nvmft_connect_io_queue(nvmft_port_t *np, struct nvmft_qpair *qp,
+    const nvmf_fabric_connect_cmd_t *cmd,
+    const nvmf_fabric_connect_data_t *data)
+{
+	nvmft_controller_t *ctrlr;
+	uint16_t cntlid, qid;
+
+	qid = LE_16(cmd->nfcc_qid);
+	cntlid = LE_16(data->nfcd_cntlid);
 
 	mutex_enter(&np->np_lock);
 	for (ctrlr = list_head(&np->np_controllers); ctrlr != NULL;
@@ -357,6 +386,13 @@ nvmft_handoff_io_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
 		return (ENOENT);
 	}
 
+	if (ctrlr->ctrlr_trtype != nvmft_qpair_trtype(qp)) {
+		mutex_exit(&np->np_lock);
+		nvmft_connect_invalid_parameters(qp, cmd, B_TRUE,
+		    offsetof(nvmf_fabric_connect_data_t, nfcd_cntlid));
+		nvmft_qpair_destroy(qp);
+		return (EINVAL);
+	}
 	if (memcmp(ctrlr->ctrlr_hostid, data->nfcd_hostid,
 	    sizeof (ctrlr->ctrlr_hostid)) != 0) {
 		mutex_exit(&np->np_lock);

@@ -68,6 +68,114 @@ nvmf_nqn_valid(const char *nqn)
 	return (B_TRUE);
 }
 
+static void
+nvmft_connect_invalid(nvmft_connect_status_t *st, boolean_t data,
+    uint16_t offset)
+{
+	st->ncs_sct = NVME_CQE_SCT_SPECIFIC;
+	st->ncs_sc = NVMF_FABRIC_SC_INVALID_PARAM;
+	st->ncs_invalid = B_TRUE;
+	st->ncs_iattr = data;
+	st->ncs_ipo = offset;
+}
+
+static void
+nvmft_connect_fail(nvmft_connect_status_t *st, uint8_t sct, uint8_t sc)
+{
+	st->ncs_sct = sct;
+	st->ncs_sc = sc;
+	st->ncs_invalid = B_FALSE;
+	st->ncs_iattr = B_FALSE;
+	st->ncs_ipo = 0;
+}
+
+/*
+ * The checks libnvmf's nvmf_accept() makes on a Connect command, for a queue
+ * that the kernel accepted.  cm_qid and cm_sqsize are the values the host gave
+ * the transport when it set up the connection.
+ */
+boolean_t
+nvmft_connect_cmd_valid(const nvmf_fabric_connect_cmd_t *cmd, size_t data_len,
+    uint16_t cm_qid, uint16_t cm_sqsize, uint32_t max_admin_qsize,
+    uint32_t max_io_qsize, nvmft_connect_status_t *st)
+{
+	uint32_t qsize;
+
+	if (cmd->nfcc_opcode != NVMFT_OPC_FABRICS ||
+	    cmd->nfcc_fctype != NVMF_FCTYPE_CONNECT) {
+		nvmft_connect_fail(st, NVME_CQE_SCT_GENERIC,
+		    NVME_CQE_SC_GEN_INV_OPC);
+		return (B_FALSE);
+	}
+	if (LE_16(cmd->nfcc_recfmt) != 0) {
+		nvmft_connect_fail(st, NVME_CQE_SCT_SPECIFIC,
+		    NVMF_FABRIC_SC_INCOMPATIBLE_FORMAT);
+		return (B_FALSE);
+	}
+	if (LE_16(cmd->nfcc_qid) != cm_qid) {
+		nvmft_connect_invalid(st, B_FALSE,
+		    offsetof(nvmf_fabric_connect_cmd_t, nfcc_qid));
+		return (B_FALSE);
+	}
+
+	qsize = (uint32_t)LE_16(cmd->nfcc_sqsize) + 1;
+	if (LE_16(cmd->nfcc_sqsize) != cm_sqsize ||
+	    (cm_qid == 0 && (qsize < NVME_MIN_ADMIN_ENTRIES ||
+	    qsize > NVME_MAX_ADMIN_ENTRIES || qsize > max_admin_qsize)) ||
+	    (cm_qid != 0 && (qsize < NVME_MIN_IO_ENTRIES ||
+	    qsize > NVME_MAX_IO_ENTRIES || qsize > max_io_qsize))) {
+		nvmft_connect_invalid(st, B_FALSE,
+		    offsetof(nvmf_fabric_connect_cmd_t, nfcc_sqsize));
+		return (B_FALSE);
+	}
+	if (cm_qid != 0 && cmd->nfcc_kato != 0) {
+		nvmft_connect_invalid(st, B_FALSE,
+		    offsetof(nvmf_fabric_connect_cmd_t, nfcc_kato));
+		return (B_FALSE);
+	}
+	if (data_len != sizeof (nvmf_fabric_connect_data_t)) {
+		nvmft_connect_invalid(st, B_FALSE,
+		    offsetof(nvmf_fabric_connect_cmd_t, nfcc_sgl1));
+		return (B_FALSE);
+	}
+	return (B_TRUE);
+}
+
+/*
+ * The checks libnvmf's nvmf_accept() makes on Connect data, for the dynamic
+ * controller model that nvmfd uses.  Both NQN fields may lack a NUL.
+ */
+boolean_t
+nvmft_connect_data_valid(const nvmf_fabric_connect_cmd_t *cmd,
+    const nvmf_fabric_connect_data_t *data, nvmft_connect_status_t *st)
+{
+	static const uint8_t hostid_zero[sizeof (data->nfcd_hostid)];
+	uint16_t cntlid = LE_16(data->nfcd_cntlid);
+
+	if (memcmp(data->nfcd_hostid, hostid_zero, sizeof (hostid_zero)) == 0) {
+		nvmft_connect_invalid(st, B_TRUE,
+		    offsetof(nvmf_fabric_connect_data_t, nfcd_hostid));
+		return (B_FALSE);
+	}
+	if ((cmd->nfcc_qid == 0 && cntlid != NVMF_CNTLID_DYNAMIC) ||
+	    (cmd->nfcc_qid != 0 && cntlid > NVMF_CNTLID_STATIC_MAX)) {
+		nvmft_connect_invalid(st, B_TRUE,
+		    offsetof(nvmf_fabric_connect_data_t, nfcd_cntlid));
+		return (B_FALSE);
+	}
+	if (!nvmf_nqn_valid((const char *)data->nfcd_subnqn)) {
+		nvmft_connect_invalid(st, B_TRUE,
+		    offsetof(nvmf_fabric_connect_data_t, nfcd_subnqn));
+		return (B_FALSE);
+	}
+	if (!nvmf_nqn_valid((const char *)data->nfcd_hostnqn)) {
+		nvmft_connect_invalid(st, B_TRUE,
+		    offsetof(nvmf_fabric_connect_data_t, nfcd_hostnqn));
+		return (B_FALSE);
+	}
+	return (B_TRUE);
+}
+
 /*
  * Compute the initial value of the Controller Capabilities (CAP) property.  The
  * only runtime-significant fields for a Fabrics controller are TO (timeout), CQR,

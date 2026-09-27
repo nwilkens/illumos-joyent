@@ -87,13 +87,6 @@
 #include "../../stmf/lun_map.h"
 
 #include "nvmft_var.h"
-/*
- * nvmf_memdesc_t (the controller-side receive-buffer descriptor consumed by
- * nvmf_receive_controller_data()) lives in the transport-internal header, which
- * the in-tree consumers (the bd(9)-backed host and this STMF controller)
- * include directly.  (FreeBSD passed a "struct memdesc" here.)
- */
-#include "../../../nvmf/nvmf_transport_internal.h"
 
 /*
  * Per-task scratch carried in scsi_task_t->task_port_private.  Ties an STMF task

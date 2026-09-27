@@ -136,6 +136,41 @@ nvmf_allocate_qpair(nvmf_trtype_t trtype, boolean_t controller,
 	return (qp);
 }
 
+int
+nvmf_adopt_qpair(struct nvmf_transport_ops *ops, struct nvmf_qpair *qp,
+    boolean_t controller, boolean_t admin, nvmf_qpair_error_t *error_cb,
+    void *error_cb_arg, nvmf_capsule_receive_t *receive_cb,
+    void *receive_cb_arg)
+{
+	struct nvmf_transport *nt;
+
+	if (!nvmf_supported_trtype(ops->trtype))
+		return (ENXIO);
+
+	rw_enter(&nvmf_transports_lock, RW_READER);
+	for (nt = list_head(&nvmf_transports[ops->trtype]); nt != NULL;
+	    nt = list_next(&nvmf_transports[ops->trtype], nt)) {
+		if (nt->nt_ops == ops) {
+			atomic_inc_uint(&nt->nt_active_qpairs);
+			break;
+		}
+	}
+	rw_exit(&nvmf_transports_lock);
+	if (nt == NULL)
+		return (ENXIO);
+
+	qp->nq_transport = nt;
+	qp->nq_ops = ops;
+	qp->nq_controller = controller;
+	qp->nq_error = error_cb;
+	qp->nq_error_arg = error_cb_arg;
+	qp->nq_receive = receive_cb;
+	qp->nq_receive_arg = receive_cb_arg;
+	qp->nq_admin = admin;
+	membar_producer();
+	return (0);
+}
+
 void
 nvmf_free_qpair(struct nvmf_qpair *qp)
 {

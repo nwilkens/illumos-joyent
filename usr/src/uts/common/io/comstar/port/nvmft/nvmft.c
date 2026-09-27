@@ -176,15 +176,21 @@ _fini(void)
 	int status;
 
 	mutex_enter(&nvmft_global->ns_lock);
-	if (!list_is_empty(&nvmft_global->ns_ports)) {
+	if (!list_is_empty(&nvmft_global->ns_ports) ||
+	    nvmft_global->ns_kernel_qpairs != 0) {
 		mutex_exit(&nvmft_global->ns_lock);
 		return (EBUSY);
 	}
+	nvmft_global->ns_closing = B_TRUE;
 	mutex_exit(&nvmft_global->ns_lock);
 
 	status = mod_remove(&nvmft_modlinkage);
-	if (status != DDI_SUCCESS)
+	if (status != DDI_SUCCESS) {
+		mutex_enter(&nvmft_global->ns_lock);
+		nvmft_global->ns_closing = B_FALSE;
+		mutex_exit(&nvmft_global->ns_lock);
 		return (status);
+	}
 
 	taskq_destroy(nvmft_global->ns_taskq);
 	list_destroy(&nvmft_global->ns_ports);
@@ -274,7 +280,8 @@ nvmft_drv_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	}
 
 	mutex_enter(&nvmft_global->ns_lock);
-	if (!list_is_empty(&nvmft_global->ns_ports)) {
+	if (!list_is_empty(&nvmft_global->ns_ports) ||
+	    nvmft_global->ns_kernel_qpairs != 0) {
 		mutex_exit(&nvmft_global->ns_lock);
 		return (DDI_FAILURE);
 	}
@@ -332,6 +339,17 @@ nvmft_port_lookup(const char *subnqn)
 		}
 	}
 	return (NULL);
+}
+
+nvmft_port_t *
+nvmft_port_find(const char *subnqn)
+{
+	nvmft_port_t *np;
+
+	mutex_enter(&nvmft_global->ns_lock);
+	np = nvmft_port_lookup(subnqn);
+	mutex_exit(&nvmft_global->ns_lock);
+	return (np);
 }
 
 /*
@@ -618,9 +636,7 @@ nvmft_ioc_handoff(intptr_t arg, int mode)
 		return (EINVAL);
 	}
 
-	mutex_enter(&nvmft_global->ns_lock);
-	np = nvmft_port_lookup(subnqn);
-	mutex_exit(&nvmft_global->ns_lock);
+	np = nvmft_port_find(subnqn);
 	if (np == NULL) {
 		nvlist_free(req);
 		return (ENOENT);

@@ -59,6 +59,7 @@
 
 /* Raw nvme_sqe_t/nvme_cqe_t and NVME_OPC_* live in the nvme(4D) private header. */
 #include "../../../nvme/nvme_reg.h"
+#include "../../../nvmf/nvmf_transport_internal.h"
 
 #include <sys/stmf.h>
 #include <sys/stmf_ioctl.h>
@@ -262,9 +263,20 @@ typedef struct nvmft_softc {
 	/* Worker taskq for controller shutdown/terminate work. */
 	taskq_t			*ns_taskq;
 
-	kmutex_t		ns_lock;	/* protects ns_ports */
+	kmutex_t		ns_lock;	/* protects the fields below */
 	list_t			ns_ports;	/* nvmft_port list */
+	uint_t			ns_kernel_qpairs; /* adopted, not destroyed */
+	boolean_t		ns_closing;	/* _fini is unloading */
 } nvmft_softc_t;
+
+/* Why a Connect was refused, in the form the Connect response carries. */
+typedef struct nvmft_connect_status {
+	uint8_t		ncs_sct;
+	uint8_t		ncs_sc;
+	boolean_t	ncs_invalid;	/* Invalid Parameter: ncs_iattr/ipo */
+	boolean_t	ncs_iattr;
+	uint16_t	ncs_ipo;
+} nvmft_connect_status_t;
 
 extern nvmft_softc_t *nvmft_global;
 
@@ -327,10 +339,22 @@ int	nvmft_handoff_admin_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
 int	nvmft_handoff_io_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
 	    const nvlist_t *params, const nvmf_fabric_connect_cmd_t *cmd,
 	    const nvmf_fabric_connect_data_t *data);
+int	nvmft_connect_admin_queue(nvmft_port_t *np, struct nvmft_qpair *qp,
+	    const nvmf_fabric_connect_cmd_t *cmd,
+	    const nvmf_fabric_connect_data_t *data);
+int	nvmft_connect_io_queue(nvmft_port_t *np, struct nvmft_qpair *qp,
+	    const nvmf_fabric_connect_cmd_t *cmd,
+	    const nvmf_fabric_connect_data_t *data);
+
+/* nvmft.c */
+nvmft_port_t *nvmft_port_find(const char *subnqn);
 
 /* nvmft_qpair.c */
 struct nvmft_qpair *nvmft_qpair_init(nvmf_trtype_t trtype,
 	    const nvlist_t *params, uint16_t qid, const char *name);
+int	nvmft_adopt_qpair(struct nvmf_transport_ops *ops,
+	    struct nvmf_qpair *nq, uint16_t qid, uint16_t sqsize);
+nvmf_trtype_t nvmft_qpair_trtype(struct nvmft_qpair *qp);
 void	nvmft_qpair_shutdown(struct nvmft_qpair *qp);
 void	nvmft_qpair_destroy(struct nvmft_qpair *qp);
 nvmft_controller_t *nvmft_qpair_ctrlr(struct nvmft_qpair *qp);
@@ -359,6 +383,12 @@ int	nvmft_finish_accept(struct nvmft_qpair *qp,
 
 /* nvmft_subr.c (portable helpers shared with userland). */
 boolean_t nvmf_nqn_valid(const char *nqn);
+boolean_t nvmft_connect_cmd_valid(const nvmf_fabric_connect_cmd_t *cmd,
+	    size_t data_len, uint16_t cm_qid, uint16_t cm_sqsize,
+	    uint32_t max_admin_qsize, uint32_t max_io_qsize,
+	    nvmft_connect_status_t *st);
+boolean_t nvmft_connect_data_valid(const nvmf_fabric_connect_cmd_t *cmd,
+	    const nvmf_fabric_connect_data_t *data, nvmft_connect_status_t *st);
 uint64_t _nvmf_controller_cap(uint32_t max_io_qsize, uint8_t enable_timeout);
 boolean_t _nvmf_validate_cc(uint32_t max_io_qsize, uint64_t cap,
 	    uint32_t old_cc, uint32_t new_cc);

@@ -192,6 +192,18 @@ struct nvmf_capsule {
 	struct nvmf_io_request nc_data;
 };
 
+/*
+ * Register a qpair that the transport created in the kernel, as the handoff
+ * path does for nvmf_allocate_qpair().  The callbacks are fixed for the life
+ * of the qpair, and the transport must not deliver events before this returns
+ * 0.  On success nvmf_free_qpair() releases the qpair; on failure the caller
+ * still owns it.
+ */
+int	nvmf_adopt_qpair(struct nvmf_transport_ops *ops,
+    struct nvmf_qpair *qp, boolean_t controller, boolean_t admin,
+    nvmf_qpair_error_t *error_cb, void *error_cb_arg,
+    nvmf_capsule_receive_t *receive_cb, void *receive_cb_arg);
+
 static inline void
 nvmf_qpair_error(struct nvmf_qpair *nq, int error)
 {
