@@ -623,8 +623,7 @@ nvmf_sgl_decode(const nvme_sqe_t *sqe, size_t icd_len, uint64_t max_len,
 		sgl->nsl_key = (uint32_t)d[11] | (uint32_t)d[12] << 8 |
 		    (uint32_t)d[13] << 16 | (uint32_t)d[14] << 24;
 		if ((max_len != 0 && sgl->nsl_len > max_len) ||
-		    (sgl->nsl_len != 0 &&
-		    addr > UINT64_MAX - (sgl->nsl_len - 1)))
+		    addr > UINT64_MAX - sgl->nsl_len)
 			return (NVME_CQE_SC_GEN_INV_DSGL_LEN);
 		return (NVME_CQE_SC_GEN_SUCCESS);
 	}

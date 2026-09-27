@@ -93,7 +93,7 @@ model(const uint8_t *b, size_t icd, uint64_t max, nvmf_sgl_t *out)
 		out->nsl_key = d[11] | d[12] << 8 | d[13] << 16 |
 		    (uint32_t)d[14] << 24;
 		if ((max != 0 && len > max) ||
-		    addr + len > ((unsigned __int128)1 << 64))
+		    addr + len >= ((unsigned __int128)1 << 64))
 			return (NVME_CQE_SC_GEN_INV_DSGL_LEN);
 		return (NVME_CQE_SC_GEN_SUCCESS);
 	}
@@ -134,10 +134,12 @@ cases(void)
 	CHECK(new_sqe(0x02, 0, 0x40, 0, 1 << 20, 1), 0, 1 << 20, OK);
 	CHECK(new_sqe(0x02, 0, 0x40, 0, (1 << 20) + 1, 1), 0, 1 << 20, LEN);
 	CHECK(new_sqe(0x02, 0, 0x40, 0, 0xffffff, 1), 0, 0, OK);
-	CHECK(new_sqe(0x02, 0, 0x40, UINT64_MAX, 1, 1), 0, 0, OK);
-	CHECK(new_sqe(0x02, 0, 0x40, UINT64_MAX, 2, 1), 0, 0, LEN);
-	CHECK(new_sqe(0x02, 0, 0x40, UINT64_MAX - 4094, 4096, 1), 0, 0, LEN);
-	CHECK(new_sqe(0x02, 0, 0x40, UINT64_MAX - 4095, 4096, 1), 0, 0, OK);
+	/* The exclusive end must not wrap either. */
+	CHECK(new_sqe(0x02, 0, 0x40, UINT64_MAX, 0, 1), 0, 0, OK);
+	CHECK(new_sqe(0x02, 0, 0x40, UINT64_MAX, 1, 1), 0, 0, LEN);
+	CHECK(new_sqe(0x02, 0, 0x40, UINT64_MAX - 1, 1, 1), 0, 0, OK);
+	CHECK(new_sqe(0x02, 0, 0x40, UINT64_MAX - 4095, 4096, 1), 0, 0, LEN);
+	CHECK(new_sqe(0x02, 0, 0x40, UINT64_MAX - 4096, 4096, 1), 0, 0, OK);
 	CHECK(new_sqe(0x01, 0, 0x40, 0, 512, 1), 512, 0,
 	    NVME_CQE_SC_GEN_INV_FLD);
 
@@ -220,8 +222,8 @@ fuzz(unsigned long iters)
 				    got.nsl_len <= icd - got.nsl_addr);
 			} else {
 				assert(max == 0 || got.nsl_len <= max);
-				assert(got.nsl_len == 0 || got.nsl_addr <=
-				    UINT64_MAX - (got.nsl_len - 1));
+				assert(got.nsl_addr <=
+				    UINT64_MAX - got.nsl_len);
 			}
 		}
 		free(b);
