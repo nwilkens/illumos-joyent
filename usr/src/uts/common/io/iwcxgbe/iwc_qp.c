@@ -746,7 +746,9 @@ iwc_post_send(struct rdk_qp *rqp, const struct rdk_send_wr *wr,
 			ret = ENOMEM;
 			break;
 		}
-		if (wr->num_sge > (int)qp->qp_sq_max_sge) {
+		/* No inline data: the adapter would read the buffer later. */
+		if (wr->num_sge > (int)qp->qp_sq_max_sge ||
+		    (wr->send_flags & RDK_SEND_INLINE) != 0) {
 			ret = EINVAL;
 			break;
 		}

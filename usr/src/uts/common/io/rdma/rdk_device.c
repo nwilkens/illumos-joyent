@@ -695,6 +695,19 @@ rdk_dma_release(struct rdk_device *dev, void (*release)(void *), void *arg,
 	return (B_FALSE);
 }
 
+int
+rdk_vector_info(struct rdk_device *dev, uint32_t vec,
+    struct rdk_vector_info *vi)
+{
+	vi->rvi_lgrp = -1;
+	vi->rvi_cpu = -1;
+	if (vec >= dev->rd_num_comp_vectors)
+		return (EINVAL);
+	if (dev->rd_ops->vector_info != NULL)
+		dev->rd_ops->vector_info(dev, vec, vi);
+	return (0);
+}
+
 /*
  * Module linkage.
  */

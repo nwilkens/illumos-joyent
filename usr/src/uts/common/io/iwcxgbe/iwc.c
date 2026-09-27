@@ -150,6 +150,7 @@ iwc_query_device(struct rdk_device *rdev, struct rdk_device_attr *a)
 	a->max_send_sge = (int)MIN(T4_MAX_SEND_SGE, T4_MAX_WRITE_SGE);
 	a->max_recv_sge = T4_MAX_RECV_SGE;
 	a->max_sge_rd = 1;
+	a->max_inline_data = 0;
 	a->max_cq = (int)iwc->iwc_qid_n;
 	a->max_cqe = IWC_MAX_CQE;
 	a->max_mr = (int)iwc->iwc_nstag;

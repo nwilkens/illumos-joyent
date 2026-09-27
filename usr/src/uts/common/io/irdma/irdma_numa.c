@@ -187,10 +187,14 @@ irdma_numa_place(irdma_t *irdma)
 		irdma_vec_t *iv = &irdma->irdma_vecs[i];
 		processorid_t cpu = cpus[i % n];
 
-		if ((place & IRDMA_NUMA_INTR) != 0 &&
-		    set_intr_affinity(in->irin_handles[i], cpu) != DDI_SUCCESS)
-			irdma_error(irdma, "failed to move RDMA vector %u to "
-			    "CPU %d", i, cpu);
+		if ((place & IRDMA_NUMA_INTR) != 0) {
+			if (set_intr_affinity(in->irin_handles[i], cpu) ==
+			    DDI_SUCCESS)
+				iv->iv_intr_cpu = cpu;
+			else
+				irdma_error(irdma, "failed to move RDMA vector "
+				    "%u to CPU %d", i, cpu);
+		}
 		if ((place & IRDMA_NUMA_THREAD) == 0)
 			continue;
 		mutex_enter(&iv->iv_lock);

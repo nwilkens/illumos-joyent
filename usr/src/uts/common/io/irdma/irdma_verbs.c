@@ -300,7 +300,7 @@ irdma_query_device(struct rdk_device *rdev, struct rdk_device_attr *a)
 	    hw->uk_attrs.max_hw_wq_quanta / 8);
 	a->device_cap_flags = RDK_DEVICE_MEM_MGT_EXTENSIONS |
 	    RDK_DEVICE_RC_RNR_NAK_GEN;
-	a->kernel_cap_flags = RDK_KCAP_LOCAL_DMA_LKEY;
+	a->kernel_cap_flags = RDK_KCAP_LOCAL_DMA_LKEY | RDK_KCAP_READ_WITH_INV;
 	a->local_dma_lkey = 0;
 	a->max_send_sge = (int)hw->uk_attrs.max_hw_wq_frags;
 	a->max_recv_sge = (int)hw->uk_attrs.max_hw_wq_frags;
@@ -505,6 +505,19 @@ irdma_destroy_ah(struct rdk_ah *rah)
 	atomic_dec_32(&irdma->irdma_nahs);
 }
 
+/* The CEQ of each completion vector is on its own MSI-X vector. */
+static void
+irdma_vector_info(struct rdk_device *rdev, uint32_t vec,
+    struct rdk_vector_info *vi)
+{
+	irdma_t *irdma = IRDMA_DEV(rdev);
+
+	if (vec >= irdma->irdma_nceqs)
+		return;
+	vi->rvi_lgrp = (int32_t)irdma->irdma_numa_lgrp;
+	vi->rvi_cpu = irdma->irdma_ceqs[vec].ic_vec->iv_intr_cpu;
+}
+
 /*
  * DMA buffers for consumers come from ice through the osdep layer, so a
  * buffer freed while the device may still write it is quarantined.
@@ -563,6 +576,7 @@ static const struct rdk_device_ops irdma_rdk_ops = {
 	.dma_free = irdma_dma_free,
 	.cq_resched = irdma_cq_resched,
 	.modify_cq = irdma_modify_cq,
+	.vector_info = irdma_vector_info,
 	.size_pd = sizeof (irdma_pd_t),
 	.size_cq = sizeof (irdma_cq_t),
 	.size_qp = sizeof (irdma_qp_t),

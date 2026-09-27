@@ -60,6 +60,12 @@ root with Python 3.9+ and a C99 compiler.
   the destroys, drains and `rdk_teardown_wait()` panic and
   `rdk_dereg_mr()` returns EDEADLK.  A build whose free waits in the
   callback must deadlock (caught by an alarm).
+- `rdk_caps.py`: runs `rdk_vector_info()` (out of range refused, nothing
+  known without the provider operation) and checks that irdma reports
+  READ_WITH_INV, its inline size, its READ sink SGE limit and each
+  vector's lgroup and interrupt CPU, while iwcxgbe reports one READ sink
+  SGE, no READ_WITH_INV and no inline data, and refuses a send marked
+  inline.
 - `rdk_locks.py`: no function of the rdmak completion, teardown or RDMA
   READ/WRITE code reaches a consumer callback, a provider operation or a
   wait while it holds a lock it initializes; a done() moved under the

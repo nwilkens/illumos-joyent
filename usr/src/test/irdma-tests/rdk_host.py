@@ -51,13 +51,16 @@ def _run(command, phase, timeout):
     return result.stdout
 
 
-def run(test, names, replace=None, args=(), timeout=120):
+def run(test, names, replace=None, args=(), timeout=120, extra=None):
     """Compile test (a .c in TESTDIR that includes "rdk_unit.h") with the
-    sanitizers when the compiler has them, run it and return its output."""
+    sanitizers when the compiler has them, run it and return its output.
+    extra maps more generated header names to their text."""
     with tempfile.TemporaryDirectory(prefix="rdk-host-") as tmp:
         work = Path(tmp)
         (work / "rdk_unit.h").write_text(unit(names, replace),
                                          encoding="utf-8")
+        for name, text in (extra or {}).items():
+            (work / name).write_text(text, encoding="utf-8")
         binary = work / "t"
         cc = shlex.split(os.environ.get("CC", "cc"))
         base = cc + ["-std=gnu11", "-g", "-O1", "-pthread", "-Wall",

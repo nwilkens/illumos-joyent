@@ -16,6 +16,7 @@ TESTS = (
     "ice_qsets.py",
     "license_notices.py",
     "lock_order.py",
+    "rdk_caps.py",
     "rdk_locks.py",
     "rdk_teardown.py",
     "rdk_verbs.py",

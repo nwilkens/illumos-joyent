@@ -161,6 +161,8 @@ struct rdk_port_attr {
 
 /* kernel_cap_flags */
 #define	RDK_KCAP_LOCAL_DMA_LKEY		(1ULL << 0)
+/* RDK_WR_RDMA_READ_WITH_INV invalidates the sink MR, sg_list[0].lkey. */
+#define	RDK_KCAP_READ_WITH_INV		(1ULL << 1)
 
 struct rdk_device_attr {
 	uint64_t	fw_ver;
@@ -638,6 +640,16 @@ typedef struct rdk_dma_buf {
 } rdk_dma_buf_t;
 
 /*
+ * Where a completion vector runs, so that a consumer can place its work and
+ * memory near it: the lgroup nearest the device and the CPU the vector's
+ * interrupt goes to, each -1 when the provider does not know.
+ */
+struct rdk_vector_info {
+	int32_t		rvi_lgrp;
+	int32_t		rvi_cpu;
+};
+
+/*
  * The provider interface.  Each operation returns 0 or a positive errno.
  * The destroy operations always release the object; if the device could
  * not confirm it, the provider keeps the memory the device may reach.
@@ -688,6 +700,9 @@ struct rdk_device_ops {
 	void	(*cq_resched)(struct rdk_cq *);
 	/* Optional: hold the CQ's events up to usec; see rdk_modify_cq(). */
 	int	(*modify_cq)(struct rdk_cq *, uint16_t, uint16_t);
+	/* Optional: see rdk_vector_info(). */
+	void	(*vector_info)(struct rdk_device *, uint32_t,
+	    struct rdk_vector_info *);
 
 	size_t	size_pd;
 	size_t	size_cq;
@@ -776,6 +791,10 @@ extern void rdk_device_taint(struct rdk_device *);
 extern boolean_t rdk_device_tainted(const struct rdk_device *);
 extern boolean_t rdk_dma_release(struct rdk_device *, void (*)(void *),
     void *, size_t);
+
+/* EINVAL for a vector at or above rd_num_comp_vectors. */
+extern int rdk_vector_info(struct rdk_device *, uint32_t,
+    struct rdk_vector_info *);
 
 /*
  * rdk_verbs.c
