@@ -9,6 +9,7 @@ import sys
 TESTS = (
     "adopt_lifecycle.py",
     "connect_checks.py",
+    "sgl_decode.py",
 )
 
 

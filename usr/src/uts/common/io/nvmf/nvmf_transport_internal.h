@@ -40,6 +40,7 @@
 #include <sys/types.h>
 #include <sys/nvpair.h>
 #include <sys/stream.h>
+#include <sys/ddidmareq.h>
 #include <sys/nvme/nvmf.h>
 #include <sys/nvme/nvmf_transport.h>
 
@@ -67,6 +68,9 @@ extern "C" {
  */
 #ifndef	NVME_PSDT_SGL
 #define	NVME_PSDT_SGL		0x1
+#endif
+#ifndef	NVMF_FABRICS_OPC
+#define	NVMF_FABRICS_OPC	0x7f
 #endif
 #ifndef	NVME_MIN_ADMIN_ENTRIES
 #define	NVME_MIN_ADMIN_ENTRIES	2
@@ -97,8 +101,15 @@ struct nvmf_io_request;
  */
 typedef enum {
 	NVMF_MEMDESC_VADDR = 1,		/* nmd_vaddr / nmd_len kernel buffer */
-	NVMF_MEMDESC_MBLK		/* nmd_mp mblk_t chain */
+	NVMF_MEMDESC_MBLK,		/* nmd_mp mblk_t chain */
+	NVMF_MEMDESC_SGL		/* nmd_sgl segment array */
 } nvmf_memdesc_type_t;
+
+/* One kernel buffer segment.  The layout matches stmf_sglist_ent_t. */
+typedef struct nvmf_seg {
+	uint32_t	nsg_len;
+	uint8_t		*nsg_addr;
+} nvmf_seg_t;
 
 typedef struct nvmf_memdesc {
 	nvmf_memdesc_type_t	nmd_type;
@@ -106,8 +117,45 @@ typedef struct nvmf_memdesc {
 	union {
 		void	*nmd_vaddr;
 		mblk_t	*nmd_mp;
+		struct {
+			const nvmf_seg_t	*nmd_segs;
+			uint_t			nmd_nsegs;
+			/* DMA addresses of the segments, if bound. */
+			const ddi_dma_cookie_t	*nmd_cookies;
+			uint_t			nmd_ncookies;
+		} nmd_sgl;
 	} nmd_u;
 } nvmf_memdesc_t;
+
+/*
+ * Copy len bytes at offset off into (copyin) or out of (copyout) a memdesc.
+ * The range must lie within nmd_len; nothing outside nmd_len or the backing
+ * store is touched.
+ */
+void	nvmf_memdesc_copyin(const nvmf_memdesc_t *md, size_t off,
+    const void *src, size_t len);
+void	nvmf_memdesc_copyout(const nvmf_memdesc_t *md, size_t off, void *dst,
+    size_t len);
+
+/*
+ * SGL Data Block descriptors a transport can accept in SGL1: in-capsule data
+ * at an offset (subtype 1), or a keyed remote buffer (type 4).
+ */
+#define	NVMF_SGL_DATA_BLOCK	0x0
+#define	NVMF_SGL_KEYED_DATA_BLOCK	0x4
+#define	NVMF_SGL_SUBTYPE_ADDRESS	0x0
+#define	NVMF_SGL_SUBTYPE_OFFSET		0x1
+
+typedef struct nvmf_sgl {
+	boolean_t	nsl_keyed;	/* else in-capsule data */
+	boolean_t	nsl_invalidate;	/* the host asks for SEND_WITH_INV */
+	uint32_t	nsl_len;
+	uint32_t	nsl_key;
+	uint64_t	nsl_addr;	/* remote address, or capsule offset */
+} nvmf_sgl_t;
+
+uint8_t	nvmf_sgl_decode(const nvme_sqe_t *sqe, size_t icd_len,
+    uint64_t max_len, nvmf_sgl_t *sgl);
 
 struct nvmf_transport_ops {
 	/* Queue pair management. */

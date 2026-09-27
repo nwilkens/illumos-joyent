@@ -879,34 +879,9 @@ nvmf_tcp_send_next_r2t(nvmf_tcp_qpair_t *qp, nvmf_tcp_command_buffer_t *cb)
 }
 
 /*
- * Copy 'len' bytes into the destination mblk chain 'dmp' starting at chain
- * offset 'io_offset'.  Helper for the NVMF_MEMDESC_MBLK case of
- * nvmf_tcp_mblk_copyto_io().
- */
-static void
-nvmf_tcp_copyto_mblk(mblk_t *dmp, uint_t io_offset, const uint8_t *src,
-    uint_t len)
-{
-	while (dmp != NULL && io_offset >= MBLKL(dmp)) {
-		io_offset -= MBLKL(dmp);
-		dmp = dmp->b_cont;
-	}
-	while (len != 0 && dmp != NULL) {
-		uint_t todo = (uint_t)MIN(MBLKL(dmp) - io_offset, len);
-		bcopy(src, dmp->b_rptr + io_offset, todo);
-		io_offset = 0;
-		src += todo;
-		len -= todo;
-		dmp = dmp->b_cont;
-	}
-}
-
-/*
  * Copy len bytes starting at offset skip from an mblk chain into an I/O buffer
  * (nvmf_memdesc) at destination offset io_offset.  mblk equivalent of FreeBSD
- * mbuf_copyto_io(); honors both the flat-buffer (NVMF_MEMDESC_VADDR) and the
- * destination mblk chain (NVMF_MEMDESC_MBLK) backing stores the same way
- * FreeBSD's memdesc_copyback() dispatches on memdesc type.
+ * mbuf_copyto_io().
  */
 static void
 nvmf_tcp_mblk_copyto_io(mblk_t *mp, uint_t skip, uint_t len,
@@ -919,14 +894,8 @@ nvmf_tcp_mblk_copyto_io(mblk_t *mp, uint_t skip, uint_t len,
 	while (len != 0 && mp != NULL) {
 		uint_t todo = (uint_t)MIN(MBLKL(mp) - skip, len);
 
-		if (io->io_mem.nmd_type == NVMF_MEMDESC_VADDR) {
-			bcopy(mp->b_rptr + skip,
-			    (caddr_t)io->io_mem.nmd_u.nmd_vaddr + io_offset,
-			    todo);
-		} else {
-			nvmf_tcp_copyto_mblk(io->io_mem.nmd_u.nmd_mp, io_offset,
-			    mp->b_rptr + skip, todo);
-		}
+		nvmf_memdesc_copyin(&io->io_mem, io_offset, mp->b_rptr + skip,
+		    todo);
 		skip = 0;
 		io_offset += todo;
 		len -= todo;
@@ -955,14 +924,7 @@ nvmf_tcp_command_buffer_mblk(nvmf_tcp_command_buffer_t *cb,
 	if (mp == NULL)
 		return (NULL);
 	mp->b_wptr = mp->b_rptr + data_len;
-
-	if (md->nmd_type == NVMF_MEMDESC_VADDR) {
-		bcopy((caddr_t)md->nmd_u.nmd_vaddr + data_offset, mp->b_rptr,
-		    data_len);
-	} else {
-		nvmf_tcp_mblk_copydata(md->nmd_u.nmd_mp, data_offset, data_len,
-		    mp->b_rptr);
-	}
+	nvmf_memdesc_copyout(md, data_offset, mp->b_rptr, data_len);
 	return (mp);
 }
 

@@ -55,6 +55,7 @@
 #include <sys/nvpair.h>
 #include <sys/stream.h>
 #include <sys/strsubr.h>
+#include <sys/strsun.h>
 #include <sys/sysmacros.h>
 #include <sys/modctl.h>
 #include <sys/errno.h>
@@ -350,6 +351,158 @@ nvmf_send_controller_data(struct nvmf_capsule *nc, uint32_t data_offset,
 	ASSERT3U(msgdsize(mp), ==, len);
 	return (nc->nc_qpair->nq_ops->send_controller_data(nc, data_offset, mp,
 	    len));
+}
+
+static void
+nvmf_memdesc_copy(const nvmf_memdesc_t *md, size_t off, uint8_t *buf,
+    size_t len, boolean_t in)
+{
+	ASSERT3U(off, <=, md->nmd_len);
+	ASSERT3U(len, <=, md->nmd_len - off);
+	if (off > md->nmd_len)
+		return;
+	len = MIN(len, md->nmd_len - off);
+
+	switch (md->nmd_type) {
+	case NVMF_MEMDESC_VADDR: {
+		uint8_t *p = (uint8_t *)md->nmd_u.nmd_vaddr + off;
+
+		if (in)
+			bcopy(buf, p, len);
+		else
+			bcopy(p, buf, len);
+		break;
+	}
+	case NVMF_MEMDESC_MBLK: {
+		mblk_t *mp = md->nmd_u.nmd_mp;
+
+		while (mp != NULL && off >= MBLKL(mp)) {
+			off -= MBLKL(mp);
+			mp = mp->b_cont;
+		}
+		for (; len != 0 && mp != NULL; mp = mp->b_cont, off = 0) {
+			size_t todo = MIN(MBLKL(mp) - off, len);
+
+			if (in)
+				bcopy(buf, mp->b_rptr + off, todo);
+			else
+				bcopy(mp->b_rptr + off, buf, todo);
+			buf += todo;
+			len -= todo;
+		}
+		break;
+	}
+	case NVMF_MEMDESC_SGL: {
+		const nvmf_seg_t *seg = md->nmd_u.nmd_sgl.nmd_segs;
+		const nvmf_seg_t *end = seg + md->nmd_u.nmd_sgl.nmd_nsegs;
+
+		while (seg < end && off >= seg->nsg_len) {
+			off -= seg->nsg_len;
+			seg++;
+		}
+		for (; len != 0 && seg < end; seg++, off = 0) {
+			size_t todo = MIN(seg->nsg_len - off, len);
+
+			if (in)
+				bcopy(buf, seg->nsg_addr + off, todo);
+			else
+				bcopy(seg->nsg_addr + off, buf, todo);
+			buf += todo;
+			len -= todo;
+		}
+		break;
+	}
+	default:
+		panic("nvmf: memdesc type %d", md->nmd_type);
+	}
+}
+
+void
+nvmf_memdesc_copyin(const nvmf_memdesc_t *md, size_t off, const void *src,
+    size_t len)
+{
+	nvmf_memdesc_copy(md, off, (uint8_t *)src, len, B_TRUE);
+}
+
+void
+nvmf_memdesc_copyout(const nvmf_memdesc_t *md, size_t off, void *dst,
+    size_t len)
+{
+	nvmf_memdesc_copy(md, off, dst, len, B_FALSE);
+}
+
+/*
+ * The data direction of a command: bits 1:0 of the opcode, or of the Fabrics
+ * command type for a Fabrics command.
+ */
+static uint8_t
+nvmf_sqe_xfer_dir(const nvme_sqe_t *sqe)
+{
+	const uint8_t *b = (const uint8_t *)sqe;
+
+	if (sqe->sqe_opc == NVMF_FABRICS_OPC)
+		return (b[4] & 0x3);
+	return (sqe->sqe_opc & 0x3);
+}
+
+#define	NVMF_XFER_HOST_TO_CTRLR	0x1
+
+/*
+ * Decode and check SGL1 of a command for a transport that uses keyed SGLs.
+ * icd_len is the number of in-capsule data bytes that arrived with the
+ * command, and max_len is the largest transfer allowed (0 for no limit).
+ * Returns a generic status code; only exact descriptor forms are accepted.
+ */
+uint8_t
+nvmf_sgl_decode(const nvme_sqe_t *sqe, size_t icd_len, uint64_t max_len,
+    nvmf_sgl_t *sgl)
+{
+	const uint8_t *d = (const uint8_t *)&sqe->sqe_dptr;
+	uint8_t type = d[15] >> 4, subtype = d[15] & 0xf;
+	uint64_t addr = 0;
+	int i;
+
+	if (sqe->sqe_psdt != NVME_PSDT_SGL)
+		return (NVME_CQE_SC_GEN_INV_FLD);
+	for (i = 7; i >= 0; i--)
+		addr = (addr << 8) | d[i];
+	bzero(sgl, sizeof (*sgl));
+	sgl->nsl_addr = addr;
+
+	if (type == NVMF_SGL_DATA_BLOCK &&
+	    subtype == NVMF_SGL_SUBTYPE_OFFSET) {
+		if (d[12] != 0 || d[13] != 0 || d[14] != 0 ||
+		    nvmf_sqe_xfer_dir(sqe) != NVMF_XFER_HOST_TO_CTRLR)
+			return (NVME_CQE_SC_GEN_INV_SGL_DESC);
+		sgl->nsl_len = (uint32_t)d[8] | (uint32_t)d[9] << 8 |
+		    (uint32_t)d[10] << 16 | (uint32_t)d[11] << 24;
+		if (addr > icd_len)
+			return (NVME_CQE_SC_GEN_INV_SGL_OFF);
+		if (sgl->nsl_len > icd_len - addr)
+			return (NVME_CQE_SC_GEN_INV_DSGL_LEN);
+		return (NVME_CQE_SC_GEN_SUCCESS);
+	}
+
+	if (type == NVMF_SGL_KEYED_DATA_BLOCK &&
+	    (subtype == NVMF_SGL_SUBTYPE_ADDRESS ||
+	    subtype == NVMF_SGL_SUBTYPE_INVALIDATE_KEY)) {
+		if (icd_len != 0)
+			return (NVME_CQE_SC_GEN_INV_FLD);
+		sgl->nsl_keyed = B_TRUE;
+		sgl->nsl_invalidate =
+		    (subtype == NVMF_SGL_SUBTYPE_INVALIDATE_KEY);
+		sgl->nsl_len = (uint32_t)d[8] | (uint32_t)d[9] << 8 |
+		    (uint32_t)d[10] << 16;
+		sgl->nsl_key = (uint32_t)d[11] | (uint32_t)d[12] << 8 |
+		    (uint32_t)d[13] << 16 | (uint32_t)d[14] << 24;
+		if ((max_len != 0 && sgl->nsl_len > max_len) ||
+		    (sgl->nsl_len != 0 &&
+		    addr > UINT64_MAX - (sgl->nsl_len - 1)))
+			return (NVME_CQE_SC_GEN_INV_DSGL_LEN);
+		return (NVME_CQE_SC_GEN_SUCCESS);
+	}
+
+	return (NVME_CQE_SC_GEN_INV_SGL_DESC);
 }
 
 int

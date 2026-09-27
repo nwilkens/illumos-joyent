@@ -178,13 +178,10 @@ static void nvmft_dbuf_store_destroy(stmf_dbuf_store_t *ds);
 /*
  * Per-transfer state for an in-flight WRITE (H2C) datamove.  The transport
  * receive callback runs asynchronously and uses this to complete the dbuf.
- * nx_mp is the mblk chain (if any) wrapping the dbuf sglist, freed on
- * completion.
  */
 typedef struct nvmft_xfer {
 	scsi_task_t	*nx_task;
 	stmf_data_buf_t	*nx_dbuf;
-	mblk_t		*nx_mp;
 } nvmft_xfer_t;
 
 /*
@@ -1093,72 +1090,26 @@ nvmft_dbuf_to_mblk(stmf_data_buf_t *dbuf)
 	return (mp);
 }
 
-/*
- * Free callback for the desballoc'd receive mblks that wrap a dbuf's sglist
- * segments.  No storage is owned by the mblk itself; the dbuf is freed
- * separately by STMF, so this only releases the frtn_t.
- */
+CTASSERT(sizeof (nvmf_seg_t) == sizeof (stmf_sglist_ent_t));
+CTASSERT(offsetof(nvmf_seg_t, nsg_len) ==
+    offsetof(stmf_sglist_ent_t, seg_length));
+CTASSERT(offsetof(nvmf_seg_t, nsg_addr) ==
+    offsetof(stmf_sglist_ent_t, seg_addr));
+
+/* Describe the db_data_size bytes of a dbuf's sglist as a memdesc. */
 static void
-nvmft_rxseg_free(caddr_t arg)
+nvmft_dbuf_to_memdesc(stmf_data_buf_t *dbuf, nvmf_memdesc_t *mem)
 {
-	kmem_free(arg, sizeof (frtn_t));
-}
-
-/*
- * Wrap a dbuf's sglist as an nvmf_memdesc_t for receiving host data (H2C /
- * WRITE).  Single-segment dbufs (the common case from our store) use a flat
- * VADDR descriptor; multi-segment dbufs are wrapped as an mblk chain via
- * desballoc() so the transport writes directly into the segment buffers.
- *
- * On success *mpp holds the mblk chain to free after the transfer (NULL for the
- * VADDR case).  Returns B_FALSE on allocation failure.
- */
-static boolean_t
-nvmft_dbuf_to_memdesc(stmf_data_buf_t *dbuf, nvmf_memdesc_t *mem, mblk_t **mpp)
-{
-	mblk_t *head = NULL, *tail = NULL;
-	uint32_t resid = dbuf->db_data_size;
-	uint16_t i;
-
-	*mpp = NULL;
-
+	bzero(mem, sizeof (*mem));
+	mem->nmd_len = dbuf->db_data_size;
 	if (dbuf->db_sglist_length == 1) {
 		mem->nmd_type = NVMF_MEMDESC_VADDR;
-		mem->nmd_len = resid;
 		mem->nmd_u.nmd_vaddr = dbuf->db_sglist[0].seg_addr;
-		return (B_TRUE);
+		return;
 	}
-
-	for (i = 0; i < dbuf->db_sglist_length && resid != 0; i++) {
-		uint32_t todo = dbuf->db_sglist[i].seg_length;
-		frtn_t *frtn;
-		mblk_t *mp;
-
-		if (todo > resid)
-			todo = resid;
-		frtn = kmem_zalloc(sizeof (frtn_t), KM_SLEEP);
-		frtn->free_func = nvmft_rxseg_free;
-		frtn->free_arg = (caddr_t)frtn;
-		mp = desballoc(dbuf->db_sglist[i].seg_addr, todo, BPRI_MED, frtn);
-		if (mp == NULL) {
-			kmem_free(frtn, sizeof (frtn_t));
-			freemsg(head);
-			return (B_FALSE);
-		}
-		mp->b_wptr = mp->b_rptr + todo;
-		if (head == NULL)
-			head = mp;
-		else
-			tail->b_cont = mp;
-		tail = mp;
-		resid -= todo;
-	}
-
-	mem->nmd_type = NVMF_MEMDESC_MBLK;
-	mem->nmd_len = dbuf->db_data_size;
-	mem->nmd_u.nmd_mp = head;
-	*mpp = head;
-	return (B_TRUE);
+	mem->nmd_type = NVMF_MEMDESC_SGL;
+	mem->nmd_u.nmd_sgl.nmd_segs = (const nvmf_seg_t *)dbuf->db_sglist;
+	mem->nmd_u.nmd_sgl.nmd_nsegs = dbuf->db_sglist_length;
 }
 
 /*
@@ -1174,8 +1125,6 @@ nvmft_datamove_in_cb(void *arg, size_t xfered, int error)
 	scsi_task_t *task = nx->nx_task;
 	stmf_data_buf_t *dbuf = nx->nx_dbuf;
 
-	if (nx->nx_mp != NULL)
-		freemsg(nx->nx_mp);
 	kmem_free(nx, sizeof (*nx));
 
 	if (error != 0) {
@@ -1381,25 +1330,17 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 		/* H2C: receive controller data (WRITE). */
 		nvmft_xfer_t *nx;
 		nvmf_memdesc_t mem;
-		mblk_t *mp;
 		int error;
 
-		if (!nvmft_dbuf_to_memdesc(dbuf, &mem, &mp)) {
-			ret = STMF_ALLOC_FAILURE;
-			goto done;
-		}
-
+		nvmft_dbuf_to_memdesc(dbuf, &mem);
 		nx = kmem_zalloc(sizeof (*nx), KM_SLEEP);
 		nx->nx_task = task;
 		nx->nx_dbuf = dbuf;
-		nx->nx_mp = mp;
 
 		error = nvmf_receive_controller_data(nc,
 		    dbuf->db_relative_offset, &mem, dbuf->db_data_size,
 		    nvmft_datamove_in_cb, nx);
 		if (error != 0) {
-			if (mp != NULL)
-				freemsg(mp);
 			kmem_free(nx, sizeof (*nx));
 			(void) nvmft_printf(nvmft_qpair_ctrlr(qp),
 			    "Failed to request capsule data: 0x%x\n", error);
