@@ -390,8 +390,9 @@ cpu_per_gib(double ns, double bytes)
 }
 
 static void
-report(const bconf_t *c, uint64_t wall, const host_stats_t *a0,
-    const host_stats_t *a1, const host_stats_t *b0, const host_stats_t *b1)
+report(const bconf_t *c, uint64_t wall, uint64_t wall_b,
+    const host_stats_t *a0, const host_stats_t *a1, const host_stats_t *b0,
+    const host_stats_t *b1)
 {
 	double bytes = 0, ops = 0, qmin = 1e30, qmax = 0, gbps;
 	double busy, attr, intr;
@@ -483,9 +484,9 @@ report(const bconf_t *c, uint64_t wall, const host_stats_t *a0,
 	    (double)(a1->hs_cq_arms - a0->hs_cq_arms) / ops);
 	if (remote) {
 		busy = (double)(b1->hs_busy_ns - b0->hs_busy_ns) -
-		    idle_busy_b * (double)wall;
+		    idle_busy_b * (double)wall_b;
 		intr = (double)(b1->hs_intr_ns - b0->hs_intr_ns) -
-		    idle_intr_b * (double)wall;
+		    idle_intr_b * (double)wall_b;
 		attr = (double)(b1->hs_proc_ns - b0->hs_proc_ns) +
 		    (double)(b1->hs_taskq_ns - b0->hs_taskq_ns) +
 		    (double)(b1->hs_ceq_ns - b0->hs_ceq_ns) +
@@ -521,7 +522,7 @@ bench_one(const bconf_t *c)
 {
 	host_stats_t a0, a1, b0, b1;
 	uint32_t i;
-	uint64_t t0, t1;
+	uint64_t t0, t1, tb0 = 0, tb1 = 0;
 	int ret;
 
 	if (c->c_inline && (c->c_size > local_dev.rdi_max_inline ||
@@ -555,6 +556,15 @@ bench_one(const bconf_t *c)
 		}
 	}
 
+	/*
+	 * A server answers nothing else while a passive run is in progress,
+	 * so its counters are read before the passive runs start and after
+	 * they end.
+	 */
+	if (remote) {
+		peer_stats(c->c_qps, &b0);
+		tb0 = now_ns();
+	}
 	/* Passive sides first, so the active ones find them waiting. */
 	for (i = 0; i < c->c_qps; i++) {
 		bside_t *sb = &pairs[i].bp_sb;
@@ -569,8 +579,6 @@ bench_one(const bconf_t *c)
 			fatal("pthread_create failed");
 	}
 	host_stats(&a0);
-	if (remote)
-		peer_stats(c->c_qps, &b0);
 	t0 = now_ns();
 	(void) pthread_mutex_lock(&go_lock);
 	go = 1;
@@ -586,9 +594,11 @@ bench_one(const bconf_t *c)
 	}
 	t1 = now_ns();
 	host_stats(&a1);
-	if (remote)
+	if (remote) {
 		peer_stats(c->c_qps, &b1);
-	report(c, t1 - t0, &a0, &a1, &b0, &b1);
+		tb1 = now_ns();
+	}
+	report(c, t1 - t0, tb1 - tb0, &a0, &a1, &b0, &b1);
 }
 
 static void
