@@ -41,6 +41,12 @@
 
 /* Requests being resolved at once, all ports together. */
 uint_t rdk_cm_roce_max_resolving = 256;
+/*
+ * Bounds on the REP retransmissions a requester asks for: the interval,
+ * and all of them together (Linux defaults take 4096 ms and 65.5 s).
+ */
+uint_t rdk_ibcm_passive_resp_max_ms = 8192;
+uint_t rdk_ibcm_passive_max_ms = 70000;
 
 static void rdk_ibconn_arp_hold(void *);
 static void rdk_ibconn_arp_rele(void *);
@@ -254,6 +260,7 @@ rdk_ibconn_from_req(rdk_ibconn_t *c, const rdk_ibcm_msg_t *m,
 {
 	const struct rdk_device_attr *da = &c->ic_cd->rcd_dev->rd_attr;
 	uint8_t life = m->m_ack_timeout > 0 ? m->m_ack_timeout - 1 : 0;
+	uint32_t resp, tries;
 
 	c->ic_rid = m->m_local_id;
 	c->ic_rguid = m->m_ca_guid;
@@ -281,8 +288,11 @@ rdk_ibconn_from_req(rdk_ibconn_t *c, const rdk_ibcm_msg_t *m,
 	c->ic_ack_timeout = rdk_ibcm_ack_timeout(da->local_ca_ack_delay, life);
 	c->ic_pdata_len = IBCM_CMA_REQ_PDATA;
 	bcopy(m->m_pdata + IBCM_CMA_HDR_LEN, c->ic_pdata, IBCM_CMA_REQ_PDATA);
-	rdk_ibcm_fsm_init(&c->ic_fsm, B_FALSE, m->m_max_retries,
-	    rdk_ibcm_time_ms(m->m_local_resp_to),
+	resp = MAX(MIN(rdk_ibcm_time_ms(m->m_local_resp_to),
+	    rdk_ibcm_passive_resp_max_ms), 1);
+	tries = MIN(m->m_max_retries, rdk_ibcm_passive_max_ms / resp);
+	rdk_ibcm_fsm_init(&c->ic_fsm, B_FALSE,
+	    (uint8_t)(tries > 0 ? tries - 1 : 0), resp,
 	    rdk_ibcm_time_ms(c->ic_ack_timeout),
 	    rdk_ibcm_time_ms(c->ic_ack_timeout));
 }

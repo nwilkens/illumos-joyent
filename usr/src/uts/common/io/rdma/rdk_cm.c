@@ -922,13 +922,14 @@ rdk_cm_accept(rdk_cm_id_t *id, const struct rdk_cm_conn_param *p)
 	id->rci_canceled = B_FALSE;
 	mutex_exit(&id->rci_lock);
 
-	rdk_cm_admit_release(id);
+	/* The request counts against the backlog until the accept ends. */
 	if ((ret = tp->ct_accept(id, p)) != 0) {
 		/* The transport refused the connection; nothing is live. */
 		mutex_enter(&id->rci_lock);
 		(void) rdk_cm_op_end_locked(id, RCO_ACCEPT, gen);
 		id->rci_state = RCS_DONE;
 		mutex_exit(&id->rci_lock);
+		rdk_cm_admit_release(id);
 		rdk_cm_conn_unquota();
 	}
 	return (ret);
@@ -1022,10 +1023,11 @@ rdk_cm_conn_event(rdk_cm_id_t *id, rdk_cm_tev_t type, int status,
 {
 	rdk_cm_qev_t *q = NULL, *q2 = NULL;
 	enum rdk_cm_event_type ev;
-	boolean_t disarm = B_FALSE;
+	boolean_t disarm = B_FALSE, accepted;
 	int err;
 
 	mutex_enter(&id->rci_lock);
+	accepted = id->rci_op == RCO_ACCEPT;
 	switch (type) {
 	case RCT_REPLY:
 	case RCT_ESTABLISHED:
@@ -1101,9 +1103,12 @@ rdk_cm_conn_event(rdk_cm_id_t *id, rdk_cm_tev_t type, int status,
 		rdk_cm_queue_locked(id, q);
 	if (q2 != NULL)
 		rdk_cm_queue_locked(id, q2);
+	accepted = accepted && id->rci_op != RCO_ACCEPT;
 	mutex_exit(&id->rci_lock);
 	if (disarm)
 		rdk_cm_disarm(id);
+	if (accepted)
+		rdk_cm_admit_release(id);
 }
 
 struct rdk_device *
