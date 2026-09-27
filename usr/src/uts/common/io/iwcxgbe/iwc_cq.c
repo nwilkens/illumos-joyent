@@ -685,17 +685,28 @@ iwc_poll_one(iwc_cq_t *cq, struct rdk_wc *wc)
 	return (ret);
 }
 
+/* CQEs polled without a completion before iwc_poll_cq() returns. */
+#define	IWC_POLL_SKIP	256
+
 int
 iwc_poll_cq(struct rdk_cq *rcq, int n, struct rdk_wc *wc)
 {
 	iwc_cq_t *cq = (iwc_cq_t *)rcq;
-	int done = 0, ret;
+	int done = 0, skipped = 0, ret;
 
 	mutex_enter(&cq->cq_lock);
 	while (done < n) {
 		ret = iwc_poll_one(cq, &wc[done]);
-		if (ret == EAGAIN)
+		/*
+		 * Entries that complete nothing are bounded too, so that a
+		 * CQ the chip keeps filling with them cannot hold the caller;
+		 * a short return makes rdmak arm, look again and yield.
+		 */
+		if (ret == EAGAIN) {
+			if (++skipped >= IWC_POLL_SKIP)
+				break;
 			continue;
+		}
 		if (ret != 0)
 			break;
 		done++;
