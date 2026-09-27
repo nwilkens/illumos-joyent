@@ -417,7 +417,7 @@ rdk_cm_roce_req(rdk_gsi_t *g, const rdk_gsi_rx_t *rx, const rdk_ibcm_msg_t *m)
 		rdk_ibconn_rele(c);
 		goto out;
 	}
-	if (!rdk_ibconn_insert_remote(c, &o)) {
+	if (rdk_ibconn_insert_remote(c, &o) != 0) {
 		/* The same request came twice at once; the other one has it. */
 		if (o != NULL)
 			rdk_ibconn_rele(o);
@@ -445,6 +445,7 @@ rdk_cm_roce_rep(rdk_gsi_t *g, const rdk_gsi_rx_t *rx, const rdk_ibcm_msg_t *m)
 	rdk_ibconn_t *c, *o;
 	boolean_t dup = B_FALSE, take = B_FALSE;
 	uint8_t life;
+	int ret;
 
 	if ((c = rdk_ibconn_find(m->m_remote_id)) == NULL)
 		return;
@@ -484,20 +485,21 @@ rdk_cm_roce_rep(rdk_gsi_t *g, const rdk_gsi_rx_t *rx, const rdk_ibcm_msg_t *m)
 	} else if (take) {
 		bzero(&in, sizeof (in));
 		in.ci_msg = m;
-		if (!rdk_ibconn_insert_remote(c, &o)) {
+		if ((ret = rdk_ibconn_insert_remote(c, &o)) == EEXIST) {
 			rdk_cm_roce_reply(g, rx, m, IBCM_ATTR_REJ,
 			    IBCM_REJ_STALE_CONN, IBCM_MSG_RESPONSE_REP);
-			if (o != NULL && o != c)
+			if (o != c)
 				rdk_ibconn_input(o, IBCI_DISCONNECT);
-			if (o != NULL)
-				rdk_ibconn_rele(o);
+			rdk_ibconn_rele(o);
 			in.ci_in.ii_input = IBCI_REJ;
 			in.ci_in.ii_rej_reason = IBCM_REJ_STALE_CONN;
 			in.ci_msg = NULL;
 		} else {
 			in.ci_in.ii_input = IBCI_REP;
 		}
-		(void) rdk_ibconn_step(c, &in);
+		/* A connection that ended meanwhile takes no REP. */
+		if (ret != ENOENT)
+			(void) rdk_ibconn_step(c, &in);
 	}
 	rdk_ibconn_rele(c);
 }

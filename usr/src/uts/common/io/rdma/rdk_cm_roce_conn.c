@@ -209,10 +209,11 @@ rdk_ibconn_insert(rdk_ibconn_t *c)
 
 /*
  * Enter the remote IDs, for duplicate and stale detection (Linux
- * cm_insert_remote_id() and cm_insert_remote_qpn()).  On B_FALSE *otherp
- * is the held connection that has them already.
+ * cm_insert_remote_id() and cm_insert_remote_qpn()).  EEXIST: *otherp is
+ * the held connection that has them already.  ENOENT: the connection has
+ * ended and left the tables, and must not enter them again.
  */
-boolean_t
+int
 rdk_ibconn_insert_remote(rdk_ibconn_t *c, rdk_ibconn_t **otherp)
 {
 	rdk_ibconn_t *o;
@@ -220,18 +221,22 @@ rdk_ibconn_insert_remote(rdk_ibconn_t *c, rdk_ibconn_t **otherp)
 
 	*otherp = NULL;
 	mutex_enter(&rdk_ibcm_lock);
+	if (!c->ic_in_l) {
+		mutex_exit(&rdk_ibcm_lock);
+		return (ENOENT);
+	}
 	if ((o = avl_find(&rdk_ibcm_rids, c, &wr)) == NULL &&
 	    (o = avl_find(&rdk_ibcm_qpns, c, &wq)) == NULL) {
 		avl_insert(&rdk_ibcm_rids, c, wr);
 		avl_insert(&rdk_ibcm_qpns, c, wq);
 		c->ic_in_r = c->ic_in_q = B_TRUE;
 		mutex_exit(&rdk_ibcm_lock);
-		return (B_TRUE);
+		return (0);
 	}
 	rdk_ibconn_hold(o);
 	mutex_exit(&rdk_ibcm_lock);
 	*otherp = o;
-	return (B_FALSE);
+	return (EEXIST);
 }
 
 void

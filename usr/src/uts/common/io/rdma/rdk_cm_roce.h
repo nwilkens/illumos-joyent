@@ -118,7 +118,7 @@ extern rdk_ibconn_t *rdk_ibconn_alloc(rdk_cm_dev_t *, uint32_t, boolean_t);
 extern void rdk_ibconn_hold(rdk_ibconn_t *);
 extern void rdk_ibconn_rele(rdk_ibconn_t *);
 extern int rdk_ibconn_insert(rdk_ibconn_t *);
-extern boolean_t rdk_ibconn_insert_remote(rdk_ibconn_t *, rdk_ibconn_t **);
+extern int rdk_ibconn_insert_remote(rdk_ibconn_t *, rdk_ibconn_t **);
 extern void rdk_ibconn_drop_remote(rdk_ibconn_t *);
 extern void rdk_ibconn_unlink(rdk_ibconn_t *);
 extern rdk_ibconn_t *rdk_ibconn_find(uint32_t);
