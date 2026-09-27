@@ -502,13 +502,12 @@ nvmft_connect_finish(struct nvmft_qpair *qp)
 	nvmf_free_capsule(qp->qp_connect_nc);
 	qp->qp_connect_nc = NULL;
 
+	/* On failure these destroy qp. */
 	if (qp->qp_admin)
-		error = nvmft_connect_admin_queue(np, qp, &cmdc, data);
+		(void) nvmft_connect_admin_queue(np, qp, &cmdc, data);
 	else
-		error = nvmft_connect_io_queue(np, qp, &cmdc, data);
+		(void) nvmft_connect_io_queue(np, qp, &cmdc, data);
 	nvmft_port_rele(np);
-	if (error != 0)
-		NVMFT_DPRINTF_L2("%s: Connect refused: %d", qp->qp_name, error);
 	return (B_TRUE);
 }
 
@@ -539,17 +538,17 @@ nvmft_qpair_connect_task(void *arg)
 		return;
 
 	/*
-	 * Destroying the transport qpair completes any Connect data transfer,
-	 * whose callback sees DYING and does nothing.
+	 * Freeing the transport qpair completes any Connect data transfer,
+	 * whose callback sees DYING and does nothing.  Only then can the
+	 * capsule go, which its transport qpair outlives.
 	 */
 	mutex_enter(&qp->qp_lock);
 	qp->qp_state = NVMFT_QP_DYING;
 	mutex_exit(&qp->qp_lock);
-	if (qp->qp_connect_nc != NULL) {
+	nvmft_qpair_shutdown(qp);
+	if (qp->qp_connect_nc != NULL)
 		nvmf_free_capsule(qp->qp_connect_nc);
-		qp->qp_connect_nc = NULL;
-	}
-	nvmft_qpair_destroy(qp);
+	nvmft_qpair_free(qp);
 }
 
 void

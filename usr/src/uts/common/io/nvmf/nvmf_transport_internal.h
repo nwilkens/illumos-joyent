@@ -309,6 +309,10 @@ struct nvmf_capsule {
  * of the qpair, and the transport must not deliver events before this returns
  * 0.  On success nvmf_free_qpair() releases the qpair; on failure the caller
  * still owns it.
+ *
+ * As with TCP, free_qpair must complete every transfer still registered and
+ * return only after the last callback has returned, and a capsule keeps its
+ * transport qpair valid until the capsule is freed.
  */
 int	nvmf_adopt_qpair(struct nvmf_transport_ops *ops,
     struct nvmf_qpair *qp, boolean_t controller, boolean_t admin,
