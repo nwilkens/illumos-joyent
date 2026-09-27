@@ -336,7 +336,7 @@ irdma_query_port(struct rdk_device *rdev, uint32_t port,
 	    RDK_PORT_DOWN;
 	a->max_mtu = RDK_MTU_4096;
 	a->phys_mtu = irdma->irdma_mtu;
-	a->active_mtu = rdk_mtu_int_to_enum((int)irdma->irdma_mtu);
+	a->active_mtu = rdk_roce_mtu((int)irdma->irdma_mtu);
 	a->gid_tbl_len = IRDMA_GID_TBL_LEN;
 	a->max_msg_sz =
 	    (uint32_t)MIN(irdma->irdma_sc.hw_attrs.max_hw_outbound_msg_size,

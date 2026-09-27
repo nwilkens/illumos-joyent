@@ -371,7 +371,7 @@ irdma_roce_ctx(irdma_qp_t *iqp)
 	struct irdma_roce_offload_info *roce = &iqp->iqp_roce;
 
 	udp->snd_mss = (u32)rdk_mtu_enum_to_int(
-	    rdk_mtu_int_to_enum((int)irdma->irdma_vsi.mtu));
+	    MAX(rdk_roce_mtu((int)irdma->irdma_vsi.mtu), RDK_MTU_256));
 	udp->cwnd = IRDMA_ROCE_CWND_DEFAULT;
 	udp->rexmit_thresh = 2;
 	udp->rnr_nak_thresh = 2;
@@ -719,7 +719,7 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 	    ((mask & RDK_QP_RNR_RETRY) != 0 && attr->rnr_retry > 7))
 		return (EINVAL);
 	if ((mask & RDK_QP_PATH_MTU) != 0 &&
-	    rdk_mtu_enum_to_int(attr->path_mtu) > (int)irdma->irdma_mtu)
+	    attr->path_mtu > rdk_roce_mtu((int)irdma->irdma_mtu))
 		return (EINVAL);
 	if ((mask & RDK_QP_MAX_QP_RD_ATOMIC) != 0 &&
 	    attr->max_rd_atomic > dev->hw_attrs.max_hw_ord)
