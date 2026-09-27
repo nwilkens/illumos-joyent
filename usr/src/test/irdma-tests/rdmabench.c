@@ -200,9 +200,9 @@ idle_rates(void)
 	    (double)(a1.hs_now_ns - a0.hs_now_ns);
 	if (remote) {
 		idle_busy_b = (double)(b1.hs_busy_ns - b0.hs_busy_ns) /
-		    (double)(a1.hs_now_ns - a0.hs_now_ns);
+		    (double)(b1.hs_now_ns - b0.hs_now_ns);
 		idle_intr_b = (double)(b1.hs_intr_ns - b0.hs_intr_ns) /
-		    (double)(a1.hs_now_ns - a0.hs_now_ns);
+		    (double)(b1.hs_now_ns - b0.hs_now_ns);
 	}
 	(void) printf("# idle CPUs busy: %.2f here (%.3f interrupt), %.2f on "
 	    "the peer (%.3f interrupt), subtracted\n", idle_busy_a,
@@ -522,7 +522,7 @@ bench_one(const bconf_t *c)
 {
 	host_stats_t a0, a1, b0, b1;
 	uint32_t i;
-	uint64_t t0, t1, tb0 = 0, tb1 = 0;
+	uint64_t t0, t1;
 	int ret;
 
 	if (c->c_inline && (c->c_size > local_dev.rdi_max_inline ||
@@ -561,10 +561,8 @@ bench_one(const bconf_t *c)
 	 * so its counters are read before the passive runs start and after
 	 * they end.
 	 */
-	if (remote) {
+	if (remote)
 		peer_stats(c->c_qps, &b0);
-		tb0 = now_ns();
-	}
 	/* Passive sides first, so the active ones find them waiting. */
 	for (i = 0; i < c->c_qps; i++) {
 		bside_t *sb = &pairs[i].bp_sb;
@@ -594,11 +592,10 @@ bench_one(const bconf_t *c)
 	}
 	t1 = now_ns();
 	host_stats(&a1);
-	if (remote) {
+	if (remote)
 		peer_stats(c->c_qps, &b1);
-		tb1 = now_ns();
-	}
-	report(c, t1 - t0, tb1 - tb0, &a0, &a1, &b0, &b1);
+	report(c, t1 - t0, remote ? b1.hs_now_ns - b0.hs_now_ns : 0, &a0,
+	    &a1, &b0, &b1);
 }
 
 static void
