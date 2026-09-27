@@ -147,6 +147,7 @@ typedef struct irdma_qp {
 	int			iqp_access;	/* RDK_ACCESS_* */
 	boolean_t		iqp_ird_zero;
 	uint32_t		iqp_arp_idx;	/* held; iqp_mod_lock */
+	boolean_t		iqp_lpbk;	/* the peer is this port */
 	uint32_t		iqp_max_send_wr;
 	uint32_t		iqp_max_recv_wr;
 	struct irdma_dma_mem	iqp_q2ctx;

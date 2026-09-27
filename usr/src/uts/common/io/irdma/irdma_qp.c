@@ -684,6 +684,9 @@ irdma_qp_av(irdma_qp_t *iqp, struct rdk_qp_attr *attr, uint32_t dest_qp)
 	if (arp < 0)
 		return (EIO);
 	udp->arp_idx = (u16)arp;
+	/* E810 takes a frame to its own MAC off the wire as malicious. */
+	iqp->iqp_lpbk = bcmp(sip, dip, sizeof (sip)) == 0 ||
+	    bcmp(ah->roce.dmac, irdma->irdma_info.iri_mac, ETHERADDRL) == 0;
 	return (0);
 }
 
@@ -863,6 +866,7 @@ irdma_modify_qp(struct rdk_qp *rqp, struct rdk_qp_attr *attr, int mask)
 		goto out;
 
 	ctx->rem_endpoint_idx = udp->arp_idx;
+	info.force_lpb = iqp->iqp_lpbk;
 	if ((ret = irdma_hw_modify_qp(iqp, &info)) != 0) {
 		/* The device may have applied it, with its ARP index. */
 		irdma_verbs_uncertain(irdma, "failed to modify a QP");

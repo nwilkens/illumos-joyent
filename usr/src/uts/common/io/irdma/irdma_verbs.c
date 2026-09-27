@@ -459,7 +459,9 @@ irdma_create_ah(struct rdk_ah *rah, struct rdk_ah_attr *attr)
 	info->ipv4_valid = dv4;
 	bcopy(dip, info->dest_ip_addr, sizeof (dip));
 	bcopy(sip, info->src_ip_addr, sizeof (sip));
-	info->do_lpbk = bcmp(sip, dip, sizeof (sip)) == 0;
+	/* E810 takes a frame to its own MAC off the wire as malicious. */
+	info->do_lpbk = bcmp(sip, dip, sizeof (sip)) == 0 ||
+	    bcmp(attr->roce.dmac, irdma->irdma_info.iri_mac, ETHERADDRL) == 0;
 	bcopy(sgid->mac, info->mac_addr, ETHERADDRL);
 	info->vlan_tag = 0;
 	info->insert_vlan_tag = false;
