@@ -414,6 +414,26 @@ abort_drain(void)
 	    STMF_ABORT_SUCCESS);
 	assert(priv.ntp_xfers == 0);
 	mutex_destroy(&priv.ntp_lock);
+
+	/*
+	 * TCP folded success into the last data while an abort was pending:
+	 * the host has its completion, so the CID must be free for reuse.
+	 */
+	memset(&priv, 0, sizeof (priv));
+	mutex_init(&priv.ntp_lock, NULL, MUTEX_DRIVER, NULL);
+	memset(nx, 0, sizeof (nx));
+	assert(nvmft_xfer_begin(&priv));
+	nx[0].nx_task = &task;
+	nx[0].nx_dbuf = &dbuf[0];
+	nx[0].nx_to_rport = B_TRUE;
+	assert(!nvmft_xfer_arrive(&nx[0], NVMFT_XFER_SUBMITTED));
+	xfer_dones = requeues = cid_clears = 0;
+	assert(nvmft_lport_abort(NULL, STMF_LPORT_ABORT_TASK, &task, 0) ==
+	    STMF_BUSY);
+	nvmft_datamove_out_cb(&nx[0], NVMF_SUCCESS_SENT);
+	assert(cid_clears == 1 && priv.ntp_success_sent);
+	assert(xfer_dones == 0 && requeues == 1);
+	mutex_destroy(&priv.ntp_lock);
 }
 
 int

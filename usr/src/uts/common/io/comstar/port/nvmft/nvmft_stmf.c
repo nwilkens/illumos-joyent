@@ -1172,6 +1172,15 @@ nvmft_xfer_finish(nvmft_xfer_t *nx)
 	nvmft_task_priv_t *priv = task->task_port_private;
 	uint32_t iof = 0;
 
+	/* Account for a response on the wire even if the task is aborting. */
+	if (nx->nx_to_rport && (nx->nx_final ||
+	    nx->nx_status == NVMF_SUCCESS_SENT)) {
+		ASSERT(nx->nx_final || !(nvmft_qpair_caps(priv->ntp_qp) &
+		    NVMF_QP_CAP_ALWAYS_RESPONSE));
+		if (!nx->nx_final)
+			nvmft_command_completed(priv->ntp_qp, priv->ntp_nc);
+		priv->ntp_success_sent = B_TRUE;
+	}
 	if (!nvmft_xfer_end(task))
 		return;
 
@@ -1184,17 +1193,12 @@ nvmft_xfer_finish(nvmft_xfer_t *nx)
 
 	switch (nx->nx_status) {
 	case NVMF_SUCCESS_SENT:
-		ASSERT(nx->nx_final || !(nvmft_qpair_caps(priv->ntp_qp) &
-		    NVMF_QP_CAP_ALWAYS_RESPONSE));
 		/*
 		 * The response is on the wire, either our final_cqe or success
 		 * folded into the data (the TCP SUCCESS flag).  If the LU put
 		 * status in this dbuf it calls stmf_task_lu_done(), which needs
 		 * the port to have released the task already.
 		 */
-		if (!nx->nx_final)
-			nvmft_command_completed(priv->ntp_qp, priv->ntp_nc);
-		priv->ntp_success_sent = B_TRUE;
 		dbuf->db_xfer_status = STMF_SUCCESS;
 		if (dbuf->db_flags & DB_SEND_STATUS_GOOD)
 			iof = STMF_IOF_LPORT_DONE;
@@ -1206,10 +1210,8 @@ nvmft_xfer_finish(nvmft_xfer_t *nx)
 		break;
 	default:
 		dbuf->db_xfer_status = STMF_FAILURE;
-		if (nx->nx_final) {
-			priv->ntp_success_sent = B_TRUE;
+		if (nx->nx_final)
 			iof = STMF_IOF_LPORT_DONE;
-		}
 		break;
 	}
 	stmf_data_xfer_done(task, dbuf, iof);
