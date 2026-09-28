@@ -179,6 +179,8 @@ struct rdk_port_attr {
 
 /* kernel_cap_flags */
 #define	RDK_KCAP_LOCAL_DMA_LKEY		(1ULL << 0)
+/* RDK_WR_RDMA_READ_WITH_INV invalidates the sink MR, sg_list[0].lkey. */
+#define	RDK_KCAP_READ_WITH_INV		(1ULL << 1)
 
 struct rdk_device_attr {
 	uint64_t	fw_ver;
@@ -663,6 +665,16 @@ typedef struct rdk_dma_buf {
 } rdk_dma_buf_t;
 
 /*
+ * Where a completion vector runs, so that a consumer can place its work and
+ * memory near it: the lgroup nearest the device and the CPU the vector's
+ * interrupt goes to, each -1 when the provider does not know.
+ */
+struct rdk_vector_info {
+	int32_t		rvi_lgrp;
+	int32_t		rvi_cpu;
+};
+
+/*
  * The provider interface.  Each operation returns 0 or a positive errno.
  * The destroy operations always release the object; if the device could
  * not confirm it, the provider keeps the memory the device may reach.
@@ -713,6 +725,9 @@ struct rdk_device_ops {
 	void	(*cq_resched)(struct rdk_cq *);
 	/* Optional: hold the CQ's events up to usec; see rdk_modify_cq(). */
 	int	(*modify_cq)(struct rdk_cq *, uint16_t, uint16_t);
+	/* Optional: see rdk_vector_info(). */
+	void	(*vector_info)(struct rdk_device *, uint32_t,
+	    struct rdk_vector_info *);
 
 	size_t	size_pd;
 	size_t	size_cq;
@@ -735,6 +750,7 @@ struct rdk_device {
 	/* Set by the framework. */
 	struct rdk_device_attr		rd_attr;
 	struct rdk_device_priv		*rd_priv;
+	volatile uint32_t		rd_tainted;	/* rdk_device_taint() */
 };
 
 /*
@@ -778,6 +794,32 @@ extern boolean_t rdk_gid_to_ipv4(const rdk_gid_t *, ipaddr_t *);
 
 extern int rdk_dma_buf_alloc(struct rdk_device *, size_t, rdk_dma_buf_t *);
 extern void rdk_dma_buf_free(struct rdk_device *, rdk_dma_buf_t *);
+
+/*
+ * DMA quarantine.  Memory the device may still reach does not go back to
+ * the system: it is freed once the provider has confirmed the destroy of
+ * every object that reaches it, or once the device has been reset, and is
+ * leaked otherwise.
+ *
+ * A provider that cannot confirm a destroy or a deregistration calls
+ * rdk_device_taint() before the operation returns; the device stays tainted
+ * until it is unregistered.  The provider then keeps every buffer given to
+ * rdk_dma_buf_free() until the device is reset, and rdk_dma_release()
+ * leaks what it is given.  rdk_dereg_mr() returning EIO taints the device.
+ *
+ * A consumer frees memory only after it has destroyed every QP and MR that
+ * can reach it.  Memory it mapped for the device itself goes back through
+ * rdk_dma_release(), which calls release(arg) at once on a device that is
+ * not tainted and returns B_TRUE, and otherwise leaks it and returns B_FALSE.
+ */
+extern void rdk_device_taint(struct rdk_device *);
+extern boolean_t rdk_device_tainted(const struct rdk_device *);
+extern boolean_t rdk_dma_release(struct rdk_device *, void (*)(void *),
+    void *, size_t);
+
+/* EINVAL for a vector at or above rd_num_comp_vectors. */
+extern int rdk_vector_info(struct rdk_device *, uint32_t,
+    struct rdk_vector_info *);
 
 /*
  * rdk_verbs.c
@@ -848,6 +890,112 @@ extern int rdk_modify_cq(struct rdk_cq *, uint16_t, uint16_t);
 extern boolean_t rdk_cq_poll_begin(struct rdk_cq *);
 extern int rdk_cq_poll(struct rdk_cq *, int);
 extern void rdk_cq_poll_end(struct rdk_cq *);
+
+/*
+ * Teardown from a callback (rdk_quiesce.c).  A done() function or an event
+ * handler must not drain or destroy the objects it serves: a destroy waits
+ * for the callbacks, and the rest of a batch may still name the objects.
+ * From a callback, rdk_destroy_qp(), rdk_destroy_cq() and the drains panic,
+ * rdk_dereg_mr() returns EDEADLK and keeps the MR, and rdk_free_cq()
+ * finishes in another thread once the callbacks are done.
+ *
+ * A callback instead marks its objects dying and calls rdk_teardown_start(),
+ * which runs the teardown's function once in a framework thread that runs
+ * no callbacks; there the function may drain and destroy the QP, MRs and
+ * CQs and free the memory they reached.  rdk_teardown_start() takes any
+ * context that can take an adaptive mutex, and returns B_TRUE for the call
+ * that started the teardown.  rdk_teardown_wait() returns once the function
+ * has; neither it nor the function may wait for another teardown.
+ * rdk_teardown_free() waits too, unless it is called from the function or a
+ * callback: the teardown is then freed when the function returns, and
+ * nothing may wait for it.  Providers call a CQ's comp_handler through
+ * rdk_comp_upcall() and a QP's or CQ's event handler through
+ * rdk_event_upcall().
+ */
+typedef struct rdk_teardown rdk_teardown_t;
+
+extern rdk_teardown_t *rdk_teardown_alloc(void (*)(void *), void *);
+extern boolean_t rdk_teardown_start(rdk_teardown_t *);
+extern boolean_t rdk_teardown_dying(rdk_teardown_t *);
+extern void rdk_teardown_wait(rdk_teardown_t *);
+extern void rdk_teardown_free(rdk_teardown_t *);
+extern boolean_t rdk_in_callback(void);
+extern void rdk_event_upcall(void (*)(struct rdk_event *, void *),
+    struct rdk_event *, void *);
+extern void rdk_comp_upcall(struct rdk_cq *);
+
+/*
+ * RDMA READ and WRITE between local DMA memory and a peer's keyed memory
+ * (rdk_rw.c).  A context holds one transfer on an RC QP: the local memory
+ * as DMA cookies, an offset and a length, and the peer's memory as keyed
+ * segments whose lengths add up to the same length.  rdk_rw_init() builds
+ * the work requests and rdk_rw_post() posts them in one call, only the last
+ * one signaled, followed by the caller's chain (a WRITE's response SEND).
+ *
+ * A READ sink the device reaches only through an MR (on iWARP, or with
+ * RDK_RW_F_MR) is registered part by part from the MRs the caller lends:
+ * each registration covers exactly the bytes of its READs, with a new key,
+ * LOCAL_WRITE and on iWARP REMOTE_WRITE, and is invalidated after them by
+ * READ_WITH_INV or else by a fenced LOCAL_INV.  The MRs are free again once
+ * the transfer completes successfully.
+ *
+ * Each work request carries the caller's cqe, and done() runs once on
+ * success.  After an error it may run more than once, and a failed post may
+ * leave part of the chain queued: the caller then moves the QP to the error
+ * state and drains it before it reuses the memory, and deregisters the MRs
+ * instead of reusing them if the drain fails.
+ *
+ * rdk_rw_limits() gives the most send queue entries and MRs one transfer
+ * within the attributes takes: a queue of depth d needs d times rwl_wrs
+ * plus its responses, plus one entry for the drain.  rdk_rw_send_inv()
+ * turns a response SEND into SEND_WITH_INV for the peer's key when the
+ * transfer used a single key and the device can.
+ */
+typedef struct rdk_rw_ctx rdk_rw_ctx_t;
+
+enum rdk_rw_dir {
+	RDK_RW_WRITE = 1,	/* local to remote */
+	RDK_RW_READ		/* remote to local */
+};
+
+#define	RDK_RW_F_MR		0x1	/* a READ sink always gets an MR */
+#define	RDK_RW_MAX_LEN		(1U << 30)
+#define	RDK_RW_MAX_SEGS		16
+
+struct rdk_rw_seg {
+	uint64_t	rs_addr;
+	uint32_t	rs_len;
+	uint32_t	rs_key;
+};
+
+struct rdk_rw_attr {
+	uint32_t	rwa_flags;
+	uint32_t	rwa_max_sge;	/* the QP's cap.max_send_sge */
+	uint32_t	rwa_mr_pages;	/* of each MR lent; 0 for none */
+	uint32_t	rwa_max_cookies;
+	uint32_t	rwa_max_segs;
+	uint32_t	rwa_max_len;
+};
+
+struct rdk_rw_limits {
+	uint32_t	rwl_wrs;
+	uint32_t	rwl_mrs;
+	uint32_t	rwl_sges;
+};
+
+extern int rdk_rw_limits(struct rdk_device *, const struct rdk_rw_attr *,
+    struct rdk_rw_limits *);
+extern int rdk_rw_ctx_alloc(struct rdk_device *, const struct rdk_rw_attr *,
+    rdk_rw_ctx_t **);
+extern void rdk_rw_ctx_free(rdk_rw_ctx_t *);
+extern int rdk_rw_init(rdk_rw_ctx_t *, struct rdk_qp *, enum rdk_rw_dir,
+    const ddi_dma_cookie_t *, uint_t, uint64_t, uint32_t,
+    const struct rdk_rw_seg *, uint_t, struct rdk_mr *const *, uint_t);
+extern int rdk_rw_post(rdk_rw_ctx_t *, struct rdk_cqe *,
+    struct rdk_send_wr *);
+extern uint_t rdk_rw_nwr(const rdk_rw_ctx_t *);
+extern uint_t rdk_rw_nmr(const rdk_rw_ctx_t *);
+extern boolean_t rdk_rw_send_inv(const rdk_rw_ctx_t *, struct rdk_send_wr *);
 
 /*
  * The data path goes straight to the provider.

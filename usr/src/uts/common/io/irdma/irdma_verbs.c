@@ -17,8 +17,9 @@
  * it as an rkey.  There is no other all-memory registration.
  *
  * A destroy that cannot issue its control command (the device is being
- * reset or has failed) taints the function; every DMA buffer freed after
- * that goes to ice's quarantine until the reset completes.  That includes
+ * reset or has failed) taints the function and its rdmak device; every DMA
+ * buffer freed after that goes to ice's quarantine until the reset
+ * completes.  That includes
  * consumer buffers from rdk_dma_buf_alloc(), which come from ice too.  A
  * tainted function issues no more verbs commands and reuses no resource
  * number; a command that fails on a healthy one also asks for a reset.
@@ -307,7 +308,7 @@ irdma_query_device(struct rdk_device *rdev, struct rdk_device_attr *a)
 	    hw->uk_attrs.max_hw_wq_quanta / 8);
 	a->device_cap_flags = RDK_DEVICE_MEM_MGT_EXTENSIONS |
 	    RDK_DEVICE_RC_RNR_NAK_GEN;
-	a->kernel_cap_flags = RDK_KCAP_LOCAL_DMA_LKEY;
+	a->kernel_cap_flags = RDK_KCAP_LOCAL_DMA_LKEY | RDK_KCAP_READ_WITH_INV;
 	a->local_dma_lkey = 0;
 	a->max_send_sge = (int)hw->uk_attrs.max_hw_wq_frags;
 	a->max_recv_sge = (int)hw->uk_attrs.max_hw_wq_frags;
@@ -514,6 +515,19 @@ irdma_destroy_ah(struct rdk_ah *rah)
 	atomic_dec_32(&irdma->irdma_nahs);
 }
 
+/* The CEQ of each completion vector is on its own MSI-X vector. */
+static void
+irdma_vector_info(struct rdk_device *rdev, uint32_t vec,
+    struct rdk_vector_info *vi)
+{
+	irdma_t *irdma = IRDMA_DEV(rdev);
+
+	if (vec >= irdma->irdma_nceqs)
+		return;
+	vi->rvi_lgrp = (int32_t)irdma->irdma_numa_lgrp;
+	vi->rvi_cpu = irdma->irdma_ceqs[vec].ic_vec->iv_intr_cpu;
+}
+
 /*
  * DMA buffers for consumers come from ice through the osdep layer, so a
  * buffer freed while the device may still write it is quarantined.
@@ -572,6 +586,7 @@ static const struct rdk_device_ops irdma_rdk_ops = {
 	.dma_free = irdma_dma_free,
 	.cq_resched = irdma_cq_resched,
 	.modify_cq = irdma_modify_cq,
+	.vector_info = irdma_vector_info,
 	.size_pd = sizeof (irdma_pd_t),
 	.size_cq = sizeof (irdma_cq_t),
 	.size_qp = sizeof (irdma_qp_t),
@@ -715,6 +730,9 @@ irdma_verbs_register(irdma_t *irdma)
 	rdev->rd_phys_port_cnt = 1;
 	rdev->rd_node_guid = irdma_node_guid(irdma->irdma_info.iri_mac);
 	rdev->rd_num_comp_vectors = irdma->irdma_nceqs;
+	/* The bzero may have lost a taint from another thread. */
+	if ((irdma->irdma_flags & IRDMA_F_TAINTED) != 0)
+		rdk_device_taint(rdev);
 	if ((ret = rdk_register_device(rdev)) != 0) {
 		irdma_error(irdma, "failed to register with rdmak: %d", ret);
 		return (ret);

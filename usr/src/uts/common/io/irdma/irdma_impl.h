@@ -133,6 +133,7 @@ typedef struct irdma_vec {
 	uint64_t		iv_rescues_on;
 	struct irdma_ceq	*iv_ceq;
 	processorid_t		iv_cpu;		/* irdma_numa_place() */
+	processorid_t		iv_intr_cpu;	/* irdma_numa_place() */
 	processorid_t		iv_bound;	/* the thread's own */
 	kt_did_t		iv_did;
 } irdma_vec_t;

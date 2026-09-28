@@ -220,6 +220,7 @@ rdk_destroy_cq(struct rdk_cq *cq)
 		    "leaking it", cq->usecnt);
 		return;
 	}
+	rdk_cb_forbid("rdk_destroy_cq");
 	dev->rd_ops->destroy_cq(cq);
 	kmem_free(cq, dev->rd_ops->size_cq);
 	rdk_obj_rele(dev);
@@ -519,6 +520,7 @@ rdk_destroy_qp(struct rdk_qp *qp)
 {
 	struct rdk_device *dev = qp->device;
 
+	rdk_cb_forbid("rdk_destroy_qp");
 	rdk_cm_roce_qp_gone(qp);
 	dev->rd_ops->destroy_qp(qp);
 	rdk_cq_barrier(qp->send_cq);
@@ -655,7 +657,8 @@ next_page:
 
 /*
  * Returns EIO if the provider could not confirm that the device let go of
- * the memory; the MR is released either way.
+ * the memory; the MR is released either way.  From a callback it returns
+ * EDEADLK and keeps the MR.
  */
 int
 rdk_dereg_mr(struct rdk_mr *mr)
@@ -664,7 +667,11 @@ rdk_dereg_mr(struct rdk_mr *mr)
 	struct rdk_pd *pd = mr->pd;
 	int ret;
 
+	if (rdk_in_callback())
+		return (EDEADLK);
 	ret = dev->rd_ops->dereg_mr(mr);
+	if (ret == EIO)
+		rdk_device_taint(dev);
 	atomic_dec_32(&pd->usecnt);
 	rdk_obj_rele(dev);
 	return (ret);
@@ -879,6 +886,7 @@ rdk_drain_sq(struct rdk_qp *qp)
 	rdk_drain_cqe_t *d;
 	int ret;
 
+	rdk_cb_forbid("rdk_drain_sq");
 	if (qp->send_cq->poller == NULL ||
 	    rdk_drain_to_err(qp, "send queue") != 0)
 		return;
@@ -913,6 +921,7 @@ rdk_drain_rq(struct rdk_qp *qp)
 	rdk_drain_cqe_t *d;
 	int ret;
 
+	rdk_cb_forbid("rdk_drain_rq");
 	if (qp->recv_cq->poller == NULL ||
 	    rdk_drain_to_err(qp, "receive queue") != 0)
 		return;

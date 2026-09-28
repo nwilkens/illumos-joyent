@@ -76,7 +76,7 @@ irdma_qp_event(irdma_qp_t *iqp, enum irdma_qp_event_type type)
 	}
 	ev.device = rqp->device;
 	ev.element.qp = rqp;
-	rqp->event_handler(&ev, rqp->qp_context);
+	rdk_event_upcall(rqp->event_handler, &ev, rqp->qp_context);
 }
 
 /*

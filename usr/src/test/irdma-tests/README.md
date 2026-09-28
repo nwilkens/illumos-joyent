@@ -43,6 +43,46 @@ root with Python 3.9+ and a C99 compiler.
   out-of-range attributes, states and types, and the DMA page walk against
   offsets, gaps, a full page list and a cookie that wraps the address
   space.
+- `dma_quarantine.py`: runs the rdmak DMA quarantine with the irdma
+  consumer free: a healthy device frees at once, a reset in progress holds
+  without tainting, a failed deregistration or an irdma taint makes rdmak
+  leak what `rdk_dma_release()` is given and irdma hand buffers to ice as
+  still in use; a run with the irdma taint not passed on must fail.  It
+  also checks that iwcxgbe taints on every destroy the adapter did not
+  confirm.
+- `rdk_teardown.py`: builds the whole of `rdk_quiesce.c`, `rdk_cq.c` and
+  `rdk_verbs.c` against `rdk_kenv.h` (the kernel calls it needs, on POSIX
+  threads) and a fake provider.  A done() that frees its own CQ, from a
+  vector thread or a direct poll, returns and the CQ goes on the teardown
+  taskq; a done() that frees a CQ whose poller is busy in another thread
+  does not wait for it; a teardown started twice from a callback runs once,
+  outside callbacks, drains and destroys, and frees itself; from a callback
+  the destroys, drains and `rdk_teardown_wait()` panic and
+  `rdk_dereg_mr()` returns EDEADLK.  A build whose free waits in the
+  callback must deadlock (caught by an alarm).
+- `rdk_caps.py`: runs `rdk_vector_info()` (out of range refused, nothing
+  known without the provider operation) and checks that irdma reports
+  READ_WITH_INV, its inline size, its READ sink SGE limit and each
+  vector's lgroup and interrupt CPU, while iwcxgbe reports one READ sink
+  SGE, no READ_WITH_INV and no inline data, and refuses a send marked
+  inline.
+- `rdk_rw.py`: builds `rdk_rw.c` with the page walk of `rdk_verbs.c`
+  against a fake provider and runs each posted chain on a model of the
+  device and the peer, for 20,000 random transfer shapes and the page and
+  page-list edges (cookie layout, offset, length, remote segments, SGE and
+  READ SGE limits, MR sizes, iWARP, READ_WITH_INV, `RDK_RW_F_MR`).  The
+  bytes must land only where they belong, each registration must cover
+  exactly the bytes its READs write with a rotated key and only
+  LOCAL_WRITE (and REMOTE_WRITE on iWARP), every MR must be invalid at the
+  end, a LOCAL_INV must be fenced, only the last request (and a chained
+  SEND) is signaled, and the transfer fits `rdk_rw_limits()`.  Bad
+  arguments, a missing or foreign MR, a double post and SEND_WITH_INV
+  selection are checked too; builds without the fence, the cut of the
+  last cookie or the key rotation must fail.
+- `rdk_locks.py`: no function of the rdmak completion, teardown or RDMA
+  READ/WRITE code reaches a consumer callback, a provider operation or a
+  wait while it holds a lock it initializes; a done() moved under the
+  poller lock must be reported.
 - `cstyle.py`: `cstyle -pP` over the driver, rdmak and the tests.
 
 ## On hardware
@@ -65,7 +105,8 @@ enabled for the LAN.
 `rdma_verbs.sh` runs the verbs tests on hardware with irdma, rdmak and
 rdmat installed; `rdmatool.c` drives rdmat:
 
-    gcc -m64 -pthread -o rdmatool rdmatool.c rdmabench.c -lkstat -lsocket -lnsl
+    gcc -m64 -pthread -o rdmatool rdmatool.c rdmabench.c rdmatool_iw.c \
+        rdmatool_rw.c -lkstat -lsocket -lnsl
     rdma_verbs.sh -i <local_ip> [-p <peer_ip>] [-s <server_ip>] [tests]
 
 On one host it runs the rdmatool suite between two sessions (SEND/RECV,
@@ -74,7 +115,11 @@ invalidate, rejection of a bad or zero rkey, an out-of-bounds address and
 missing MR or QP rights, latency, bandwidth with CPU per GB, and teardown with work
 in flight), the same traffic with pings to the peer, irdma detached with a
 stream in flight, a PF reset (DEBUG ice `_reset`) with a stream in flight,
-and an interrupt resource management trim with a stream in flight.  With
+and an interrupt resource management trim with a stream in flight.
+Tests 8 and 9 run the rdk_rw tests of `rdmatool_rw.c` (every cookie
+layout and remote split through WRITE, READ and FRWR READ, a WRITE with
+its SEND_WITH_INV response chained, an FRWR READ stream) and a PF reset
+with that stream in flight.  With
 `-s` it runs the suite and a TCP baseline (`rdmatool ... client <server>
 tcp`) against `rdmatool -i <ip> server` on the other host.
 

@@ -54,6 +54,8 @@ struct rdk_device_priv {
 	kcondvar_t		rdp_cv;
 	boolean_t		rdp_dying;
 	uint64_t		rdp_nobjs;
+	uint64_t		rdp_leaked;		/* rdk_dma_release() */
+	uint64_t		rdp_leaked_bytes;
 	list_t			rdp_cdata;
 	krwlock_t		rdp_ev_lock;
 	list_t			rdp_handlers;
@@ -80,6 +82,14 @@ extern int rdk_create_cq_poll(struct rdk_device *, rdk_comp_handler_t,
 extern int rdk_cq_init(void);
 extern void rdk_cq_fini(void);
 extern void rdk_cq_barrier(struct rdk_cq *);
+
+/* rdk_quiesce.c */
+extern taskq_t *rdk_td_taskq;
+extern int rdk_quiesce_init(void);
+extern void rdk_quiesce_fini(void);
+extern void *rdk_cb_enter(void *);
+extern void rdk_cb_exit(void *);
+extern void rdk_cb_forbid(const char *);
 
 #ifdef __cplusplus
 }

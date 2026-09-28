@@ -149,6 +149,7 @@ void
 irdma_taint(irdma_t *irdma)
 {
 	atomic_or_32(&irdma->irdma_flags, IRDMA_F_TAINTED);
+	rdk_device_taint(&irdma->irdma_rdk);
 }
 
 /*
@@ -261,7 +262,8 @@ irdma_dma_free(struct device *od, size_t size, void *va, dma_addr_t pa,
 	 * the consumer destroyed first, so a pending control command does not
 	 * matter for it, only a device that failed to confirm the destroy.
 	 */
-	quiesced = consumer ? irdma_healthy(irdma) : irdma_quiesced(irdma);
+	quiesced = consumer ? irdma_healthy(irdma) &&
+	    !rdk_device_tainted(&irdma->irdma_rdk) : irdma_quiesced(irdma);
 	irdma->irdma_ops->iro_dma_free(irdma->irdma_peer, b->iob_dma, quiesced);
 	kmem_free(b, sizeof (*b));
 }

@@ -21,7 +21,7 @@
 #
 #	rdma_verbs.sh -i local_ip [-p peer_ip] [-s server_ip] [tests]
 #
-# tests is a list of test numbers, 1 to 7; the default runs all.
+# tests is a list of test numbers, 1 to 9; the default runs all.
 #
 #   1	the rdmatool suite between two sessions on this device
 #   2	RDMA writes, reads and bandwidth with Ethernet traffic to the peer
@@ -32,6 +32,10 @@
 #   5	an interrupt resource management trim with a stream in flight
 #   6	the rdmatool suite against "rdmatool server" on another host (-s)
 #   7	latency and bandwidth against the server (-s)
+#   8	the rdk_rw tests (rwshapes rwsend rwstream) between two sessions
+#   9	a PF reset (DEBUG ice _reset) with an rdk_rw FRWR READ stream in
+#	flight: the stream ends, every buffer and MR the device might still
+#	reach is held until the reset completes, and rdk_rw works after
 #
 # Each prints PASS or FAIL with its numbers.  Exit status 0 only if all pass.
 #
@@ -50,7 +54,7 @@ while getopts "i:p:s:" c; do
 	esac
 done
 shift $((OPTIND - 1))
-TESTS=" ${*:-1 2 3 4 5 6 7} "
+TESTS=" ${*:-1 2 3 4 5 6 7 8 9} "
 [ -n "$LOCAL" ] || { echo "-i is required"; exit 2; }
 TOOL=./rdmatool
 CTL=./irdmactl
@@ -75,7 +79,8 @@ up() {
 
 # Start a long write stream in the background; its output goes to $1.
 stream() {
-	($TOOL -i "$LOCAL" -t 5 loop bw > "$1" 2>&1; echo "rc=$?" >> "$1") &
+	($TOOL -i "$LOCAL" -t 5 loop ${2:-bw} > "$1" 2>&1
+	    echo "rc=$?" >> "$1") &
 	sleep 5
 }
 stream_wait() {
@@ -245,6 +250,56 @@ else
 	fi
 	rm -f $out
 fi
+fi
+
+# 8. rdk_rw in loopback.
+if want 8; then
+out=/tmp/rv8.$$
+m=$(msgs)
+$TOOL -i "$LOCAL" -t 5 loop rwshapes rwsend rwstream > $out 2>&1
+rc=$?
+grep -E '^(PASS|FAIL)' $out | sed 's/^/  /'
+if [ $rc = 0 ] && [ "$(k irdma:0:ctl:verbs_mrs)" = 0 ] &&
+    [ "$(k irdma:0:ctl:verbs_qps)" = 0 ] &&
+    ! since $m | grep -qE 'leak|failed to drain'; then
+	pass "rdk_rw: $(grep -c '^PASS' $out) checks, every MR and QP freed"
+else
+	fail "rdk_rw: rc $rc, mrs $(k irdma:0:ctl:verbs_mrs)," \
+	    "qps $(k irdma:0:ctl:verbs_qps)"
+fi
+rm -f $out
+fi
+
+# 9. A PF reset with rdk_rw FRWR READs in flight.
+if want 9; then
+out=/tmp/rv9.$$
+f0=$(k ice:0:rdma:quarantine_freed); g0=$(k ice:0:rdma:generation)
+m=$(msgs)
+stream $out rwstream
+if dladm set-linkprop -p _reset=1 ice0 2>/dev/null; then
+	stream_wait $out 90
+	up 90
+	f1=$(k ice:0:rdma:quarantine_freed)
+	if grep -qE 'No such device|I/O error' $out &&
+	    [ "$f1" -gt "$f0" ] &&
+	    [ "$(k ice:0:rdma:generation)" -gt "$g0" ] &&
+	    [ "$(k ice:0:rdma:quarantine_bufs)" = 0 ] &&
+	    $TOOL -i "$LOCAL" loop rwshapes > /dev/null 2>&1; then
+		pass "rdk_rw reset in flight: the stream ended with" \
+		    "$(grep -oE 'No such device|I/O error' $out | head -1)," \
+		    "$((f1 - f0)) buffers held until the reset and then" \
+		    "freed, generation $g0 -> $(k ice:0:rdma:generation)," \
+		    "rwshapes passed after"
+	else
+		fail "rdk_rw reset in flight: freed $f0 -> $f1, quarantine" \
+		    "$(k ice:0:rdma:quarantine_bufs);" \
+		    "$(grep -E 'FAIL|rc=' $out | tr '\n' ' ')"
+	fi
+else
+	stream_wait $out 120
+	fail "rdk_rw reset in flight: _reset needs the DEBUG ice"
+fi
+rm -f $out
 fi
 
 echo "=== irdma: qps $(k irdma:0:ctl:verbs_qps) cqs $(k irdma:0:ctl:verbs_cqs)" \

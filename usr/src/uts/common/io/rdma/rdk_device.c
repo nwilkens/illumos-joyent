@@ -36,6 +36,7 @@
 #include <sys/sysmacros.h>
 #include <sys/byteorder.h>
 #include <sys/disp.h>
+#include <sys/atomic.h>
 #include <netinet/in.h>
 
 #include "rdk_impl.h"
@@ -293,6 +294,12 @@ rdk_unregister_device(struct rdk_device *dev)
 			    (u_longlong_t)p->rdp_nobjs);
 		}
 	}
+	if (p->rdp_leaked != 0) {
+		dev_err(dev->rd_dip, CE_WARN, "!%s: leaked %llu buffers "
+		    "(%llu bytes) the device may still reach", dev->rd_name,
+		    (u_longlong_t)p->rdp_leaked,
+		    (u_longlong_t)p->rdp_leaked_bytes);
+	}
 	mutex_exit(&p->rdp_lock);
 	mutex_exit(&rdk_reg_lock);
 
@@ -375,15 +382,18 @@ rdk_dispatch_event(const struct rdk_event *ev)
 	struct rdk_device_priv *p = ev->device->rd_priv;
 	struct rdk_event_handler *h;
 	struct rdk_event copy;
+	void *old;
 
 	if (p == NULL)
 		return;
 	rw_enter(&p->rdp_ev_lock, RW_READER);
+	old = rdk_cb_enter(&copy);
 	for (h = list_head(&p->rdp_handlers); h != NULL;
 	    h = list_next(&p->rdp_handlers, h)) {
 		copy = *ev;
 		h->handler(h, &copy);
 	}
+	rdk_cb_exit(old);
 	rw_exit(&p->rdp_ev_lock);
 }
 
@@ -708,6 +718,54 @@ rdk_dma_buf_free(struct rdk_device *dev, rdk_dma_buf_t *buf)
 	dev->rd_ops->dma_free(dev, buf);
 	bzero(buf, sizeof (*buf));
 	rdk_obj_rele(dev);
+}
+
+/* Any context: providers taint from their error paths. */
+void
+rdk_device_taint(struct rdk_device *dev)
+{
+	atomic_or_32(&dev->rd_tainted, 1);
+}
+
+boolean_t
+rdk_device_tainted(const struct rdk_device *dev)
+{
+	return (dev->rd_tainted != 0);
+}
+
+boolean_t
+rdk_dma_release(struct rdk_device *dev, void (*release)(void *), void *arg,
+    size_t len)
+{
+	struct rdk_device_priv *p = dev->rd_priv;
+	boolean_t first;
+
+	if (!rdk_device_tainted(dev)) {
+		release(arg);
+		return (B_TRUE);
+	}
+	mutex_enter(&p->rdp_lock);
+	first = p->rdp_leaked++ == 0;
+	p->rdp_leaked_bytes += len;
+	mutex_exit(&p->rdp_lock);
+	if (first) {
+		dev_err(dev->rd_dip, CE_WARN, "!%s may still reach memory it "
+		    "was given; leaking it", dev->rd_name);
+	}
+	return (B_FALSE);
+}
+
+int
+rdk_vector_info(struct rdk_device *dev, uint32_t vec,
+    struct rdk_vector_info *vi)
+{
+	vi->rvi_lgrp = -1;
+	vi->rvi_cpu = -1;
+	if (vec >= dev->rd_num_comp_vectors)
+		return (EINVAL);
+	if (dev->rd_ops->vector_info != NULL)
+		dev->rd_ops->vector_info(dev, vec, vi);
+	return (0);
 }
 
 /*

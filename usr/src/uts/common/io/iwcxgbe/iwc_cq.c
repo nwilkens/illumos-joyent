@@ -854,9 +854,7 @@ iwc_vec_thread(void *arg)
 		mutex_enter(&cq->cq_lock);
 		cq->cq_hw.armed = B_FALSE;
 		mutex_exit(&cq->cq_lock);
-		if (cq->cq_rdk.comp_handler != NULL)
-			cq->cq_rdk.comp_handler(&cq->cq_rdk,
-			    cq->cq_rdk.cq_context);
+		rdk_comp_upcall(&cq->cq_rdk);
 
 		mutex_enter(&iv->iv_lock);
 		iv->iv_runs++;
@@ -998,10 +996,12 @@ iwc_destroy_cq(struct rdk_cq *rcq)
 
 	/* t4nex frees the ring, or keeps it if the firmware did not answer. */
 	ret = iwc->iwc_ops->tro_cq_destroy(iwc->iwc_peer, cq->cq_hw.cqid);
-	if (ret == 0)
+	if (ret == 0) {
 		iwc_qid_free(iwc, cq->cq_hw.cqid);
-	else
+	} else {
 		IWC_STAT(iwc, is_quar);
+		iwc_taint(iwc);
+	}
 	kmem_free(cq->cq_hw.sw_queue, cq->cq_memlen);
 	mutex_destroy(&cq->cq_lock);
 }

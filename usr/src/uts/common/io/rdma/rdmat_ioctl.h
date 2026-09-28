@@ -26,6 +26,9 @@
  * RDMAT_IOC_SETUP	Create the session's objects (rdmat_setup_t).
  * RDMAT_IOC_CONNECT	Connect one QP to a peer (rdmat_connect_t).
  * RDMAT_IOC_RUN	Run one operation to completion (rdmat_run_t).
+ *			RDMAT_OP_RW moves data with rdk_rw: local cookies of
+ *			rr_frag bytes rr_stride apart (or the chunks), the
+ *			remote window cut into rr_nsegs segments.
  * RDMAT_IOC_BUF	Fill, check or clear part of a QP's buffer
  *			(rdmat_buf_t); checking compares every byte.
  * RDMAT_IOC_QUERY	Read a QP's state and counters (rdmat_query_t).
@@ -59,6 +62,8 @@ extern "C" {
 #define	RDMAT_MAX_COUNT		(1U << 28)
 #define	RDMAT_MAX_TIMEOUT_MS	120000
 #define	RDMAT_MAX_SPIN_US	100000
+#define	RDMAT_MAX_VECS		16
+#define	RDMAT_RW_MAX_CK		1024
 /* The GRH a UD receive gets in front of the payload. */
 #define	RDMAT_GRH_LEN		40
 
@@ -76,6 +81,10 @@ typedef struct rdmat_devinfo {
 	uint32_t	rdi_max_mr_pages;
 	uint32_t	rdi_max_inline;
 	uint32_t	rdi_comp_vectors;
+	uint32_t	rdi_max_sge_rd;
+	uint32_t	rdi_kcaps;	/* kernel_cap_flags */
+	int32_t		rdi_vec_lgrp[RDMAT_MAX_VECS];	/* -1: not known */
+	int32_t		rdi_vec_cpu[RDMAT_MAX_VECS];
 } rdmat_devinfo_t;
 
 typedef struct rdmat_devices {
@@ -121,6 +130,9 @@ typedef struct rdmat_setup {
 	uint8_t		rs_mac[6];
 	uint16_t	rs_gid_index;
 	rdmat_qpinfo_t	rs_qp[RDMAT_MAX_QPS];
+	/* In */
+	uint32_t	rs_max_sge;	/* send SGEs per request; 0 is 1 */
+	uint32_t	rs_sq_depth;	/* 0 is rs_depth + 4 */
 } rdmat_setup_t;
 
 typedef struct rdmat_connect {
@@ -158,7 +170,8 @@ typedef enum rdmat_op {
 	RDMAT_OP_WRITE_PING,	/* write, wait for the peer's write; count */
 	RDMAT_OP_WRITE_PONG,	/* wait for the peer's write, write back */
 	RDMAT_OP_MR_ALLOC,	/* allocate and free an MR of size; count */
-	RDMAT_OP_FRWR		/* REG_MR then LOCAL_INV over size; count */
+	RDMAT_OP_FRWR,		/* REG_MR then LOCAL_INV over size; count */
+	RDMAT_OP_RW		/* count rdk_rw transfers of size */
 } rdmat_op_t;
 
 /*
@@ -218,7 +231,32 @@ typedef struct rdmat_run {
 	uint64_t	rr_lat_p999;
 	uint64_t	rr_posted;	/* requests posted */
 	uint64_t	rr_post_calls;
+	/* In: RDMAT_OP_RW */
+	uint32_t	rr_rw_flags;	/* RDMAT_RW_* */
+	uint32_t	rr_frag;	/* local cookie bytes; 0 for chunks */
+	uint32_t	rr_stride;	/* from one local cookie to the next */
+	uint32_t	rr_nsegs;	/* remote segments; 0 is 1 */
+	uint32_t	rr_mr_pages;	/* of each MR lent */
+	uint32_t	rr_rw_pad;
+	/* Out */
+	uint32_t	rr_rw_wrs;	/* requests of the last transfer */
+	uint32_t	rr_rw_mrs;	/* MRs of the last transfer */
+	uint32_t	rr_rw_limit_wrs;	/* rdk_rw_limits() */
+	uint32_t	rr_rw_limit_mrs;
+	uint32_t	rr_rw_send_inv;	/* the SEND invalidated the rkey */
+	uint32_t	rr_rw_pad2;
 } rdmat_run_t;
+
+/*
+ * rr_rw_flags.  RDMAT_RW_SEND chains a 64 byte SEND from the start of the
+ * buffer after each WRITE, and RDMAT_RW_SEND_INV makes it invalidate the
+ * peer's rkey.
+ */
+#define	RDMAT_RW_READ		0x1
+#define	RDMAT_RW_MR		0x2	/* RDK_RW_F_MR */
+#define	RDMAT_RW_SEND		0x4
+#define	RDMAT_RW_SEND_INV	0x8
+#define	RDMAT_RW_SEND_LEN	64
 
 #define	RDMAT_ACC_REMOTE_WRITE	0x1
 #define	RDMAT_ACC_REMOTE_READ	0x2
@@ -227,9 +265,15 @@ typedef struct rdmat_run {
 typedef enum rdmat_bufop {
 	RDMAT_BUF_FILL = 1,
 	RDMAT_BUF_VERIFY,
-	RDMAT_BUF_ZERO
+	RDMAT_BUF_ZERO,
+	RDMAT_BUF_VERIFY_ZERO
 } rdmat_bufop_t;
 
+/*
+ * With rb_frag set, byte i of the rb_len bytes is at rb_offset +
+ * (i / rb_frag) * rb_stride + i % rb_frag, the layout of RDMAT_OP_RW's
+ * local cookies.
+ */
 typedef struct rdmat_buf {
 	uint32_t	rb_qp;
 	uint32_t	rb_op;		/* rdmat_bufop_t */
@@ -239,6 +283,8 @@ typedef struct rdmat_buf {
 	uint64_t	rb_pattern_base; /* pattern offset of rb_offset */
 	int64_t		rb_mismatch;	/* out: first bad offset, or -1 */
 	uint64_t	rb_ns;		/* out */
+	uint32_t	rb_frag;
+	uint32_t	rb_stride;
 } rdmat_buf_t;
 
 typedef struct rdmat_query {

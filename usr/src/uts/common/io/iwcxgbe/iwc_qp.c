@@ -435,6 +435,7 @@ iwc_destroy_qp(struct rdk_qp *rqp)
 	} else {
 		/* The firmware may still own the queues and the RQT. */
 		IWC_STAT(iwc, is_quar);
+		iwc_taint(iwc);
 	}
 	kmem_free(wq->sq.sw_sq, wq->sq.size * sizeof (t4_swsqe_t));
 	kmem_free(wq->rq.sw_rq, wq->rq.size * sizeof (t4_swrqe_t));
@@ -745,7 +746,9 @@ iwc_post_send(struct rdk_qp *rqp, const struct rdk_send_wr *wr,
 			ret = ENOMEM;
 			break;
 		}
-		if (wr->num_sge > (int)qp->qp_sq_max_sge) {
+		/* No inline data: the adapter would read the buffer later. */
+		if (wr->num_sge > (int)qp->qp_sq_max_sge ||
+		    (wr->send_flags & RDK_SEND_INLINE) != 0) {
 			ret = EINVAL;
 			break;
 		}
@@ -1064,8 +1067,7 @@ iwc_qp_async(iwc_t *iwc, const t4_cqe_t *cqe)
 		ev.event = RDK_EVENT_QP_FATAL;
 		break;
 	}
-	if (qp->qp_rdk.event_handler != NULL)
-		qp->qp_rdk.event_handler(&ev, qp->qp_rdk.qp_context);
+	rdk_event_upcall(qp->qp_rdk.event_handler, &ev, qp->qp_rdk.qp_context);
 
 	mutex_enter(&qp->qp_lock);
 	ep = qp->qp_ep;

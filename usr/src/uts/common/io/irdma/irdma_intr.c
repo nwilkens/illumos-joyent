@@ -486,7 +486,7 @@ irdma_vecs_init(irdma_t *irdma)
 		iv->iv_irdma = irdma;
 		iv->iv_idx = i;
 		iv->iv_ctl = i == 0;
-		iv->iv_cpu = iv->iv_bound = -1;
+		iv->iv_cpu = iv->iv_bound = iv->iv_intr_cpu = -1;
 		(mutex_init)(&iv->iv_lock, NULL, MUTEX_DRIVER,
 		    DDI_INTR_PRI(irdma->irdma_intr.irin_pri));
 		cv_init(&iv->iv_cv, NULL, CV_DRIVER, NULL);

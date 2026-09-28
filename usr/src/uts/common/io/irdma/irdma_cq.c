@@ -368,8 +368,7 @@ irdma_cq_ceq_dispatch(irdma_cq_t *icq, boolean_t event)
 		icq->icq_armed = B_FALSE;
 		mutex_exit(&icq->icq_lock);
 	}
-	if (rcq->comp_handler != NULL)
-		rcq->comp_handler(rcq, rcq->cq_context);
+	rdk_comp_upcall(rcq);
 	irdma_cq_rele(icq);
 }
 
@@ -384,8 +383,8 @@ irdma_comp_handler(irdma_cq_t *icq)
 	armed = icq->icq_armed;
 	icq->icq_armed = B_FALSE;
 	mutex_exit(&icq->icq_lock);
-	if (armed && rcq->comp_handler != NULL)
-		rcq->comp_handler(rcq, rcq->cq_context);
+	if (armed)
+		rdk_comp_upcall(rcq);
 }
 
 /* An asynchronous CQ error from the AEQ. */
@@ -418,7 +417,8 @@ irdma_cq_error(irdma_t *irdma, uint32_t cq_id)
 		ev.device = icq->icq_rdk.device;
 		ev.event = RDK_EVENT_CQ_ERR;
 		ev.element.cq = &icq->icq_rdk;
-		icq->icq_rdk.event_handler(&ev, icq->icq_rdk.cq_context);
+		rdk_event_upcall(icq->icq_rdk.event_handler, &ev,
+		    icq->icq_rdk.cq_context);
 	}
 	irdma_cq_rele(icq);
 }

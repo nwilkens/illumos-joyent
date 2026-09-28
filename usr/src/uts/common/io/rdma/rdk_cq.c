@@ -30,6 +30,10 @@
  *
  * RDK_POLL_DIRECT: the consumer calls rdk_process_cq_direct() and the CQ
  * is never armed.
+ *
+ * done() runs with the thread marked as in a callback.  rdk_free_cq() from
+ * a callback cannot wait for the pollers, one of which may be its own
+ * caller, so it finishes on rdk_td_taskq.
  */
 
 #include <sys/types.h>
@@ -77,6 +81,7 @@ struct rdk_cq_poller {
 	boolean_t	rcp_mod_pending;	/* a delayed poll is set */
 	boolean_t	rcp_mod_done;	/* the next run arms */
 	callout_id_t	rcp_mod_tid;
+	taskq_ent_t	rcp_free_ent;	/* rdk_free_cq() from a callback */
 	struct rdk_wc	rcp_wc[RDK_CQ_BATCH];
 };
 
@@ -84,10 +89,17 @@ int
 rdk_cq_init(void)
 {
 	int n = MAX(MIN(ncpus, 32), 2);
+	int ret;
 
+	if ((ret = rdk_quiesce_init()) != 0)
+		return (ret);
 	rdk_cq_taskq = taskq_create("rdk_cq", n, minclsyspri, n, INT_MAX,
 	    TASKQ_PREPOPULATE);
-	return (rdk_cq_taskq == NULL ? ENOMEM : 0);
+	if (rdk_cq_taskq == NULL) {
+		rdk_quiesce_fini();
+		return (ENOMEM);
+	}
+	return (0);
 }
 
 void
@@ -95,6 +107,7 @@ rdk_cq_fini(void)
 {
 	taskq_destroy(rdk_cq_taskq);
 	rdk_cq_taskq = NULL;
+	rdk_quiesce_fini();
 }
 
 /*
@@ -106,33 +119,43 @@ rdk_cq_process(struct rdk_cq *cq, struct rdk_wc *wcs, int budget)
 {
 	struct rdk_cq_poller *cp = cq->poller;
 	int done = 0, want, n, i;
+	boolean_t dying;
+	void *old;
 
+	/* A direct poll has only rcp_runner to keep rdk_free_cq() waiting. */
+	mutex_enter(&cp->rcp_lock);
+	cp->rcp_runner = curthread;
+	mutex_exit(&cp->rcp_lock);
 	for (;;) {
 		want = RDK_CQ_BATCH;
 		if (budget >= 0)
 			want = MIN(want, budget - done);
 		if (want <= 0)
 			break;
-		mutex_enter(&cp->rcp_lock);
-		cp->rcp_runner = curthread;
-		mutex_exit(&cp->rcp_lock);
 		n = rdk_poll_cq(cq, want, wcs);
+		old = rdk_cb_enter(cq);
 		for (i = 0; i < n; i++) {
 			if (wcs[i].wr_cqe != NULL)
 				wcs[i].wr_cqe->done(cq, &wcs[i]);
 			else
 				cp->rcp_no_cqe++;
 		}
+		rdk_cb_exit(old);
 		mutex_enter(&cp->rcp_lock);
-		cp->rcp_runner = NULL;
 		cp->rcp_batches++;
+		dying = cp->rcp_dying;
 		cv_broadcast(&cp->rcp_cv);
 		mutex_exit(&cp->rcp_lock);
 		if (n > 0)
 			done += n;
-		if (n < want)
+		if (n < want || dying)
 			break;
 	}
+	/* A done() that freed the CQ may let it go once we unlock. */
+	mutex_enter(&cp->rcp_lock);
+	cp->rcp_runner = NULL;
+	cv_broadcast(&cp->rcp_cv);
+	mutex_exit(&cp->rcp_lock);
 	return (done);
 }
 
@@ -300,15 +323,17 @@ rdk_cq_event(struct rdk_cq *cq, void *ctx)
 }
 
 /*
- * Wait until no poller run is in progress or owed to rdk_cq_taskq.  A
- * poller handed back to the provider is not waited for: the provider
- * drops it when the CQ is destroyed, and a late call sees rcp_dying.
+ * Wait until no poller run or batch is in progress or owed to
+ * rdk_cq_taskq.  A poller handed back to the provider is not waited for:
+ * the provider drops it when the CQ is destroyed, and a late call sees
+ * rcp_dying.
  */
 static void
 rdk_cq_wait_idle(struct rdk_cq_poller *cp)
 {
 	ASSERT(MUTEX_HELD(&cp->rcp_lock));
-	while (cp->rcp_queued && (!cp->rcp_deferred || cp->rcp_in_tq))
+	while ((cp->rcp_queued && (!cp->rcp_deferred || cp->rcp_in_tq)) ||
+	    cp->rcp_runner != NULL)
 		cv_wait(&cp->rcp_cv, &cp->rcp_lock);
 }
 
@@ -356,19 +381,14 @@ rdk_alloc_cq(struct rdk_device *dev, void *private, int nr_cqe,
 	return (0);
 }
 
-void
-rdk_free_cq(struct rdk_cq *cq)
+static void
+rdk_free_cq_task(void *arg)
 {
+	struct rdk_cq *cq = arg;
 	struct rdk_cq_poller *cp = cq->poller;
 	callout_id_t tid;
 
-	if (cq->usecnt != 0) {
-		/* rdk_destroy_cq() leaks it too; keep the poller with it. */
-		rdk_destroy_cq(cq);
-		return;
-	}
 	mutex_enter(&cp->rcp_lock);
-	cp->rcp_dying = B_TRUE;
 	tid = cp->rcp_mod_tid;
 	mutex_exit(&cp->rcp_lock);
 	/* This waits for a delayed poll that has started. */
@@ -382,6 +402,28 @@ rdk_free_cq(struct rdk_cq *cq)
 	cv_destroy(&cp->rcp_cv);
 	mutex_destroy(&cp->rcp_lock);
 	kmem_free(cp, sizeof (*cp));
+}
+
+void
+rdk_free_cq(struct rdk_cq *cq)
+{
+	struct rdk_cq_poller *cp = cq->poller;
+
+	if (cq->usecnt != 0) {
+		/* rdk_destroy_cq() leaks it too; keep the poller with it. */
+		rdk_destroy_cq(cq);
+		return;
+	}
+	mutex_enter(&cp->rcp_lock);
+	VERIFY(!cp->rcp_dying);
+	cp->rcp_dying = B_TRUE;
+	mutex_exit(&cp->rcp_lock);
+	if (rdk_in_callback()) {
+		taskq_dispatch_ent(rdk_td_taskq, rdk_free_cq_task, cq, 0,
+		    &cp->rcp_free_ent);
+		return;
+	}
+	rdk_free_cq_task(cq);
 }
 
 /*

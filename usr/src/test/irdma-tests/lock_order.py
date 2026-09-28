@@ -87,7 +87,7 @@ def main():
             ceq.rindex("mutex_enter(&ic->ic_lock);", 0, call), name
     cq = (IRDMA / "irdma_cq.c").read_text(encoding="utf-8")
     dispatch = body(cq, "irdma_cq_ceq_dispatch")
-    handler = dispatch.index("rcq->comp_handler(rcq, rcq->cq_context);")
+    handler = dispatch.index("rdk_comp_upcall(rcq);")
     assert dispatch.rindex("mutex_exit(&icq->icq_lock);", 0, handler) > \
         dispatch.rindex("mutex_enter(&icq->icq_lock);", 0, handler)
     assert "comp_handler" not in isr
@@ -202,11 +202,12 @@ def main():
 
     # A moderation delay is cancelled, waiting for one in progress, before
     # the CQ is freed; the delay hands the poller back with no poller lock.
-    free = body(rdk, "rdk_free_cq")
+    free = body(rdk, "rdk_free_cq_task")
     assert free.index("untimeout_generic(tid, 0);") < \
         free.index("rdk_cq_wait_idle(cp);") < free.rindex("rdk_destroy_cq(cq);")
-    assert free.index("cp->rcp_dying = B_TRUE;") < \
-        free.index("untimeout_generic(tid, 0);")
+    start = body(rdk, "rdk_free_cq")
+    assert start.index("cp->rcp_dying = B_TRUE;") < \
+        start.index("rdk_free_cq_task(cq);")
     fire = body(rdk, "rdk_cq_mod_fire")
     call = fire.index("resched(cq);")
     assert fire.rindex("mutex_exit(&cp->rcp_lock);", 0, call) > \
@@ -264,7 +265,8 @@ def main():
     assert "ts->ts_dying" in cost and "t0 >= deadline" in cost
     run = (rdma / "rdmat_run.c").read_text(encoding="utf-8")
     runf = body(run, "rdmat_run")
-    assert runf.index("if (tq->tq_bmr != NULL)") < runf.index("switch (op)")
+    assert runf.index("if (tq->tq_bmr != NULL || tq->tq_rw != NULL)") < \
+        runf.index("switch (op)")
     down = body(run, "rdmat_teardown")
     assert down.index("rdk_destroy_qp(tq->tq_qp);") < \
         down.index("rdk_dereg_mr(tq->tq_bmr);")

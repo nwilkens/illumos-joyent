@@ -90,6 +90,8 @@ extern int failures;
 extern uint32_t fresh_b_access;
 extern uint32_t fresh_inline;
 extern uint32_t fresh_vector;
+extern uint32_t fresh_max_sge;
+extern uint32_t fresh_sq_depth;
 extern uint16_t fresh_mod_count;
 extern uint16_t fresh_mod_us;
 extern rdmat_devinfo_t local_dev;
@@ -115,6 +117,9 @@ extern void host_stats(host_stats_t *);
 
 /* rdmabench.c */
 extern int bench_main(peer_t *, peer_t *, int, char **);
+
+/* rdmatool_rw.c */
+extern int rw_test(peer_t *, peer_t *, const char *);
 
 /* rdmatool_iw.c */
 extern int iw_pair(peer_t *, peer_t *);
