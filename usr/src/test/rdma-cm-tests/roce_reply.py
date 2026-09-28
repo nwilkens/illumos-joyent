@@ -44,10 +44,11 @@ def check(texts):
     back = bodies.get("rdk_cm_roce_back", "")
     use = back.find("rx->rx_smac")
     nbr = back.find("rdk_cm_nexthop_lookup")
+    local = back.find("p.cp_smac")
     if use < 0:
         bad.append("rdk_cm_roce_back() does not use the source MAC")
-    elif nbr >= 0 and nbr < use:
-        bad.append("rdk_cm_roce_back() asks the neighbor cache first")
+    elif 0 <= nbr < use or 0 <= local < use:
+        bad.append("rdk_cm_roce_back() prefers a route's MAC to the frame's")
     req = bodies.get("rdk_cm_roce_req", "")
     back_at = req.find("rdk_cm_roce_back(")
     mac_at = req.find("c->ic_path.gp_dmac")
@@ -73,6 +74,12 @@ def main():
          "rx->rx_smac, ETHERADDRL);\n", ""),
         ("rdk_cm_roce_rx.c", "\t\telse if (rx->rx_has_smac)\n\t\t\tbcopy("
          "rx->rx_smac, gp->gp_dmac, ETHERADDRL);\n", ""),
+        ("rdk_cm_roce_rx.c", "\t\telse if (rx->rx_has_smac)\n\t\t\tbcopy("
+         "rx->rx_smac, gp->gp_dmac, ETHERADDRL);\n\t\telse if (p.cp_local)\n"
+         "\t\t\tbcopy(p.cp_smac, gp->gp_dmac, ETHERADDRL);\n",
+         "\t\telse if (p.cp_local)\n\t\t\tbcopy(p.cp_smac, gp->gp_dmac, "
+         "ETHERADDRL);\n\t\telse if (rx->rx_has_smac)\n\t\t\tbcopy("
+         "rx->rx_smac, gp->gp_dmac, ETHERADDRL);\n"),
         ("rdk_cm_roce_rx.c", "\t\t\tret = rdk_cm_nexthop_lookup(",
          "\t\t\tret = rdk_cm_arp_start("),
         ("rdk_cm_roce_rx.c", "\t\tbcopy(gp.gp_dmac, c->ic_path.gp_dmac, "

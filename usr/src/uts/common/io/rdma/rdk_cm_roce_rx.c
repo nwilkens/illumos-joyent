@@ -100,10 +100,10 @@ rdk_cm_roce_back(rdk_gsi_t *g, const rdk_gsi_rx_t *rx, rdk_gsi_path_t *gp)
 	    rx->rx_ip.ip_dst, &p)) == 0) {
 		if (p.cp_dev->rcd_dev != g->rg_dev || p.cp_port != g->rg_port)
 			ret = ENETUNREACH;
-		else if (p.cp_local)
-			bcopy(p.cp_smac, gp->gp_dmac, ETHERADDRL);
 		else if (rx->rx_has_smac)
 			bcopy(rx->rx_smac, gp->gp_dmac, ETHERADDRL);
+		else if (p.cp_local)
+			bcopy(p.cp_smac, gp->gp_dmac, ETHERADDRL);
 		else
 			ret = rdk_cm_nexthop_lookup(GLOBAL_ZONEID,
 			    p.cp_ifindex, p.cp_nexthop, gp->gp_dmac);
