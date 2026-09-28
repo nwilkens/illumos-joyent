@@ -307,6 +307,7 @@ typedef struct nr_queue {
 	nr_kind_t		nq_kind;
 	list_node_t		nq_lnode;	/* the listener's queues */
 	list_node_t		nq_dnode;	/* the device's queues */
+	boolean_t		nq_listed;
 	kmutex_t		nq_lock;
 	kcondvar_t		nq_cv;
 	nr_qstate_t		nq_state;
@@ -411,6 +412,7 @@ extern int nr_listen(cred_t *, const struct sockaddr_in *,
     uint32_t, uint32_t *);
 extern int nr_unlisten(uint32_t);
 extern void nr_queue_detach(nr_queue_t *);
+extern void nr_queue_gone(nr_queue_t *);
 extern void nr_queue_connected(nr_queue_t *);
 
 #endif /* _KERNEL */

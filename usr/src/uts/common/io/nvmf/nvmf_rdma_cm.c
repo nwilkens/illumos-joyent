@@ -152,7 +152,7 @@ nr_listener_stop(nr_listener_t *nl)
 
 /*
  * The device is going: stop its listeners, fail its queues and wait for
- * their teardowns, then for STMF to give back the pool's buffers.
+ * nvmft to free them, then for STMF to give back the pool's buffers.
  */
 static void
 nr_client_remove(struct rdk_device *dev, void *arg)
@@ -388,6 +388,7 @@ nr_cm_request(nr_listener_t *nl, rdk_cm_id_t *id,
 	q->nq_charge = sz.nrs_bytes;
 	mutex_enter(&nd->nd_lock);
 	list_insert_tail(&nd->nd_qlist, q);
+	q->nq_listed = B_TRUE;
 	nd->nd_building--;
 	cv_broadcast(&nd->nd_cv);
 	mutex_exit(&nd->nd_lock);
@@ -531,7 +532,6 @@ void
 nr_queue_detach(nr_queue_t *q)
 {
 	nr_listener_t *nl = q->nq_listener;
-	nr_dev_t *nd = q->nq_dev;
 	timeout_id_t tid;
 	boolean_t counted;
 
@@ -552,7 +552,19 @@ nr_queue_detach(nr_queue_t *q)
 	nr_unadmit(nl, q->nq_peer_ent, counted, q->nq_charge);
 	q->nq_listener = NULL;
 	nr_listener_rele(nl);
+}
 
+/*
+ * The queue is freed.  nvmft may call in with a dead queue until then, so
+ * the device, its PD and its pool stay until every queue is gone.
+ */
+void
+nr_queue_gone(nr_queue_t *q)
+{
+	nr_dev_t *nd = q->nq_dev;
+
+	if (!q->nq_listed)
+		return;
 	mutex_enter(&nd->nd_lock);
 	list_remove(&nd->nd_qlist, q);
 	cv_broadcast(&nd->nd_cv);

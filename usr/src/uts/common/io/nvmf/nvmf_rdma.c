@@ -601,6 +601,7 @@ nr_queue_rele(nr_queue_t *q)
 	mutex_exit(&q->nq_lock);
 
 	ASSERT(q->nq_state == NR_Q_DEAD);
+	nr_queue_gone(q);
 	rdk_teardown_free(q->nq_td);
 	while (list_remove_head(&q->nq_free_cmds) != NULL)
 		;

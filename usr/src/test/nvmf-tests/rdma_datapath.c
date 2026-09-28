@@ -124,6 +124,12 @@ nr_queue_connected(nr_queue_t *q)
 	(void) q;
 }
 
+void
+nr_queue_gone(nr_queue_t *q)
+{
+	(void) q;
+}
+
 /*
  * Memory the device may reach: every DMA buffer and pool buffer, with its
  * physical address equal to its virtual one.
