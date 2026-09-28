@@ -133,6 +133,22 @@ rdk_ibcm_gid_ip4(const uint8_t *gid, uint32_t *ip)
 	return (B_TRUE);
 }
 
+/*
+ * A REJ for a timeout names the connection by the sender's CA GUID, in
+ * its ARI, and the sender's comm ID, whatever the remote ID (Linux
+ * cm_acquire_rejected_id()).  *guid is the GUID when it does.
+ */
+boolean_t
+rdk_ibcm_rej_by_guid(const rdk_ibcm_msg_t *m, uint64_t *guid)
+{
+	if (m->m_attr != IBCM_ATTR_REJ || m->m_reason != IBCM_REJ_TIMEOUT ||
+	    m->m_ari_len < 8 || m->m_local_id == 0)
+		return (B_FALSE);
+	if (guid != NULL)
+		*guid = get64(m->m_ari, 0);
+	return (B_TRUE);
+}
+
 void
 rdk_ibcm_ip4_gid(uint32_t ip, uint8_t *gid)
 {
@@ -321,12 +337,14 @@ rdk_ibcm_parse(const uint8_t *b, rdk_ibcm_msg_t *m)
 		m->m_msg = getbits(b, CM(8), 0, 2);
 		m->m_ari_len = getbits(b, CM(9), 0, 7);
 		m->m_reason = get16(b, CM(10));
-		if (m->m_remote_id == 0 || m->m_msg > 2 ||
-		    m->m_ari_len > IBCM_REJ_ARI_MAX) {
+		if (m->m_msg > 2 || m->m_ari_len > IBCM_REJ_ARI_MAX) {
 			ret = EINVAL;
 			break;
 		}
 		bcopy(&b[CM(12)], m->m_ari, m->m_ari_len);
+		/* Only a timed-out REJ may lack the remote ID (Linux). */
+		if (m->m_remote_id == 0 && !rdk_ibcm_rej_by_guid(m, NULL))
+			ret = EINVAL;
 		break;
 	case IBCM_ATTR_RTU:
 	case IBCM_ATTR_DREP:

@@ -525,9 +525,13 @@ rdk_cm_roce_conn_msg(const rdk_gsi_rx_t *rx, const rdk_ibcm_msg_t *m)
 {
 	rdk_ibconn_in_t in;
 	rdk_ibconn_t *c;
-	boolean_t ok;
+	uint64_t guid;
+	boolean_t ok, by_guid;
 
-	if ((c = rdk_ibconn_find(m->m_remote_id)) == NULL) {
+	by_guid = rdk_ibcm_rej_by_guid(m, &guid);
+	c = by_guid ? rdk_ibconn_find_remote(guid, m->m_local_id) :
+	    rdk_ibconn_find(m->m_remote_id);
+	if (c == NULL) {
 		if (m->m_attr == IBCM_ATTR_DREQ) {
 			rdk_cm_roce_reply(rx->rx_gsi, rx, m, IBCM_ATTR_DREP,
 			    0, 0);
@@ -546,7 +550,9 @@ rdk_cm_roce_conn_msg(const rdk_gsi_rx_t *rx, const rdk_ibcm_msg_t *m)
 	case IBCM_ATTR_REJ:
 		in.ci_in.ii_input = IBCI_REJ;
 		in.ci_in.ii_rej_reason = m->m_reason;
-		ok = ok && (m->m_msg == IBCM_MSG_RESPONSE_REQ ||
+		ok = ok && (by_guid ? m->m_remote_id == 0 ||
+		    m->m_remote_id == c->ic_lid :
+		    m->m_msg == IBCM_MSG_RESPONSE_REQ ||
 		    m->m_local_id == c->ic_rid) &&
 		    (m->m_tid == c->ic_tid || m->m_tid == c->ic_dreq_tid);
 		break;

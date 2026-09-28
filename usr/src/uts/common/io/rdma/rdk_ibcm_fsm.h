@@ -24,6 +24,8 @@
 
 #include <sys/types.h>
 
+#include "rdk_ibcm_msg.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -86,7 +88,6 @@ typedef enum rdk_ibcm_ev {
 } rdk_ibcm_ev_t;
 
 /* REJ reasons and MRA/REJ message codes (IBTA vol 1, 12.6.7 and 12.6.6). */
-#define	IBCM_REJ_TIMEOUT		4
 #define	IBCM_REJ_INVALID_COMM_ID	6
 #define	IBCM_REJ_INVALID_SERVICE_ID	8
 #define	IBCM_REJ_INVALID_TRANSPORT	9

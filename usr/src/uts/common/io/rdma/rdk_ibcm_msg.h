@@ -71,6 +71,9 @@ extern "C" {
 #define	IBCM_PS_TCP		0x0106
 #define	IBCM_SID_TCP(port)	((uint64_t)IBCM_PS_TCP << 16 | (port))
 
+/* A timed-out REJ names the connection by the sender's CA GUID in its ARI. */
+#define	IBCM_REJ_TIMEOUT	4
+
 #define	IBCM_TRANSPORT_RC	0
 #define	IBCM_QPN_MAX		0xfffffe
 #define	IBCM_LID_PERMISSIVE	0xffff
@@ -149,6 +152,7 @@ extern uint16_t rdk_ibcm_pdata_len(uint16_t);
 extern int rdk_cma_hdr_parse(const uint8_t *, uint16_t, rdk_cma_hdr_t *);
 extern void rdk_cma_hdr_build(uint8_t *, const rdk_cma_hdr_t *);
 extern boolean_t rdk_ibcm_gid_ip4(const uint8_t *, uint32_t *);
+extern boolean_t rdk_ibcm_rej_by_guid(const rdk_ibcm_msg_t *, uint64_t *);
 extern void rdk_ibcm_ip4_gid(uint32_t, uint8_t *);
 
 #ifdef __cplusplus

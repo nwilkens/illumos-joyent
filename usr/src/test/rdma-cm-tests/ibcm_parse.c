@@ -324,7 +324,8 @@ invariants(const uint8_t *b, const rdk_ibcm_msg_t *m)
 		CHECK(m->m_qpn >= 2 && m->m_qpn <= IBCM_QPN_MAX);
 		break;
 	case IBCM_ATTR_REJ:
-		CHECK(m->m_remote_id != 0 && m->m_msg <= 2);
+		CHECK((m->m_remote_id != 0 || rdk_ibcm_rej_by_guid(m, NULL)) &&
+		    m->m_msg <= 2);
 		CHECK(m->m_ari_len <= IBCM_REJ_ARI_MAX);
 		break;
 	case IBCM_ATTR_MRA:
@@ -475,6 +476,7 @@ t_refusals(void)
 {
 	uint8_t b[IBCM_MAD_LEN];
 	rdk_ibcm_msg_t m;
+	uint64_t guid;
 
 	req_bytes(b);
 	b[0] = 2;
@@ -527,6 +529,31 @@ t_refusals(void)
 	CHECK(rdk_ibcm_parse(b, &m) == 0 && m.m_ari_len == 72);
 	b[32] = 3 << 6;
 	CHECK(rdk_ibcm_parse(b, &m) == EINVAL);
+
+	/* A timed-out REJ from Linux: no remote ID, the CA GUID in the ARI. */
+	hdr(b, IBCM_ATTR_REJ);
+	put(b, 24, 0x51, 4);
+	b[33] = 8 << 1;
+	put(b, 34, IBCM_REJ_TIMEOUT, 2);
+	put(b, 36, 0x0123456789abcdefULL, 8);
+	CHECK(rdk_ibcm_parse(b, &m) == 0 && m.m_remote_id == 0);
+	CHECK(rdk_ibcm_rej_by_guid(&m, &guid) &&
+	    guid == 0x0123456789abcdefULL && m.m_local_id == 0x51);
+	b[33] = 7 << 1;
+	CHECK(rdk_ibcm_parse(b, &m) == EINVAL);
+	b[33] = 8 << 1;
+	put(b, 34, 28, 2);
+	CHECK(rdk_ibcm_parse(b, &m) == EINVAL);
+	put(b, 34, IBCM_REJ_TIMEOUT, 2);
+	put(b, 24, 0, 4);
+	CHECK(rdk_ibcm_parse(b, &m) == EINVAL);
+	/* With a remote ID it is still found by the GUID, as Linux does. */
+	put(b, 24, 0x51, 4);
+	put(b, 28, 0x77, 4);
+	CHECK(rdk_ibcm_parse(b, &m) == 0 && rdk_ibcm_rej_by_guid(&m, NULL));
+	put(b, 34, 28, 2);
+	CHECK(rdk_ibcm_parse(b, &m) == 0 && !rdk_ibcm_rej_by_guid(&m, NULL));
+
 	hdr(b, IBCM_ATTR_MRA);
 	put(b, 24, 1, 4);
 	put(b, 28, 1, 4);
