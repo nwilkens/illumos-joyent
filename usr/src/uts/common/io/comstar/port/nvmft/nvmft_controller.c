@@ -284,6 +284,8 @@ static void
 nvmft_update_cdata(nvmft_controller_t *ctrlr)
 {
 	uint32_t val, ioccsz, le_ioccsz;
+	uint64_t mdts;
+	uint_t shift;
 
 	/*
 	 * Clamp Identify Controller IOCCSZ to the transport's maximum in-capsule
@@ -295,6 +297,14 @@ nvmft_update_cdata(nvmft_controller_t *ctrlr)
 	 */
 	nvmft_init_sgls(&ctrlr->ctrlr_cdata,
 	    nvmft_qpair_caps(ctrlr->ctrlr_admin));
+
+	/* MDTS is a power of two in units of the 4 KiB CAP.MPSMIN page. */
+	mdts = nvmft_max_xfer_size(ctrlr->ctrlr_admin) / 4096;
+	if (mdts != 0) {
+		for (shift = 0; shift < 15 && (2ULL << shift) <= mdts; shift++)
+			;
+		ctrlr->ctrlr_cdata.id_mdts = (uint8_t)shift;
+	}
 
 	val = nvmft_max_ioccsz(ctrlr->ctrlr_admin);
 	if (val == 0)
