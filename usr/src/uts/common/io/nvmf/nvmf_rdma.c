@@ -115,7 +115,11 @@ nr_queue_create(nr_dev_t *nd, const nvmf_rdma_sizes_t *sz, uint16_t qid,
 	q->nq_qid = qid;
 	q->nq_io_icd = icd;
 	q->nq_icd = qid == 0 ? 0 : icd;
-	q->nq_max_xfer = nvmf_rdma_max_xfer;
+	/*
+	 * One keyed descriptor carries 24 bits of length, and MDTS cannot say
+	 * less than 8 KiB.
+	 */
+	q->nq_max_xfer = MIN(MAX(nvmf_rdma_max_xfer, 8192), 0xffffff);
 	q->nq_send_inv = (dev->rd_attr.device_cap_flags &
 	    RDK_DEVICE_MEM_MGT_EXTENSIONS) != 0;
 	q->nq_inline = dev->rd_attr.max_inline_data >= NVMF_RDMA_CQE_LEN;

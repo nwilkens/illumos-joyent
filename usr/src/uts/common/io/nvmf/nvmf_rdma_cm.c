@@ -126,7 +126,27 @@ nr_listener_rele(nr_listener_t *nl)
 	kmem_free(nl, sizeof (*nl));
 }
 
-/* Empty a listener's slot and destroy its ID; thread context. */
+/*
+ * Claim a filled slot for stopping its listener.  Unlisten, a failed
+ * listen and device removal may race; only one claim wins.
+ */
+static nr_listener_t *
+nr_slot_claim(nr_lslot_t *ls, nr_dev_t *nd)
+{
+	nr_listener_t *nl;
+
+	mutex_enter(&ls->ls_lock);
+	nl = ls->ls_nl;
+	if (nl == NULL || ls->ls_busy || (nd != NULL && nl->nl_dev != nd)) {
+		mutex_exit(&ls->ls_lock);
+		return (NULL);
+	}
+	ls->ls_busy = B_TRUE;
+	mutex_exit(&ls->ls_lock);
+	return (nl);
+}
+
+/* Empty a claimed slot and destroy its listener's ID; thread context. */
 static void
 nr_listener_stop(nr_listener_t *nl)
 {
@@ -135,7 +155,9 @@ nr_listener_stop(nr_listener_t *nl)
 
 	mutex_enter(&ls->ls_lock);
 	ASSERT3P(ls->ls_nl, ==, nl);
+	ASSERT(ls->ls_busy);
 	ls->ls_nl = NULL;
+	ls->ls_busy = B_FALSE;
 	mutex_exit(&ls->ls_lock);
 	(void) rdk_cm_destroy_id(nl->nl_cmid);
 	nl->nl_cmid = NULL;
@@ -170,27 +192,23 @@ nr_client_remove(struct rdk_device *dev, void *arg)
 	nd->nd_removing = B_TRUE;
 	mutex_exit(&nd->nd_lock);
 
-	for (i = 0; i < NVMF_RDMA_MAX_LISTENERS; i++) {
-		nr_lslot_t *ls = &nr_lslots[i];
-
-		mutex_enter(&ls->ls_lock);
-		nl = ls->ls_nl;
-		if (nl == NULL || ls->ls_busy || nl->nl_dev != nd) {
-			mutex_exit(&ls->ls_lock);
-			continue;
-		}
-		ls->ls_busy = B_TRUE;
-		mutex_exit(&ls->ls_lock);
-		nr_listener_stop(nl);
-		mutex_enter(&ls->ls_lock);
-		ls->ls_busy = B_FALSE;
-		mutex_exit(&ls->ls_lock);
-	}
-
-	/* An unlisten that raced us finishes before the device goes. */
+	/*
+	 * A listen counts itself on the device before it fills its slot, and
+	 * an unlisten may hold a claim, so look again until none is left.
+	 */
 	mutex_enter(&nd->nd_lock);
-	while (nd->nd_listeners != 0)
-		cv_wait(&nd->nd_cv, &nd->nd_lock);
+	while (nd->nd_listeners != 0) {
+		mutex_exit(&nd->nd_lock);
+		for (i = 0; i < NVMF_RDMA_MAX_LISTENERS; i++) {
+			if ((nl = nr_slot_claim(&nr_lslots[i], nd)) != NULL)
+				nr_listener_stop(nl);
+		}
+		mutex_enter(&nd->nd_lock);
+		if (nd->nd_listeners != 0) {
+			(void) cv_reltimedwait(&nd->nd_cv, &nd->nd_lock,
+			    drv_usectohz(100000), TR_CLOCK_TICK);
+		}
+	}
 	mutex_exit(&nd->nd_lock);
 
 	mutex_enter(&nd->nd_lock);
@@ -527,7 +545,10 @@ nr_queue_connected(nr_queue_t *q)
 	mutex_exit(&nl->nl_lock);
 }
 
-/* The end of a queue's teardown: give back what the queue was charged. */
+/*
+ * The end of a queue's teardown: it no longer counts as unconnected, and
+ * the CNTLID check no longer finds it.  Its charge stays until it is freed.
+ */
 void
 nr_queue_detach(nr_queue_t *q)
 {
@@ -548,21 +569,29 @@ nr_queue_detach(nr_queue_t *q)
 	list_remove(&nl->nl_queues, q);
 	counted = q->nq_counted;
 	q->nq_counted = B_TRUE;
+	if (!counted) {
+		ASSERT3U(q->nq_peer_ent->np_unconnected, >, 0);
+		q->nq_peer_ent->np_unconnected--;
+	}
 	mutex_exit(&nl->nl_lock);
-	nr_unadmit(nl, q->nq_peer_ent, counted, q->nq_charge);
-	q->nq_listener = NULL;
-	nr_listener_rele(nl);
 }
 
 /*
- * The queue is freed.  nvmft may call in with a dead queue until then, so
- * the device, its PD and its pool stay until every queue is gone.
+ * The queue is freed.  nvmft may call in with a dead queue until then, a
+ * late Connect response included, so the listener, the device, its PD and
+ * its pool stay until every queue is gone.
  */
 void
 nr_queue_gone(nr_queue_t *q)
 {
 	nr_dev_t *nd = q->nq_dev;
 
+	/* The queue's contexts lived until now, so its charge did too. */
+	if (q->nq_listener != NULL) {
+		nr_unadmit(q->nq_listener, q->nq_peer_ent, B_TRUE,
+		    q->nq_charge);
+		nr_listener_rele(q->nq_listener);
+	}
 	if (!q->nq_listed)
 		return;
 	mutex_enter(&nd->nd_lock);
@@ -659,10 +688,13 @@ nr_listen(cred_t *cr, const struct sockaddr_in *addr,
 	mutex_exit(&nr_cm_lock);
 	nl->nl_dev = nd;
 
-	/* Fill the slot first: a request may come as soon as we listen. */
+	/*
+	 * Fill the slot first, since a request may come as soon as we listen,
+	 * but keep it claimed until the listen is done: until then device
+	 * removal waits for the slot rather than stopping the listener.
+	 */
 	mutex_enter(&ls->ls_lock);
 	ls->ls_nl = nl;
-	ls->ls_busy = B_FALSE;
 	mutex_exit(&ls->ls_lock);
 	if ((ret = nr_pool_prime(nd)) != 0 ||
 	    (ret = rdk_cm_listen(nl->nl_cmid, (int)nvmf_rdma_backlog,
@@ -673,6 +705,9 @@ nr_listen(cred_t *cr, const struct sockaddr_in *addr,
 	}
 	rdk_cm_acl_rele(acl);
 	*idp = nl->nl_id;
+	mutex_enter(&ls->ls_lock);
+	ls->ls_busy = B_FALSE;
+	mutex_exit(&ls->ls_lock);
 	return (0);
 
 fail:
@@ -696,28 +731,12 @@ fail:
 int
 nr_unlisten(uint32_t id)
 {
-	nr_lslot_t *ls;
 	nr_listener_t *nl;
 
-	if (id >= NVMF_RDMA_MAX_LISTENERS)
+	if (id >= NVMF_RDMA_MAX_LISTENERS ||
+	    (nl = nr_slot_claim(&nr_lslots[id], NULL)) == NULL)
 		return (ENOENT);
-	ls = &nr_lslots[id];
-	mutex_enter(&nr_cm_lock);
-	mutex_enter(&ls->ls_lock);
-	nl = ls->ls_nl;
-	if (nl == NULL || ls->ls_busy) {
-		mutex_exit(&ls->ls_lock);
-		mutex_exit(&nr_cm_lock);
-		return (ENOENT);
-	}
-	ls->ls_busy = B_TRUE;
-	mutex_exit(&ls->ls_lock);
-	mutex_exit(&nr_cm_lock);
-
 	nr_listener_stop(nl);
-	mutex_enter(&ls->ls_lock);
-	ls->ls_busy = B_FALSE;
-	mutex_exit(&ls->ls_lock);
 	return (0);
 }
 

@@ -5,6 +5,7 @@
   drops a queue reference, waits, or destroys an rdmak object;
 - every post to the QP happens with nq_lock held, and every call to a
   *_locked function too;
+- a queue's admission charge is released only when the queue is freed;
 - nothing a completion or QP event handler can reach drains, destroys or
   frees what the callback serves, or waits for a teardown; those run in the
   teardown the handler starts.
@@ -118,6 +119,12 @@ def check(replace=None):
                 if not held and call.endswith("_locked") and \
                         call in funcs and QUEUE.search(funcs[call]):
                     errors.append(f"{name}: {call}() without nq_lock")
+    # A queue's admission charge covers memory that lives until it is freed.
+    for name, body in funcs.items():
+        if not name.startswith("__") and "nr_unadmit(" in strip(body) and \
+                name not in ("nr_queue_gone", "nr_cm_request"):
+            errors.append(f"{name}: releases a queue's charge before it "
+                          "is freed")
     cbs = roots(funcs)
     if not cbs >= {"nr_recv_done", "nr_send_done", "nr_rw_done",
                    "nr_qp_event"}:
@@ -156,6 +163,11 @@ MUTANTS = (
                         ("\tnr_cmd_rele_locked(c);\n\tmutex_exit(&q->nq_lock);"
                          "\n\tnr_queue_rele(q);\n}",
                          "\tnr_cmd_rele_locked(c);\n\tnr_queue_rele(q);\n}"))}),
+    ("a queue keeps its charge until it is freed", {
+        "nvmf_rdma_cm.c": (("\tmutex_exit(&nl->nl_lock);\n}\n\n/*\n * The queue is freed.",
+                            "\tmutex_exit(&nl->nl_lock);\n"
+                            "\tnr_unadmit(nl, q->nq_peer_ent, B_TRUE, "
+                            "q->nq_charge);\n}\n\n/*\n * The queue is freed."),)}),
     ("a callback does not destroy what it serves", {
         "nvmf_rdma_xfer.c": (("\tnr_xreq_run_locked(q, &done);\n"
                               "\tmutex_exit(&q->nq_lock);\n",

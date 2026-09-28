@@ -334,7 +334,7 @@ typedef struct nr_queue {
 	timeout_id_t		nq_deadline;
 	nvmf_rdma_sizes_t	nq_sz;
 	uint32_t		nq_icd;		/* of this queue's RECVs */
-	uint32_t		nq_io_icd;	/* of the listener's I/O queues */
+	uint32_t		nq_io_icd;	/* of its I/O queues */
 	uint64_t		nq_max_xfer;
 	uint32_t		nq_xfer_len;	/* largest transfer */
 	boolean_t		nq_send_inv;	/* SEND_WITH_INV works */
