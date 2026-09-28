@@ -157,10 +157,13 @@ nr_listener_stop(nr_listener_t *nl)
 	ASSERT3P(ls->ls_nl, ==, nl);
 	ASSERT(ls->ls_busy);
 	ls->ls_nl = NULL;
-	ls->ls_busy = B_FALSE;
 	mutex_exit(&ls->ls_lock);
 	(void) rdk_cm_destroy_id(nl->nl_cmid);
 	nl->nl_cmid = NULL;
+	/* No new listener takes the slot while the old ID may deliver. */
+	mutex_enter(&ls->ls_lock);
+	ls->ls_busy = B_FALSE;
+	mutex_exit(&ls->ls_lock);
 
 	mutex_enter(&nd->nd_lock);
 	nd->nd_listeners--;
@@ -507,9 +510,12 @@ nr_cm_handler(rdk_cm_id_t *id, void *ctx, const struct rdk_cm_event *ev)
 	ASSERT3U(kind, ==, NR_KIND_LISTENER);
 	if (ev->event != RDK_CM_EVENT_CONNECT_REQUEST)
 		return (0);
+	/* A request the slot's previous listener took is not this one's. */
 	ls = ctx;
 	mutex_enter(&ls->ls_lock);
-	if ((nl = ls->ls_nl) != NULL) {
+	if ((nl = ls->ls_nl) != NULL && nl->nl_cmid != ev->listen_id)
+		nl = NULL;
+	if (nl != NULL) {
 		mutex_enter(&nl->nl_lock);
 		nl->nl_refs++;
 		mutex_exit(&nl->nl_lock);

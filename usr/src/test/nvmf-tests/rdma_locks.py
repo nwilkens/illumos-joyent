@@ -6,7 +6,8 @@
 - every post to the QP happens with nq_lock held, and every call to a
   *_locked function too;
 - a queue's admission charge is released only when the queue is freed;
-- a CM context points at the kind the CM handler reads;
+- a CM context points at the kind the CM handler reads, and a request
+  reaches only the listener whose ID took it;
 - nothing a completion or QP event handler can reach drains, destroys or
   frees what the callback serves, or waits for a teardown; those run in the
   teardown the handler starts.
@@ -137,6 +138,10 @@ def check(replace=None):
             if "nr_lslot_t *" + ctx not in text and \
                     f"nr_lslot_t\t*{ctx}" not in text and ctx != "ls":
                 errors.append(f"CM context {ctx} is not a listener slot")
+    # A request binds to the listener whose ID took it, not a slot's next.
+    if "->nl_cmid != ev->listen_id" not in strip(funcs.get("nr_cm_handler",
+                                                           "")):
+        errors.append("nr_cm_handler: a request may reach another listener")
     cbs = roots(funcs)
     if not cbs >= {"nr_recv_done", "nr_send_done", "nr_rw_done",
                    "nr_qp_event"}:
@@ -183,6 +188,10 @@ MUTANTS = (
     ("a CM context points at its kind", {
         "nvmf_rdma_cm.c": (("rdk_cm_set_context(id, &q->nq_kind);",
                             "rdk_cm_set_context(id, q);"),)}),
+    ("a request reaches only the listener that took it", {
+        "nvmf_rdma_cm.c": (("if ((nl = ls->ls_nl) != NULL && "
+                            "nl->nl_cmid != ev->listen_id)\n\t\tnl = NULL;\n",
+                            "nl = ls->ls_nl;\n"),)}),
     ("a callback does not destroy what it serves", {
         "nvmf_rdma_xfer.c": (("\tnr_xreq_run_locked(q, &done);\n"
                               "\tmutex_exit(&q->nq_lock);\n",
