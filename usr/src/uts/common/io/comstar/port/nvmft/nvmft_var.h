@@ -376,6 +376,7 @@ nvmft_controller_t *nvmft_qpair_ctrlr(struct nvmft_qpair *qp);
 uint16_t nvmft_qpair_id(struct nvmft_qpair *qp);
 const char *nvmft_qpair_name(struct nvmft_qpair *qp);
 uint32_t nvmft_max_ioccsz(struct nvmft_qpair *qp);
+uint64_t nvmft_max_xfer_size(struct nvmft_qpair *qp);
 struct nvmf_qpair *nvmft_qpair_data_hold(struct nvmft_qpair *qp);
 void	nvmft_qpair_data_rele(struct nvmft_qpair *qp, struct nvmf_qpair *nq);
 void	nvmft_command_completed(struct nvmft_qpair *qp,

@@ -464,7 +464,6 @@ nvmft_connect_finish(struct nvmft_qpair *qp)
 	nvmft_connect_status_t st;
 	nvmft_port_t *np;
 	nvmf_fabric_connect_cmd_t cmdc;
-	int error;
 
 	if (qp->qp_data_error != 0) {
 		nvmft_connect_error(qp, cmd, NVME_CQE_SCT_GENERIC,
@@ -596,6 +595,12 @@ uint32_t
 nvmft_max_ioccsz(struct nvmft_qpair *qp)
 {
 	return (nvmf_max_ioccsz(qp->qp_qp));
+}
+
+uint64_t
+nvmft_max_xfer_size(struct nvmft_qpair *qp)
+{
+	return (nvmf_max_xfer_size(qp->qp_qp));
 }
 
 /* Called with qp_lock held. */
