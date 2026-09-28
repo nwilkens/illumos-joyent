@@ -2011,6 +2011,12 @@ NVMF_OBJS += nvmf_transport.o
 #
 NVMF_TCP_OBJS += nvmf_tcp.o
 
+#
+# NVMe over Fabrics RDMA transport of the nvmft target (drv/nvmf_rdma).
+#
+NVMF_RDMA_OBJS += nvmf_rdma.o nvmf_rdma_xfer.o nvmf_rdma_pool.o \
+		nvmf_rdma_cm.o nvmf_rdma_subr.o nvmf_rdma_mod.o
+
 PVSCSI_OBJS = pvscsi.o
 
 #
