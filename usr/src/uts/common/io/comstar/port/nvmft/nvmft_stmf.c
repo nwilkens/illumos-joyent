@@ -1,0 +1,2034 @@
+/*
+ * This file and its contents are supplied under the terms of the
+ * Common Development and Distribution License ("CDDL"), version 1.0.
+ * You may only use this file in accordance with the terms of version
+ * 1.0 of the CDDL.
+ *
+ * A full copy of the text of the CDDL should have accompanied this
+ * source.  A copy of the CDDL is also available via the Internet at
+ * http://www.illumos.org/license/CDDL.
+ */
+
+/*
+ * Copyright 2026 Edgecast Cloud LLC.
+ */
+
+/*
+ * NEW file.  Replaces FreeBSD sys/dev/nvmf/controller/ctl_frontend_nvmf.c.
+ *
+ * This is the COMSTAR/STMF binding for the NVMe-over-Fabrics controller.  Where
+ * FreeBSD's ctl_frontend_nvmf.c bound the controller protocol layer to CTL
+ * (union ctl_io, ctl_run, ctl_datamove, struct ctl_port), this file binds it to
+ * illumos STMF:
+ *
+ *   FreeBSD CTL                              illumos STMF
+ *   -----------                              ------------
+ *   struct ctl_port (registered via          stmf_local_port_t (registered via
+ *     ctl_port_register)                       stmf_register_local_port)
+ *   ctl_frontend.init/shutdown               stmf_port_provider_t pp_cb
+ *   union ctl_io / ctl_alloc_io / ctl_run    scsi_task_t / stmf_task_alloc /
+ *                                              stmf_post_task
+ *   io->nvmeio.cmd (raw NVMe SQE)            translate NVMe SQE -> SCSI CDB on
+ *                                              the scsi_task_t (this file)
+ *   fe_datamove / ctl_datamove               lport_xfer_data + dbuf store
+ *   nvmf_receive/send_controller_data        same transport API, fed from dbufs
+ *   port.lun_enable/lun_disable              STMF LU bind via the standard
+ *                                              port-provider session/LU model
+ *
+ * The NVMe->SCSI command translation that FreeBSD performs inside CTL is done
+ * here against the STMF scsi_task_t so the existing stmf_sbd LU (over a zvol)
+ * executes the I/O and enforces SCSI-3 persistent reservations (see
+ * nvmft_resv.c and NVMEOF.md sections 7.2 / 7.4).
+ *
+ * The per-IO control flow modeled on srpt_stp.c is:
+ *   capsule received -> nvmft_dispatch_command()
+ *     -> stmf_task_alloc() + translate NVMe cmd to CDB + set TF flags/xfer len
+ *     -> stmf_post_task()
+ *   LU calls stmf_xfer_data() -> our lport_xfer_data() moves dbuf data as
+ *     C2H/H2C via nvmf_send_controller_data/nvmf_receive_controller_data
+ *   LU calls stmf_send_scsi_status() -> our lport_send_status() emits the
+ *     NVMe completion capsule
+ */
+
+#include <sys/types.h>
+#include <sys/sysmacros.h>
+#include <sys/byteorder.h>
+#include <sys/cmn_err.h>
+#include <sys/ksynch.h>
+#include <sys/kmem.h>
+#include <sys/list.h>
+#include <sys/taskq.h>
+#include <sys/id_space.h>
+#include <sys/ddi.h>
+#include <sys/sunddi.h>
+#include <sys/stream.h>
+#include <sys/atomic.h>
+#include <sys/scsi/scsi.h>
+#include <sys/scsi/generic/commands.h>
+#include <sys/scsi/generic/status.h>
+#include <sys/scsi/generic/sense.h>
+
+#include <sys/nvme.h>
+#include <sys/nvme/nvmf.h>
+#include <sys/nvme/nvmf_transport.h>
+
+#include <sys/time.h>		/* hrtime_t (sys/stmf.h needs it) */
+#include <sys/stmf.h>
+#include <sys/lpif.h>		/* stmf_lu_t (referenced by stmf_impl.h) */
+#include <sys/stmf_ioctl.h>
+#include <sys/portif.h>
+/*
+ * The session LU map (which STMF LUNs are visible to a controller) is the
+ * source of truth for the namespace list and per-namespace identity.  STMF
+ * exposes it only through these in-tree headers, the same way dlun0 reads it to
+ * answer SCSI REPORT LUNS.  (stmf_i_scsi_session_t::iss_sm / iss_lockp,
+ * stmf_lun_map_ent_t, stmf_get_ent_from_map().)
+ */
+#include "../../stmf/stmf_impl.h"
+#include "../../stmf/lun_map.h"
+
+#include "nvmft_var.h"
+
+/*
+ * Per-task scratch carried in scsi_task_t->task_port_private.  Ties an STMF task
+ * back to the Fabrics capsule and qpair it was created from, so the data and
+ * status phases can drive the transport.  (FreeBSD stashed nc/qp in
+ * io->io_hdr.ctl_private[CTL_PRIV_FRONTEND].)
+ */
+typedef struct nvmft_task_priv {
+	struct nvmf_capsule	*ntp_nc;
+	struct nvmft_qpair	*ntp_qp;
+	list_node_t		ntp_link;	/* ctrlr_deferred */
+	boolean_t		ntp_success_sent;
+	/*
+	 * Transfers the transport holds for this task.  STMF frees the dbufs
+	 * of an aborted task, so an abort waits for these to drain.
+	 */
+	kmutex_t		ntp_lock;
+	uint_t			ntp_xfers;
+	boolean_t		ntp_aborting;
+	/* Command payload length, charged against ctrlr_pending_bytes. */
+	uint32_t		ntp_data_len;
+	/*
+	 * Non-NULL for driver-issued (internal) tasks that capture their read
+	 * data into a local buffer instead of sending it to a host -- used to
+	 * query LU geometry via READ CAPACITY(16) for Identify Namespace.
+	 */
+	struct nvmft_internal_io *ntp_iio;
+} nvmft_task_priv_t;
+
+/*
+ * Completion rendezvous for an internal (driver-issued) STMF task.  The issuing
+ * thread blocks on iio_cv; the data phase copies into iio_buf and the status
+ * phase (or a phase-collapsed final data buffer) sets iio_done and signals.
+ */
+typedef struct nvmft_internal_io {
+	kmutex_t	iio_lock;
+	kcondvar_t	iio_cv;
+	boolean_t	iio_done;
+	uint8_t		iio_scsi_status;
+	uint8_t		iio_sense_key;
+	uint8_t		*iio_buf;
+	uint32_t	iio_buflen;
+	uint32_t	iio_xfered;
+} nvmft_internal_io_t;
+
+/*
+ * Bound the number of commands concurrently in flight per controller
+ * (nvmft_max_active_commands) so a fast writeback-cached initiator cannot overrun
+ * the backing store's drain rate.  Over-cap commands are DEFERRED (queued and
+ * re-dispatched on completion) rather than refused, so the initiator paces itself
+ * via SQ-credit backpressure: the host maps any non-zero CQE to EIO and will not
+ * retry.  nvmft_max_pending_bytes is a secondary byte ceiling.  Either cap is
+ * disabled when 0 (with the count cap off the legacy nvmft_max_pending_commands
+ * refuse-path still applies as a hard backstop).
+ */
+uint_t nvmft_max_active_commands = 16;
+uint_t nvmft_max_pending_commands = 8192;
+uint64_t nvmft_max_pending_bytes = 1024ULL * 1024 * 1024;	/* 1 GiB */
+
+/*
+ * A host command's task private lives in its capsule, so the receive path does
+ * not allocate.  Commands deferred by the in-flight cap above wait on
+ * ctrlr_deferred, linked through ntp_link.
+ */
+CTASSERT(sizeof (nvmft_task_priv_t) <=
+    sizeof (((struct nvmf_capsule *)0)->nc_consumer));
+
+static nvmft_task_priv_t *
+nvmft_task_priv_init(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
+    uint32_t data_len)
+{
+	nvmft_task_priv_t *priv = NVMF_CAPSULE_CONSUMER(nc);
+
+	bzero(priv, sizeof (*priv));
+	priv->ntp_nc = nc;
+	priv->ntp_qp = qp;
+	priv->ntp_data_len = data_len;
+	mutex_init(&priv->ntp_lock, NULL, MUTEX_DRIVER, NULL);
+	return (priv);
+}
+
+/* Free a host command's capsule, and with it the task private. */
+static void
+nvmft_task_priv_free(nvmft_task_priv_t *priv)
+{
+	struct nvmf_capsule *nc = priv->ntp_nc;
+
+	ASSERT0(priv->ntp_xfers);
+	mutex_destroy(&priv->ntp_lock);
+	nvmf_free_capsule(nc);
+}
+
+/* lport ops (modeled on srpt_stp.c). */
+static stmf_status_t nvmft_lport_xfer_data(scsi_task_t *task,
+    stmf_data_buf_t *dbuf, uint32_t ioflags);
+static stmf_status_t nvmft_lport_send_status(scsi_task_t *task,
+    uint32_t ioflags);
+static void nvmft_lport_task_free(scsi_task_t *task);
+static stmf_status_t nvmft_lport_abort(stmf_local_port_t *lport, int abort_cmd,
+    void *arg, uint32_t flags);
+static void nvmft_lport_task_poll(scsi_task_t *task);
+static void nvmft_lport_ctl(stmf_local_port_t *lport, int cmd, void *arg);
+static stmf_status_t nvmft_lport_info(uint32_t cmd, stmf_local_port_t *lport,
+    void *arg, uint8_t *buf, uint32_t *bufsizep);
+static void nvmft_lport_event_handler(stmf_local_port_t *lport, int eventid,
+    void *arg, uint32_t flags);
+
+static scsi_devid_desc_t *nvmft_alloc_scsi_devid_desc(const char *nqn);
+static void nvmft_free_scsi_devid_desc(scsi_devid_desc_t *sdd);
+
+/* dbuf store: transport buffers, or kmem copy buffers for TCP. */
+static stmf_data_buf_t *nvmft_dbuf_alloc(scsi_task_t *task, uint32_t size,
+    uint32_t *pminsize, uint32_t flags);
+static void nvmft_dbuf_free(stmf_dbuf_store_t *ds, stmf_data_buf_t *dbuf);
+static stmf_dbuf_store_t *nvmft_dbuf_store_create(void);
+static void nvmft_dbuf_store_destroy(stmf_dbuf_store_t *ds);
+
+/*
+ * State of the transfer in flight on one dbuf.  The thread that submits it and
+ * the transport completion race; whichever arrives second finishes it, so the
+ * submitter has dropped its qpair reference before STMF can free the task.
+ */
+#define	NVMFT_XFER_SUBMITTED	0x1
+#define	NVMFT_XFER_COMPLETED	0x2
+
+typedef struct nvmft_xfer {
+	scsi_task_t	*nx_task;
+	stmf_data_buf_t	*nx_dbuf;
+	volatile uint_t	nx_state;
+	uint_t		nx_status;
+	boolean_t	nx_to_rport;
+	boolean_t	nx_final;	/* the transport sends the response */
+	nvme_cqe_t	nx_cqe;
+} nvmft_xfer_t;
+
+/* Per-dbuf private state of the dbuf store. */
+#define	NVMFT_DBUF_MAGIC	0x6e766474	/* "nvdt" */
+
+typedef struct nvmft_dbuf_priv {
+	uint32_t	ndp_magic;
+	uint32_t	ndp_size;
+	void		*ndp_buf;	/* kmem buffer */
+	boolean_t	ndp_transport;	/* ndp_db is the transport's */
+	nvmf_databuf_t	ndp_db;
+	nvmft_xfer_t	ndp_xfer;
+} nvmft_dbuf_priv_t;
+
+/*
+ * ============================================================================
+ * Port lifecycle (replaces nvmft_port_create / nvmft_port_remove)
+ * ============================================================================
+ */
+
+/*
+ * Allocate and register an stmf_local_port_t for a subsystem (SubNQN).
+ *
+ * PORT-TODO (FreeBSD ctl_frontend_nvmf.c:nvmft_port_create): the parameter
+ * parsing (subnqn/portid/serial/max_io_qsize/ioccsz/iorcsz/nn) is driven by a
+ * ctl_req nvlist in FreeBSD.  On illumos the equivalent comes from the STMF
+ * provider configuration ioctl path (stmfadm / libstmf), delivered through the
+ * pp_cb STMF_PROVIDER_DATA_UPDATED callback in nvmft.c.  This function takes the
+ * already-parsed values; wire the nvlist plumbing in nvmft.c.
+ */
+nvmft_port_t *
+nvmft_port_alloc(const char *subnqn, uint16_t portid, const char *serial,
+    uint32_t max_io_qsize, uint32_t enable_timeout, uint32_t ioccsz,
+    uint32_t iorcsz, uint32_t nn)
+{
+	stmf_local_port_t *lport;
+	nvmft_port_t *np;
+
+	lport = stmf_alloc(STMF_STRUCT_STMF_LOCAL_PORT, sizeof (*np), 0);
+	if (lport == NULL)
+		return (NULL);
+
+	np = lport->lport_port_private;
+	np->np_lport = lport;
+	np->np_portid = portid;
+	np->np_max_io_qsize = max_io_qsize;
+	np->np_cap = _nvmf_controller_cap(max_io_qsize, enable_timeout / 500);
+	np->np_online = B_FALSE;
+	np->np_refs = 1;
+
+	mutex_init(&np->np_lock, NULL, MUTEX_DRIVER, NULL);
+	cv_init(&np->np_controllers_cv, NULL, CV_DRIVER, NULL);
+	np->np_ids = id_space_create("nvmft_cntlid", 0,
+	    NVMF_CNTLID_STATIC_MAX);
+	list_create(&np->np_controllers, sizeof (nvmft_controller_t),
+	    offsetof(nvmft_controller_t, ctrlr_link));
+
+	/* The cntlid is set per-controller; pass 0 for the template. */
+	_nvmf_init_io_controller_data(0, max_io_qsize, serial, utsname.sysname,
+	    utsname.version, subnqn, nn, ioccsz, iorcsz, &np->np_cdata);
+
+	/*
+	 * PORT-TODO (FreeBSD nvmft_port_create): set cdata.aerl = NVMFT_NUM_AER-1,
+	 * cdata.oaes (NS_ATTRIBUTE), cdata.oncs (WRZERO|DSM once backed by
+	 * WRITE SAME / UNMAP translations), cdata.fuses (CNW), and the
+	 * firmware-slot page np_fp, using the nvme_identify_ctrl_t field names.
+	 * Also advertise CMIC/ANACAP here for ANA (NVMEOF.md 9.4 /
+	 * nvmft_ana.c:nvmft_ana_init_identify).
+	 *
+	 * Do NOT advertise the ONCS COMPARE bit (id_oncs.on_nvmcpys): stmf_sbd
+	 * has no read-and-compare path, so nvmft_translate_cmd() rejects
+	 * NVME_OPC_NVM_COMPARE.  The bit is left clear (cdata is bzero'd in
+	 * _nvmf_init_io_controller_data) so hosts will not issue COMPARE.
+	 */
+
+	np->np_devid = nvmft_alloc_scsi_devid_desc(subnqn);
+	lport->lport_id = np->np_devid;
+	lport->lport_pp = nvmft_global->ns_pp;
+	/*
+	 * STMF requires a dbuf store; stmf_alloc_dbuf() unconditionally calls
+	 * ds_alloc_data_buf.  For the TCP transport this is a kmem copy buffer.
+	 * (NVMEOF.md section 8: an RDMA transport would back this with
+	 * registered memory; the store seam is identical.)
+	 */
+	lport->lport_ds = nvmft_dbuf_store_create();
+	if (lport->lport_ds == NULL) {
+		nvmft_free_scsi_devid_desc(np->np_devid);
+		np->np_devid = NULL;
+		id_space_destroy(np->np_ids);
+		np->np_ids = NULL;
+		cv_destroy(&np->np_controllers_cv);
+		mutex_destroy(&np->np_lock);
+		list_destroy(&np->np_controllers);
+		stmf_free(lport);
+		return (NULL);
+	}
+	lport->lport_xfer_data = nvmft_lport_xfer_data;
+	lport->lport_send_status = nvmft_lport_send_status;
+	lport->lport_task_free = nvmft_lport_task_free;
+	lport->lport_abort = nvmft_lport_abort;
+	lport->lport_abort_timeout = 300;	/* 5 minutes */
+	lport->lport_task_poll = nvmft_lport_task_poll;
+	lport->lport_ctl = nvmft_lport_ctl;
+	lport->lport_info = nvmft_lport_info;
+	lport->lport_event_handler = nvmft_lport_event_handler;
+
+	/* Participate in ALUA so ANA state can be coordinated (NVMEOF.md 9.2). */
+	stmf_set_port_alua(lport);
+
+	if (stmf_register_local_port(lport) != STMF_SUCCESS) {
+		nvmft_port_free(np);
+		return (NULL);
+	}
+
+	mutex_enter(&nvmft_global->ns_lock);
+	list_insert_tail(&nvmft_global->ns_ports, np);
+	mutex_exit(&nvmft_global->ns_lock);
+
+	return (np);
+}
+
+void
+nvmft_port_free(nvmft_port_t *np)
+{
+	ASSERT(list_is_empty(&np->np_controllers));
+
+	if (np->np_lport->lport_ds != NULL) {
+		nvmft_dbuf_store_destroy(np->np_lport->lport_ds);
+		np->np_lport->lport_ds = NULL;
+	}
+	if (np->np_devid != NULL)
+		nvmft_free_scsi_devid_desc(np->np_devid);
+	if (np->np_ids != NULL)
+		id_space_destroy(np->np_ids);
+	if (np->np_active_ns != NULL)
+		kmem_free(np->np_active_ns,
+		    np->np_num_ns * sizeof (uint32_t));
+	list_destroy(&np->np_controllers);
+	cv_destroy(&np->np_controllers_cv);
+	mutex_destroy(&np->np_lock);
+	/* stmf_free() releases the lport and the embedded nvmft_port. */
+	stmf_free(np->np_lport);
+}
+
+/*
+ * Register a per-controller STMF SCSI session for one host association.
+ *
+ * stmf_task_alloc() dereferences task->task_session->ss_stmf_private, and
+ * sbd_pgr keys SCSI-3 persistent reservations off task_session->ss_rport, so
+ * every association needs a registered stmf_scsi_session_t before any command
+ * is dispatched.  FreeBSD's CTL frontend created this I_T nexus implicitly; on
+ * STMF we create it explicitly here, once per controller (Fabrics association),
+ * modeled on srpt_stp_alloc_session().
+ *
+ * The remote-port identity is the host NQN as a SCSI name string.  We leave
+ * ss_rport NULL so stmf_register_scsi_session() builds the transport id from
+ * ss_rport_id via stmf_scsilib_devid_to_remote_port() (the default-tptid path,
+ * since there is no NVMe SCSI protocol identifier).  Registration requires the
+ * local port to be online, which the admin-queue handoff has already confirmed.
+ */
+int
+nvmft_session_register(nvmft_controller_t *ctrlr)
+{
+	nvmft_port_t *np = ctrlr->ctrlr_np;
+	stmf_scsi_session_t *ss;
+	scsi_devid_desc_t *rport_id;
+	char hostnqn[NVMF_NQN_FIELD_SIZE + 1];
+
+	/*
+	 * nfcd_hostnqn is a fixed 256-byte, NUL-padded on-wire field that is not
+	 * guaranteed terminated; copy the field and terminate it explicitly
+	 * before strlen() in nvmft_alloc_scsi_devid_desc().
+	 */
+	(void) memcpy(hostnqn, ctrlr->ctrlr_hostnqn, NVMF_NQN_FIELD_SIZE);
+	hostnqn[NVMF_NQN_FIELD_SIZE] = '\0';
+
+	ss = stmf_alloc(STMF_STRUCT_SCSI_SESSION, 0, 0);
+	if (ss == NULL)
+		return (ENOMEM);
+
+	rport_id = nvmft_alloc_scsi_devid_desc(hostnqn);
+	ss->ss_rport_id = rport_id;
+	ss->ss_lport = np->np_lport;
+
+	if (stmf_register_scsi_session(np->np_lport, ss) != STMF_SUCCESS) {
+		nvmft_free_scsi_devid_desc(rport_id);
+		stmf_free(ss);
+		return (EIO);
+	}
+
+	ctrlr->ctrlr_session = ss;
+	return (0);
+}
+
+/*
+ * Tear down the controller's STMF session.  stmf_deregister_scsi_session()
+ * aborts the nexus's outstanding tasks and frees the transport id it built
+ * (ISS_NULL_TPTID); we free the devid we supplied and the session itself.
+ */
+void
+nvmft_session_deregister(nvmft_controller_t *ctrlr)
+{
+	stmf_scsi_session_t *ss = ctrlr->ctrlr_session;
+
+	if (ss == NULL)
+		return;
+
+	stmf_deregister_scsi_session(ctrlr->ctrlr_np->np_lport, ss);
+	nvmft_free_scsi_devid_desc(ss->ss_rport_id);
+	stmf_free(ss);
+	ctrlr->ctrlr_session = NULL;
+}
+
+/*
+ * ============================================================================
+ * Namespace presentation (active list, Identify Namespace, NS descriptor)
+ * ============================================================================
+ *
+ * A namespace (NSID) is the STMF LUN (NSID - 1) in the controller's session LU
+ * map.  The map (populated by stmfadm add-view) is the source of truth for both
+ * the active-namespace list (Identify CNS 2) and per-namespace identity
+ * (CNS 0 / CNS 3); we read it under the session's ilport_lock, exactly as the
+ * STMF dlun0 REPORT LUNS path does.
+ *
+ * Block geometry (namespace size / LBA size) is not exposed by stmf_lu_t, so it
+ * is obtained by issuing an internal READ CAPACITY(16) to the LU through the
+ * normal STMF task path.  This is provider-agnostic (any STMF LU, not only
+ * sbd).  The internal task captures its read data into a local buffer rather
+ * than sending it to a host; see ntp_iio handling in nvmft_lport_xfer_data(),
+ * nvmft_lport_send_status() and nvmft_lport_task_free().
+ */
+
+/*
+ * Look up the controller session's LU map entry for nsid (LUN nsid-1).  Returns
+ * B_TRUE if a LU is mapped, optionally copying its 16-byte identity (the LU
+ * GUID) for the namespace identification descriptor.  Read under iss_lockp.
+ */
+static boolean_t
+nvmft_ns_mapped(nvmft_controller_t *ctrlr, uint32_t nsid, uint8_t *guid)
+{
+	stmf_scsi_session_t *ss = ctrlr->ctrlr_session;
+	stmf_i_scsi_session_t *iss;
+	stmf_lun_map_ent_t *ent;
+	uint32_t lun_id;
+	boolean_t mapped = B_FALSE;
+
+	if (ss == NULL || nsid == 0)
+		return (B_FALSE);
+	lun_id = nsid - 1;
+	if (lun_id > 0x3fff)		/* STMF single-level LUN limit */
+		return (B_FALSE);
+
+	iss = (stmf_i_scsi_session_t *)ss->ss_stmf_private;
+	rw_enter(iss->iss_lockp, RW_READER);
+	/*
+	 * iss_sm is NULL during the session create/teardown window (stmf clears
+	 * it under iss_lockp); stmf_get_ent_from_map() would deref it.  Guard as
+	 * nvmft_build_active_nslist() does.
+	 */
+	if (iss->iss_sm != NULL) {
+		ent = (stmf_lun_map_ent_t *)stmf_get_ent_from_map(iss->iss_sm,
+		    (uint16_t)lun_id);
+		if (ent != NULL && ent->ent_lu != NULL) {
+			mapped = B_TRUE;
+			if (guid != NULL) {
+				scsi_devid_desc_t *id = ent->ent_lu->lu_id;
+
+				(void) bzero(guid, 16);
+				if (id != NULL)
+					(void) memcpy(guid, id->ident,
+					    MIN(id->ident_length, 16));
+			}
+		}
+	}
+	rw_exit(iss->iss_lockp);
+	return (mapped);
+}
+
+/*
+ * How many times to reissue the internal READ CAPACITY when the LU reports a
+ * pending UNIT ATTENTION.  Each command clears one UA; a handful covers the
+ * power-on plus any reported-LUNs/capacity-changed UAs a new session may queue.
+ */
+#define	NVMFT_READ_CAPACITY_UA_RETRIES	5
+
+/*
+ * Issue an internal READ CAPACITY(16) to the LU backing nsid and return its
+ * block count and block size.  Blocks until the LU completes the command on an
+ * STMF worker thread (independent of this thread), so it must run in thread
+ * context (it is called from the admin-command handler).
+ */
+static int
+nvmft_lu_read_capacity(nvmft_controller_t *ctrlr, uint32_t nsid,
+    uint64_t *nblocksp, uint32_t *blksizep)
+{
+	scsi_task_t *task;
+	nvmft_task_priv_t *priv;
+	nvmft_internal_io_t iio;
+	uint8_t capbuf[32];
+	uint8_t lun[8];
+	uint32_t lun_id = nsid - 1;
+	uint_t attempt;
+	int rc;
+
+	if (ctrlr->ctrlr_session == NULL)
+		return (ENXIO);
+
+	(void) bzero(lun, sizeof (lun));
+	lun[0] = (uint8_t)((lun_id >> 8) & 0x3f);
+	lun[1] = (uint8_t)(lun_id & 0xff);
+
+	/*
+	 * The first command on a freshly registered STMF session draws a
+	 * UNIT ATTENTION (29h/00h, power-on/reset occurred), failing with
+	 * CHECK CONDITION and no data.  A SCSI initiator clears a pending UA by
+	 * reissuing -- each command reports one UA -- so retry a bounded number
+	 * of times.  (Without this the host gets a zero-size namespace on
+	 * connect, since nvmf_host issues IDENTIFY only once.)
+	 */
+	for (attempt = 0; ; attempt++) {
+		task = stmf_task_alloc(ctrlr->ctrlr_np->np_lport,
+		    ctrlr->ctrlr_session, lun, 16, 0);
+		if (task == NULL)
+			return (ENOMEM);
+
+		(void) bzero(&iio, sizeof (iio));
+		mutex_init(&iio.iio_lock, NULL, MUTEX_DRIVER, NULL);
+		cv_init(&iio.iio_cv, NULL, CV_DRIVER, NULL);
+		iio.iio_buf = capbuf;
+		iio.iio_buflen = sizeof (capbuf);
+
+		priv = kmem_zalloc(sizeof (*priv), KM_SLEEP);
+		priv->ntp_iio = &iio;
+		task->task_port_private = priv;
+		task->task_flags |= TF_READ_DATA | TF_ATTR_SIMPLE_QUEUE;
+
+		(void) bzero(task->task_cdb, task->task_cdb_length);
+		task->task_cdb[0] = SCMD_SVC_ACTION_IN_G4;
+		task->task_cdb[1] = SSVC_ACTION_READ_CAPACITY_G4;
+		/* allocation length (bytes 10-13) */
+		task->task_cdb[13] = sizeof (capbuf);
+		task->task_expected_xfer_length = sizeof (capbuf);
+		task->task_cmd_xfer_length = sizeof (capbuf);
+		task->task_max_nbufs = 1;
+		task->task_max_xfer_len = sizeof (capbuf);
+		task->task_1st_xfer_len = sizeof (capbuf);
+
+		stmf_post_task(task, NULL);
+
+		mutex_enter(&iio.iio_lock);
+		while (!iio.iio_done)
+			cv_wait(&iio.iio_cv, &iio.iio_lock);
+		mutex_exit(&iio.iio_lock);
+
+		/*
+		 * READ CAPACITY(16): max LBA at bytes 0-7, block length at 8-11.
+		 */
+		if (iio.iio_scsi_status == STATUS_GOOD && iio.iio_xfered >= 12) {
+			*nblocksp = BE_IN64(&capbuf[0]) + 1;
+			*blksizep = BE_IN32(&capbuf[8]);
+			rc = 0;
+		} else if (iio.iio_scsi_status == STATUS_CHECK &&
+		    iio.iio_sense_key == KEY_UNIT_ATTENTION &&
+		    attempt < NVMFT_READ_CAPACITY_UA_RETRIES) {
+			rc = EAGAIN;	/* UA cleared by this command; retry */
+		} else {
+			rc = EIO;
+		}
+
+		mutex_destroy(&iio.iio_lock);
+		cv_destroy(&iio.iio_cv);
+
+		if (rc != EAGAIN)
+			return (rc);
+	}
+}
+
+/*
+ * Build the active-namespace list (Identify CNS 2): every mapped LUN whose NSID
+ * exceeds start_nsid, in increasing order.  (Replaces the np_active_ns scan,
+ * which was never populated.)
+ */
+void
+nvmft_build_active_nslist(nvmft_controller_t *ctrlr, uint32_t start_nsid,
+    nvme_identify_nsid_list_t *nslist)
+{
+	stmf_scsi_session_t *ss = ctrlr->ctrlr_session;
+	stmf_i_scsi_session_t *iss;
+	uint_t nitems, count = 0;
+	uint16_t i;
+
+	nitems = sizeof (nslist->nl_nsid) / sizeof (nslist->nl_nsid[0]);
+	if (ss == NULL)
+		return;
+	iss = (stmf_i_scsi_session_t *)ss->ss_stmf_private;
+
+	rw_enter(iss->iss_lockp, RW_READER);
+	if (iss->iss_sm != NULL) {
+		for (i = 0; i < iss->iss_sm->lm_nentries && count < nitems; i++) {
+			stmf_lun_map_ent_t *ent =
+			    (stmf_lun_map_ent_t *)iss->iss_sm->lm_plus[i];
+			uint32_t nsid = (uint32_t)i + 1;
+
+			if (ent == NULL || ent->ent_lu == NULL)
+				continue;
+			if (nsid <= start_nsid)
+				continue;
+			nslist->nl_nsid[count++] = LE_32(nsid);
+		}
+	}
+	rw_exit(iss->iss_lockp);
+}
+
+/*
+ * Build Identify Namespace (CNS 0) for nsid from the LU geometry.  Returns
+ * B_FALSE if nsid is not a mapped/active namespace.
+ */
+boolean_t
+nvmft_build_identify_nsid(nvmft_controller_t *ctrlr, uint32_t nsid,
+    nvme_identify_nsid_t *nsdata)
+{
+	uint64_t nblocks;
+	uint32_t blksize;
+	uint8_t guid[16];
+
+	if (!nvmft_ns_mapped(ctrlr, nsid, guid))
+		return (B_FALSE);
+	if (nvmft_lu_read_capacity(ctrlr, nsid, &nblocks, &blksize) != 0)
+		return (B_FALSE);
+	if (blksize == 0 || (blksize & (blksize - 1)) != 0)
+		return (B_FALSE);		/* expect a power-of-two LBA size */
+
+	(void) bzero(nsdata, sizeof (*nsdata));
+	nsdata->id_nsize = LE_64(nblocks);
+	nsdata->id_ncap = LE_64(nblocks);
+	nsdata->id_nuse = LE_64(nblocks);
+	nsdata->id_nlbaf = 0;			/* a single LBA format */
+	nsdata->id_flbas.lba_format = 0;	/* format 0 in use */
+	nsdata->id_lbaf[0].lbaf_lbads = (uint8_t)(highbit(blksize) - 1);
+	/*
+	 * Expose the LU GUID as the NVMe 1.2+ namespace globally-unique
+	 * identifier (NGUID).  Real controllers populate this in Identify
+	 * Namespace as well as in the Namespace Identification Descriptor (CNS
+	 * 3); the illumos host builds its devid from the Identify Namespace
+	 * NGUID, so without this the blkdev attach fails (no devid).
+	 */
+	(void) memcpy(nsdata->id_nguid, guid, sizeof (guid));
+	return (B_TRUE);
+}
+
+/*
+ * Build the Namespace Identification Descriptor list (CNS 3) for nsid: a single
+ * NGUID descriptor from the LU identity, terminated by a zero-length
+ * descriptor.  buf is the (zeroed) 4096-byte Identify payload.
+ */
+boolean_t
+nvmft_build_nsid_desc(nvmft_controller_t *ctrlr, uint32_t nsid, uint8_t *buf,
+    size_t buflen)
+{
+	uint8_t guid[16];
+
+	/* NIDT(1) + NIDL(1) + rsvd(2) + NGUID(16), then a zero terminator. */
+	if (buflen < 4 + 16 + 1)
+		return (B_FALSE);
+	if (!nvmft_ns_mapped(ctrlr, nsid, guid))
+		return (B_FALSE);
+
+	buf[0] = 0x02;		/* NIDT = NGUID */
+	buf[1] = 16;		/* NIDL */
+	(void) memcpy(&buf[4], guid, 16);
+	/* buf[20] (next NIDT) stays 0: end-of-list terminator. */
+	return (B_TRUE);
+}
+
+/*
+ * ============================================================================
+ * NVMe command -> scsi_task_t translation + dispatch
+ * ============================================================================
+ */
+
+/*
+ * Translate an NVMe NVM command into a SCSI CDB on the supplied scsi_task_t and
+ * set the data-direction/transfer-length task fields.  The translated I/O is
+ * executed by the STMF LU (stmf_sbd over a zvol) which also enforces SCSI-3
+ * persistent reservations (NVMEOF.md 7.2 / 7.4).
+ *
+ * READ/WRITE map to the 16-byte CDB variants so the 64-bit NVMe SLBA fits.
+ * NVMe carries SLBA in cdw10 (low) / cdw11 (high) and the 0's-based NLB in the
+ * low 16 bits of cdw12; the SCSI transfer length is NLB + 1 logical blocks.
+ * The byte transfer length comes from the capsule data length so it is
+ * independent of the LU's logical block size.
+ *
+ * NVMe COMPARE is deliberately not translated.  The only SCSI analogue is
+ * VERIFY(16)/BYTCHK=1, which stmf_sbd does not implement: SCMD_VERIFY_G4 is not
+ * recognised by sbd_handle_cmd() (it terminates as INVALID OPCODE) and even the
+ * VERIFY(10) path it does accept neither drains the requested data-out nor
+ * performs a miscompare.  Advertising COMPARE without a backing read-and-compare
+ * path would fail every host COMPARE, so the ONCS COMPARE bit is left clear and
+ * the opcode is rejected here (-> INVALID OPCODE) until a real path exists.
+ *
+ * (FreeBSD performed this NVMe->SCSI mapping inside CTL's ctl_nvmeio handling;
+ * on illumos STMF the mapping is done here against the scsi_task_t.)
+ */
+static boolean_t
+nvmft_translate_cmd(scsi_task_t *task, const nvme_sqe_t *cmd,
+    uint32_t data_len)
+{
+	uint8_t *cdb = task->task_cdb;
+	uint64_t slba;
+	uint32_t nlb;
+	uint8_t opc = cmd->sqe_opc;
+
+	(void) bzero(cdb, task->task_cdb_length);
+
+	slba = (uint64_t)LE_32(cmd->sqe_cdw10) |
+	    ((uint64_t)LE_32(cmd->sqe_cdw11) << 32);
+	nlb = (LE_32(cmd->sqe_cdw12) & 0xffff) + 1;	/* NLB is 0's based */
+
+	switch (opc) {
+	case NVME_OPC_NVM_READ:
+		cdb[0] = SCMD_READ_G4;			/* READ(16) */
+		BE_OUT64(&cdb[2], slba);
+		BE_OUT32(&cdb[10], nlb);
+		task->task_flags |= TF_READ_DATA;
+		task->task_expected_xfer_length = data_len;
+		break;
+	case NVME_OPC_NVM_WRITE:
+		cdb[0] = SCMD_WRITE_G4;			/* WRITE(16) */
+		BE_OUT64(&cdb[2], slba);
+		BE_OUT32(&cdb[10], nlb);
+		task->task_flags |= TF_WRITE_DATA;
+		task->task_expected_xfer_length = data_len;
+		break;
+	case NVME_OPC_NVM_FLUSH:
+		cdb[0] = SCMD_SYNCHRONIZE_CACHE;	/* SYNCHRONIZE CACHE(10) */
+		task->task_expected_xfer_length = 0;
+		break;
+	default:
+		/*
+		 * PORT-TODO (NVMEOF.md R3): WRITE_ZERO -> WRITE SAME(16),
+		 * DSET_MGMT -> UNMAP.  The reservation opcodes (RESV_*) are a
+		 * deferred decision (see nvmft_resv.c) and are not yet dispatched.
+		 */
+		return (B_FALSE);
+	}
+
+	if (task->task_expected_xfer_length == 0)
+		task->task_additional_flags |= TASK_AF_NO_EXPECTED_XFER_LENGTH;
+	task->task_cmd_xfer_length = task->task_expected_xfer_length;
+
+	return (B_TRUE);
+}
+
+/*
+ * Whether nvmft_translate_cmd() can map this opcode to a SCSI CDB.  Must stay in
+ * sync with the switch above: it gates task allocation so we never create an
+ * STMF task we cannot post (see nvmft_dispatch_command).
+ */
+static boolean_t
+nvmft_cmd_translatable(uint8_t opc)
+{
+	switch (opc) {
+	case NVME_OPC_NVM_READ:
+	case NVME_OPC_NVM_WRITE:
+	case NVME_OPC_NVM_FLUSH:
+		return (B_TRUE);
+	default:
+		return (B_FALSE);
+	}
+}
+
+/*
+ * Whether a newly arrived command must be deferred rather than posted now.
+ * Called with ctrlr_lock held.  Always admit when nothing is in flight so a
+ * single command larger than the byte cap still makes progress.
+ */
+static boolean_t
+nvmft_should_defer(nvmft_controller_t *ctrlr, uint32_t data_len)
+{
+	ASSERT(MUTEX_HELD(&ctrlr->ctrlr_lock));
+
+	if (ctrlr->ctrlr_pending_commands == 0)
+		return (B_FALSE);
+	if (nvmft_max_active_commands != 0 &&
+	    ctrlr->ctrlr_pending_commands >= nvmft_max_active_commands)
+		return (B_TRUE);
+	if (nvmft_max_pending_commands != 0 &&
+	    ctrlr->ctrlr_pending_commands >= nvmft_max_pending_commands)
+		return (B_TRUE);
+	if (nvmft_max_pending_bytes != 0 &&
+	    ctrlr->ctrlr_pending_bytes + data_len > nvmft_max_pending_bytes)
+		return (B_TRUE);
+	return (B_FALSE);
+}
+
+/*
+ * Pop the next deferred command if there is now room to post it, charging it
+ * against the in-flight accounting.  Called with ctrlr_lock held; the caller
+ * posts the returned command (via nvmft_post_command) after dropping the lock.
+ * Returns NULL when the queue is empty or still over a cap.
+ */
+static nvmft_task_priv_t *
+nvmft_admit_one_deferred(nvmft_controller_t *ctrlr)
+{
+	nvmft_task_priv_t *d;
+
+	ASSERT(MUTEX_HELD(&ctrlr->ctrlr_lock));
+
+	if (ctrlr->ctrlr_deferred_commands == 0)
+		return (NULL);
+	d = list_head(&ctrlr->ctrlr_deferred);
+	if (nvmft_should_defer(ctrlr, d->ntp_data_len))
+		return (NULL);
+
+	list_remove(&ctrlr->ctrlr_deferred, d);
+	ctrlr->ctrlr_deferred_commands--;
+	if (ctrlr->ctrlr_pending_commands == 0)
+		ctrlr->ctrlr_start_busy = gethrtime();
+	ctrlr->ctrlr_pending_commands++;
+	ctrlr->ctrlr_pending_bytes += d->ntp_data_len;
+	return (d);
+}
+
+/* Controller lifecycle hooks for the deferred-command queue (nvmft_var.h). */
+void
+nvmft_deferred_init(nvmft_controller_t *ctrlr)
+{
+	list_create(&ctrlr->ctrlr_deferred, sizeof (nvmft_task_priv_t),
+	    offsetof(nvmft_task_priv_t, ntp_link));
+}
+
+/*
+ * Drop every queued (never-posted) command, freeing its capsule.  Called from
+ * controller shutdown after the I/O qpairs are stopped, so no new command can
+ * be deferred.  Queued commands were never posted to STMF and are not counted
+ * in ctrlr_pending_commands, so they are simply discarded -- the host's
+ * association is tearing down and will not see a completion for them.
+ */
+void
+nvmft_deferred_drain(nvmft_controller_t *ctrlr)
+{
+	list_t drain;
+	nvmft_task_priv_t *d;
+
+	list_create(&drain, sizeof (nvmft_task_priv_t),
+	    offsetof(nvmft_task_priv_t, ntp_link));
+
+	mutex_enter(&ctrlr->ctrlr_lock);
+	list_move_tail(&drain, &ctrlr->ctrlr_deferred);
+	ctrlr->ctrlr_deferred_commands = 0;
+	mutex_exit(&ctrlr->ctrlr_lock);
+
+	while ((d = list_remove_head(&drain)) != NULL)
+		nvmft_task_priv_free(d);
+	list_destroy(&drain);
+}
+
+void
+nvmft_deferred_fini(nvmft_controller_t *ctrlr)
+{
+	VERIFY0(ctrlr->ctrlr_deferred_commands);
+	list_destroy(&ctrlr->ctrlr_deferred);
+}
+
+/*
+ * Allocate and post the STMF task for an admitted command.  The in-flight
+ * accounting was already charged (in dispatch or admit).  On STMF task-alloc
+ * failure -- rare, STMF resource exhaustion -- the slot is rolled back and the
+ * next deferred command is admitted and posted in the same loop (iteratively,
+ * never recursively), so the deferred queue cannot stall on a failed post.
+ */
+static void
+nvmft_post_command(nvmft_task_priv_t *priv)
+{
+	nvmft_controller_t *ctrlr = nvmft_qpair_ctrlr(priv->ntp_qp);
+	nvmft_port_t *np = ctrlr->ctrlr_np;
+
+	for (;;) {
+		struct nvmft_qpair *qp = priv->ntp_qp;
+		struct nvmf_capsule *nc = priv->ntp_nc;
+		uint32_t data_len = priv->ntp_data_len;
+		const nvme_sqe_t *cmd = nvmf_capsule_sqe(nc);
+		scsi_task_t *task;
+		uint8_t lun[8];
+
+		/*
+		 * STMF LUN is the NVMe NSID minus one, encoded as a single-level
+		 * LUN.  stmf_task_alloc() decodes luNbr = lun[1] | ((lun[0] & 0x3f)
+		 * << 8), so the 14-bit LUN splits across lun[0:1] for NSIDs >= 256.
+		 */
+		(void) bzero(lun, sizeof (lun));
+		lun[0] = (uint8_t)(((LE_32(cmd->sqe_nsid) - 1) >> 8) & 0x3f);
+		lun[1] = (uint8_t)((LE_32(cmd->sqe_nsid) - 1) & 0xff);
+
+		task = stmf_task_alloc(np->np_lport, ctrlr->ctrlr_session, lun,
+		    16 /* cdb_length */, 0);
+		if (task != NULL) {
+			task->task_port_private = priv;
+			task->task_flags |= TF_ATTR_SIMPLE_QUEUE;
+
+			/*
+			 * NVMe/TCP needs a command's data as one in-order byte
+			 * stream: C2H offsets must be sequential, and only the
+			 * chunk that ends the transfer carries LAST_PDU and the
+			 * implicit SUCCESS.  Unless the transport takes chunks
+			 * in any order, allow one dbuf in flight so sbd issues
+			 * the data at advancing offsets.  The transfer lengths
+			 * are pinned so the LU prefers one buffer per command.
+			 */
+			task->task_max_nbufs = (nvmft_qpair_caps(qp) &
+			    NVMF_QP_CAP_UNORDERED_DATA) ? STMF_BUFS_MAX : 1;
+			if (nvmft_qpair_caps(qp) & NVMF_QP_CAP_LU_DBUF) {
+				task->task_additional_flags |=
+				    TASK_AF_ACCEPT_LU_DBUF;
+			}
+			task->task_max_xfer_len = data_len;
+			task->task_1st_xfer_len = data_len;
+
+			/*
+			 * The opcode was already vetted by nvmft_cmd_translatable(),
+			 * so the translation cannot fail here.  VERIFY the invariant
+			 * rather than kmem_free()'ing an allocated-and-linked STMF
+			 * task (which would corrupt the LU task list); a posted task
+			 * is disposed only through STMF.
+			 */
+			VERIFY(nvmft_translate_cmd(task, cmd, data_len));
+			stmf_post_task(task, NULL);
+			return;
+		}
+
+		/*
+		 * Could not allocate the STMF task.  Error this command back to the
+		 * host, release its in-flight slot, and admit the next deferred
+		 * command (if any) to post on the next loop iteration -- so a failed
+		 * post still drains the backpressure queue.
+		 */
+		(void) nvmft_send_generic_error(qp, nc,
+		    NVME_CQE_SC_GEN_INTERNAL_ERR);
+		nvmft_task_priv_free(priv);
+
+		mutex_enter(&ctrlr->ctrlr_lock);
+		ASSERT3U(ctrlr->ctrlr_pending_commands, >, 0);
+		ctrlr->ctrlr_pending_commands--;
+		ctrlr->ctrlr_pending_bytes -= data_len;
+		if (ctrlr->ctrlr_pending_commands == 0)
+			cv_signal(&ctrlr->ctrlr_pending_cv);
+		priv = nvmft_admit_one_deferred(ctrlr);
+		mutex_exit(&ctrlr->ctrlr_lock);
+
+		if (priv == NULL)
+			return;
+	}
+}
+
+/*
+ * Dispatch a received command capsule to the STMF LU.
+ *
+ * (FreeBSD: nvmft_dispatch_command -> ctl_alloc_io / ctl_run.)
+ */
+void
+nvmft_dispatch_command(struct nvmft_qpair *qp, struct nvmf_capsule *nc,
+    boolean_t admin)
+{
+	nvmft_controller_t *ctrlr = nvmft_qpair_ctrlr(qp);
+	const nvme_sqe_t *cmd = nvmf_capsule_sqe(nc);
+	nvmft_task_priv_t *priv;
+	uint32_t data_len;
+
+	_NOTE(ARGUNUSED(admin));
+
+	if (cmd->sqe_nsid == LE_32(0)) {
+		(void) nvmft_send_generic_error(qp, nc,
+		    0x0b /* INVALID_NAMESPACE_OR_FORMAT */);
+		nvmf_free_capsule(nc);
+		return;
+	}
+
+	/*
+	 * Defensive: the per-controller STMF session is created during the admin
+	 * handoff (nvmft_session_register), so it is non-NULL for any controller
+	 * that can receive commands.  Guard anyway -- stmf_task_alloc() derefs
+	 * the session unconditionally, so a NULL here would panic the box.
+	 */
+	if (ctrlr->ctrlr_session == NULL) {
+		(void) nvmft_send_generic_error(qp, nc,
+		    NVME_CQE_SC_GEN_INTERNAL_ERR);
+		nvmf_free_capsule(nc);
+		return;
+	}
+
+	/*
+	 * Reject opcodes we cannot translate BEFORE allocating an STMF task.
+	 * stmf_task_alloc() links the task into the LU's ilu_tasks list and bumps
+	 * its task counters; an allocated task may only be disposed through STMF's
+	 * lifecycle (post -> complete/abort -> task_lu_free), never kmem_free'd.
+	 * Freeing a half-registered task corrupts ilu_tasks (use-after-free) and
+	 * leaks the counters so LU offline/deregister hangs.  (FreeBSD rejects
+	 * these inside CTL on a pooled io; STMF has no allocated-but-never-posted
+	 * free path.)
+	 */
+	if (!nvmft_cmd_translatable(cmd->sqe_opc)) {
+		(void) nvmft_send_generic_error(qp, nc, NVME_CQE_SC_GEN_INV_OPC);
+		nvmf_free_capsule(nc);
+		return;
+	}
+
+	data_len = (uint32_t)nvmf_capsule_data_len(nc);
+	priv = nvmft_task_priv_init(qp, nc, data_len);
+
+	mutex_enter(&ctrlr->ctrlr_lock);
+	if (nvmft_should_defer(ctrlr, data_len)) {
+		/*
+		 * At the in-flight cap.  Queue the command rather than refuse it:
+		 * the host maps any non-zero CQE to EIO and does not retry
+		 * NS_NOTRDY, so refusing would corrupt the I/O.  Deferring leaves
+		 * the command outstanding (no CQE), so the initiator simply runs
+		 * out of SQ credits and paces itself; nvmft_lport_task_free()
+		 * re-dispatches it when a slot frees.
+		 */
+		list_insert_tail(&ctrlr->ctrlr_deferred, priv);
+		ctrlr->ctrlr_deferred_commands++;
+		mutex_exit(&ctrlr->ctrlr_lock);
+		return;
+	}
+	if (ctrlr->ctrlr_pending_commands == 0)
+		ctrlr->ctrlr_start_busy = gethrtime();
+	ctrlr->ctrlr_pending_commands++;
+	ctrlr->ctrlr_pending_bytes += data_len;
+	mutex_exit(&ctrlr->ctrlr_lock);
+
+	nvmft_post_command(priv);
+}
+
+void
+nvmft_terminate_commands(nvmft_controller_t *ctrlr)
+{
+	/*
+	 * FreeBSD issues a CTL_TASK_I_T_NEXUS_RESET to proactively abort this
+	 * nexus's in-flight CTL commands so the drain below returns sooner.  STMF
+	 * has no single nexus-reset primitive (only per-task stmf_abort(), which
+	 * would need a per-controller task list we do not yet keep), so we rely on
+	 * the slower but correct path: nvmft_qpair_shutdown() has already freed
+	 * each I/O qpair, and freeing the transport qpair aborts any registered
+	 * H2C receive (tcp_free_qpair -> nvmf_complete_io_request -> the dbuf is
+	 * failed back to STMF), while nvmft_lport_xfer_data() fails fast once
+	 * qp_qp == NULL.  Both drive every in-flight task to completion, so
+	 * ctrlr_pending_commands drains without an explicit abort here.  Proactive
+	 * per-task abort remains a future optimization.
+	 */
+	mutex_enter(&ctrlr->ctrlr_lock);
+	if (ctrlr->ctrlr_pending_commands == 0)
+		cv_signal(&ctrlr->ctrlr_pending_cv);
+	mutex_exit(&ctrlr->ctrlr_lock);
+}
+
+/*
+ * ============================================================================
+ * Data movement: lport_xfer_data
+ * ============================================================================
+ */
+
+CTASSERT(sizeof (nvmf_seg_t) == sizeof (stmf_sglist_ent_t));
+CTASSERT(offsetof(nvmf_seg_t, nsg_len) ==
+    offsetof(stmf_sglist_ent_t, seg_length));
+CTASSERT(offsetof(nvmf_seg_t, nsg_addr) ==
+    offsetof(stmf_sglist_ent_t, seg_addr));
+
+/* Describe the db_data_size bytes of a dbuf's sglist as a memdesc. */
+static void
+nvmft_dbuf_to_memdesc(stmf_data_buf_t *dbuf, const nvmft_dbuf_priv_t *ndp,
+    nvmf_memdesc_t *mem)
+{
+	bzero(mem, sizeof (*mem));
+	mem->nmd_len = dbuf->db_data_size;
+	if (ndp->ndp_transport) {
+		mem->nmd_type = NVMF_MEMDESC_SGL;
+		mem->nmd_u.nmd_sgl.nmd_segs =
+		    (const nvmf_seg_t *)dbuf->db_sglist;
+		mem->nmd_u.nmd_sgl.nmd_nsegs = dbuf->db_sglist_length;
+		mem->nmd_u.nmd_sgl.nmd_cookies = ndp->ndp_db.ndb_cookies;
+		mem->nmd_u.nmd_sgl.nmd_ncookies = ndp->ndp_db.ndb_ncookies;
+		return;
+	}
+	if (dbuf->db_sglist_length == 1) {
+		mem->nmd_type = NVMF_MEMDESC_VADDR;
+		mem->nmd_u.nmd_vaddr = dbuf->db_sglist[0].seg_addr;
+		return;
+	}
+	mem->nmd_type = NVMF_MEMDESC_SGL;
+	mem->nmd_u.nmd_sgl.nmd_segs = (const nvmf_seg_t *)dbuf->db_sglist;
+	mem->nmd_u.nmd_sgl.nmd_nsegs = dbuf->db_sglist_length;
+}
+
+/* Count a transfer the transport is about to hold, unless we are aborting. */
+static boolean_t
+nvmft_xfer_begin(nvmft_task_priv_t *priv)
+{
+	boolean_t ok;
+
+	mutex_enter(&priv->ntp_lock);
+	ok = !priv->ntp_aborting;
+	if (ok)
+		priv->ntp_xfers++;
+	mutex_exit(&priv->ntp_lock);
+	return (ok);
+}
+
+/*
+ * The transport is done with a transfer.  Returns B_FALSE if the task is being
+ * aborted: STMF must then not see the dbuf back, and the abort is retried.
+ */
+static boolean_t
+nvmft_xfer_end(scsi_task_t *task)
+{
+	nvmft_task_priv_t *priv = task->task_port_private;
+	boolean_t aborting;
+
+	mutex_enter(&priv->ntp_lock);
+	ASSERT3U(priv->ntp_xfers, >, 0);
+	priv->ntp_xfers--;
+	aborting = priv->ntp_aborting;
+	mutex_exit(&priv->ntp_lock);
+	if (aborting) {
+		stmf_abort(STMF_REQUEUE_TASK_ABORT_LPORT, task, STMF_ABORTED,
+		    NULL);
+		return (B_FALSE);
+	}
+	return (B_TRUE);
+}
+
+static boolean_t
+nvmft_xfer_arrive(nvmft_xfer_t *nx, uint_t who)
+{
+	uint_t both = NVMFT_XFER_SUBMITTED | NVMFT_XFER_COMPLETED;
+
+	membar_producer();
+	if (atomic_or_uint_nv(&nx->nx_state, who) != both)
+		return (B_FALSE);
+	membar_consumer();
+	return (B_TRUE);
+}
+
+/* Hand the dbuf back to STMF.  (FreeBSD: nvmft_datamove_*_cb.) */
+static void
+nvmft_xfer_finish(nvmft_xfer_t *nx)
+{
+	scsi_task_t *task = nx->nx_task;
+	stmf_data_buf_t *dbuf = nx->nx_dbuf;
+	nvmft_task_priv_t *priv = task->task_port_private;
+	uint32_t iof = 0;
+
+	/* Account for a response on the wire even if the task is aborting. */
+	if (nx->nx_to_rport && (nx->nx_final ||
+	    nx->nx_status == NVMF_SUCCESS_SENT)) {
+		ASSERT(nx->nx_final || !(nvmft_qpair_caps(priv->ntp_qp) &
+		    NVMF_QP_CAP_ALWAYS_RESPONSE));
+		if (!nx->nx_final)
+			nvmft_command_completed(priv->ntp_qp, priv->ntp_nc);
+		priv->ntp_success_sent = B_TRUE;
+	}
+	if (!nvmft_xfer_end(task))
+		return;
+
+	if (!nx->nx_to_rport) {
+		dbuf->db_xfer_status = (nx->nx_status == 0) ? STMF_SUCCESS :
+		    STMF_FAILURE;
+		stmf_data_xfer_done(task, dbuf, 0);
+		return;
+	}
+
+	switch (nx->nx_status) {
+	case NVMF_SUCCESS_SENT:
+		/*
+		 * The response is on the wire, either our final_cqe or success
+		 * folded into the data (the TCP SUCCESS flag).  If the LU put
+		 * status in this dbuf it calls stmf_task_lu_done(), which needs
+		 * the port to have released the task already.
+		 */
+		dbuf->db_xfer_status = STMF_SUCCESS;
+		if (dbuf->db_flags & DB_SEND_STATUS_GOOD)
+			iof = STMF_IOF_LPORT_DONE;
+		break;
+	case NVME_CQE_SC_GEN_SUCCESS:
+	case NVMF_MORE:
+		ASSERT(!nx->nx_final);
+		dbuf->db_xfer_status = STMF_SUCCESS;
+		break;
+	default:
+		dbuf->db_xfer_status = STMF_FAILURE;
+		if (nx->nx_final)
+			iof = STMF_IOF_LPORT_DONE;
+		break;
+	}
+	stmf_data_xfer_done(task, dbuf, iof);
+}
+
+static void
+nvmft_datamove_out_cb(void *arg, uint_t status)
+{
+	nvmft_xfer_t *nx = arg;
+
+	nx->nx_status = status;
+	if (nvmft_xfer_arrive(nx, NVMFT_XFER_COMPLETED))
+		nvmft_xfer_finish(nx);
+}
+
+static void
+nvmft_datamove_in_cb(void *arg, size_t xfered, int error)
+{
+	nvmft_xfer_t *nx = arg;
+
+	if (error == 0 && xfered != nx->nx_dbuf->db_data_size)
+		error = EIO;
+	nx->nx_status = (uint_t)error;
+	if (nvmft_xfer_arrive(nx, NVMFT_XFER_COMPLETED))
+		nvmft_xfer_finish(nx);
+}
+
+/*
+ * STMF calls lport_xfer_data() to move one dbuf either to (C2H, READ) or from
+ * (H2C, WRITE) the remote host.  We describe the dbuf's sglist as a memdesc
+ * and hand it to nvmf_send_controller_data_io() (C2H) or
+ * nvmf_receive_controller_data() (H2C).  Both complete asynchronously.  When
+ * the LU puts good status in the dbuf, the transport also sends the response.
+ *
+ * Without NVMF_QP_CAP_UNORDERED_DATA, nvmft_post_command() allows one dbuf
+ * in flight, so C2H chunks arrive at advancing offsets.
+ */
+static stmf_status_t
+nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
+    uint32_t ioflags)
+{
+	nvmft_task_priv_t *priv = task->task_port_private;
+	struct nvmf_capsule *nc;
+	struct nvmft_qpair *qp;
+	struct nvmf_qpair *nq;
+	nvmft_dbuf_priv_t *ndp;
+	nvmft_xfer_t *nx = NULL;
+	nvmf_memdesc_t mem;
+	stmf_status_t ret;
+	boolean_t do_xfer_done = B_FALSE, submitted = B_FALSE;
+	uint32_t xfer_iof = 0;
+	int error;
+
+	_NOTE(ARGUNUSED(ioflags));
+
+	ASSERT((dbuf->db_flags & (DB_DIRECTION_TO_RPORT |
+	    DB_DIRECTION_FROM_RPORT)) != (DB_DIRECTION_TO_RPORT |
+	    DB_DIRECTION_FROM_RPORT));
+
+	/*
+	 * Internal (driver-issued) task: capture the read data into the issuing
+	 * thread's buffer instead of sending it to a host.  These are always
+	 * small single-buffer C2H reads (READ CAPACITY).
+	 */
+	if (priv->ntp_iio != NULL) {
+		nvmft_internal_io_t *iio = priv->ntp_iio;
+
+		if (dbuf->db_flags & DB_DIRECTION_TO_RPORT) {
+			uint32_t off = dbuf->db_relative_offset;
+			uint32_t resid = dbuf->db_data_size;
+			uint16_t i;
+
+			for (i = 0; i < dbuf->db_sglist_length && resid != 0 &&
+			    off < iio->iio_buflen; i++) {
+				uint32_t todo = dbuf->db_sglist[i].seg_length;
+
+				if (todo > resid)
+					todo = resid;
+				if (todo > iio->iio_buflen - off)
+					todo = iio->iio_buflen - off;
+				bcopy(dbuf->db_sglist[i].seg_addr,
+				    iio->iio_buf + off, todo);
+				off += todo;
+				resid -= todo;
+			}
+			if (off > iio->iio_xfered)
+				iio->iio_xfered = off;
+		}
+		dbuf->db_xfer_status = STMF_SUCCESS;
+		/*
+		 * If the LU collapsed status into this final data buffer no
+		 * send_status will follow, so complete the rendezvous here and
+		 * release the task (STMF_IOF_LPORT_DONE) so the LU's
+		 * stmf_task_lu_done() does not panic on a still-owned task.
+		 * The non-collapsed case (the sbd READ CAPACITY short read)
+		 * leaves iof=0 and is completed by send_status, which now
+		 * carries STMF_IOF_LPORT_DONE.
+		 */
+		if (dbuf->db_flags & DB_SEND_STATUS_GOOD) {
+			mutex_enter(&iio->iio_lock);
+			iio->iio_scsi_status = STATUS_GOOD;
+			iio->iio_done = B_TRUE;
+			cv_signal(&iio->iio_cv);
+			mutex_exit(&iio->iio_lock);
+			stmf_data_xfer_done(task, dbuf, STMF_IOF_LPORT_DONE);
+			return (STMF_SUCCESS);
+		}
+		stmf_data_xfer_done(task, dbuf, 0);
+		return (STMF_SUCCESS);
+	}
+
+	nc = priv->ntp_nc;
+	qp = priv->ntp_qp;
+
+	/*
+	 * The send/receive below dereferences the transport qpair, which a racing
+	 * controller teardown frees (nvmft_qpair_shutdown -> nvmf_free_qpair).
+	 * Hold a reference across the transfer (nvmft_qpair_data_hold/rele, the
+	 * same handshake _nvmft_send_response() uses): if the qpair is already
+	 * shut down, fail the dbuf back to STMF (iof=0, as in the synchronous
+	 * failure path below) so STMF completes the task -- via abort or
+	 * lport_send_status(), which finds the qpair gone -- instead of touching a
+	 * freed qpair.  The reference only needs to span submitting the
+	 * transfer: its completion touches no transport state, and freeing the
+	 * qpair completes any transfer still registered (tcp_free_qpair ->
+	 * nvmf_complete_io_request), which is what lets the controller drain.
+	 */
+	nq = nvmft_qpair_data_hold(qp);
+	if (nq == NULL) {
+		dbuf->db_xfer_status = STMF_FAILURE;
+		stmf_data_xfer_done(task, dbuf, 0);
+		return (STMF_SUCCESS);
+	}
+
+	ndp = dbuf->db_port_private;
+	if (ndp == NULL || ndp->ndp_magic != NVMFT_DBUF_MAGIC) {
+		ret = STMF_FAILURE;
+		goto done;
+	}
+	if (!nvmft_xfer_begin(priv)) {
+		ret = STMF_ABORTED;
+		goto done;
+	}
+	nx = &ndp->ndp_xfer;
+	bzero(nx, sizeof (*nx));
+	nx->nx_task = task;
+	nx->nx_dbuf = dbuf;
+	nvmft_dbuf_to_memdesc(dbuf, ndp, &mem);
+
+	if (dbuf->db_flags & DB_DIRECTION_TO_RPORT) {
+		/* C2H: send controller data (READ). */
+		nx->nx_to_rport = B_TRUE;
+		nx->nx_final = (dbuf->db_flags & DB_SEND_STATUS_GOOD) != 0;
+		if (nx->nx_final) {
+			nvmft_init_cqe(&nx->nx_cqe, nc, 0);
+			nvmft_prepare_response(qp, &nx->nx_cqe);
+		}
+		error = nvmf_send_controller_data_io(nc,
+		    dbuf->db_relative_offset, &mem, dbuf->db_data_size,
+		    nx->nx_final ? &nx->nx_cqe : NULL, nvmft_datamove_out_cb,
+		    nx);
+		if (error != 0 && nx->nx_final) {
+			/* The response is ours to send after all. */
+			nx->nx_cqe.cqe_sf.sf_sct = NVME_CQE_SCT_GENERIC;
+			nx->nx_cqe.cqe_sf.sf_sc = NVME_CQE_SC_GEN_DATA_XFR_ERR;
+			(void) nvmft_transmit_response(qp, &nx->nx_cqe);
+			priv->ntp_success_sent = B_TRUE;
+			dbuf->db_xfer_status = STMF_FAILURE;
+			xfer_iof = STMF_IOF_LPORT_DONE;
+			do_xfer_done = nvmft_xfer_end(task);
+			ret = STMF_SUCCESS;
+			goto done;
+		}
+		if (error != 0) {
+			ret = nvmft_xfer_end(task) ? STMF_ALLOC_FAILURE :
+			    STMF_ABORTED;
+			goto done;
+		}
+	} else {
+		/* H2C: receive controller data (WRITE). */
+		error = nvmf_receive_controller_data(nc,
+		    dbuf->db_relative_offset, &mem, dbuf->db_data_size,
+		    nvmft_datamove_in_cb, nx);
+		if (error != 0) {
+			(void) nvmft_printf(nvmft_qpair_ctrlr(qp),
+			    "Failed to request capsule data: 0x%x\n", error);
+			ret = nvmft_xfer_end(task) ? STMF_FAILURE :
+			    STMF_ABORTED;
+			goto done;
+		}
+	}
+	submitted = B_TRUE;
+	ret = STMF_SUCCESS;
+
+done:
+	/*
+	 * Drop the qpair reference BEFORE completing the transfer: with
+	 * STMF_IOF_LPORT_DONE, stmf_data_xfer_done() can synchronously free the
+	 * task (stmf_task_free -> nvmft_lport_task_free), which drops
+	 * ctrlr_pending_commands and lets the controller-shutdown drain destroy
+	 * the qpair (struct nvmft_qpair).  nvmft_qpair_data_rele() touches that
+	 * struct, so it must run while the task is still pending and the qpair is
+	 * still alive.
+	 */
+	nvmft_qpair_data_rele(qp, nq);
+	if (submitted && nvmft_xfer_arrive(nx, NVMFT_XFER_SUBMITTED))
+		nvmft_xfer_finish(nx);
+	if (do_xfer_done)
+		stmf_data_xfer_done(task, dbuf, xfer_iof);
+	return (ret);
+}
+
+/*
+ * ============================================================================
+ * Status phase: lport_send_status
+ * ============================================================================
+ */
+
+/*
+ * Add a 64-bit addend to a little-endian 128-bit SMART counter.
+ * (FreeBSD: hip_add.)
+ */
+static void
+nvmft_hip_add(nvme_uint128_t *val, uint64_t addend)
+{
+	uint64_t old, new;
+
+	old = LE_64(val->lo);
+	new = old + addend;
+	val->lo = LE_64(new);
+	if (new < old)
+		val->hi = LE_64(LE_64(val->hi) + 1);
+}
+
+/*
+ * Translate a SCSI sense key / ASC / ASCQ into an NVMe (SCT, SC) status.  Only
+ * the mappings that the stmf_sbd LU actually produces for the translated
+ * READ/WRITE/FLUSH commands are covered; anything else falls back to a generic
+ * Internal Error.  Both the status code type (*sctp) and the status code (*scp)
+ * are output: most mappings stay in the Generic type, but some (e.g. a compare
+ * miscompare) require a Command Specific type.  (FreeBSD let CTL set ctl_nvmeio
+ * status directly; on STMF the LU speaks SCSI so we reverse the mapping here.)
+ */
+static void
+nvmft_scsi_sense_to_nvme(scsi_task_t *task, uint8_t *sctp, uint8_t *scp)
+{
+	struct scsi_extended_sense *sense;
+	uint8_t key;
+
+	*sctp = NVME_CQE_SCT_GENERIC;
+	*scp = NVME_CQE_SC_GEN_INTERNAL_ERR;
+
+	if (task->task_sense_length < sizeof (*sense) ||
+	    task->task_sense_data == NULL)
+		return;
+
+	sense = (struct scsi_extended_sense *)task->task_sense_data;
+	key = sense->es_key;
+
+	switch (key) {
+	case KEY_NO_SENSE:
+		*scp = NVME_CQE_SC_GEN_SUCCESS;
+		break;
+	case KEY_NOT_READY:
+		*scp = NVME_CQE_SC_GEN_NVM_NS_NOTRDY;
+		break;
+	case KEY_MEDIUM_ERROR:
+		*scp = NVME_CQE_SC_GEN_DATA_XFR_ERR;
+		break;
+	case KEY_MISCOMPARE:
+		/*
+		 * A VERIFY/BYTCHK miscompare maps to NVMe Compare Failure, which
+		 * is a Command Specific status (SCT 1), not a Generic one.  We do
+		 * not translate COMPARE today (see nvmft_translate_cmd), so the LU
+		 * should never emit this, but report it correctly if it does.
+		 */
+		*sctp = NVME_CQE_SCT_SPECIFIC;
+		*scp = NVME_CQE_SC_INT_NVM_COMPARE;
+		break;
+	case KEY_ILLEGAL_REQUEST:
+		/* LBA out of range -> ASC 0x21. */
+		if (sense->es_add_code == 0x21)
+			*scp = NVME_CQE_SC_GEN_NVM_LBA_RANGE;
+		else
+			*scp = NVME_CQE_SC_GEN_INV_FLD;
+		break;
+	case KEY_DATA_PROTECT:
+		*scp = NVME_CQE_SC_GEN_NS_RDONLY;
+		break;
+	default:
+		*scp = NVME_CQE_SC_GEN_INTERNAL_ERR;
+		break;
+	}
+}
+
+/*
+ * Fold the SMART host read/write command and data-units counters for a
+ * completed READ/WRITE.  The COMPARE case is retained for fidelity with FreeBSD
+ * nvmft_done() (COMPARE counts as a host read) even though COMPARE is not
+ * currently translated.  (FreeBSD nvmft_done.)
+ */
+static void
+nvmft_account_smart(nvmft_controller_t *ctrlr, uint8_t opc, size_t data_len,
+    boolean_t success)
+{
+	size_t len = success ? data_len / 512 : 0;
+
+	switch (opc) {
+	case NVME_OPC_NVM_WRITE:
+		mutex_enter(&ctrlr->ctrlr_lock);
+		nvmft_hip_add(&ctrlr->ctrlr_hip.hl_host_write, 1);
+		len += ctrlr->ctrlr_partial_duw;
+		if (len > 1000)
+			nvmft_hip_add(&ctrlr->ctrlr_hip.hl_data_write,
+			    len / 1000);
+		ctrlr->ctrlr_partial_duw = len % 1000;
+		mutex_exit(&ctrlr->ctrlr_lock);
+		break;
+	case NVME_OPC_NVM_READ:
+	case NVME_OPC_NVM_COMPARE:
+		mutex_enter(&ctrlr->ctrlr_lock);
+		nvmft_hip_add(&ctrlr->ctrlr_hip.hl_host_read, 1);
+		len += ctrlr->ctrlr_partial_dur;
+		if (len > 1000)
+			nvmft_hip_add(&ctrlr->ctrlr_hip.hl_data_read,
+			    len / 1000);
+		ctrlr->ctrlr_partial_dur = len % 1000;
+		mutex_exit(&ctrlr->ctrlr_lock);
+		break;
+	}
+}
+
+/*
+ * STMF calls lport_send_status() once the LU has produced SCSI status.  We
+ * translate that SCSI status back to an NVMe completion and emit a response
+ * capsule.  (FreeBSD did the equivalent in nvmft_done().)
+ */
+static stmf_status_t
+nvmft_lport_send_status(scsi_task_t *task, uint32_t ioflags)
+{
+	nvmft_task_priv_t *priv = task->task_port_private;
+	struct nvmf_capsule *nc;
+	nvmft_controller_t *ctrlr;
+	const nvme_sqe_t *cmd;
+	boolean_t good = (task->task_scsi_status == STATUS_GOOD);
+	nvme_cqe_t cpl;
+	uint8_t sct, sc;
+
+	_NOTE(ARGUNUSED(ioflags));
+
+	/*
+	 * Internal (driver-issued) task: there is no host capsule.  Hand the
+	 * SCSI status back to the issuing thread and complete.
+	 */
+	if (priv->ntp_iio != NULL) {
+		nvmft_internal_io_t *iio = priv->ntp_iio;
+
+		mutex_enter(&iio->iio_lock);
+		if (!iio->iio_done) {
+			iio->iio_scsi_status = task->task_scsi_status;
+			if (task->task_scsi_status == STATUS_CHECK &&
+			    task->task_sense_data != NULL) {
+				iio->iio_sense_key =
+				    task->task_sense_data[2] & 0x0f;
+			}
+			iio->iio_done = B_TRUE;
+			cv_signal(&iio->iio_cv);
+		}
+		mutex_exit(&iio->iio_lock);
+		stmf_send_status_done(task, STMF_SUCCESS, STMF_IOF_LPORT_DONE);
+		return (STMF_SUCCESS);
+	}
+
+	nc = priv->ntp_nc;
+	ctrlr = nvmft_qpair_ctrlr(priv->ntp_qp);
+	cmd = nvmf_capsule_sqe(nc);
+
+	nvmft_account_smart(ctrlr, cmd->sqe_opc, nvmf_capsule_data_len(nc),
+	    good);
+
+	if (priv->ntp_success_sent) {
+		/*
+		 * The transport already sent an implicit success CQE folded into
+		 * the final C2H data PDU; STMF still wants its completion.
+		 *
+		 * Forcing a single in-order C2H dbuf (see nvmft_dispatch_command)
+		 * means the implicit SUCCESS is only stamped on the final chunk,
+		 * so reaching here normally implies the whole transfer succeeded.
+		 * A late backend error on the last dbuf could still leave the LU
+		 * reporting CHECK while the host has already seen success: that is
+		 * an unrecoverable protocol inconsistency, but it must not panic
+		 * the controller.  Warn and honour the success already on the wire.
+		 */
+		if (!good) {
+			(void) nvmft_printf(ctrlr,
+			    "implicit success already sent but LU reported "
+			    "SCSI status 0x%x; host already saw success\n",
+			    task->task_scsi_status);
+		}
+		stmf_send_status_done(task, STMF_SUCCESS, STMF_IOF_LPORT_DONE);
+		return (STMF_SUCCESS);
+	}
+
+	if (good) {
+		sct = NVME_CQE_SCT_GENERIC;
+		sc = NVME_CQE_SC_GEN_SUCCESS;
+	} else {
+		nvmft_scsi_sense_to_nvme(task, &sct, &sc);
+	}
+
+	(void) bzero(&cpl, sizeof (cpl));
+	cpl.cqe_cid = cmd->sqe_cid;
+	cpl.cqe_sf.sf_sct = sct;
+	cpl.cqe_sf.sf_sc = sc;
+	(void) nvmft_send_response(priv->ntp_qp, &cpl);
+
+	stmf_send_status_done(task, STMF_SUCCESS, STMF_IOF_LPORT_DONE);
+	return (STMF_SUCCESS);
+}
+
+static void
+nvmft_lport_task_free(scsi_task_t *task)
+{
+	nvmft_task_priv_t *priv = task->task_port_private;
+	nvmft_controller_t *ctrlr;
+	nvmft_task_priv_t *d;
+	uint32_t data_len;
+
+	if (priv == NULL)
+		return;
+
+	/*
+	 * Internal (driver-issued) task: no host capsule, no pending-command
+	 * accounting, and no qpair.  The issuing thread owns the rendezvous
+	 * (iio) on its stack; we only release the private block here.
+	 */
+	if (priv->ntp_iio != NULL) {
+		task->task_port_private = NULL;
+		kmem_free(priv, sizeof (*priv));
+		return;
+	}
+
+	ctrlr = nvmft_qpair_ctrlr(priv->ntp_qp);
+	data_len = priv->ntp_data_len;
+	task->task_port_private = NULL;
+	nvmft_task_priv_free(priv);
+
+	mutex_enter(&ctrlr->ctrlr_lock);
+	ASSERT3U(ctrlr->ctrlr_pending_commands, >, 0);
+	ctrlr->ctrlr_pending_commands--;
+	ctrlr->ctrlr_pending_bytes -= data_len;
+	if (ctrlr->ctrlr_pending_commands == 0) {
+		ctrlr->ctrlr_busy_total +=
+		    gethrtime() - ctrlr->ctrlr_start_busy;
+		cv_signal(&ctrlr->ctrlr_pending_cv);
+	}
+	/* This slot just freed: re-dispatch the next deferred command, if any. */
+	d = nvmft_admit_one_deferred(ctrlr);
+	mutex_exit(&ctrlr->ctrlr_lock);
+
+	if (d != NULL)
+		nvmft_post_command(d);
+}
+
+/*
+ * STMF asks us to abort a task.  For STMF_LPORT_ABORT_TASK, arg is the
+ * scsi_task_t.  While the transport still holds a transfer into one of the
+ * task's dbufs we return STMF_BUSY, because STMF frees the dbufs of an aborted
+ * task; the transfer's completion asks STMF to retry the abort.
+ *
+ * STMF keeps the task valid for the duration of this call and serialises abort
+ * against lport_task_free.  nvmf_abort_capsule_data() is a no-op when no H2C
+ * receive is outstanding.
+ */
+/* ARGSUSED */
+static stmf_status_t
+nvmft_lport_abort(stmf_local_port_t *lport, int abort_cmd, void *arg,
+    uint32_t flags)
+{
+	scsi_task_t *task = arg;
+	nvmft_task_priv_t *priv;
+	boolean_t busy;
+
+	_NOTE(ARGUNUSED(lport, flags));
+
+	if (abort_cmd != STMF_LPORT_ABORT_TASK)
+		return (STMF_ABORT_SUCCESS);
+
+	priv = task->task_port_private;
+	if (priv == NULL)
+		return (STMF_ABORT_SUCCESS);
+
+	/*
+	 * Internal (driver-issued) task: no send_status will follow an abort,
+	 * so release the issuing thread with a failure status instead of
+	 * leaving it blocked in nvmft_lu_read_capacity().
+	 */
+	if (priv->ntp_iio != NULL) {
+		nvmft_internal_io_t *iio = priv->ntp_iio;
+
+		mutex_enter(&iio->iio_lock);
+		if (!iio->iio_done) {
+			iio->iio_scsi_status = STATUS_CHECK;
+			iio->iio_done = B_TRUE;
+			cv_signal(&iio->iio_cv);
+		}
+		mutex_exit(&iio->iio_lock);
+		return (STMF_ABORT_SUCCESS);
+	}
+
+	if (priv->ntp_nc != NULL)
+		nvmf_abort_capsule_data(priv->ntp_nc, ECANCELED);
+
+	mutex_enter(&priv->ntp_lock);
+	priv->ntp_aborting = B_TRUE;
+	busy = (priv->ntp_xfers != 0);
+	mutex_exit(&priv->ntp_lock);
+	return (busy ? STMF_BUSY : STMF_ABORT_SUCCESS);
+}
+
+/* ARGSUSED */
+static void
+nvmft_lport_task_poll(scsi_task_t *task)
+{
+	_NOTE(ARGUNUSED(task));
+}
+
+/*
+ * lport control callback: STMF online/offline transitions.  Modeled on
+ * srpt_stp_ctl().
+ */
+static void
+nvmft_lport_ctl(stmf_local_port_t *lport, int cmd, void *arg)
+{
+	nvmft_port_t *np = lport->lport_port_private;
+	stmf_change_status_t cstatus;
+
+	cstatus.st_completion_status = STMF_SUCCESS;
+	cstatus.st_additional_info = NULL;
+
+	switch (cmd) {
+	case STMF_CMD_LPORT_ONLINE:
+		mutex_enter(&np->np_lock);
+		np->np_online = B_TRUE;
+		mutex_exit(&np->np_lock);
+		(void) stmf_ctl(STMF_CMD_LPORT_ONLINE_COMPLETE, lport,
+		    &cstatus);
+		break;
+	case STMF_CMD_LPORT_OFFLINE: {
+		nvmft_controller_t *ctrlr;
+
+		/*
+		 * Mirror FreeBSD nvmft_offline(): mark the port offline, fault
+		 * every controller so its association terminates, and wait for
+		 * the controller list to drain before reporting offline complete.
+		 * Otherwise controllers and their in-flight tasks could outlive
+		 * the offline and race port teardown.
+		 *
+		 * nvmft_controller_error() takes ctrlr_lock (the np_lock ->
+		 * ctrlr_lock order is preserved here) and schedules an
+		 * asynchronous terminate; the terminate path removes the
+		 * controller under np_lock and broadcasts np_controllers_cv when
+		 * the list empties while offline.  cv_wait() drops np_lock so
+		 * those drainers can make progress.
+		 */
+		mutex_enter(&np->np_lock);
+		np->np_online = B_FALSE;
+		for (ctrlr = list_head(&np->np_controllers); ctrlr != NULL;
+		    ctrlr = list_next(&np->np_controllers, ctrlr)) {
+			(void) nvmft_printf(ctrlr,
+			    "shutting down due to port going offline\n");
+			nvmft_controller_error(ctrlr, NULL, ENODEV);
+		}
+		while (!list_is_empty(&np->np_controllers))
+			cv_wait(&np->np_controllers_cv, &np->np_lock);
+		mutex_exit(&np->np_lock);
+		(void) stmf_ctl(STMF_CMD_LPORT_OFFLINE_COMPLETE, lport,
+		    &cstatus);
+		break;
+	}
+	case STMF_ACK_LPORT_ONLINE_COMPLETE:
+	case STMF_ACK_LPORT_OFFLINE_COMPLETE:
+		break;
+	default:
+		NVMFT_DPRINTF_L2("nvmft_lport_ctl: cmd %d not handled", cmd);
+		break;
+	}
+}
+
+/* ARGSUSED */
+static stmf_status_t
+nvmft_lport_info(uint32_t cmd, stmf_local_port_t *lport, void *arg,
+    uint8_t *buf, uint32_t *bufsizep)
+{
+	_NOTE(ARGUNUSED(cmd, lport, arg, buf, bufsizep));
+	return (STMF_SUCCESS);
+}
+
+/* ARGSUSED */
+static void
+nvmft_lport_event_handler(stmf_local_port_t *lport, int eventid, void *arg,
+    uint32_t flags)
+{
+	/*
+	 * PORT-TODO (NVMEOF.md 9.2/9.4): STMF fires LU access-state related
+	 * events here.  Consume them as a coarse input to ANA group state
+	 * (standby LU -> Inaccessible/Non-Optimized) via nvmft_ana.c.
+	 */
+	_NOTE(ARGUNUSED(lport, eventid, arg, flags));
+}
+
+/*
+ * ============================================================================
+ * SCSI device id descriptor for the local port identity
+ * ============================================================================
+ */
+
+/*
+ * Build a SCSI device id descriptor from the SubNQN so the port has a stable
+ * STMF identity.  Modeled on srpt_stp_alloc_scsi_devid_desc(), which used an
+ * EUI-64; here we use the NQN as a T10/SCSI name string.
+ */
+static scsi_devid_desc_t *
+nvmft_alloc_scsi_devid_desc(const char *nqn)
+{
+	scsi_devid_desc_t *sdd;
+	size_t nqnlen, total;
+
+	nqnlen = strlen(nqn);
+	total = sizeof (scsi_devid_desc_t) - 1 + nqnlen + 1;
+	sdd = kmem_zalloc(total, KM_SLEEP);
+	/*
+	 * STMF/SCSI has no protocol identifier for NVMe-oF.  PROTOCOL_ANY (15)
+	 * is the SPC "no specific protocol" wildcard, but it must NOT be used as
+	 * a concrete port protocol_id: STMF's stmf_create_kstat_lport() indexes
+	 * protocol_ident[protocol_id], that table is sized [PROTOCOL_ANY], and
+	 * its only guard is "> PROTOCOL_ANY" -- so protocol_id == PROTOCOL_ANY
+	 * reads one element past the table end and panics on the resulting
+	 * garbage string pointer.  Use the highest in-bounds slot, which STMF
+	 * renders as "UNKNOWN", rather than mislabel the port as a real SCSI
+	 * transport (iSCSI/SRP/...).
+	 */
+	sdd->protocol_id = PROTOCOL_ANY - 1;
+	sdd->code_set = CODE_SET_ASCII;
+	sdd->ident_type = ID_TYPE_SCSI_NAME_STRING;
+	sdd->ident_length = (uint8_t)nqnlen;
+	(void) memcpy(sdd->ident, nqn, nqnlen);
+	return (sdd);
+}
+
+static void
+nvmft_free_scsi_devid_desc(scsi_devid_desc_t *sdd)
+{
+	size_t total;
+
+	total = sizeof (scsi_devid_desc_t) - 1 + sdd->ident_length + 1;
+	kmem_free(sdd, total);
+}
+
+/*
+ * ============================================================================
+ * dbuf store
+ * ============================================================================
+ *
+ * STMF requires every local port to supply a dbuf store; the LU calls
+ * stmf_alloc_dbuf() (which dispatches to ds_alloc_data_buf) to obtain a buffer,
+ * fills it (WRITE) or has us fill it (READ), and drives the transfer through
+ * lport_xfer_data().  A port serves every transport, so the store asks the
+ * task's transport for a buffer from its pool, and falls back to kmem (as for
+ * TCP) when the transport has none.  A transport that maps LU memory gets the
+ * LU's buffers through ds_setup_dbuf.
+ */
+
+static struct nvmf_qpair *
+nvmft_dbuf_qpair(scsi_task_t *task, uint32_t cap, struct nvmft_qpair **qpp)
+{
+	nvmft_task_priv_t *priv = task->task_port_private;
+
+	if (priv == NULL || priv->ntp_iio != NULL ||
+	    (nvmft_qpair_caps(priv->ntp_qp) & cap) == 0)
+		return (NULL);
+	*qpp = priv->ntp_qp;
+	return (nvmft_qpair_data_hold(priv->ntp_qp));
+}
+
+/* ARGSUSED */
+static stmf_data_buf_t *
+nvmft_dbuf_alloc(scsi_task_t *task, uint32_t size, uint32_t *pminsize,
+    uint32_t flags)
+{
+	stmf_data_buf_t *dbuf;
+	nvmft_dbuf_priv_t *ndp;
+	struct nvmft_qpair *qp;
+	struct nvmf_qpair *nq;
+	void *buf = NULL;
+	int error;
+
+	_NOTE(ARGUNUSED(flags));
+
+	if (size == 0)
+		return (NULL);
+
+	dbuf = stmf_alloc(STMF_STRUCT_DATA_BUF, sizeof (nvmft_dbuf_priv_t), 0);
+	if (dbuf == NULL)
+		return (NULL);
+	ndp = dbuf->db_port_private;
+
+	nq = nvmft_dbuf_qpair(task, NVMF_QP_CAP_DATA_BUF, &qp);
+	if (nq != NULL) {
+		error = nvmf_alloc_data_buf(nq, size, MIN(*pminsize, size),
+		    &ndp->ndp_db);
+		nvmft_qpair_data_rele(qp, nq);
+		if (error != 0) {
+			stmf_free(dbuf);
+			return (NULL);
+		}
+		ndp->ndp_transport = B_TRUE;
+		buf = ndp->ndp_db.ndb_addr;
+		size = (uint32_t)ndp->ndp_db.ndb_len;
+	} else {
+		buf = kmem_alloc(size, KM_NOSLEEP);
+		if (buf == NULL) {
+			stmf_free(dbuf);
+			return (NULL);
+		}
+		ndp->ndp_buf = buf;
+		ndp->ndp_size = size;
+	}
+	ndp->ndp_magic = NVMFT_DBUF_MAGIC;
+
+	dbuf->db_flags = DB_DONT_CACHE;
+	dbuf->db_buf_size = size;
+	dbuf->db_data_size = size;
+	dbuf->db_sglist_length = 1;
+	dbuf->db_sglist[0].seg_addr = buf;
+	dbuf->db_sglist[0].seg_length = size;
+	return (dbuf);
+}
+
+/* ARGSUSED */
+static void
+nvmft_dbuf_free(stmf_dbuf_store_t *ds, stmf_data_buf_t *dbuf)
+{
+	nvmft_dbuf_priv_t *ndp = dbuf->db_port_private;
+
+	_NOTE(ARGUNUSED(ds));
+
+	if (ndp->ndp_transport)
+		nvmf_free_data_buf(&ndp->ndp_db);
+	else
+		kmem_free(ndp->ndp_buf, ndp->ndp_size);
+	stmf_free(dbuf);
+}
+
+/* Let the transport map an LU buffer.  sbd leaves db_port_private to us. */
+/* ARGSUSED */
+static stmf_status_t
+nvmft_dbuf_setup(scsi_task_t *task, stmf_data_buf_t *dbuf, uint32_t flags)
+{
+	nvmft_dbuf_priv_t *ndp;
+	struct nvmft_qpair *qp;
+	struct nvmf_qpair *nq;
+	int error;
+
+	_NOTE(ARGUNUSED(flags));
+
+	nq = nvmft_dbuf_qpair(task, NVMF_QP_CAP_LU_DBUF, &qp);
+	if (nq == NULL)
+		return (STMF_FAILURE);
+	ndp = kmem_zalloc(sizeof (*ndp), KM_NOSLEEP);
+	if (ndp == NULL) {
+		nvmft_qpair_data_rele(qp, nq);
+		return (STMF_FAILURE);
+	}
+	error = nvmf_map_data_buf(nq, (const nvmf_seg_t *)dbuf->db_sglist,
+	    dbuf->db_sglist_length, &ndp->ndp_db);
+	nvmft_qpair_data_rele(qp, nq);
+	if (error != 0) {
+		kmem_free(ndp, sizeof (*ndp));
+		return (STMF_FAILURE);
+	}
+	ndp->ndp_magic = NVMFT_DBUF_MAGIC;
+	ndp->ndp_transport = B_TRUE;
+	dbuf->db_port_private = ndp;
+	return (STMF_SUCCESS);
+}
+
+/* ARGSUSED */
+static void
+nvmft_dbuf_teardown(stmf_dbuf_store_t *ds, stmf_data_buf_t *dbuf)
+{
+	nvmft_dbuf_priv_t *ndp = dbuf->db_port_private;
+
+	_NOTE(ARGUNUSED(ds));
+
+	nvmf_free_data_buf(&ndp->ndp_db);
+	kmem_free(ndp, sizeof (*ndp));
+	dbuf->db_port_private = NULL;
+}
+
+static stmf_dbuf_store_t *
+nvmft_dbuf_store_create(void)
+{
+	stmf_dbuf_store_t *ds;
+
+	ds = stmf_alloc(STMF_STRUCT_DBUF_STORE, 0, 0);
+	if (ds == NULL)
+		return (NULL);
+	ds->ds_alloc_data_buf = nvmft_dbuf_alloc;
+	ds->ds_free_data_buf = nvmft_dbuf_free;
+	ds->ds_setup_dbuf = nvmft_dbuf_setup;
+	ds->ds_teardown_dbuf = nvmft_dbuf_teardown;
+	return (ds);
+}
+
+static void
+nvmft_dbuf_store_destroy(stmf_dbuf_store_t *ds)
+{
+	stmf_free(ds);
+}

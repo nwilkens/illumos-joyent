@@ -753,6 +753,10 @@ $(OBJS_DIR)/%.o:		$(UTSBASE)/common/io/comstar/port/srpt/%.c
 	$(COMPILE.c) -o $@ $<
 	$(CTFCONVERT_O)
 
+$(OBJS_DIR)/%.o:		$(UTSBASE)/common/io/comstar/port/nvmft/%.c
+	$(COMPILE.c) -o $@ $<
+	$(CTFCONVERT_O)
+
 $(OBJS_DIR)/%.o:		$(UTSBASE)/common/io/comstar/port/fcoet/%.c
 	$(COMPILE.c) -o $@ $<
 	$(CTFCONVERT_O)
@@ -1084,6 +1088,14 @@ $(OBJS_DIR)/%.o:		$(UTSBASE)/common/io/nge/%.c
 	$(CTFCONVERT_O)
 
 $(OBJS_DIR)/%.o:		$(UTSBASE)/common/io/nvme/%.c
+	$(COMPILE.c) -o $@ $<
+	$(CTFCONVERT_O)
+
+$(OBJS_DIR)/%.o:		$(UTSBASE)/common/io/nvmf/%.c
+	$(COMPILE.c) -o $@ $<
+	$(CTFCONVERT_O)
+
+$(OBJS_DIR)/%.o:		$(UTSBASE)/common/io/nvmf_host/%.c
 	$(COMPILE.c) -o $@ $<
 	$(CTFCONVERT_O)
 

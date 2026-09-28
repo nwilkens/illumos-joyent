@@ -178,6 +178,7 @@ SUBDIRS +=				\
 	libnisdb	\
 	libnls		\
 	libnvme		\
+	libnvmf		\
 	libnwam		\
 	libofmt		\
 	libpam		\
@@ -435,6 +436,7 @@ HDRSUBDIRS=				\
 	libndmp		\
 	libnsl		\
 	libnvme		\
+	libnvmf		\
 	libnvpair	\
 	libnwam		\
 	libofmt		\
@@ -657,6 +659,7 @@ libmlrpc:	libsmbfs libuuid
 libndmp:	libscf
 libnisdb:	libldap5
 libnvme:	libdevinfo libnvpair
+libnvmf:	libnvpair libuuid libsmbios
 libnwam:	libscf libbsm libdladm libipadm
 libpcp:		libumem libdevinfo
 libpctx:	libproc

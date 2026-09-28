@@ -1,0 +1,926 @@
+/*
+ * This file and its contents are supplied under the terms of the
+ * Common Development and Distribution License ("CDDL"), version 1.0.
+ * You may only use this file in accordance with the terms of version
+ * 1.0 of the CDDL.
+ *
+ * A full copy of the text of the CDDL should have accompanied this
+ * source.  A copy of the CDDL is also available via the Internet at
+ * http://www.illumos.org/license/CDDL.
+ */
+
+/*
+ * Copyright 2026 Edgecast Cloud LLC.
+ */
+
+/*
+ * Provenance: ported to illumos from FreeBSD sys/dev/nvmf/nvmf_transport.c.
+ *
+ * Original: Copyright (c) 2022-2024 Chelsio Communications, Inc.
+ *           Written by: John Baldwin <jhb@FreeBSD.org>
+ *           SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Transport-independent support for fabrics queue pairs and commands.  This is
+ * the dispatch core: it owns the registry of transport providers (TCP, RDMA),
+ * dispatches queue-pair and capsule operations through the provider vtable, and
+ * provides the nvlist ioctl helpers.  Every function body is translated
+ * one-for-one from the FreeBSD source; the OS-glue substitutions are:
+ *
+ *   FreeBSD                       illumos
+ *   -------                       -------
+ *   malloc/free (M_WAITOK/...)    kmem_zalloc/kmem_free (KM_SLEEP/...)
+ *   struct sx (sx_xlock/...)      krwlock_t (rw_enter(RW_WRITER)/...)
+ *   refcount(9) volatile u_int    atomic_inc/dec_uint_nv with a count guard
+ *   wakeup()/sx_sleep()           kcondvar_t + cv_broadcast/cv_wait
+ *   SLIST                         list_t (sorted by priority)
+ *   module event handler + macro  nvmf_transport_register/unregister + _init
+ *
+ * The provider is registered explicitly (see nvmf_transport_register) rather
+ * than via FreeBSD's declarative NVMF_TRANSPORT() module macro, because illumos
+ * has no per-subsystem module load event to hang that off of.
+ */
+
+#include <sys/types.h>
+#include <sys/stddef.h>
+#include <sys/param.h>
+#include <sys/ddi.h>
+#include <sys/sunddi.h>
+#include <sys/kmem.h>
+#include <sys/cmn_err.h>
+#include <sys/list.h>
+#include <sys/atomic.h>
+#include <sys/condvar.h>
+#include <sys/mutex.h>
+#include <sys/rwlock.h>
+#include <sys/nvpair.h>
+#include <sys/stream.h>
+#include <sys/strsubr.h>
+#include <sys/strsun.h>
+#include <sys/sysmacros.h>
+#include <sys/modctl.h>
+#include <sys/errno.h>
+
+#include <sys/nvme.h>
+#include <sys/nvme/nvmf.h>
+#include <sys/nvme/nvmf_transport.h>
+
+#include "nvmf_core.h"
+#include "nvmf_transport_internal.h"
+
+/*
+ * A registered transport provider for a given trtype.  FreeBSD threads these
+ * together with an SLIST; illumos uses list_t.  nt_active_qpairs is a reference
+ * count of live qpairs allocated through this provider, protected (for the
+ * unload wait) by the registry lock and signalled through nt_cv.
+ */
+struct nvmf_transport {
+	struct nvmf_transport_ops *nt_ops;
+
+	/* Live data buffers count here too; each pins the transport. */
+	volatile uint_t nt_active_qpairs;
+	list_node_t nt_link;
+};
+
+/* nvmf_transports[trtype] is sorted by priority. */
+static list_t nvmf_transports[NVMF_TRTYPE_TCP + 1];
+static krwlock_t nvmf_transports_lock;
+
+/*
+ * Serializes the unload-wait below with qpair release.  FreeBSD reuses the sx
+ * lock with sx_sleep()/wakeup(); illumos cv_wait requires a mutex, so a
+ * dedicated mutex/cv pair stands in for the wakeup channel keyed on the
+ * transport in the FreeBSD source.
+ */
+static kmutex_t nvmf_transports_cv_lock;
+static kcondvar_t nvmf_transports_cv;
+
+static boolean_t
+nvmf_supported_trtype(nvmf_trtype_t trtype)
+{
+	return (trtype < ARRAY_SIZE(nvmf_transports));
+}
+
+struct nvmf_qpair *
+nvmf_allocate_qpair(nvmf_trtype_t trtype, boolean_t controller,
+    const nvlist_t *params, nvmf_qpair_error_t *error_cb, void *error_cb_arg,
+    nvmf_capsule_receive_t *receive_cb, void *receive_cb_arg)
+{
+	struct nvmf_transport *nt;
+	struct nvmf_qpair *qp;
+	boolean_t admin;
+
+	if (!nvmf_supported_trtype(trtype))
+		return (NULL);
+
+	qp = NULL;
+	rw_enter(&nvmf_transports_lock, RW_READER);
+	for (nt = list_head(&nvmf_transports[trtype]); nt != NULL;
+	    nt = list_next(&nvmf_transports[trtype], nt)) {
+		qp = nt->nt_ops->allocate_qpair(controller, params);
+		if (qp != NULL) {
+			atomic_inc_uint(&nt->nt_active_qpairs);
+			break;
+		}
+	}
+	rw_exit(&nvmf_transports_lock);
+	if (qp == NULL)
+		return (NULL);
+
+	qp->nq_transport = nt;
+	qp->nq_ops = nt->nt_ops;
+	qp->nq_controller = controller;
+	qp->nq_error = error_cb;
+	qp->nq_error_arg = error_cb_arg;
+	qp->nq_receive = receive_cb;
+	qp->nq_receive_arg = receive_cb_arg;
+	(void) nvlist_lookup_boolean_value((nvlist_t *)params, "admin", &admin);
+	qp->nq_admin = admin;
+	return (qp);
+}
+
+int
+nvmf_adopt_qpair(struct nvmf_transport_ops *ops, struct nvmf_qpair *qp,
+    boolean_t controller, boolean_t admin, nvmf_qpair_error_t *error_cb,
+    void *error_cb_arg, nvmf_capsule_receive_t *receive_cb,
+    void *receive_cb_arg)
+{
+	struct nvmf_transport *nt;
+
+	if (!nvmf_supported_trtype(ops->trtype))
+		return (ENXIO);
+
+	rw_enter(&nvmf_transports_lock, RW_READER);
+	for (nt = list_head(&nvmf_transports[ops->trtype]); nt != NULL;
+	    nt = list_next(&nvmf_transports[ops->trtype], nt)) {
+		if (nt->nt_ops == ops) {
+			atomic_inc_uint(&nt->nt_active_qpairs);
+			break;
+		}
+	}
+	rw_exit(&nvmf_transports_lock);
+	if (nt == NULL)
+		return (ENXIO);
+
+	qp->nq_transport = nt;
+	qp->nq_ops = ops;
+	qp->nq_controller = controller;
+	qp->nq_error = error_cb;
+	qp->nq_error_arg = error_cb_arg;
+	qp->nq_receive = receive_cb;
+	qp->nq_receive_arg = receive_cb_arg;
+	qp->nq_admin = admin;
+	membar_producer();
+	return (0);
+}
+
+/*
+ * FreeBSD: if (refcount_release(&nt->nt_active_qpairs)) wakeup(nt);
+ * refcount_release() returns true when the count reaches zero.  Mirror
+ * that with an atomic decrement and broadcast the unload waiter when
+ * the last qpair drains.
+ */
+static void
+nvmf_transport_rele(struct nvmf_transport *nt)
+{
+	if (atomic_dec_uint_nv(&nt->nt_active_qpairs) == 0) {
+		mutex_enter(&nvmf_transports_cv_lock);
+		cv_broadcast(&nvmf_transports_cv);
+		mutex_exit(&nvmf_transports_cv_lock);
+	}
+}
+
+void
+nvmf_free_qpair(struct nvmf_qpair *qp)
+{
+	struct nvmf_transport *nt;
+
+	nt = qp->nq_transport;
+	qp->nq_ops->free_qpair(qp);
+	nvmf_transport_rele(nt);
+}
+
+int
+nvmf_alloc_data_buf(struct nvmf_qpair *qp, size_t len, size_t min_len,
+    nvmf_databuf_t *db)
+{
+	struct nvmf_transport_ops *ops = qp->nq_ops;
+	int error;
+
+	bzero(db, sizeof (*db));
+	if (ops->alloc_data_buf == NULL || ops->free_data_buf == NULL)
+		return (ENOTSUP);
+	if (min_len > len)
+		return (EINVAL);
+	error = ops->alloc_data_buf(qp, len, min_len, db);
+	if (error != 0)
+		return (error);
+	if (db->ndb_len < min_len || db->ndb_len > len ||
+	    db->ndb_addr == NULL) {
+		ops->free_data_buf(db);
+		return (EINVAL);
+	}
+	atomic_inc_uint(&qp->nq_transport->nt_active_qpairs);
+	db->ndb_transport = qp->nq_transport;
+	return (0);
+}
+
+int
+nvmf_map_data_buf(struct nvmf_qpair *qp, const nvmf_seg_t *segs, uint_t nsegs,
+    nvmf_databuf_t *db)
+{
+	struct nvmf_transport_ops *ops = qp->nq_ops;
+	int error;
+
+	bzero(db, sizeof (*db));
+	if (ops->map_data_buf == NULL || ops->free_data_buf == NULL)
+		return (ENOTSUP);
+	error = ops->map_data_buf(qp, segs, nsegs, db);
+	if (error != 0)
+		return (error);
+	atomic_inc_uint(&qp->nq_transport->nt_active_qpairs);
+	db->ndb_transport = qp->nq_transport;
+	return (0);
+}
+
+void
+nvmf_free_data_buf(nvmf_databuf_t *db)
+{
+	struct nvmf_transport *nt = db->ndb_transport;
+
+	nt->nt_ops->free_data_buf(db);
+	nvmf_transport_rele(nt);
+}
+
+struct nvmf_capsule *
+nvmf_allocate_command(struct nvmf_qpair *qp, const void *sqe, int how)
+{
+	struct nvmf_capsule *nc;
+
+	ASSERT(how == KM_SLEEP || how == KM_NOSLEEP);
+	nc = qp->nq_ops->allocate_capsule(qp, how);
+	if (nc == NULL)
+		return (NULL);
+
+	nc->nc_qpair = qp;
+	nc->nc_qe_len = sizeof (nvme_sqe_t);
+	bcopy(sqe, &nc->nc_sqe, nc->nc_qe_len);
+
+	/*
+	 * 4.2 of NVMe base spec: Fabrics always uses SGL.
+	 *
+	 * FreeBSD clears/sets the PSDT field inside the fuse byte via
+	 * NVMEM(NVME_CMD_PSDT)/NVMEF(NVME_CMD_PSDT, NVME_PSDT_SGL).  The
+	 * illumos generic SQE breaks the same byte out into bitfields, so the
+	 * PSDT selector is just the sqe_psdt bit; NVME_PSDT_SGL == 0x1.
+	 */
+	nc->nc_sqe.sqe_psdt = NVME_PSDT_SGL;
+	return (nc);
+}
+
+struct nvmf_capsule *
+nvmf_allocate_response(struct nvmf_qpair *qp, const void *cqe, int how)
+{
+	struct nvmf_capsule *nc;
+
+	ASSERT(how == KM_SLEEP || how == KM_NOSLEEP);
+	nc = qp->nq_ops->allocate_capsule(qp, how);
+	if (nc == NULL)
+		return (NULL);
+
+	nc->nc_qpair = qp;
+	nc->nc_qe_len = sizeof (nvme_cqe_t);
+	bcopy(cqe, &nc->nc_cqe, nc->nc_qe_len);
+	return (nc);
+}
+
+int
+nvmf_capsule_append_data(struct nvmf_capsule *nc, struct nvmf_memdesc *mem,
+    size_t len, boolean_t send, nvmf_io_complete_t *complete_cb,
+    void *cb_arg)
+{
+	if (nc->nc_data.io_len != 0)
+		return (EBUSY);
+
+	nc->nc_send_data = send;
+	nc->nc_data.io_mem = *mem;
+	nc->nc_data.io_len = len;
+	nc->nc_data.io_complete = complete_cb;
+	nc->nc_data.io_complete_arg = cb_arg;
+	return (0);
+}
+
+void
+nvmf_free_capsule(struct nvmf_capsule *nc)
+{
+	nc->nc_qpair->nq_ops->free_capsule(nc);
+}
+
+int
+nvmf_transmit_capsule(struct nvmf_capsule *nc)
+{
+	return (nc->nc_qpair->nq_ops->transmit_capsule(nc));
+}
+
+void
+nvmf_abort_capsule_data(struct nvmf_capsule *nc, int error)
+{
+	if (nc->nc_data.io_len != 0)
+		nvmf_complete_io_request(&nc->nc_data, 0, error);
+}
+
+void *
+nvmf_capsule_sqe(struct nvmf_capsule *nc)
+{
+	ASSERT3U(nc->nc_qe_len, ==, sizeof (nvme_sqe_t));
+	return (&nc->nc_sqe);
+}
+
+void *
+nvmf_capsule_cqe(struct nvmf_capsule *nc)
+{
+	ASSERT3U(nc->nc_qe_len, ==, sizeof (nvme_cqe_t));
+	return (&nc->nc_cqe);
+}
+
+boolean_t
+nvmf_sqhd_valid(struct nvmf_capsule *nc)
+{
+	ASSERT3U(nc->nc_qe_len, ==, sizeof (nvme_cqe_t));
+	return (nc->nc_sqhd_valid);
+}
+
+uint64_t
+nvmf_max_xfer_size(struct nvmf_qpair *qp)
+{
+	return (qp->nq_ops->max_xfer_size(qp));
+}
+
+uint32_t
+nvmf_qpair_caps(struct nvmf_qpair *qp)
+{
+	if (qp->nq_ops->caps == NULL)
+		return (0);
+	return (qp->nq_ops->caps(qp));
+}
+
+uint32_t
+nvmf_max_ioccsz(struct nvmf_qpair *qp)
+{
+	return (qp->nq_ops->max_ioccsz(qp));
+}
+
+uint8_t
+nvmf_validate_command_capsule(struct nvmf_capsule *nc)
+{
+	ASSERT3U(nc->nc_qe_len, ==, sizeof (nvme_sqe_t));
+
+	/*
+	 * FreeBSD: NVMEV(NVME_CMD_PSDT, nc_sqe.fuse) != NVME_PSDT_SGL.  The
+	 * illumos SQE exposes PSDT as the sqe_psdt bit directly.
+	 */
+	if (nc->nc_sqe.sqe_psdt != NVME_PSDT_SGL)
+		return (NVME_CQE_SC_GEN_INV_FLD);
+
+	return (nc->nc_qpair->nq_ops->validate_command_capsule(nc));
+}
+
+size_t
+nvmf_capsule_data_len(const struct nvmf_capsule *nc)
+{
+	return (nc->nc_qpair->nq_ops->capsule_data_len(nc));
+}
+
+int
+nvmf_receive_controller_data(struct nvmf_capsule *nc, uint32_t data_offset,
+    struct nvmf_memdesc *mem, size_t len, nvmf_io_complete_t *complete_cb,
+    void *cb_arg)
+{
+	struct nvmf_io_request io;
+
+	io.io_mem = *mem;
+	io.io_len = len;
+	io.io_complete = complete_cb;
+	io.io_complete_arg = cb_arg;
+	return (nc->nc_qpair->nq_ops->receive_controller_data(nc, data_offset,
+	    &io));
+}
+
+uint_t
+nvmf_send_controller_data(struct nvmf_capsule *nc, uint32_t data_offset,
+    mblk_t *mp, size_t len)
+{
+	/*
+	 * FreeBSD: MPASS(m_length(m, NULL) == len).  msgdsize() returns the
+	 * number of data bytes in an mblk chain, the mblk_t analogue of
+	 * m_length().
+	 */
+	ASSERT3U(msgdsize(mp), ==, len);
+	return (nc->nc_qpair->nq_ops->send_controller_data(nc, data_offset, mp,
+	    len));
+}
+
+/*
+ * send_controller_data_io for a transport that has only the mblk op.  The op
+ * runs to completion here, so the callback runs before this returns.
+ */
+static int
+nvmf_send_data_sync(struct nvmf_capsule *nc, uint32_t data_offset,
+    const struct nvmf_send_request *req, const nvme_cqe_t *final_cqe)
+{
+	struct nvmf_capsule *rc;
+	nvme_cqe_t cqe;
+	mblk_t *mp;
+	uint_t status;
+
+	mp = allocb(req->nsr_len, BPRI_MED);
+	if (mp == NULL)
+		return (ENOMEM);
+	nvmf_memdesc_copyout(&req->nsr_mem, 0, mp->b_wptr, req->nsr_len);
+	mp->b_wptr += req->nsr_len;
+	status = nvmf_send_controller_data(nc, data_offset, mp, req->nsr_len);
+
+	if (final_cqe != NULL && status != NVMF_SUCCESS_SENT) {
+		cqe = *final_cqe;
+		if (status != NVME_CQE_SC_GEN_SUCCESS) {
+			/* NVMF_MORE: the SGL is longer than the data. */
+			if (status == NVMF_MORE)
+				status = NVME_CQE_SC_GEN_INV_DSGL_LEN;
+			cqe.cqe_sf.sf_sct = NVME_CQE_SCT_GENERIC;
+			cqe.cqe_sf.sf_sc = (uint8_t)status;
+		}
+		rc = nvmf_allocate_response(nc->nc_qpair, &cqe, KM_SLEEP);
+		(void) nvmf_transmit_capsule(rc);
+		nvmf_free_capsule(rc);
+		if (status == NVME_CQE_SC_GEN_SUCCESS)
+			status = NVMF_SUCCESS_SENT;
+	}
+
+	req->nsr_complete(req->nsr_complete_arg, status);
+	return (0);
+}
+
+int
+nvmf_send_controller_data_io(struct nvmf_capsule *nc, uint32_t data_offset,
+    struct nvmf_memdesc *mem, size_t len, const void *final_cqe,
+    nvmf_send_complete_t *complete_cb, void *cb_arg)
+{
+	struct nvmf_transport_ops *ops = nc->nc_qpair->nq_ops;
+	struct nvmf_send_request req;
+
+	if (len > mem->nmd_len)
+		return (EINVAL);
+	req.nsr_mem = *mem;
+	req.nsr_len = len;
+	req.nsr_complete = complete_cb;
+	req.nsr_complete_arg = cb_arg;
+	if (ops->send_controller_data_io != NULL) {
+		return (ops->send_controller_data_io(nc, data_offset, &req,
+		    final_cqe));
+	}
+	return (nvmf_send_data_sync(nc, data_offset, &req, final_cqe));
+}
+
+static void
+nvmf_memdesc_copy(const nvmf_memdesc_t *md, size_t off, uint8_t *buf,
+    size_t len, boolean_t in)
+{
+	ASSERT3U(off, <=, md->nmd_len);
+	ASSERT3U(len, <=, md->nmd_len - off);
+	if (off > md->nmd_len)
+		return;
+	len = MIN(len, md->nmd_len - off);
+
+	switch (md->nmd_type) {
+	case NVMF_MEMDESC_VADDR: {
+		uint8_t *p = (uint8_t *)md->nmd_u.nmd_vaddr + off;
+
+		if (in)
+			bcopy(buf, p, len);
+		else
+			bcopy(p, buf, len);
+		break;
+	}
+	case NVMF_MEMDESC_MBLK: {
+		mblk_t *mp = md->nmd_u.nmd_mp;
+
+		while (mp != NULL && off >= MBLKL(mp)) {
+			off -= MBLKL(mp);
+			mp = mp->b_cont;
+		}
+		for (; len != 0 && mp != NULL; mp = mp->b_cont, off = 0) {
+			size_t todo = MIN(MBLKL(mp) - off, len);
+
+			if (in)
+				bcopy(buf, mp->b_rptr + off, todo);
+			else
+				bcopy(mp->b_rptr + off, buf, todo);
+			buf += todo;
+			len -= todo;
+		}
+		break;
+	}
+	case NVMF_MEMDESC_SGL: {
+		const nvmf_seg_t *seg = md->nmd_u.nmd_sgl.nmd_segs;
+		const nvmf_seg_t *end = seg + md->nmd_u.nmd_sgl.nmd_nsegs;
+
+		while (seg < end && off >= seg->nsg_len) {
+			off -= seg->nsg_len;
+			seg++;
+		}
+		for (; len != 0 && seg < end; seg++, off = 0) {
+			size_t todo = MIN(seg->nsg_len - off, len);
+
+			if (in)
+				bcopy(buf, seg->nsg_addr + off, todo);
+			else
+				bcopy(seg->nsg_addr + off, buf, todo);
+			buf += todo;
+			len -= todo;
+		}
+		break;
+	}
+	default:
+		panic("nvmf: memdesc type %d", md->nmd_type);
+	}
+}
+
+void
+nvmf_memdesc_copyin(const nvmf_memdesc_t *md, size_t off, const void *src,
+    size_t len)
+{
+	nvmf_memdesc_copy(md, off, (uint8_t *)src, len, B_TRUE);
+}
+
+void
+nvmf_memdesc_copyout(const nvmf_memdesc_t *md, size_t off, void *dst,
+    size_t len)
+{
+	nvmf_memdesc_copy(md, off, dst, len, B_FALSE);
+}
+
+/*
+ * The data direction of a command: bits 1:0 of the opcode, or of the Fabrics
+ * command type for a Fabrics command.
+ */
+static uint8_t
+nvmf_sqe_xfer_dir(const nvme_sqe_t *sqe)
+{
+	const uint8_t *b = (const uint8_t *)sqe;
+
+	if (sqe->sqe_opc == NVMF_FABRICS_OPC)
+		return (b[4] & 0x3);
+	return (sqe->sqe_opc & 0x3);
+}
+
+#define	NVMF_XFER_HOST_TO_CTRLR	0x1
+
+/*
+ * Decode and check SGL1 of a command for a transport that uses keyed SGLs.
+ * icd_len is the number of in-capsule data bytes that arrived with the
+ * command, and max_len is the largest transfer allowed (0 for no limit).
+ * Returns a generic status code; only exact descriptor forms are accepted.
+ */
+uint8_t
+nvmf_sgl_decode(const nvme_sqe_t *sqe, size_t icd_len, uint64_t max_len,
+    nvmf_sgl_t *sgl)
+{
+	const uint8_t *d = (const uint8_t *)&sqe->sqe_dptr;
+	uint8_t type = d[15] >> 4, subtype = d[15] & 0xf;
+	uint64_t addr = 0;
+	int i;
+
+	if (sqe->sqe_psdt != NVME_PSDT_SGL)
+		return (NVME_CQE_SC_GEN_INV_FLD);
+	for (i = 7; i >= 0; i--)
+		addr = (addr << 8) | d[i];
+	bzero(sgl, sizeof (*sgl));
+	sgl->nsl_addr = addr;
+
+	if (type == NVMF_SGL_DATA_BLOCK &&
+	    subtype == NVMF_SGL_SUBTYPE_OFFSET) {
+		if (d[12] != 0 || d[13] != 0 || d[14] != 0 ||
+		    nvmf_sqe_xfer_dir(sqe) != NVMF_XFER_HOST_TO_CTRLR)
+			return (NVME_CQE_SC_GEN_INV_SGL_DESC);
+		sgl->nsl_len = (uint32_t)d[8] | (uint32_t)d[9] << 8 |
+		    (uint32_t)d[10] << 16 | (uint32_t)d[11] << 24;
+		if (addr > icd_len)
+			return (NVME_CQE_SC_GEN_INV_SGL_OFF);
+		if (sgl->nsl_len > icd_len - addr)
+			return (NVME_CQE_SC_GEN_INV_DSGL_LEN);
+		return (NVME_CQE_SC_GEN_SUCCESS);
+	}
+
+	if (type == NVMF_SGL_KEYED_DATA_BLOCK &&
+	    (subtype == NVMF_SGL_SUBTYPE_ADDRESS ||
+	    subtype == NVMF_SGL_SUBTYPE_INVALIDATE_KEY)) {
+		if (icd_len != 0)
+			return (NVME_CQE_SC_GEN_INV_FLD);
+		sgl->nsl_keyed = B_TRUE;
+		sgl->nsl_invalidate =
+		    (subtype == NVMF_SGL_SUBTYPE_INVALIDATE_KEY);
+		sgl->nsl_len = (uint32_t)d[8] | (uint32_t)d[9] << 8 |
+		    (uint32_t)d[10] << 16;
+		sgl->nsl_key = (uint32_t)d[11] | (uint32_t)d[12] << 8 |
+		    (uint32_t)d[13] << 16 | (uint32_t)d[14] << 24;
+		if ((max_len != 0 && sgl->nsl_len > max_len) ||
+		    addr > UINT64_MAX - sgl->nsl_len)
+			return (NVME_CQE_SC_GEN_INV_DSGL_LEN);
+		return (NVME_CQE_SC_GEN_SUCCESS);
+	}
+
+	return (NVME_CQE_SC_GEN_INV_SGL_DESC);
+}
+
+int
+nvmf_pack_ioc_nvlist(nvlist_t *nvl, struct nvmf_ioc_nv *nv)
+{
+	char *packed;
+	size_t packed_len;
+	int error;
+
+	/*
+	 * FreeBSD checks nvlist_error(nvl) here; illumos nvlists do not carry a
+	 * cumulative error, so the equivalent guard is nvlist_size() failing
+	 * below.  nvlist_size()/nvlist_pack() use NV_ENCODE_NATIVE since the
+	 * carrier is consumed by the local kernel/userland pair.
+	 */
+	if (nv->size == 0) {
+		error = nvlist_size(nvl, &nv->len, NV_ENCODE_NATIVE);
+		return (error);
+	}
+
+	packed = NULL;
+	packed_len = 0;
+	error = nvlist_pack(nvl, &packed, &packed_len, NV_ENCODE_NATIVE,
+	    KM_SLEEP);
+	if (error != 0)
+		return (error);
+
+	nv->len = packed_len;
+	if (nv->len > nv->size) {
+		error = EFBIG;
+	} else if (ddi_copyout(packed, nv->data, nv->len, 0) != 0) {
+		error = EFAULT;
+	} else {
+		error = 0;
+	}
+	kmem_free(packed, packed_len);
+	return (error);
+}
+
+/*
+ * Upper bound on a packed ioctl nvlist.  nv->size comes verbatim from a
+ * (privileged) userland struct nvmf_ioc_nv and drives the kmem_alloc() below.
+ * The largest legitimate carrier is the handoff nvlist, whose binary "data"
+ * member is a 1KB nvmf_fabric_connect_data_t plus a 64-byte cmd and the small
+ * params sub-nvlist; 64KB is generous headroom while still preventing a
+ * bogus/garbage size from triggering an arbitrarily large KM_SLEEP allocation
+ * (box hang/OOM panic).
+ */
+#define	NVMF_IOC_NV_MAX	(64 * 1024)
+
+int
+nvmf_unpack_ioc_nvlist(const struct nvmf_ioc_nv *nv, nvlist_t **nvlp)
+{
+	char *packed;
+	nvlist_t *nvl;
+	int error;
+
+	if (nv->size == 0 || nv->size > NVMF_IOC_NV_MAX)
+		return (EINVAL);
+
+	packed = kmem_alloc(nv->size, KM_SLEEP);
+	if (ddi_copyin(nv->data, packed, nv->size, 0) != 0) {
+		kmem_free(packed, nv->size);
+		return (EFAULT);
+	}
+
+	error = nvlist_unpack(packed, nv->size, &nvl, KM_SLEEP);
+	kmem_free(packed, nv->size);
+	if (error != 0)
+		return (EINVAL);
+
+	*nvlp = nvl;
+	return (0);
+}
+
+boolean_t
+nvmf_validate_qpair_nvlist(const nvlist_t *nvl, boolean_t controller)
+{
+	nvlist_t *nv = (nvlist_t *)nvl;
+	uint64_t value, qsize;
+	boolean_t admin, sqfc, valid;
+
+	/*
+	 * FreeBSD uses nvlist_exists_bool()/nvlist_exists_number() to confirm a
+	 * key exists with the expected type.  illumos nvpair has no typed
+	 * existence predicate, so a successful typed lookup (return value 0)
+	 * carries the same meaning.
+	 */
+	valid = B_TRUE;
+	valid &= (nvlist_lookup_boolean_value(nv, "admin", &admin) == 0);
+	valid &= (nvlist_lookup_boolean_value(nv, "sq_flow_control",
+	    &sqfc) == 0);
+	valid &= (nvlist_lookup_uint64(nv, "qsize", &qsize) == 0);
+	valid &= (nvlist_lookup_uint64(nv, "sqhd", &value) == 0);
+	if (!controller)
+		valid &= (nvlist_lookup_uint64(nv, "sqtail", &value) == 0);
+	if (!valid)
+		return (B_FALSE);
+
+	if (admin) {
+		if (qsize < NVME_MIN_ADMIN_ENTRIES ||
+		    qsize > NVME_MAX_ADMIN_ENTRIES)
+			return (B_FALSE);
+	} else {
+		if (qsize < NVME_MIN_IO_ENTRIES || qsize > NVME_MAX_IO_ENTRIES)
+			return (B_FALSE);
+	}
+	(void) nvlist_lookup_uint64(nv, "sqhd", &value);
+	if (value > qsize - 1)
+		return (B_FALSE);
+	if (!controller) {
+		(void) nvlist_lookup_uint64(nv, "sqtail", &value);
+		if (value > qsize - 1)
+			return (B_FALSE);
+	}
+
+	return (B_TRUE);
+}
+
+/*
+ * Transport provider registration.
+ *
+ * FreeBSD routes MOD_LOAD/MOD_UNLOAD/MOD_QUIESCE for each transport module
+ * through nvmf_transport_module_handler() (declared via the NVMF_TRANSPORT()
+ * macro).  illumos transports are misc modules that call these two functions
+ * directly from their _init()/_fini() entry points.  The MOD_LOAD body becomes
+ * nvmf_transport_register(); the MOD_QUIESCE busy check and the MOD_UNLOAD
+ * drain-and-free become nvmf_transport_unregister().
+ */
+int
+nvmf_transport_register(struct nvmf_transport_ops *ops)
+{
+	struct nvmf_transport *nt, *nt2, *prev;
+
+	if (!nvmf_supported_trtype(ops->trtype)) {
+		cmn_err(CE_WARN, "NVMF: Unsupported transport %u", ops->trtype);
+		return (EINVAL);
+	}
+
+	nt = kmem_zalloc(sizeof (*nt), KM_SLEEP);
+	nt->nt_ops = ops;
+
+	rw_enter(&nvmf_transports_lock, RW_WRITER);
+	if (list_is_empty(&nvmf_transports[ops->trtype])) {
+		list_insert_head(&nvmf_transports[ops->trtype], nt);
+	} else {
+		prev = NULL;
+		for (nt2 = list_head(&nvmf_transports[ops->trtype]); nt2 != NULL;
+		    nt2 = list_next(&nvmf_transports[ops->trtype], nt2)) {
+			if (ops->priority > nt2->nt_ops->priority)
+				break;
+			prev = nt2;
+		}
+		if (prev == NULL)
+			list_insert_head(&nvmf_transports[ops->trtype], nt);
+		else
+			list_insert_after(&nvmf_transports[ops->trtype], prev,
+			    nt);
+	}
+	rw_exit(&nvmf_transports_lock);
+	return (0);
+}
+
+int
+nvmf_transport_unregister(struct nvmf_transport_ops *ops)
+{
+	struct nvmf_transport *nt;
+
+	if (!nvmf_supported_trtype(ops->trtype))
+		return (0);
+
+	/*
+	 * MOD_QUIESCE in FreeBSD refuses to quiesce (EBUSY) while any qpair is
+	 * still active.  Preserve that gate before unlinking: if the provider
+	 * is busy, fail the unregister so the module stays loaded.
+	 */
+	rw_enter(&nvmf_transports_lock, RW_READER);
+	for (nt = list_head(&nvmf_transports[ops->trtype]); nt != NULL;
+	    nt = list_next(&nvmf_transports[ops->trtype], nt)) {
+		if (nt->nt_ops == ops)
+			break;
+	}
+	if (nt == NULL) {
+		rw_exit(&nvmf_transports_lock);
+		return (0);
+	}
+	if (nt->nt_active_qpairs != 0) {
+		rw_exit(&nvmf_transports_lock);
+		return (EBUSY);
+	}
+	rw_exit(&nvmf_transports_lock);
+
+	/* MOD_UNLOAD: unlink, drain any racing qpairs, then free. */
+	rw_enter(&nvmf_transports_lock, RW_WRITER);
+	for (nt = list_head(&nvmf_transports[ops->trtype]); nt != NULL;
+	    nt = list_next(&nvmf_transports[ops->trtype], nt)) {
+		if (nt->nt_ops == ops)
+			break;
+	}
+	if (nt == NULL) {
+		rw_exit(&nvmf_transports_lock);
+		return (0);
+	}
+
+	list_remove(&nvmf_transports[ops->trtype], nt);
+	rw_exit(&nvmf_transports_lock);
+
+	/*
+	 * FreeBSD sleeps on the transport (sx_sleep) holding the registry lock
+	 * until nt_active_qpairs drains, releasing the lock across the sleep.
+	 * Here the provider is already unlinked, so no new qpairs can reference
+	 * it; wait on the dedicated cv for in-flight releases to finish.
+	 */
+	mutex_enter(&nvmf_transports_cv_lock);
+	while (nt->nt_active_qpairs != 0)
+		cv_wait(&nvmf_transports_cv, &nvmf_transports_cv_lock);
+	mutex_exit(&nvmf_transports_cv_lock);
+
+	kmem_free(nt, sizeof (*nt));
+	return (0);
+}
+
+/*
+ * Misc module plumbing.  This replaces FreeBSD's nvmf_transport_modevent() /
+ * DECLARE_MODULE(nvmf_transport, ...): _init() initializes the registry the way
+ * MOD_LOAD did, and _fini() tears it down.
+ */
+static struct modlmisc nvmf_transport_modlmisc = {
+	&mod_miscops,
+	"NVMe over Fabrics transport"
+};
+
+static struct modlinkage nvmf_transport_modlinkage = {
+	MODREV_1,
+	{ &nvmf_transport_modlmisc, NULL }
+};
+
+int
+_init(void)
+{
+	uint_t i;
+	int error;
+
+	for (i = 0; i < ARRAY_SIZE(nvmf_transports); i++) {
+		list_create(&nvmf_transports[i], sizeof (struct nvmf_transport),
+		    offsetof(struct nvmf_transport, nt_link));
+	}
+	rw_init(&nvmf_transports_lock, NULL, RW_DRIVER, NULL);
+	mutex_init(&nvmf_transports_cv_lock, NULL, MUTEX_DRIVER, NULL);
+	cv_init(&nvmf_transports_cv, NULL, CV_DRIVER, NULL);
+
+	error = mod_install(&nvmf_transport_modlinkage);
+	if (error != 0) {
+		cv_destroy(&nvmf_transports_cv);
+		mutex_destroy(&nvmf_transports_cv_lock);
+		rw_destroy(&nvmf_transports_lock);
+		for (i = 0; i < ARRAY_SIZE(nvmf_transports); i++)
+			list_destroy(&nvmf_transports[i]);
+	}
+	return (error);
+}
+
+int
+_fini(void)
+{
+	uint_t i;
+	int error;
+
+	/* Refuse to unload while any transport provider is still registered. */
+	rw_enter(&nvmf_transports_lock, RW_READER);
+	for (i = 0; i < ARRAY_SIZE(nvmf_transports); i++) {
+		if (!list_is_empty(&nvmf_transports[i])) {
+			rw_exit(&nvmf_transports_lock);
+			return (EBUSY);
+		}
+	}
+	rw_exit(&nvmf_transports_lock);
+
+	error = mod_remove(&nvmf_transport_modlinkage);
+	if (error != 0)
+		return (error);
+
+	cv_destroy(&nvmf_transports_cv);
+	mutex_destroy(&nvmf_transports_cv_lock);
+	rw_destroy(&nvmf_transports_lock);
+	for (i = 0; i < ARRAY_SIZE(nvmf_transports); i++)
+		list_destroy(&nvmf_transports[i]);
+	return (0);
+}
+
+int
+_info(struct modinfo *modinfop)
+{
+	return (mod_info(&nvmf_transport_modlinkage, modinfop));
+}
