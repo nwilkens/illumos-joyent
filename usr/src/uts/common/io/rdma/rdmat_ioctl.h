@@ -266,6 +266,7 @@ typedef enum rdmat_cm_op {
 #define	RDMAT_CM_AUTO		0x1	/* LISTEN: accept into new QPs */
 #define	RDMAT_CM_REJECT		0x2	/* LISTEN: refuse every request */
 #define	RDMAT_CM_FAST		0x4	/* wait for DISCONNECTED only */
+#define	RDMAT_CM_SLOW		0x8	/* LISTEN: decide after 500 ms */
 
 /* The private data a RDMAT_CM_REJECT listener refuses with. */
 #define	RDMAT_CM_REJ_DATA	"rdmat-no"
