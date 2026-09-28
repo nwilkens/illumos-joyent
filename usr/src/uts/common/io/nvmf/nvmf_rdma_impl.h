@@ -122,7 +122,10 @@ struct nr_queue;
 struct nr_cmd;
 struct nr_listener;
 
-/* The first member of each CM context, so the handler can tell them apart. */
+/*
+ * A CM context points at one of these, so the handler can tell a listener
+ * slot from a queue; a queue's is not its first member.
+ */
 typedef enum nr_kind {
 	NR_KIND_LISTENER = 0x4c53,
 	NR_KIND_QUEUE = 0x5155

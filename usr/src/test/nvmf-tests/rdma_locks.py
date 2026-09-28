@@ -6,6 +6,7 @@
 - every post to the QP happens with nq_lock held, and every call to a
   *_locked function too;
 - a queue's admission charge is released only when the queue is freed;
+- a CM context points at the kind the CM handler reads;
 - nothing a completion or QP event handler can reach drains, destroys or
   frees what the callback serves, or waits for a teardown; those run in the
   teardown the handler starts.
@@ -125,6 +126,17 @@ def check(replace=None):
                 name not in ("nr_queue_gone", "nr_cm_request"):
             errors.append(f"{name}: releases a queue's charge before it "
                           "is freed")
+    # The CM handler reads a kind where each context points.
+    for key, text in funcs.items():
+        if not key.startswith("__callbacks__"):
+            continue
+        for ctx in re.findall(r"rdk_cm_set_context\(\w+, ([^)]*)\)", text):
+            if not ctx.endswith("_kind"):
+                errors.append(f"CM context {ctx} is not a kind")
+        for ctx in re.findall(r"rdk_cm_create_id\([^,]+, \w+, (\w+),", text):
+            if "nr_lslot_t *" + ctx not in text and \
+                    f"nr_lslot_t\t*{ctx}" not in text and ctx != "ls":
+                errors.append(f"CM context {ctx} is not a listener slot")
     cbs = roots(funcs)
     if not cbs >= {"nr_recv_done", "nr_send_done", "nr_rw_done",
                    "nr_qp_event"}:
@@ -168,6 +180,9 @@ MUTANTS = (
                             "\tmutex_exit(&nl->nl_lock);\n"
                             "\tnr_unadmit(nl, q->nq_peer_ent, B_TRUE, "
                             "q->nq_charge);\n}\n\n/*\n * The queue is freed."),)}),
+    ("a CM context points at its kind", {
+        "nvmf_rdma_cm.c": (("rdk_cm_set_context(id, &q->nq_kind);",
+                            "rdk_cm_set_context(id, q);"),)}),
     ("a callback does not destroy what it serves", {
         "nvmf_rdma_xfer.c": (("\tnr_xreq_run_locked(q, &done);\n"
                               "\tmutex_exit(&q->nq_lock);\n",

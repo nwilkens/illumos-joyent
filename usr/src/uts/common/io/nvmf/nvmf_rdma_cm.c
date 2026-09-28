@@ -411,7 +411,7 @@ nr_cm_request(nr_listener_t *nl, rdk_cm_id_t *id,
 	cv_broadcast(&nd->nd_cv);
 	mutex_exit(&nd->nd_lock);
 
-	rdk_cm_set_context(id, q);
+	rdk_cm_set_context(id, &q->nq_kind);
 	if (nr_queue_post_ring(q) != 0 ||
 	    nvmft_adopt_qpair(&nvmf_rdma_ops, &q->nq_nq, req.nrq_qid,
 	    req.nrq_hsqsize) != 0) {
@@ -500,7 +500,8 @@ nr_cm_handler(rdk_cm_id_t *id, void *ctx, const struct rdk_cm_event *ev)
 	int ret;
 
 	if (kind == NR_KIND_QUEUE) {
-		nr_cm_queue_event(ctx, ev);
+		nr_cm_queue_event((nr_queue_t *)(void *)((caddr_t)ctx -
+		    offsetof(nr_queue_t, nq_kind)), ev);
 		return (0);
 	}
 	ASSERT3U(kind, ==, NR_KIND_LISTENER);
