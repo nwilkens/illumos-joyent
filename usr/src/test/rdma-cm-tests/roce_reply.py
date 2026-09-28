@@ -3,7 +3,8 @@
 
 A stateless reply (a REJ to a REQ nobody takes, a DREP to an unknown
 DREQ) goes to the source MAC of the frame it answers, which the GSI agent
-keeps from the completion.  Nothing on that path may start a neighbor
+keeps from the completion.  A request starts with the same way back, so a
+REJ sent before its neighbor resolution ends still reaches the peer.  Nothing on that path may start a neighbor
 resolution: a sender we do not know must not make the host ARP.
 Variants of the sources with a rule taken out must fail."""
 
@@ -47,6 +48,13 @@ def check(texts):
         bad.append("rdk_cm_roce_back() does not use the source MAC")
     elif nbr >= 0 and nbr < use:
         bad.append("rdk_cm_roce_back() asks the neighbor cache first")
+    req = bodies.get("rdk_cm_roce_req", "")
+    back_at = req.find("rdk_cm_roce_back(")
+    mac_at = req.find("c->ic_path.gp_dmac")
+    resolve_at = req.find("rdk_ibconn_resolve(")
+    if not 0 <= back_at < mac_at < resolve_at:
+        bad.append("rdk_cm_roce_req() resolves before the REQ's way back "
+                   "is set, so an early REJ has no MAC")
     for fn in ("rdk_cm_roce_back", "rdk_cm_roce_reply"):
         for n in reach(bodies, fn):
             if RESOLVE.search(bodies[n]):
@@ -67,6 +75,8 @@ def main():
          "rx->rx_smac, gp->gp_dmac, ETHERADDRL);\n", ""),
         ("rdk_cm_roce_rx.c", "\t\t\tret = rdk_cm_nexthop_lookup(",
          "\t\t\tret = rdk_cm_arp_start("),
+        ("rdk_cm_roce_rx.c", "\t\tbcopy(gp.gp_dmac, c->ic_path.gp_dmac, "
+         "ETHERADDRL);\n", ""),
     )
     for name, old, new in cases:
         if texts[name].count(old) != 1:
@@ -75,8 +85,8 @@ def main():
         if not check(dict(texts, **{name: texts[name].replace(old, new)})):
             print(f"a variant without {old.strip()!r} passed")
             return 1
-    print(f"PASS: stateless replies use the frame's source MAC and never "
-          f"resolve; {len(cases)} variants caught")
+    print(f"PASS: stateless and early replies use the frame's source MAC "
+          f"and never resolve; {len(cases)} variants caught")
     return 0
 
 

@@ -360,6 +360,7 @@ void
 rdk_cm_roce_req(rdk_gsi_t *g, const rdk_gsi_rx_t *rx, const rdk_ibcm_msg_t *m)
 {
 	const struct rdk_gid_attr *sgid;
+	rdk_gsi_path_t gp;
 	rdk_cma_hdr_t h;
 	rdk_ibconn_t *c, *o;
 	rdk_cm_id_t *lis;
@@ -426,6 +427,12 @@ rdk_cm_roce_req(rdk_gsi_t *g, const rdk_gsi_rx_t *rx, const rdk_ibcm_msg_t *m)
 	c->ic_path.gp_sgid = sgid;
 	sgid = NULL;
 	rdk_ibconn_from_req(c, m, &h, port);
+	/* A reject sent before the neighbor answers goes back the REQ's way. */
+	if (rdk_cm_roce_back(g, rx, &gp) == 0) {
+		bcopy(gp.gp_dmac, c->ic_path.gp_dmac, ETHERADDRL);
+		c->ic_path.gp_hop = gp.gp_hop;
+		rdk_put_gid_attr(gp.gp_sgid);
+	}
 	if (rdk_ibconn_insert(c) != 0) {
 		rdk_cm_roce_reply(g, rx, m, IBCM_ATTR_REJ,
 		    IBCM_REJ_CONSUMER_DEFINED, IBCM_MSG_RESPONSE_REQ);
