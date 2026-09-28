@@ -18,6 +18,7 @@ TESTS = (
     "iwc_intr.py",
     "mpa_parse.py",
     "qp_depth.py",
+    "roce_reply.py",
     "roce_mtu.py",
     "term_codes.py",
     "third_party.py",

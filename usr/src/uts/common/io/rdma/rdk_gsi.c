@@ -45,6 +45,7 @@ uint_t rdk_gsi_rx_max = 1024;
 #define	RDK_GSI_BURST_SEC	8	/* a bucket holds rate/8 tokens */
 
 static kmem_cache_t *rdk_gsi_rx_cache;
+static const uint8_t rdk_gsi_zero_mac[ETHERADDRL];
 
 static void rdk_gsi_recv_done(struct rdk_cq *, struct rdk_wc *);
 static void rdk_gsi_send_done(struct rdk_cq *, struct rdk_wc *);
@@ -206,6 +207,11 @@ rdk_gsi_recv_done(struct rdk_cq *cq, struct rdk_wc *wc)
 	g->rg_rx_out++;
 	rx->rx_gsi = g;
 	rx->rx_ip = ip;
+	rx->rx_has_smac = (wc->wc_flags & RDK_WC_WITH_SMAC) != 0 &&
+	    (wc->smac[0] & 0x01) == 0 &&
+	    bcmp(wc->smac, rdk_gsi_zero_mac, ETHERADDRL) != 0;
+	if (rx->rx_has_smac)
+		bcopy(wc->smac, rx->rx_smac, ETHERADDRL);
 	bcopy(buf + IBCM_GRH_LEN, rx->rx_mad, IBCM_MAD_LEN);
 out:
 	if (!repost)

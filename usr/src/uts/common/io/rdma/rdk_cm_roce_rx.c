@@ -79,8 +79,10 @@ rdk_ibconn_from(const rdk_ibconn_t *c, const rdk_gsi_rx_t *rx)
 }
 
 /*
- * A path back to the sender of a MAD from the neighbor cache alone, and
- * the held local GID it was sent to.
+ * A path back to the sender of a MAD, and the held local GID it was sent
+ * to.  The reply goes to the frame's own source MAC, for the packet's
+ * source IP, so that no reply depends on or starts a neighbor resolution;
+ * the neighbor cache serves only when the device gave no source MAC.
  */
 static int
 rdk_cm_roce_back(rdk_gsi_t *g, const rdk_gsi_rx_t *rx, rdk_gsi_path_t *gp)
@@ -100,6 +102,8 @@ rdk_cm_roce_back(rdk_gsi_t *g, const rdk_gsi_rx_t *rx, rdk_gsi_path_t *gp)
 			ret = ENETUNREACH;
 		else if (p.cp_local)
 			bcopy(p.cp_smac, gp->gp_dmac, ETHERADDRL);
+		else if (rx->rx_has_smac)
+			bcopy(rx->rx_smac, gp->gp_dmac, ETHERADDRL);
 		else
 			ret = rdk_cm_nexthop_lookup(GLOBAL_ZONEID,
 			    p.cp_ifindex, p.cp_nexthop, gp->gp_dmac);
