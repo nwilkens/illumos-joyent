@@ -271,7 +271,7 @@ rdk_ibconn_from_req(rdk_ibconn_t *c, const rdk_ibcm_msg_t *m,
 	c->ic_rguid = m->m_ca_guid;
 	c->ic_tid = m->m_tid;
 	c->ic_rqpn = m->m_qpn;
-	c->ic_rpsn = m->m_psn;
+	c->ic_spsn = m->m_psn;
 	c->ic_lip = h->ch_dst;
 	c->ic_rip = h->ch_src;
 	c->ic_lport = htons(port);
@@ -487,7 +487,7 @@ rdk_cm_roce_rep(rdk_gsi_t *g, const rdk_gsi_rx_t *rx, const rdk_ibcm_msg_t *m)
 		c->ic_rid = m->m_local_id;
 		c->ic_rguid = m->m_ca_guid;
 		c->ic_rqpn = m->m_qpn;
-		c->ic_rpsn = m->m_psn;
+		c->ic_spsn = m->m_psn;
 		c->ic_peer_resp_res = m->m_resp_res;
 		c->ic_peer_init_depth = m->m_init_depth;
 		c->ic_rnr_retry = m->m_rnr_retry;

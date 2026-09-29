@@ -152,7 +152,7 @@ rdk_ibconn_build(rdk_ibconn_t *c, const rdk_ibcm_act_t *a, uint8_t *buf)
 		m.m_remote_resp_to = RDK_IBCM_RESP_TIMEOUT;
 		m.m_transport = IBCM_TRANSPORT_RC;
 		m.m_flow_ctl = 1;
-		m.m_psn = c->ic_spsn;
+		m.m_psn = c->ic_rpsn;
 		m.m_local_resp_to = RDK_IBCM_RESP_TIMEOUT;
 		m.m_retry = c->ic_retry;
 		m.m_pkey = IBCM_PKEY_DEFAULT;
@@ -181,7 +181,7 @@ rdk_ibconn_build(rdk_ibconn_t *c, const rdk_ibcm_act_t *a, uint8_t *buf)
 	case IBCM_SEND_REP:
 		rdk_ibcm_msg_init(c, &m, IBCM_ATTR_REP);
 		m.m_qpn = c->ic_lqpn;
-		m.m_psn = c->ic_spsn;
+		m.m_psn = c->ic_rpsn;
 		m.m_resp_res = c->ic_resp_res;
 		m.m_init_depth = c->ic_init_depth;
 		m.m_target_ack_delay = dev->rd_attr.local_ca_ack_delay;

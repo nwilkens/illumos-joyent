@@ -66,8 +66,12 @@ typedef struct rdk_ibconn {
 	uint64_t		ic_dreq_tid;	/* the one we sent */
 	uint32_t		ic_lqpn;
 	uint32_t		ic_rqpn;
-	uint32_t		ic_spsn;	/* our starting PSN */
-	uint32_t		ic_rpsn;	/* the peer's */
+	/*
+	 * A REQ's or REP's Starting PSN is the one its sender expects to
+	 * receive (Linux cm.c), so ours goes out and the peer's is sent from.
+	 */
+	uint32_t		ic_spsn;	/* the peer's Starting PSN */
+	uint32_t		ic_rpsn;	/* ours, random */
 	ipaddr_t		ic_lip;
 	ipaddr_t		ic_rip;
 	uint16_t		ic_lport;	/* network order */

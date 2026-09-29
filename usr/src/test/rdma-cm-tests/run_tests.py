@@ -20,6 +20,7 @@ TESTS = (
     "qp_depth.py",
     "roce_reply.py",
     "roce_mtu.py",
+    "roce_psn.py",
     "term_codes.py",
     "third_party.py",
 )

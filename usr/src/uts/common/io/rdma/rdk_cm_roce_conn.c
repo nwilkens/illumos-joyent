@@ -138,9 +138,9 @@ rdk_ibconn_alloc(rdk_cm_dev_t *cd, uint32_t port, boolean_t active)
 	c->ic_gsi = g;
 	c->ic_port = port;
 	c->ic_fsm.f_active = active;
-	(void) random_get_pseudo_bytes((uint8_t *)&c->ic_spsn,
-	    sizeof (c->ic_spsn));
-	c->ic_spsn &= 0xffffff;
+	(void) random_get_pseudo_bytes((uint8_t *)&c->ic_rpsn,
+	    sizeof (c->ic_rpsn));
+	c->ic_rpsn &= 0xffffff;
 	return (c);
 }
 
