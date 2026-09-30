@@ -74,7 +74,7 @@ model(const uint8_t *b, size_t icd, uint64_t max, nvmf_sgl_t *out)
 	memset(out, 0, sizeof (*out));
 	out->nsl_addr = (uint64_t)addr;
 	if (type == 0 && sub == 1) {
-		if (d[12] | d[13] | d[14] || dir != 1)
+		if (dir != 1)
 			return (NVME_CQE_SC_GEN_INV_SGL_DESC);
 		len = d[8] | d[9] << 8 | d[10] << 16 | (uint32_t)d[11] << 24;
 		out->nsl_len = (uint32_t)len;
@@ -159,9 +159,11 @@ cases(void)
 	CHECK(new_sqe(0x02, 0, 0x01, 0, 4096, 0), 4096, 0, DESC);
 	CHECK(new_sqe(0x7f, 0x06, 0x01, 0, 16, 0), 16, 0, DESC);
 	CHECK(new_sqe(0x03, 0, 0x01, 0, 16, 0), 16, 0, DESC);
-	b = new_sqe(0x01, 0, 0x01, 0, 16, 0);
-	b[24 + 13] = 1;
-	CHECK(b, 16, 0, DESC);
+	/* Linux leaves an old key in the reserved bytes of this descriptor. */
+	b = new_sqe(0x01, 0, 0x01, 0, 4096, 0);
+	b[24 + 12] = 0xbd;
+	b[24 + 13] = 0x01;
+	CHECK(b, 4096, 0, OK);
 
 	/* Descriptor forms nobody should send here. */
 	CHECK(new_sqe(0x01, 0, 0x00, 0, 16, 0), 16, 0, DESC);
