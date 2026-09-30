@@ -147,6 +147,7 @@ def unit(replace=None):
     parts.append(typedef(NVME_H, "nvme_cqe_sf_t"))
     for name in ("nvme_sgl_t", "nvme_sqe_t", "nvme_cqe_t"):
         parts.append(typedef(NVME_REG_H, name))
+    parts.append(define(NVME_REG_H, "NVME_OPC_ASYNC_EVENT"))
     parts.append(typedef(NVMF_H, "nvmf_trtype_t"))
     parts.append(define(NVMF_H, "NVMF_SGL_SUBTYPE_INVALIDATE_KEY"))
     parts.append(_text(UTS / "sys/nvme/nvmf_transport.h"))

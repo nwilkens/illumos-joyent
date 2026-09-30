@@ -3,6 +3,7 @@
 device and the host (rdma_datapath.c), then check that the run fails once
 each guard it depends on is taken out."""
 
+from concurrent.futures import ThreadPoolExecutor
 import sys
 
 from rdma_host import HostFailure, mutant_fails, run
@@ -36,11 +37,16 @@ MUTANTS = (
             ("\t\t\twhile (!w.nw_done)\n\t\t\t\tcv_wait(&w.nw_cv, &w.nw_lock);\n"
              "\t\t\tstatus = w.nw_status;",
              "\t\t\tstatus = NVME_CQE_SC_GEN_SUCCESS;"),)}),
-    ("only a Connect waits for a response once freed", "plan", {
+    ("other commands freed unanswered give their contexts back", "plan", {
         "nvmf_rdma.c": (
-            ("\tif (c->nc_state == NR_C_ACTIVE && (q->nq_connected ||\n"
-             "\t    c->nc_cid != q->nq_connect_cid))\n"
+            ("\tif (c->nc_state == NR_C_ACTIVE && "
+             "!nr_cmd_answered_late(q, c))\n"
              "\t\tc->nc_state = NR_C_DONE;\n", ""),)}),
+    ("an accepted AER waits for its response", "plan", {
+        "nvmf_rdma.c": (
+            ("\treturn (q->nq_qid == 0 &&\n"
+             "\t    c->nc_nc.nc_sqe.sqe_opc == NVME_OPC_ASYNC_EVENT);",
+             "\treturn (B_FALSE);"),)}),
     ("a CID in use is fatal", "teardown", {
         "nvmf_rdma.c": (
             ("\tif (nr_cid_find_locked(q, c->nc_cid) != NULL) {",
@@ -80,8 +86,12 @@ def main():
         print(error)
         return 1
     status = 0
-    for what, group, replace in MUTANTS:
-        if mutant_fails(TEST, replace, (group,)):
+    # A mutant that loses a response waits out the host's deadline.
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        failed = list(pool.map(
+            lambda m: mutant_fails(TEST, m[2], (m[1],)), MUTANTS))
+    for (what, _, _), fails in zip(MUTANTS, failed):
+        if fails:
             print(f"PASS: {what} (a build without it fails)")
         else:
             print(f"FAIL: a build without the guard '{what}' passed")

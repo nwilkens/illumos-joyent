@@ -272,6 +272,7 @@ nr_free_data_buf(nvmf_databuf_t *db)
 #define	OPC_WRITE	0x01
 #define	OPC_READ	0x02
 #define	OPC_VREAD	0x06	/* a read that nvmft serves from kmem */
+#define	OPC_AER		0x0c	/* answered after nvmft frees it */
 
 typedef struct hcmd {
 	int		h_used;
@@ -318,12 +319,15 @@ static struct {
 	int		fail_at;	/* the RDMA request that fails */
 	int		hang_after;	/* WRs until the device stops */
 	int		dup_at;		/* the command that reuses a CID */
+	int		aer;		/* some commands are AERs */
 	int		executed;
 	int		lag;		/* requests between completion events */
 	int		slow_us;	/* the device's time per request */
 	int		nop[16];	/* executed, by opcode */
 	uint64_t	bytes;
 } M;
+
+static uint16_t mkq_qid = 1;
 
 /* The target works slowly on this CID, which the host then reuses. */
 static int tgt_slow_cid = -1;
@@ -920,7 +924,10 @@ host_new(void)
 	} else {
 		h->h_opc = OPC_READ;
 	}
-	if (h->h_opc == OPC_FLUSH) {
+	/* After the Connect, as a host sends them. */
+	if (M.aer && M.sent >= 2 * M.depth && h->h_cid % 16 == 9)
+		h->h_opc = OPC_AER;
+	if (h->h_opc == OPC_FLUSH || h->h_opc == OPC_AER) {
 		h->h_len = 0;
 	} else if (h->h_icd) {
 		h->h_len = rndr(1, M.icd);
@@ -1533,7 +1540,7 @@ tgt_work(void *arg)
 			tgt_data(tc, len, B_FALSE, opc == OPC_VREAD);
 		/* nvmft frees a Connect's capsule before it answers it. */
 		late = !tgt_hold && tgt_linger_us == 0 &&
-		    cid == NR_Q(nq)->nq_connect_cid;
+		    (cid == NR_Q(nq)->nq_connect_cid || opc == OPC_AER);
 		if (late)
 			nvmf_rdma_ops.free_capsule(nc);
 		if (opc == OPC_WRITE || len == 0) {
@@ -1614,7 +1621,7 @@ reset(void)
 	M.outstanding = M.to_send = M.sent = M.done = M.failed = 0;
 	M.mix = M.bad_sgls = M.rnr = M.sq_over = M.remote_read_mr = 0;
 	M.wrong_inv = M.early_rsp = M.fail_at = M.hang_after = 0;
-	M.dup_at = 0;
+	M.dup_at = M.aer = 0;
 	tgt_slow_cid = -1;
 	tgt_drop = 0;
 	M.executed = 0;
@@ -1674,7 +1681,7 @@ mkq(uint32_t depth, uint32_t icd)
 	dl.ndl_max_cqe = (uint32_t)dev.rd_attr.max_cqe;
 	dl.ndl_rw_wrs = l.rwl_wrs;
 	CHECK(nvmf_rdma_size_queue(depth, icd, &dl, &sz) == NVMF_RDMA_OK);
-	q = nr_queue_create(&ND, &sz, 1, icd, 0, &err);
+	q = nr_queue_create(&ND, &sz, mkq_qid, icd, 0, &err);
 	CHECK(q != NULL);
 	q->nq_nq.nq_ops = &nvmf_rdma_ops;
 	q->nq_nq.nq_controller = B_TRUE;
@@ -1812,7 +1819,21 @@ test_plan(void)
 		endq(q);
 	}
 
-	/* Only a Connect waits for a response after nvmft frees it. */
+	/* nvmft answers an accepted AER after it frees the capsule too. */
+	set_dev(0, 4096);
+	mkq_qid = 0;
+	q = mkq(16, 0);
+	(void) pthread_mutex_lock(&M.m);
+	M.aer = 1;
+	(void) pthread_mutex_unlock(&M.m);
+	run_host(q, 300, 16);
+	check_clean("AER");
+	CHECK(M.done == 300);
+	wait_free_cmds(q);
+	endq(q);
+	mkq_qid = 1;
+
+	/* Other commands nvmft frees unanswered give their contexts back. */
 	set_dev(0, 4096);
 	q = mkq(16, 8192);
 	tgt_drop = 1;
