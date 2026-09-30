@@ -260,8 +260,8 @@ typedef enum nr_cstate {
 
 /*
  * A command context.  nvmft owns the capsule until it frees it; the context
- * returns to the free list once that has happened and no work request that
- * names it remains.
+ * returns to the free list once that has happened, its response is posted
+ * or given up, and no work request that names it remains.
  */
 typedef struct nr_cmd {
 	struct nvmf_capsule	nc_nc;

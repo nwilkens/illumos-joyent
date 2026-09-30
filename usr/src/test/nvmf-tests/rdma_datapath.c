@@ -1443,6 +1443,7 @@ tgt_work(void *arg)
 	uint8_t opc = nc->nc_sqe.sqe_opc, sc;
 	uint16_t cid = nc->nc_sqe.sqe_cid;
 	uint32_t len;
+	boolean_t late;
 
 	tc->tc_seed = nc->nc_sqe.sqe_cdw10;
 	sc = nvmf_rdma_ops.validate_command_capsule(nc);
@@ -1457,9 +1458,20 @@ tgt_work(void *arg)
 			tgt_data(tc, len, B_TRUE, B_FALSE);
 		else if (len != 0)
 			tgt_data(tc, len, B_FALSE, opc == OPC_VREAD);
+		/* nvmft frees a Connect's capsule before it answers it. */
+		late = !tgt_hold && tgt_linger_us == 0 &&
+		    (cid & 3) == 0;
+		if (late)
+			nvmf_rdma_ops.free_capsule(nc);
 		if (opc == OPC_WRITE || len == 0) {
 			tgt_respond(nq, cid, tc->tc_failed ?
 			    NVME_CQE_SC_GEN_DATA_XFR_ERR : 0);
+		}
+		if (late) {
+			(void) pthread_mutex_destroy(&tc->tc_lock);
+			(void) pthread_cond_destroy(&tc->tc_cv);
+			free(tc);
+			return;
 		}
 	}
 	if (tgt_linger_us != 0)

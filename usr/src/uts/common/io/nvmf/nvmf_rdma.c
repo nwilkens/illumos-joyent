@@ -346,14 +346,17 @@ nr_backlog_kick_locked(nr_queue_t *q)
 	    &q->nq_backlog_ent);
 }
 
-/* Return a context once nvmft and the device are both done with it. */
+/*
+ * Return a context once nvmft and the device are both done with it and its
+ * response is posted or given up.
+ */
 void
 nr_cmd_rele_locked(nr_cmd_t *c)
 {
 	nr_queue_t *q = c->nc_q;
 
 	ASSERT(MUTEX_HELD(&q->nq_lock));
-	if (c->nc_capsule || c->nc_wrs != 0 || c->nc_state == NR_C_FREE)
+	if (c->nc_capsule || c->nc_wrs != 0 || c->nc_state != NR_C_DONE)
 		return;
 	nr_cid_remove_locked(q, c);
 	nr_cmd_unhold_locked(c);
@@ -814,8 +817,11 @@ nr_free_capsule(struct nvmf_capsule *nc)
 	mutex_enter(&q->nq_lock);
 	VERIFY(c->nc_capsule);
 	c->nc_capsule = B_FALSE;
-	if (c->nc_state == NR_C_ACTIVE)
-		c->nc_state = NR_C_DONE;
+	/*
+	 * nvmft answers a Connect after it frees the capsule, so an unanswered
+	 * command keeps its context until the response or the teardown.
+	 */
+	nr_cmd_unhold_locked(c);
 	nr_cmd_rele_locked(c);
 	mutex_exit(&q->nq_lock);
 	nr_queue_rele(q);

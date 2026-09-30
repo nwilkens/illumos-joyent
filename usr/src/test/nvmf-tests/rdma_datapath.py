@@ -27,6 +27,10 @@ MUTANTS = (
     ("an inline response names the CQE by its VA", "plan", {
         "nvmf_rdma.c": (
             ("\t\tc->nc_ssge.addr = (uint64_t)(uintptr_t)c->nc_cqe;\n", ""),)}),
+    ("a command freed unanswered waits for its response", "plan", {
+        "nvmf_rdma.c": (
+            ("c->nc_wrs != 0 || c->nc_state != NR_C_DONE)",
+             "c->nc_wrs != 0 || c->nc_state == NR_C_FREE)"),)}),
     ("a held RECV goes back before the response", "credit", {
         "nvmf_rdma.c": (
             ("\t\treturn (EALREADY);\n\tnr_cmd_unhold_locked(c);\n",
