@@ -36,6 +36,11 @@ MUTANTS = (
             ("\t\t\twhile (!w.nw_done)\n\t\t\t\tcv_wait(&w.nw_cv, &w.nw_lock);\n"
              "\t\t\tstatus = w.nw_status;",
              "\t\t\tstatus = NVME_CQE_SC_GEN_SUCCESS;"),)}),
+    ("only a Connect waits for a response once freed", "plan", {
+        "nvmf_rdma.c": (
+            ("\tif (c->nc_state == NR_C_ACTIVE && (q->nq_connected ||\n"
+             "\t    c->nc_cid != q->nq_connect_cid))\n"
+             "\t\tc->nc_state = NR_C_DONE;\n", ""),)}),
     ("a CID in use is fatal", "teardown", {
         "nvmf_rdma.c": (
             ("\tif (nr_cid_find_locked(q, c->nc_cid) != NULL) {",

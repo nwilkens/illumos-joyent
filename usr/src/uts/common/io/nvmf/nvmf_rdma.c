@@ -827,9 +827,12 @@ nr_free_capsule(struct nvmf_capsule *nc)
 	VERIFY(c->nc_capsule);
 	c->nc_capsule = B_FALSE;
 	/*
-	 * nvmft answers a Connect after it frees the capsule, so an unanswered
-	 * command keeps its context until the response or the teardown.
+	 * nvmft answers a Connect after it frees the capsule, so that command
+	 * keeps its context until the response or the teardown.
 	 */
+	if (c->nc_state == NR_C_ACTIVE && (q->nq_connected ||
+	    c->nc_cid != q->nq_connect_cid))
+		c->nc_state = NR_C_DONE;
 	nr_cmd_unhold_locked(c);
 	nr_cmd_rele_locked(c);
 	mutex_exit(&q->nq_lock);

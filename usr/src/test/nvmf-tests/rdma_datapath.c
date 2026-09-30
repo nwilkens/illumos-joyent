@@ -327,6 +327,8 @@ static struct {
 
 /* The target works slowly on this CID, which the host then reuses. */
 static int tgt_slow_cid = -1;
+/* The target frees some commands unanswered, and the host gives up. */
+static int tgt_drop;
 
 /* The device. */
 #define	DMA_LKEY	0x0d0a
@@ -1099,6 +1101,32 @@ host_response(const uint8_t *cqe, const swr_t *s)
 	host_fill();
 }
 
+/* The host gives up on a command, as after a timeout. */
+static void
+host_forget(uint16_t cid)
+{
+	hcmd_t *h = NULL;
+	int i;
+
+	(void) pthread_mutex_lock(&M.m);
+	for (i = 0; i < HMAX; i++) {
+		if (M.cmds[i].h_used && !M.cmds[i].h_done &&
+		    M.cmds[i].h_cid == cid)
+			h = &M.cmds[i];
+	}
+	CHECK(h != NULL);
+	h->h_done = 1;
+	free(h->h_buf);
+	free(h->h_want);
+	h->h_used = 0;
+	M.outstanding--;
+	M.done++;
+	(void) pthread_cond_broadcast(&M.hcv);
+	host_fill();
+	(void) pthread_cond_broadcast(&M.cv);
+	(void) pthread_mutex_unlock(&M.m);
+}
+
 /*
  * The device thread: work requests in order, then the host's sends, and a
  * QP in error flushes everything unless the device is dead.
@@ -1481,6 +1509,14 @@ tgt_work(void *arg)
 	tc->tc_seed = nc->nc_sqe.sqe_cdw10;
 	if (cid == tgt_slow_cid)
 		(void) usleep(100000);
+	if (tgt_drop && (cid % 16) == 5 && cid != NR_Q(nq)->nq_connect_cid) {
+		nvmf_rdma_ops.free_capsule(nc);
+		host_forget(cid);
+		(void) pthread_mutex_destroy(&tc->tc_lock);
+		(void) pthread_cond_destroy(&tc->tc_cv);
+		free(tc);
+		return;
+	}
 	sc = nvmf_rdma_ops.validate_command_capsule(nc);
 	if (sc != 0) {
 		tgt_respond(nq, cid, sc);
@@ -1497,7 +1533,7 @@ tgt_work(void *arg)
 			tgt_data(tc, len, B_FALSE, opc == OPC_VREAD);
 		/* nvmft frees a Connect's capsule before it answers it. */
 		late = !tgt_hold && tgt_linger_us == 0 &&
-		    (cid & 3) == 0;
+		    cid == NR_Q(nq)->nq_connect_cid;
 		if (late)
 			nvmf_rdma_ops.free_capsule(nc);
 		if (opc == OPC_WRITE || len == 0) {
@@ -1580,6 +1616,7 @@ reset(void)
 	M.wrong_inv = M.early_rsp = M.fail_at = M.hang_after = 0;
 	M.dup_at = 0;
 	tgt_slow_cid = -1;
+	tgt_drop = 0;
 	M.executed = 0;
 	M.lag = 0;
 	M.slow_us = 0;
@@ -1671,6 +1708,28 @@ endq(nr_queue_t *q)
 	(void) pthread_mutex_unlock(&M.m);
 }
 
+/* Every context is back on the free list once the queue is quiet. */
+static void
+wait_free_cmds(nr_queue_t *q)
+{
+	hrtime_t end = gethrtime() + SEC2NSEC(5);
+	nr_cmd_t *c;
+	uint_t n;
+
+	for (;;) {
+		mutex_enter(&q->nq_lock);
+		n = 0;
+		for (c = list_head(&q->nq_free_cmds); c != NULL;
+		    c = list_next(&q->nq_free_cmds, c))
+			n++;
+		mutex_exit(&q->nq_lock);
+		if (n == q->nq_sz.nrs_cmds)
+			return;
+		CHECK(gethrtime() < end);
+		(void) usleep(1000);
+	}
+}
+
 /* Send total commands, depth at a time, until done or the QP fails. */
 static void
 run_host(nr_queue_t *q, int total, int depth)
@@ -1752,6 +1811,16 @@ test_plan(void)
 		CHECK(M.done == 120);
 		endq(q);
 	}
+
+	/* Only a Connect waits for a response after nvmft frees it. */
+	set_dev(0, 4096);
+	q = mkq(16, 8192);
+	tgt_drop = 1;
+	run_host(q, 300, 16);
+	check_clean("dropped");
+	CHECK(M.done == 300);
+	wait_free_cmds(q);
+	endq(q);
 	(void) printf("PASS: transfers land only within their SGL\n");
 }
 
