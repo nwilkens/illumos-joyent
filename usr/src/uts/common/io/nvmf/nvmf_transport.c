@@ -587,8 +587,8 @@ nvmf_sgl_decode(const nvme_sqe_t *sqe, size_t icd_len, uint64_t max_len,
 
 	if (type == NVMF_SGL_DATA_BLOCK &&
 	    subtype == NVMF_SGL_SUBTYPE_OFFSET) {
-		if (d[12] != 0 || d[13] != 0 || d[14] != 0 ||
-		    nvmf_sqe_xfer_dir(sqe) != NVMF_XFER_HOST_TO_CTRLR)
+		/* Linux leaves an old key in reserved bytes 12-14. */
+		if (nvmf_sqe_xfer_dir(sqe) != NVMF_XFER_HOST_TO_CTRLR)
 			return (NVME_CQE_SC_GEN_INV_SGL_DESC);
 		sgl->nsl_len = (uint32_t)d[8] | (uint32_t)d[9] << 8 |
 		    (uint32_t)d[10] << 16 | (uint32_t)d[11] << 24;
