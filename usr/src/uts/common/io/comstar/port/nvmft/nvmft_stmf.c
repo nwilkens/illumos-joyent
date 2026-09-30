@@ -1151,6 +1151,19 @@ nvmft_xfer_end(scsi_task_t *task)
 	return (B_TRUE);
 }
 
+/*
+ * The transport refused a transfer.  sbd waits for every dbuf it hands out
+ * and does not act on an error from stmf_xfer_data(), so the dbuf goes back
+ * failed; otherwise the task waits for STMF's task timeout.
+ */
+static stmf_status_t
+nvmft_xfer_refused(scsi_task_t *task, stmf_data_buf_t *dbuf, boolean_t *donep)
+{
+	dbuf->db_xfer_status = STMF_FAILURE;
+	*donep = nvmft_xfer_end(task);
+	return (*donep ? STMF_SUCCESS : STMF_ABORTED);
+}
+
 static boolean_t
 nvmft_xfer_arrive(nvmft_xfer_t *nx, uint_t who)
 {
@@ -1386,8 +1399,7 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 			goto done;
 		}
 		if (error != 0) {
-			ret = nvmft_xfer_end(task) ? STMF_ALLOC_FAILURE :
-			    STMF_ABORTED;
+			ret = nvmft_xfer_refused(task, dbuf, &do_xfer_done);
 			goto done;
 		}
 	} else {
@@ -1398,8 +1410,7 @@ nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
 		if (error != 0) {
 			(void) nvmft_printf(nvmft_qpair_ctrlr(qp),
 			    "Failed to request capsule data: 0x%x\n", error);
-			ret = nvmft_xfer_end(task) ? STMF_FAILURE :
-			    STMF_ABORTED;
+			ret = nvmft_xfer_refused(task, dbuf, &do_xfer_done);
 			goto done;
 		}
 	}

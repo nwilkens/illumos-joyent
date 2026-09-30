@@ -95,9 +95,10 @@ uint32_t nvmft_qpair_caps(struct nvmft_qpair *);
         parts.append(define(stmf, name))
     for name in ("nvmft_task_priv_t", "nvmft_internal_io_t", "nvmft_xfer_t"):
         parts.append(typedef(stmf, name))
-    for name in ("nvmft_xfer_begin", "nvmft_xfer_end", "nvmft_xfer_arrive",
-                 "nvmft_xfer_finish", "nvmft_datamove_out_cb",
-                 "nvmft_datamove_in_cb", "nvmft_lport_abort"):
+    for name in ("nvmft_xfer_begin", "nvmft_xfer_end", "nvmft_xfer_refused",
+                 "nvmft_xfer_arrive", "nvmft_xfer_finish",
+                 "nvmft_datamove_out_cb", "nvmft_datamove_in_cb",
+                 "nvmft_lport_abort"):
         parts.append(function(stmf, name))
     run_c(TESTDIR / "send_once.c", {"send.h": "\n".join(parts)})
 
