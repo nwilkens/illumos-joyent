@@ -27,9 +27,9 @@ typedef struct { uint64_t dmac_laddress; size_t dmac_size; } ddi_dma_cookie_t;
                  "NVME_CQE_SC_GEN_INV_SGL_OFF"):
         parts.append(define(NVME_H, name))
     parts.append(define(NVMF_H, "NVMF_SGL_SUBTYPE_INVALIDATE_KEY"))
-    for name in ("NVME_PSDT_SGL", "NVMF_FABRICS_OPC", "NVMF_SGL_DATA_BLOCK",
-                 "NVMF_SGL_KEYED_DATA_BLOCK", "NVMF_SGL_SUBTYPE_ADDRESS",
-                 "NVMF_SGL_SUBTYPE_OFFSET"):
+    for name in ("NVME_PSDT_SGL", "NVMF_SQE_PSDT", "NVMF_FABRICS_OPC",
+                 "NVMF_SGL_DATA_BLOCK", "NVMF_SGL_KEYED_DATA_BLOCK",
+                 "NVMF_SGL_SUBTYPE_ADDRESS", "NVMF_SGL_SUBTYPE_OFFSET"):
         parts.append(define(internal, name))
     parts.append(define(core, "NVMF_XFER_HOST_TO_CTRLR"))
     for name in ("nvme_sgl_t", "nvme_sqe_t"):

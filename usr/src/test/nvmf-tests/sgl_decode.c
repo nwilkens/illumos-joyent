@@ -40,7 +40,8 @@ new_sqe(uint8_t opc, uint8_t fctype, uint8_t type, uint64_t addr,
 	int i;
 
 	b[0] = opc;
-	b[1] = 0x80;
+	/* PSDT, bits 7:6 of byte 1, is 01b: SGLs, as Linux sends. */
+	b[1] = 0x40;
 	b[4] = fctype;
 	for (i = 0; i < 8; i++)
 		d[i] = (uint8_t)(addr >> (8 * i));
@@ -65,7 +66,7 @@ model(const uint8_t *b, size_t icd, uint64_t max, nvmf_sgl_t *out)
 	unsigned __int128 addr = 0, len;
 	int i;
 
-	if (((b[1] >> 7) & 1) != 1)
+	if ((b[1] >> 6) != 1)
 		return (NVME_CQE_SC_GEN_INV_FLD);
 	for (i = 0; i < 8; i++)
 		addr |= (unsigned __int128)d[i] << (8 * i);
@@ -168,9 +169,20 @@ cases(void)
 	CHECK(new_sqe(0x01, 0, 0x20, 0, 16, 0), 16, 0, DESC);
 	CHECK(new_sqe(0x01, 0, 0x30, 0, 16, 0), 16, 0, DESC);
 	CHECK(new_sqe(0x01, 0, 0xf0, 0, 16, 0), 16, 0, DESC);
+	/* PRP, and the PSDT values the spec reserves or gives to metadata. */
 	b = new_sqe(0x02, 0, 0x40, 0, 16, 1);
-	b[1] = 0x40;
+	b[1] = 0x00;
 	CHECK(b, 0, 0, NVME_CQE_SC_GEN_INV_FLD);
+	b = new_sqe(0x02, 0, 0x40, 0, 16, 1);
+	b[1] = 0x80;
+	CHECK(b, 0, 0, NVME_CQE_SC_GEN_INV_FLD);
+	b = new_sqe(0x02, 0, 0x40, 0, 16, 1);
+	b[1] = 0xc0;
+	CHECK(b, 0, 0, NVME_CQE_SC_GEN_INV_FLD);
+	/* The other bits of byte 1 (FUSE and reserved) do not matter here. */
+	b = new_sqe(0x02, 0, 0x40, 0, 16, 1);
+	b[1] = 0x7f;
+	CHECK(b, 0, 0, OK);
 }
 
 static void
@@ -191,7 +203,7 @@ fuzz(unsigned long iters)
 		for (j = 0; j < 64; j++)
 			b[j] = (uint8_t)next();
 		if (next() & 1) {
-			b[1] |= 0x80;
+			b[1] = (b[1] & 0x3f) | 0x40;
 			b[24 + 15] = types[next() % sizeof (types)];
 		}
 		if (next() & 1) {

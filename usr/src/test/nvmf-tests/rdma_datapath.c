@@ -994,7 +994,7 @@ host_send(hcmd_t *h)
 
 	bzero(sqe, sizeof (sqe));
 	sqe[0] = h->h_opc;
-	sqe[1] = 0x80;
+	sqe[1] = 0x40;
 	put_le(sqe + 2, h->h_cid, 2);
 	put_le(sqe + 4, 1, 4);
 	memcpy(sqe + 24, h->h_sgl, 16);
