@@ -808,20 +808,6 @@ nr_allocate_capsule(struct nvmf_qpair *nq, int how)
 	return (&rs->rs_nc);
 }
 
-/*
- * nvmft answers a Connect, and an Asynchronous Event Request it accepted,
- * after it frees the capsule; such a command keeps its context until the
- * response or the teardown.  nvmft accepts a bounded number of AERs.
- */
-static boolean_t
-nr_cmd_answered_late(const nr_queue_t *q, const nr_cmd_t *c)
-{
-	if (!q->nq_connected)
-		return (c->nc_cid == q->nq_connect_cid);
-	return (q->nq_qid == 0 &&
-	    c->nc_nc.nc_sqe.sqe_opc == NVME_OPC_ASYNC_EVENT);
-}
-
 static void
 nr_free_capsule(struct nvmf_capsule *nc)
 {
@@ -840,7 +826,8 @@ nr_free_capsule(struct nvmf_capsule *nc)
 	mutex_enter(&q->nq_lock);
 	VERIFY(c->nc_capsule);
 	c->nc_capsule = B_FALSE;
-	if (c->nc_state == NR_C_ACTIVE && !nr_cmd_answered_late(q, c))
+	/* A deferred response still finds its command until it is posted. */
+	if (c->nc_state == NR_C_ACTIVE && !nc->nc_deferred)
 		c->nc_state = NR_C_DONE;
 	nr_cmd_unhold_locked(c);
 	nr_cmd_rele_locked(c);

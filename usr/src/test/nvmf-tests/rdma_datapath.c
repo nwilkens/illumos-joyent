@@ -924,8 +924,7 @@ host_new(void)
 	} else {
 		h->h_opc = OPC_READ;
 	}
-	/* After the Connect, as a host sends them. */
-	if (M.aer && M.sent >= 2 * M.depth && h->h_cid % 16 == 9)
+	if (M.aer && h->h_cid % 16 == 9)
 		h->h_opc = OPC_AER;
 	if (h->h_opc == OPC_FLUSH || h->h_opc == OPC_AER) {
 		h->h_len = 0;
@@ -1541,8 +1540,10 @@ tgt_work(void *arg)
 		/* nvmft frees a Connect's capsule before it answers it. */
 		late = !tgt_hold && tgt_linger_us == 0 &&
 		    (cid == NR_Q(nq)->nq_connect_cid || opc == OPC_AER);
-		if (late)
+		if (late) {
+			nvmf_capsule_defer_response(nc);
 			nvmf_rdma_ops.free_capsule(nc);
+		}
 		if (opc == OPC_WRITE || len == 0) {
 			tgt_respond(nq, cid, tc->tc_failed ?
 			    NVME_CQE_SC_GEN_DATA_XFR_ERR : 0);

@@ -305,6 +305,9 @@ struct nvmf_capsule {
 	boolean_t	nc_send_data;
 	struct nvmf_io_request nc_data;
 
+	/* The consumer answers this command after it frees the capsule. */
+	boolean_t	nc_deferred;
+
 	/* Per-command state of the consumer, so it need not allocate. */
 	uint64_t	nc_consumer[NVMF_CAPSULE_CONSUMER_WORDS];
 };

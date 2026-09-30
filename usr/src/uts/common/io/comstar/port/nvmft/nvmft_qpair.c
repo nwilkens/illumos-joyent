@@ -498,6 +498,7 @@ nvmft_connect_finish(struct nvmft_qpair *qp)
 
 	/* The capsule goes back to the transport before the queue is live. */
 	(void) memcpy(&cmdc, cmd, sizeof (cmdc));
+	nvmf_capsule_defer_response(qp->qp_connect_nc);
 	nvmf_free_capsule(qp->qp_connect_nc);
 	qp->qp_connect_nc = NULL;
 

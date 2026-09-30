@@ -147,7 +147,6 @@ def unit(replace=None):
     parts.append(typedef(NVME_H, "nvme_cqe_sf_t"))
     for name in ("nvme_sgl_t", "nvme_sqe_t", "nvme_cqe_t"):
         parts.append(typedef(NVME_REG_H, name))
-    parts.append(define(NVME_REG_H, "NVME_OPC_ASYNC_EVENT"))
     parts.append(typedef(NVMF_H, "nvmf_trtype_t"))
     parts.append(define(NVMF_H, "NVMF_SGL_SUBTYPE_INVALIDATE_KEY"))
     parts.append(_text(UTS / "sys/nvme/nvmf_transport.h"))
@@ -156,7 +155,7 @@ def unit(replace=None):
     parts.append(define(core, "NVMF_XFER_HOST_TO_CTRLR"))
     for name in ("nvmf_memdesc_copy", "nvmf_memdesc_copyin",
                  "nvmf_memdesc_copyout", "nvmf_sqe_xfer_dir",
-                 "nvmf_sgl_decode"):
+                 "nvmf_sgl_decode", "nvmf_capsule_defer_response"):
         parts.append(function(core, name))
     parts.append(_text(UTS / "sys/nvme/nvmf_rdma.h"))
     parts.append(_text(NVMF / "nvmf_rdma_impl.h",

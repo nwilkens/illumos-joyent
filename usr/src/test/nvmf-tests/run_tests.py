@@ -12,6 +12,7 @@ TESTS = (
     "connect_checks.py",
     "identify_sgls.py",
     "log_page_len.py",
+    "nvmft_defer.py",
     "rdma_datapath.py",
     "rdma_locks.py",
     "rdma_subr.py",

@@ -32,6 +32,10 @@ MUTANTS = (
         "nvmf_rdma.c": (
             ("c->nc_wrs != 0 || c->nc_state != NR_C_DONE)",
              "c->nc_wrs != 0 || c->nc_state == NR_C_FREE)"),)}),
+    ("a deferred response keeps its command", "plan", {
+        "nvmf_rdma.c": (
+            ("c->nc_state == NR_C_ACTIVE && !nc->nc_deferred)",
+             "c->nc_state == NR_C_ACTIVE)"),)}),
     ("admin data is out before its response", "plan", {
         "nvmf_rdma_xfer.c": (
             ("\t\t\twhile (!w.nw_done)\n\t\t\t\tcv_wait(&w.nw_cv, &w.nw_lock);\n"
@@ -39,14 +43,8 @@ MUTANTS = (
              "\t\t\tstatus = NVME_CQE_SC_GEN_SUCCESS;"),)}),
     ("other commands freed unanswered give their contexts back", "plan", {
         "nvmf_rdma.c": (
-            ("\tif (c->nc_state == NR_C_ACTIVE && "
-             "!nr_cmd_answered_late(q, c))\n"
+            ("\tif (c->nc_state == NR_C_ACTIVE && !nc->nc_deferred)\n"
              "\t\tc->nc_state = NR_C_DONE;\n", ""),)}),
-    ("an accepted AER waits for its response", "plan", {
-        "nvmf_rdma.c": (
-            ("\treturn (q->nq_qid == 0 &&\n"
-             "\t    c->nc_nc.nc_sqe.sqe_opc == NVME_OPC_ASYNC_EVENT);",
-             "\treturn (B_FALSE);"),)}),
     ("a CID in use is fatal", "teardown", {
         "nvmf_rdma.c": (
             ("\tif (nr_cid_find_locked(q, c->nc_cid) != NULL) {",

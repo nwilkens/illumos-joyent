@@ -122,6 +122,11 @@ struct nvmf_capsule *nvmf_allocate_command(struct nvmf_qpair *qp,
 struct nvmf_capsule *nvmf_allocate_response(struct nvmf_qpair *qp,
     const void *cqe, int how);
 void	nvmf_free_capsule(struct nvmf_capsule *nc);
+/*
+ * Mark a command whose response the controller sends after it frees the
+ * capsule, as for a Connect or an accepted Asynchronous Event Request.
+ */
+void	nvmf_capsule_defer_response(struct nvmf_capsule *nc);
 int	nvmf_capsule_append_data(struct nvmf_capsule *nc,
     struct nvmf_memdesc *mem, size_t len, boolean_t send,
     nvmf_io_complete_t *complete_cb, void *cb_arg);
