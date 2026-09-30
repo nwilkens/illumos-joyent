@@ -497,6 +497,7 @@ enum rdk_wr_opcode {
 #define	RDK_SEND_FENCE		(1 << 0)
 #define	RDK_SEND_SIGNALED	(1 << 1)
 #define	RDK_SEND_SOLICITED	(1 << 2)
+/* An inline SEND's SGE addresses are kernel virtual addresses. */
 #define	RDK_SEND_INLINE		(1 << 3)
 
 /* The layout matches the device's scatter-gather element. */

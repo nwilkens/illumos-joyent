@@ -131,9 +131,14 @@ nr_queue_gone(nr_queue_t *q)
 }
 
 /*
- * Memory the device may reach: every DMA buffer and pool buffer, with its
- * physical address equal to its virtual one.
+ * Memory the device may reach: every DMA buffer and pool buffer.  Its
+ * physical address differs from its virtual one, so that the device finds
+ * nothing at a virtual address and the CPU nothing at a physical one.
  */
+#define	DM_SKEW	(1ULL << 62)
+#define	DM_PA(va)	((uint64_t)(uintptr_t)(va) ^ DM_SKEW)
+#define	DM_VA(pa)	((void *)(uintptr_t)((pa) ^ DM_SKEW))
+
 #define	NDMA	8192
 static pthread_mutex_t dm_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct { uint64_t pa; size_t len; } dm[NDMA];
@@ -150,7 +155,7 @@ dm_alloc(size_t len)
 	for (i = 0; i < NDMA && dm[i].len != 0; i++)
 		;
 	CHECK(i < NDMA);
-	dm[i].pa = (uint64_t)(uintptr_t)p;
+	dm[i].pa = DM_PA(p);
 	dm[i].len = len;
 	(void) pthread_mutex_unlock(&dm_lock);
 	return (p);
@@ -162,7 +167,7 @@ dm_free(void *p)
 	int i;
 
 	(void) pthread_mutex_lock(&dm_lock);
-	for (i = 0; i < NDMA && dm[i].pa != (uint64_t)(uintptr_t)p; i++)
+	for (i = 0; i < NDMA && dm[i].pa != DM_PA(p); i++)
 		;
 	CHECK(i < NDMA);
 	dm[i].pa = 0;
@@ -192,7 +197,7 @@ rdk_dma_buf_alloc(struct rdk_device *d, size_t len, rdk_dma_buf_t *b)
 	(void) d;
 	bzero(b, sizeof (*b));
 	b->rdb_va = dm_alloc(len);
-	b->rdb_pa = (uint64_t)(uintptr_t)b->rdb_va;
+	b->rdb_pa = DM_PA(b->rdb_va);
 	b->rdb_len = len;
 	return (0);
 }
@@ -220,7 +225,7 @@ nr_buf_alloc(nr_dev_t *nd, size_t len, size_t min_len)
 	b->nb_dev = nd;
 	b->nb_len = len;
 	b->nb_va = dm_alloc(len);
-	b->nb_ck.dmac_laddress = (uint64_t)(uintptr_t)b->nb_va;
+	b->nb_ck.dmac_laddress = DM_PA(b->nb_va);
 	b->nb_ck.dmac_size = len;
 	__atomic_add_fetch(&pool_bufs, 1, __ATOMIC_SEQ_CST);
 	return (b);
@@ -568,6 +573,9 @@ fake_post_send(struct rdk_qp *qp, const struct rdk_send_wr *wr,
 			memcpy(s->pages, fm->fm_pages, sizeof (s->pages));
 		} else if ((wr->send_flags & RDK_SEND_INLINE) != 0) {
 			CHECK(wr->num_sge == 1 && wr->sg_list[0].length <= 16);
+			/* The provider copies inline data from a kernel VA. */
+			CHECK(dm_ok(DM_PA(wr->sg_list[0].addr),
+			    wr->sg_list[0].length));
 			memcpy(s->inl, (void *)(uintptr_t)wr->sg_list[0].addr,
 			    wr->sg_list[0].length);
 		}
@@ -713,7 +721,7 @@ sink(const struct rdk_sge *sg, enum rdk_wc_status *st)
 			*st = RDK_WC_LOC_PROT_ERR;
 			return (NULL);
 		}
-		return ((uint8_t *)(uintptr_t)sg->addr);
+		return (DM_VA(sg->addr));
 	}
 	if ((fm = mr_by_key(sg->lkey)) == NULL ||
 	    (fm->fm_access & RDK_ACCESS_LOCAL_WRITE) == 0 ||
@@ -730,7 +738,7 @@ sink(const struct rdk_sge *sg, enum rdk_wc_status *st)
 		*st = RDK_WC_LOC_PROT_ERR;
 		return (NULL);
 	}
-	return ((uint8_t *)(uintptr_t)(fm->fm_hw[pg] + off % PAGESIZE));
+	return (DM_VA(fm->fm_hw[pg] + off % PAGESIZE));
 }
 
 static void host_response(const uint8_t *cqe, const swr_t *s);
@@ -768,8 +776,8 @@ exec_wr(swr_t *s, uint32_t *lenp)
 				if (sg->lkey != DMA_LKEY ||
 				    !dm_ok(sg->addr, sg->length))
 					return (RDK_WC_LOC_PROT_ERR);
-				memcpy(h->h_buf + pos,
-				    (void *)(uintptr_t)sg->addr, sg->length);
+				memcpy(h->h_buf + pos, DM_VA(sg->addr),
+				    sg->length);
 			} else {
 				uint32_t j;
 
@@ -823,7 +831,7 @@ exec_wr(swr_t *s, uint32_t *lenp)
 			if (s->sge[0].lkey != DMA_LKEY ||
 			    !dm_ok(s->sge[0].addr, 16))
 				return (RDK_WC_LOC_PROT_ERR);
-			host_response((uint8_t *)(uintptr_t)s->sge[0].addr, s);
+			host_response(DM_VA(s->sge[0].addr), s);
 		}
 		*lenp = 16;
 		return (RDK_WC_SUCCESS);
@@ -1014,9 +1022,9 @@ host_send(hcmd_t *h)
 		fq->fq_err = 1;
 		return;
 	}
-	memcpy((void *)(uintptr_t)r.sge.addr, sqe, 64);
+	memcpy(DM_VA(r.sge.addr), sqe, 64);
 	if (n != 0) {
-		memcpy((void *)(uintptr_t)(r.sge.addr + 64), h->h_buf, n);
+		memcpy(DM_VA(r.sge.addr + 64), h->h_buf, n);
 	}
 	cq_push(fq->fq_qp.recv_cq, r.cqe, RDK_WC_SUCCESS, RDK_WC_RECV,
 	    64 + n);

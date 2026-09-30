@@ -24,6 +24,9 @@ MUTANTS = (
              "c->nc_sgl.nsl_keyed &&"),),
         "nvmf_rdma_xfer.c": (
             ("if (ret == 0 && c->nc_sgl.nsl_invalidate)", "if (ret == 0)"),)}),
+    ("an inline response names the CQE by its VA", "plan", {
+        "nvmf_rdma.c": (
+            ("\t\tc->nc_ssge.addr = (uint64_t)(uintptr_t)c->nc_cqe;\n", ""),)}),
     ("a held RECV goes back before the response", "credit", {
         "nvmf_rdma.c": (
             ("\t\treturn (EALREADY);\n\tnr_cmd_unhold_locked(c);\n",

@@ -514,8 +514,10 @@ nr_respond_locked(nr_cmd_t *c, const nvme_cqe_t *cqe,
 	c->nc_swr.num_sge = 1;
 	c->nc_swr.opcode = RDK_WR_SEND;
 	c->nc_swr.send_flags = RDK_SEND_SIGNALED;
-	if (q->nq_inline)
+	if (q->nq_inline) {
+		c->nc_ssge.addr = (uint64_t)(uintptr_t)c->nc_cqe;
 		c->nc_swr.send_flags |= RDK_SEND_INLINE;
+	}
 	/* The host's key is ours to invalidate only if its SGL was valid. */
 	if (inv && c->nc_sgl_done && c->nc_sgl_sc == 0 &&
 	    c->nc_sgl.nsl_keyed && c->nc_sgl.nsl_invalidate &&
