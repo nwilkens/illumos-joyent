@@ -24,6 +24,10 @@
  *	rccycle[=n]	n connect/teardown cycles, with the time each
  *			connection took to come up and to go down
  *	rcgsi		the GSI agent's counters: nothing was dropped
+ *	rcearly		a REJ sent before the way back is resolved reaches
+ *			A (run with rdk_cm_roce_max_resolving set to 0)
+ *	rcrejto		A gives up while B decides: A's REJ (Timeout, no
+ *			remote ID) ends B's side at once
  */
 
 #include <sys/types.h>
@@ -346,6 +350,65 @@ t_rcgsi(peer_t *a, peer_t *b)
 	(void) kstat_close(kc);
 }
 
+static void
+t_rcearly(peer_t *a, peer_t *b)
+{
+	const uint16_t port = iw_port();
+	rdmat_cm_t c;
+	uint32_t baddr, slot;
+	uint64_t t0, ms;
+	int ret;
+
+	iw_no_pair = 1;
+	ret = fresh(a, b, RDMAT_QPT_RC, RDMAT_POLL_TASKQ);
+	iw_no_pair = 0;
+	if (ret != 0 || iw_listen(b, port, o_ip, RDMAT_CM_AUTO, &baddr,
+	    &slot) != 0) {
+		result(0, "rcearly", "setup failed");
+		return;
+	}
+	t0 = now_ns();
+	ret = rc_connect(a, baddr, port, 5000, &c);
+	ms = (now_ns() - t0) / 1000000;
+	result(ret == ECONNREFUSED && c.rcm_reason == RC_REJ_CONSUMER &&
+	    ms < 1000, "rcearly", "resolution refused: %s, reason %u after "
+	    "%llu ms", strerror(ret), c.rcm_reason, (unsigned long long)ms);
+	iw_cm_init(&c, RDMAT_CM_UNLISTEN, slot);
+	(void) pio(b, RDMAT_IOC_CM, &c);
+}
+
+static void
+t_rcrejto(peer_t *a, peer_t *b)
+{
+	const uint16_t port = iw_port();
+	rdmat_cm_t c;
+	uint32_t baddr, slot;
+	int ret, i;
+
+	iw_no_pair = 1;
+	ret = fresh(a, b, RDMAT_QPT_RC, RDMAT_POLL_TASKQ);
+	iw_no_pair = 0;
+	if (ret != 0 || iw_listen(b, port, o_ip, RDMAT_CM_AUTO |
+	    RDMAT_CM_SLOW, &baddr, &slot) != 0) {
+		result(0, "rcrejto", "setup failed");
+		return;
+	}
+	ret = rc_connect(a, baddr, port, 100, &c);
+	/* B decides 500 ms after the request; give it a second more. */
+	for (i = 0; i < 15; i++) {
+		(void) usleep(100000);
+		iw_cm_init(&c, RDMAT_CM_STATUS, slot);
+		if (pio(b, RDMAT_IOC_CM, &c) != 0 || c.rcm_rejects != 0)
+			break;
+	}
+	result(ret != 0 && c.rcm_reqs == 1 && c.rcm_accepts == 0 &&
+	    c.rcm_live == 0, "rcrejto", "A gave up (%s); B: %u requests, "
+	    "%u accepted, %u refused, %u still live", strerror(ret),
+	    c.rcm_reqs, c.rcm_accepts, c.rcm_rejects, c.rcm_live);
+	iw_cm_init(&c, RDMAT_CM_UNLISTEN, slot);
+	(void) pio(b, RDMAT_IOC_CM, &c);
+}
+
 /* Returns nonzero for a name that is not a RoCE CM test. */
 int
 rc_test(peer_t *a, peer_t *b, const char *t)
@@ -358,6 +421,10 @@ rc_test(peer_t *a, peer_t *b, const char *t)
 		t_rccycle(a, b, t[7] == '=' ? (uint32_t)atoi(t + 8) : 1000);
 	else if (strcmp(t, "rcgsi") == 0)
 		t_rcgsi(a, b);
+	else if (strcmp(t, "rcearly") == 0)
+		t_rcearly(a, b);
+	else if (strcmp(t, "rcrejto") == 0)
+		t_rcrejto(a, b);
 	else
 		return (-1);
 	return (0);

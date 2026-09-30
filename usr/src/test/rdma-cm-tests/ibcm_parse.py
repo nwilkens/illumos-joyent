@@ -10,8 +10,17 @@ from cm_test import CTestFailure, RDMA, TESTDIR, run_c
 
 # Each mutation drops one check a peer could otherwise get past.
 MUTATIONS = (
-    ("rdk_ibcm_msg.c", "\t\t    m->m_ari_len > IBCM_REJ_ARI_MAX) {",
-     "\t\t    B_FALSE) {"),
+    ("rdk_ibcm_msg.c", "\t\tif (m->m_msg > 2 || m->m_ari_len > "
+     "IBCM_REJ_ARI_MAX) {", "\t\tif (m->m_msg > 2) {"),
+    # The rule before Linux interop: every REJ needs a remote ID.
+    ("rdk_ibcm_msg.c", "\t\tif (m->m_msg > 2 || m->m_ari_len > "
+     "IBCM_REJ_ARI_MAX) {", "\t\tif (m->m_remote_id == 0 || m->m_msg > 2 ||"
+     "\n\t\t    m->m_ari_len > IBCM_REJ_ARI_MAX) {"),
+    ("rdk_ibcm_msg.c", "\t\tif (m->m_remote_id == 0 && "
+     "!rdk_ibcm_rej_by_guid(m, NULL))", "\t\tif (B_FALSE)"),
+    ("rdk_ibcm_msg.c", "m->m_reason != IBCM_REJ_TIMEOUT ||", ""),
+    ("rdk_ibcm_msg.c", "\t    m->m_ari_len < 8 || m->m_local_id == 0)",
+     "\t    m->m_local_id == 0)"),
     ("rdk_ibcm_msg.c", "\t    !rdk_ibcm_qpn_ok(m->m_qpn) || m->m_pkey != "
      "IBCM_PKEY_DEFAULT ||", "\t    m->m_pkey != IBCM_PKEY_DEFAULT ||"),
     ("rdk_ibcm_msg.c", "m->m_transport != IBCM_TRANSPORT_RC ||", ""),

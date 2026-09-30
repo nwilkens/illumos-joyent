@@ -46,6 +46,8 @@ typedef struct rdk_gsi_rx {
 	taskq_ent_t		rx_tqent;
 	struct rdk_gsi		*rx_gsi;
 	rdk_ibcm_ip4_t		rx_ip;
+	boolean_t		rx_has_smac;
+	uint8_t			rx_smac[ETHERADDRL];	/* the frame's source */
 	uint8_t			rx_mad[IBCM_MAD_LEN];
 } rdk_gsi_rx_t;
 

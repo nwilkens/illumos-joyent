@@ -83,6 +83,7 @@ typedef struct rdmat_listen {
 	uint32_t		rl_qp;		/* QP to accept into */
 	boolean_t		rl_auto;
 	boolean_t		rl_reject;
+	boolean_t		rl_slow;
 	uint32_t		rl_reqs;	/* ts_cm_lock */
 	uint32_t		rl_accepts;
 	uint32_t		rl_rejects;

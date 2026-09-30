@@ -107,6 +107,9 @@ rdmat_cm_request(rdmat_listen_t *rl, rdk_cm_id_t *id,
 	mutex_enter(&ts->ts_cm_lock);
 	rl->rl_reqs++;
 	mutex_exit(&ts->ts_cm_lock);
+	/* Lets a test end the request at the peer before it is decided. */
+	if (rl->rl_slow)
+		delay(drv_usectohz(500 * MILLISEC));
 	if (rl->rl_reject) {
 		mutex_enter(&ts->ts_cm_lock);
 		rl->rl_rejects++;
@@ -278,7 +281,8 @@ rdmat_cm_listen(rdmat_sess_t *ts, rdmat_cm_t *c)
 
 	if (c->rcm_npeers == 0 || c->rcm_npeers > RDMAT_CM_MAX_PEERS ||
 	    c->rcm_lport == 0 || c->rcm_backlog == 0 ||
-	    (c->rcm_flags & ~(RDMAT_CM_AUTO | RDMAT_CM_REJECT)) != 0 ||
+	    (c->rcm_flags & ~(RDMAT_CM_AUTO | RDMAT_CM_REJECT |
+	    RDMAT_CM_SLOW)) != 0 ||
 	    ((c->rcm_flags & (RDMAT_CM_AUTO | RDMAT_CM_REJECT)) == 0 &&
 	    c->rcm_qp >= ts->ts_nqp))
 		return (EINVAL);
@@ -299,6 +303,7 @@ rdmat_cm_listen(rdmat_sess_t *ts, rdmat_cm_t *c)
 	rl->rl_qp = c->rcm_qp;
 	rl->rl_auto = (c->rcm_flags & RDMAT_CM_AUTO) != 0;
 	rl->rl_reject = (c->rcm_flags & RDMAT_CM_REJECT) != 0;
+	rl->rl_slow = (c->rcm_flags & RDMAT_CM_SLOW) != 0;
 	if ((ret = rdk_cm_create_id(ts->ts_cred, rdmat_cm_handler,
 	    &rl->rl_ctx, RDK_PS_TCP, RDK_QPT_RC, &rl->rl_id)) != 0)
 		goto fail;

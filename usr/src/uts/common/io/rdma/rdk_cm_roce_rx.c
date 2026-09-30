@@ -79,8 +79,10 @@ rdk_ibconn_from(const rdk_ibconn_t *c, const rdk_gsi_rx_t *rx)
 }
 
 /*
- * A path back to the sender of a MAD from the neighbor cache alone, and
- * the held local GID it was sent to.
+ * A path back to the sender of a MAD, and the held local GID it was sent
+ * to.  The reply goes to the frame's own source MAC, for the packet's
+ * source IP, so that no reply depends on or starts a neighbor resolution;
+ * the neighbor cache serves only when the device gave no source MAC.
  */
 static int
 rdk_cm_roce_back(rdk_gsi_t *g, const rdk_gsi_rx_t *rx, rdk_gsi_path_t *gp)
@@ -98,6 +100,8 @@ rdk_cm_roce_back(rdk_gsi_t *g, const rdk_gsi_rx_t *rx, rdk_gsi_path_t *gp)
 	    rx->rx_ip.ip_dst, &p)) == 0) {
 		if (p.cp_dev->rcd_dev != g->rg_dev || p.cp_port != g->rg_port)
 			ret = ENETUNREACH;
+		else if (rx->rx_has_smac)
+			bcopy(rx->rx_smac, gp->gp_dmac, ETHERADDRL);
 		else if (p.cp_local)
 			bcopy(p.cp_smac, gp->gp_dmac, ETHERADDRL);
 		else
@@ -267,7 +271,7 @@ rdk_ibconn_from_req(rdk_ibconn_t *c, const rdk_ibcm_msg_t *m,
 	c->ic_rguid = m->m_ca_guid;
 	c->ic_tid = m->m_tid;
 	c->ic_rqpn = m->m_qpn;
-	c->ic_rpsn = m->m_psn;
+	c->ic_spsn = m->m_psn;
 	c->ic_lip = h->ch_dst;
 	c->ic_rip = h->ch_src;
 	c->ic_lport = htons(port);
@@ -356,6 +360,7 @@ void
 rdk_cm_roce_req(rdk_gsi_t *g, const rdk_gsi_rx_t *rx, const rdk_ibcm_msg_t *m)
 {
 	const struct rdk_gid_attr *sgid;
+	rdk_gsi_path_t gp;
 	rdk_cma_hdr_t h;
 	rdk_ibconn_t *c, *o;
 	rdk_cm_id_t *lis;
@@ -422,6 +427,12 @@ rdk_cm_roce_req(rdk_gsi_t *g, const rdk_gsi_rx_t *rx, const rdk_ibcm_msg_t *m)
 	c->ic_path.gp_sgid = sgid;
 	sgid = NULL;
 	rdk_ibconn_from_req(c, m, &h, port);
+	/* A reject sent before the neighbor answers goes back the REQ's way. */
+	if (rdk_cm_roce_back(g, rx, &gp) == 0) {
+		bcopy(gp.gp_dmac, c->ic_path.gp_dmac, ETHERADDRL);
+		c->ic_path.gp_hop = gp.gp_hop;
+		rdk_put_gid_attr(gp.gp_sgid);
+	}
 	if (rdk_ibconn_insert(c) != 0) {
 		rdk_cm_roce_reply(g, rx, m, IBCM_ATTR_REJ,
 		    IBCM_REJ_CONSUMER_DEFINED, IBCM_MSG_RESPONSE_REQ);
@@ -476,7 +487,7 @@ rdk_cm_roce_rep(rdk_gsi_t *g, const rdk_gsi_rx_t *rx, const rdk_ibcm_msg_t *m)
 		c->ic_rid = m->m_local_id;
 		c->ic_rguid = m->m_ca_guid;
 		c->ic_rqpn = m->m_qpn;
-		c->ic_rpsn = m->m_psn;
+		c->ic_spsn = m->m_psn;
 		c->ic_peer_resp_res = m->m_resp_res;
 		c->ic_peer_init_depth = m->m_init_depth;
 		c->ic_rnr_retry = m->m_rnr_retry;
@@ -525,9 +536,13 @@ rdk_cm_roce_conn_msg(const rdk_gsi_rx_t *rx, const rdk_ibcm_msg_t *m)
 {
 	rdk_ibconn_in_t in;
 	rdk_ibconn_t *c;
-	boolean_t ok;
+	uint64_t guid;
+	boolean_t ok, by_guid;
 
-	if ((c = rdk_ibconn_find(m->m_remote_id)) == NULL) {
+	by_guid = rdk_ibcm_rej_by_guid(m, &guid);
+	c = by_guid ? rdk_ibconn_find_remote(guid, m->m_local_id) :
+	    rdk_ibconn_find(m->m_remote_id);
+	if (c == NULL) {
 		if (m->m_attr == IBCM_ATTR_DREQ) {
 			rdk_cm_roce_reply(rx->rx_gsi, rx, m, IBCM_ATTR_DREP,
 			    0, 0);
@@ -546,7 +561,9 @@ rdk_cm_roce_conn_msg(const rdk_gsi_rx_t *rx, const rdk_ibcm_msg_t *m)
 	case IBCM_ATTR_REJ:
 		in.ci_in.ii_input = IBCI_REJ;
 		in.ci_in.ii_rej_reason = m->m_reason;
-		ok = ok && (m->m_msg == IBCM_MSG_RESPONSE_REQ ||
+		ok = ok && (by_guid ? m->m_remote_id == 0 ||
+		    m->m_remote_id == c->ic_lid :
+		    m->m_msg == IBCM_MSG_RESPONSE_REQ ||
 		    m->m_local_id == c->ic_rid) &&
 		    (m->m_tid == c->ic_tid || m->m_tid == c->ic_dreq_tid);
 		break;
