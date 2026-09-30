@@ -11,6 +11,7 @@ TESTS = (
     "adopt_lifecycle.py",
     "connect_checks.py",
     "identify_sgls.py",
+    "log_page_len.py",
     "send_once.py",
     "sgl_decode.py",
 )
