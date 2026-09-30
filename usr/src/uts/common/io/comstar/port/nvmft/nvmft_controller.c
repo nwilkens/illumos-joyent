@@ -899,6 +899,24 @@ nvmft_alloc_zeroed(size_t len)
 	return (nvmft_alloc_data(NULL, 0, len));
 }
 
+/*
+ * The length of a Get Log Page.  NUMD is the host's, so it is bounded before
+ * it sizes an allocation, and it must match the host's SGL, as Linux nvmet
+ * requires: a longer SGL would leave the transfer short.
+ */
+static uint_t
+nvmft_log_page_len(uint32_t numd, size_t data_len, size_t *lenp)
+{
+	size_t len = ((size_t)numd + 1) * 4;
+
+	if (len > NVMFT_MAX_LOGPAGE_LEN)
+		return (NVME_CQE_SC_GEN_INV_FLD);
+	if (len != data_len)
+		return (NVME_CQE_SC_GEN_INV_DSGL_LEN);
+	*lenp = len;
+	return (NVME_CQE_SC_GEN_SUCCESS);
+}
+
 static void
 handle_get_log_page(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc,
     const nvme_sqe_t *cmd)
@@ -929,17 +947,9 @@ handle_get_log_page(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc,
 		goto done;
 	}
 
-	len = (numd + 1) * 4;
-
-	/*
-	 * NUMD is host-controlled; (numd+1)*4 can reach ~4 GiB and would drive
-	 * an unbounded kmem allocation below.  Reject oversize requests; no
-	 * supported log page approaches NVMFT_MAX_LOGPAGE_LEN.
-	 */
-	if (len > NVMFT_MAX_LOGPAGE_LEN) {
-		status = NVME_CQE_SC_GEN_INV_FLD;
+	status = nvmft_log_page_len(numd, nvmf_capsule_data_len(nc), &len);
+	if (status != NVME_CQE_SC_GEN_SUCCESS)
 		goto done;
-	}
 
 	switch (lid) {
 	case NVME_LOGPAGE_ERROR:
