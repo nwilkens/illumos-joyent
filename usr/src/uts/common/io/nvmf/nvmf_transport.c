@@ -265,15 +265,8 @@ nvmf_allocate_command(struct nvmf_qpair *qp, const void *sqe, int how)
 	nc->nc_qe_len = sizeof (nvme_sqe_t);
 	bcopy(sqe, &nc->nc_sqe, nc->nc_qe_len);
 
-	/*
-	 * 4.2 of NVMe base spec: Fabrics always uses SGL.
-	 *
-	 * FreeBSD clears/sets the PSDT field inside the fuse byte via
-	 * NVMEM(NVME_CMD_PSDT)/NVMEF(NVME_CMD_PSDT, NVME_PSDT_SGL).  The
-	 * illumos generic SQE breaks the same byte out into bitfields, so the
-	 * PSDT selector is just the sqe_psdt bit; NVME_PSDT_SGL == 0x1.
-	 */
-	nc->nc_sqe.sqe_psdt = NVME_PSDT_SGL;
+	/* 4.2 of NVMe base spec: Fabrics always uses SGL. */
+	NVMF_SQE_SET_PSDT(&nc->nc_sqe, NVME_PSDT_SGL);
 	return (nc);
 }
 
@@ -374,11 +367,7 @@ nvmf_validate_command_capsule(struct nvmf_capsule *nc)
 {
 	ASSERT3U(nc->nc_qe_len, ==, sizeof (nvme_sqe_t));
 
-	/*
-	 * FreeBSD: NVMEV(NVME_CMD_PSDT, nc_sqe.fuse) != NVME_PSDT_SGL.  The
-	 * illumos SQE exposes PSDT as the sqe_psdt bit directly.
-	 */
-	if (nc->nc_sqe.sqe_psdt != NVME_PSDT_SGL)
+	if (NVMF_SQE_PSDT(&nc->nc_sqe) != NVME_PSDT_SGL)
 		return (NVME_CQE_SC_GEN_INV_FLD);
 
 	return (nc->nc_qpair->nq_ops->validate_command_capsule(nc));
@@ -589,7 +578,7 @@ nvmf_sgl_decode(const nvme_sqe_t *sqe, size_t icd_len, uint64_t max_len,
 	uint64_t addr = 0;
 	int i;
 
-	if (sqe->sqe_psdt != NVME_PSDT_SGL)
+	if (NVMF_SQE_PSDT(sqe) != NVME_PSDT_SGL)
 		return (NVME_CQE_SC_GEN_INV_FLD);
 	for (i = 7; i >= 0; i--)
 		addr = (addr << 8) | d[i];
