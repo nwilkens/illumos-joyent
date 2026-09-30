@@ -135,8 +135,8 @@ t4_ofld_opt2(const t4_ofld_port_t *op, const t4_rdma_tcp_opts_t *o)
 	const struct adapter *sc = op->op_ofld->of_sc;
 	/*
 	 * The TX modulation queue of the port's channel, as FreeBSD sets it.
-	 * RX channel 0 as Linux: e12 stopped answering on the network when a
-	 * port 1 connection had RX channel 1.
+	 * RX channel 0 as Linux: a port 1 connection on RX channel 1 stopped
+	 * all network traffic on a T6 whose port 1 also carried the host.
 	 */
 	uint32_t opt2 = V_RX_CHANNEL(0) | F_RSS_QUEUE_VALID |
 	    V_RSS_QUEUE(op->op_ofld->of_rxq.iq.tsi_abs_id) |
