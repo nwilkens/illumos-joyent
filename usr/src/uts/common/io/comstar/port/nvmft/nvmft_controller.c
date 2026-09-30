@@ -1471,6 +1471,7 @@ nvmft_handle_admin_command(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc)
 			ctrlr->ctrlr_aer_pidx =
 			    (ctrlr->ctrlr_aer_pidx + 1) % NVMFT_NUM_AER;
 			mutex_exit(&ctrlr->ctrlr_lock);
+			nvmf_capsule_defer_response(nc);
 		}
 		nvmf_free_capsule(nc);
 		break;

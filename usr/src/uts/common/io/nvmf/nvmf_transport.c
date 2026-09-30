@@ -308,6 +308,12 @@ nvmf_free_capsule(struct nvmf_capsule *nc)
 	nc->nc_qpair->nq_ops->free_capsule(nc);
 }
 
+void
+nvmf_capsule_defer_response(struct nvmf_capsule *nc)
+{
+	nc->nc_deferred = B_TRUE;
+}
+
 int
 nvmf_transmit_capsule(struct nvmf_capsule *nc)
 {
