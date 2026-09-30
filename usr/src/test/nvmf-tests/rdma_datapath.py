@@ -36,6 +36,10 @@ MUTANTS = (
             ("\t\t\twhile (!w.nw_done)\n\t\t\t\tcv_wait(&w.nw_cv, &w.nw_lock);\n"
              "\t\t\tstatus = w.nw_status;",
              "\t\t\tstatus = NVME_CQE_SC_GEN_SUCCESS;"),)}),
+    ("a CID in use is fatal", "teardown", {
+        "nvmf_rdma.c": (
+            ("\tif (nr_cid_find_locked(q, c->nc_cid) != NULL) {",
+             "\tif (B_FALSE) {"),)}),
     ("a held RECV goes back before the response", "credit", {
         "nvmf_rdma.c": (
             ("\t\treturn (EALREADY);\n\tnr_cmd_unhold_locked(c);\n",

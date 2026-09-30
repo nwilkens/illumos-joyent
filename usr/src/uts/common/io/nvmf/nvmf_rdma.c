@@ -386,6 +386,15 @@ nr_cmd_start_locked(nr_queue_t *q, nr_recv_t *r, uint32_t byte_len)
 	c->nc_nc.nc_qe_len = NVMF_RDMA_SQE_LEN;
 	bcopy(r->rv_va, &c->nc_nc.nc_sqe, NVMF_RDMA_SQE_LEN);
 	c->nc_cid = c->nc_nc.nc_sqe.sqe_cid;
+	/*
+	 * A response finds its command by CID, and a command stops owing one
+	 * before the host can see it, so only a broken host reuses a CID here.
+	 */
+	if (nr_cid_find_locked(q, c->nc_cid) != NULL) {
+		list_insert_head(&q->nq_free_cmds, c);
+		nr_queue_fail_locked(q, EPROTO);
+		return (NULL);
+	}
 	c->nc_icd = byte_len - NVMF_RDMA_SQE_LEN;
 	c->nc_sgl_done = B_FALSE;
 	c->nc_state = NR_C_ACTIVE;

@@ -317,12 +317,16 @@ static struct {
 	uint32_t	icd;
 	int		fail_at;	/* the RDMA request that fails */
 	int		hang_after;	/* WRs until the device stops */
+	int		dup_at;		/* the command that reuses a CID */
 	int		executed;
 	int		lag;		/* requests between completion events */
 	int		slow_us;	/* the device's time per request */
 	int		nop[16];	/* executed, by opcode */
 	uint64_t	bytes;
 } M;
+
+/* The target works slowly on this CID, which the host then reuses. */
+static int tgt_slow_cid = -1;
 
 /* The device. */
 #define	DMA_LKEY	0x0d0a
@@ -1040,6 +1044,10 @@ host_fill(void)
 	while (M.qp != NULL && !M.qp->fq_err && M.outstanding < M.depth &&
 	    M.sent < M.to_send && M.rnr == 0) {
 		h = host_new();
+		if (M.dup_at != 0 && M.sent == M.dup_at - 1)
+			tgt_slow_cid = h->h_cid;
+		else if (M.dup_at != 0 && M.sent == M.dup_at)
+			h->h_cid = (uint16_t)tgt_slow_cid;
 		if (M.bad_sgls != 0 && rndr(1, M.bad_sgls) == 1)
 			host_break(h);
 		host_send(h);
@@ -1471,6 +1479,8 @@ tgt_work(void *arg)
 	boolean_t late;
 
 	tc->tc_seed = nc->nc_sqe.sqe_cdw10;
+	if (cid == tgt_slow_cid)
+		(void) usleep(100000);
 	sc = nvmf_rdma_ops.validate_command_capsule(nc);
 	if (sc != 0) {
 		tgt_respond(nq, cid, sc);
@@ -1568,6 +1578,8 @@ reset(void)
 	M.outstanding = M.to_send = M.sent = M.done = M.failed = 0;
 	M.mix = M.bad_sgls = M.rnr = M.sq_over = M.remote_read_mr = 0;
 	M.wrong_inv = M.early_rsp = M.fail_at = M.hang_after = 0;
+	M.dup_at = 0;
+	tgt_slow_cid = -1;
 	M.executed = 0;
 	M.lag = 0;
 	M.slow_us = 0;
@@ -1886,6 +1898,18 @@ test_teardown(void)
 	CHECK(tgt_reports == 1 && tgt_error_val == 0);
 	endq(q);
 	rdk_drain_timeout_ms = 10000;
+
+	/* Responses find a command by CID, so a CID in use is fatal. */
+	set_dev(0, 4096);
+	q = mkq(16, 0);
+	(void) pthread_mutex_lock(&M.m);
+	M.dup_at = 40;
+	(void) pthread_mutex_unlock(&M.m);
+	run_host(q, 400, 16);
+	wait_reports(1);
+	taskq_wait(tgt_tq);
+	CHECK(tgt_reports == 1 && tgt_error_val == EPROTO);
+	endq(q);
 	(void) printf("PASS: teardown order after an error and a dead "
 	    "device\n");
 }
