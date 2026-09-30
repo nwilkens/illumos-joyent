@@ -318,6 +318,41 @@ short_write(void)
 	assert(xfer_dones == 1 && last_status == STMF_FAILURE);
 }
 
+/*
+ * A transfer the transport refuses gives its dbuf back failed, since sbd
+ * waits for it; an aborting task keeps the dbuf and requeues the abort.
+ */
+static void
+refused(void)
+{
+	nvmft_task_priv_t priv;
+	scsi_task_t task = { .task_port_private = &priv };
+	stmf_data_buf_t dbuf = { .db_data_size = 512 };
+	boolean_t done = B_FALSE;
+	int aborting;
+
+	for (aborting = 0; aborting < 2; aborting++) {
+		memset(&priv, 0, sizeof (priv));
+		mutex_init(&priv.ntp_lock, NULL, MUTEX_DRIVER, NULL);
+		assert(nvmft_xfer_begin(&priv));
+		priv.ntp_aborting = aborting;
+		dbuf.db_xfer_status = STMF_SUCCESS;
+		requeues = 0;
+		if (aborting) {
+			assert(nvmft_xfer_refused(&task, &dbuf, &done) ==
+			    STMF_ABORTED);
+			assert(!done && requeues == 1);
+		} else {
+			assert(nvmft_xfer_refused(&task, &dbuf, &done) ==
+			    STMF_SUCCESS);
+			assert(done && requeues == 0);
+		}
+		assert(dbuf.db_xfer_status == STMF_FAILURE);
+		assert(priv.ntp_xfers == 0);
+		mutex_destroy(&priv.ntp_lock);
+	}
+}
+
 #define	FINISH(r, f, fl, st, ws, wi, wsent, wc) \
 	finish_case(r, f, fl, st, ws, wi, wsent, wc, __LINE__)
 #define	C2H	DB_DIRECTION_TO_RPORT
@@ -330,6 +365,7 @@ nvmft_side(void)
 	FINISH(0, 0, 0, 0, STMF_SUCCESS, 0, 0, 0);
 	FINISH(0, 0, 0, EIO, STMF_FAILURE, 0, 0, 0);
 	short_write();
+	refused();
 	FINISH(1, 0, C2H, NVME_CQE_SC_GEN_SUCCESS, STMF_SUCCESS, 0, 0, 0);
 	FINISH(1, 0, C2H, NVMF_MORE, STMF_SUCCESS, 0, 0, 0);
 	/* TCP folded success into the last data without an LU status. */
