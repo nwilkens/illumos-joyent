@@ -61,11 +61,12 @@ MUTANTS = (
              "sz->nrs_sq = (uint32_t)(xfers + base_sq);"),)}),
     ("a drained queue fails its transfers before the destroy", "teardown", {
         "nvmf_rdma.c": (
-            ("\tif (drained)\n\t\tnr_xfer_fail_all(q);\n", ""),)}),
+            ("\tif (drained)\n\t\tnr_xfer_fail_all(q);\n",
+             "\t(void) drained;\n"),)}),
     ("an undrained queue fails its transfers only after it", "teardown", {
         "nvmf_rdma.c": (
             ("\tif (drained)\n\t\tnr_xfer_fail_all(q);\n",
-             "\tnr_xfer_fail_all(q);\n"),)}),
+             "\t(void) drained;\n\tnr_xfer_fail_all(q);\n"),)}),
     ("a completion only starts the teardown", "teardown", {
         "nvmf_rdma_xfer.c": (
             ("\t\tif (wc->status != RDK_WC_WR_FLUSH_ERR)\n"

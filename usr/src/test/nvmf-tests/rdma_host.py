@@ -209,11 +209,12 @@ def run(test, replace=None, args=(), timeout=240):
 
 
 def mutant_fails(test, replace, args=()):
-    """True if the test fails once replace is applied."""
+    """True if the test fails once replace is applied.  A mutant that does
+    not build proves nothing, so it counts as surviving."""
     try:
         run(test, replace, args)
     except HostFailure as error:
         if "--verbose" in sys.argv:
             print(error)
-        return True
+        return not str(error).startswith("compile:")
     return False
