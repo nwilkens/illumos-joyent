@@ -31,6 +31,11 @@ MUTANTS = (
         "nvmf_rdma.c": (
             ("c->nc_wrs != 0 || c->nc_state != NR_C_DONE)",
              "c->nc_wrs != 0 || c->nc_state == NR_C_FREE)"),)}),
+    ("admin data is out before its response", "plan", {
+        "nvmf_rdma_xfer.c": (
+            ("\t\t\twhile (!w.nw_done)\n\t\t\t\tcv_wait(&w.nw_cv, &w.nw_lock);\n"
+             "\t\t\tstatus = w.nw_status;",
+             "\t\t\tstatus = NVME_CQE_SC_GEN_SUCCESS;"),)}),
     ("a held RECV goes back before the response", "credit", {
         "nvmf_rdma.c": (
             ("\t\treturn (EALREADY);\n\tnr_cmd_unhold_locked(c);\n",

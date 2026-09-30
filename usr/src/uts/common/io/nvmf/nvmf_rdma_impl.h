@@ -391,6 +391,8 @@ extern int nr_receive_controller_data(struct nvmf_capsule *, uint32_t,
     struct nvmf_io_request *);
 extern int nr_send_controller_data_io(struct nvmf_capsule *, uint32_t,
     const struct nvmf_send_request *, const nvme_cqe_t *);
+extern uint_t nr_send_controller_data(struct nvmf_capsule *, uint32_t,
+    mblk_t *, size_t);
 extern void nr_xreq_send_done(nr_cmd_t *, boolean_t);
 extern void nr_xfer_fail_all(nr_queue_t *);
 extern uint_t nr_rw_attr(nr_dev_t *, struct rdk_rw_attr *);

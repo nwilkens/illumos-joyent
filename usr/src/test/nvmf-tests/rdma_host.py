@@ -33,6 +33,8 @@ typedef struct msgb {
 	unsigned char	*b_wptr;
 } mblk_t;
 static inline void freemsg(mblk_t *mp) { (void) mp; }
+/* A tick is a millisecond here, as in rdk_kenv.h. */
+static inline void delay(long t) { (void) usleep((useconds_t)t * 1000); }
 #define	MBLKL(mp)	((size_t)((mp)->b_wptr - (mp)->b_rptr))
 typedef struct vmem vmem_t;
 typedef uintptr_t timeout_id_t;

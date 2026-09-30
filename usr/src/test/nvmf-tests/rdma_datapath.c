@@ -1434,6 +1434,31 @@ tgt_data(tcmd_t *tc, uint32_t len, boolean_t write, boolean_t kmem)
 	}
 }
 
+/*
+ * nvmft's admin data: one mblk through the synchronous op, and then the
+ * response, which must not overtake the data.
+ */
+static void
+tgt_mblk_read(tcmd_t *tc, uint32_t len)
+{
+	struct nvmf_capsule *nc = tc->tc_nc;
+	uint8_t *buf = malloc(len);
+	mblk_t mb;
+	uint32_t i;
+	uint_t status;
+
+	CHECK(buf != NULL);
+	for (i = 0; i < len; i++)
+		buf[i] = pat(tc->tc_seed, i);
+	bzero(&mb, sizeof (mb));
+	mb.b_rptr = buf;
+	mb.b_wptr = buf + len;
+	status = nvmf_rdma_ops.send_controller_data(nc, 0, &mb, len);
+	free(buf);
+	tgt_respond(nc->nc_qpair, nc->nc_sqe.sqe_cid,
+	    status == NVME_CQE_SC_GEN_SUCCESS ? 0 : (uint8_t)status);
+}
+
 static void
 tgt_work(void *arg)
 {
@@ -1456,6 +1481,8 @@ tgt_work(void *arg)
 		}
 		if (len != 0 && opc == OPC_WRITE)
 			tgt_data(tc, len, B_TRUE, B_FALSE);
+		else if (len != 0 && len <= 65536 && (cid & 7) == 1)
+			tgt_mblk_read(tc, len);
 		else if (len != 0)
 			tgt_data(tc, len, B_FALSE, opc == OPC_VREAD);
 		/* nvmft frees a Connect's capsule before it answers it. */

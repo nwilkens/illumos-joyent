@@ -893,16 +893,6 @@ nr_capsule_data_len(const struct nvmf_capsule *nc)
 	return (c->nc_sgl.nsl_len);
 }
 
-/* Data goes out only through send_controller_data_io. */
-/* ARGSUSED */
-static uint_t
-nr_send_controller_data(struct nvmf_capsule *nc, uint32_t off, mblk_t *mp,
-    size_t len)
-{
-	freemsg(mp);
-	return (NVME_CQE_SC_GEN_INTERNAL_ERR);
-}
-
 struct nvmf_transport_ops nvmf_rdma_ops = {
 	.allocate_qpair = nr_allocate_qpair,
 	.free_qpair = nr_free_qpair,

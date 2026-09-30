@@ -482,6 +482,100 @@ nr_send_controller_data_io(struct nvmf_capsule *nc, uint32_t off,
 	    NULL, req->nsr_complete, req->nsr_complete_arg, final_cqe));
 }
 
+typedef struct nr_wait {
+	kmutex_t	nw_lock;
+	kcondvar_t	nw_cv;
+	boolean_t	nw_done;
+	uint_t		nw_status;
+} nr_wait_t;
+
+static void
+nr_wait_done(void *arg, uint_t status)
+{
+	nr_wait_t *w = arg;
+
+	mutex_enter(&w->nw_lock);
+	w->nw_status = status;
+	w->nw_done = B_TRUE;
+	cv_broadcast(&w->nw_cv);
+	mutex_exit(&w->nw_lock);
+}
+
+/* nvmft's admin taskq may sleep here; the pool may not have a buffer. */
+static nr_buf_t *
+nr_buf_alloc_wait(nr_dev_t *nd, size_t len)
+{
+	nr_buf_t *b;
+	uint_t i;
+
+	for (i = 0; (b = nr_buf_alloc(nd, len, len)) == NULL && i < 100; i++)
+		delay(drv_usectohz(10000));
+	return (b);
+}
+
+/*
+ * The mblk form, for nvmft's admin data.  nvmft sends the response once this
+ * returns, so each WRITE must complete first: a response posted while the
+ * WRITE waits for a transfer context would overtake it.
+ */
+uint_t
+nr_send_controller_data(struct nvmf_capsule *nc, uint32_t off, mblk_t *mp,
+    size_t len)
+{
+	nr_cmd_t *c = nr_keyed_cmd(nc);
+	nvmf_memdesc_t src, md;
+	nr_buf_t *b;
+	nr_wait_t w;
+	uint_t status = NVME_CQE_SC_GEN_SUCCESS;
+	size_t done, n;
+	int ret;
+
+	if (c == NULL || !c->nc_sgl.nsl_keyed || len == 0 ||
+	    len > UINT32_MAX || !nvmf_rdma_range_ok(off, (uint32_t)len,
+	    c->nc_sgl.nsl_len)) {
+		freemsg(mp);
+		return (NVME_CQE_SC_GEN_INV_FLD);
+	}
+	bzero(&src, sizeof (src));
+	src.nmd_type = NVMF_MEMDESC_MBLK;
+	src.nmd_len = len;
+	src.nmd_u.nmd_mp = mp;
+	mutex_init(&w.nw_lock, NULL, MUTEX_DRIVER, NULL);
+	cv_init(&w.nw_cv, NULL, CV_DRIVER, NULL);
+	for (done = 0; done < len; done += n) {
+		n = MIN(len - done, c->nc_q->nq_xfer_len);
+		if ((b = nr_buf_alloc_wait(c->nc_q->nq_dev, n)) == NULL) {
+			status = NVME_CQE_SC_GEN_INTERNAL_ERR;
+			break;
+		}
+		nvmf_memdesc_copyout(&src, done, b->nb_va, n);
+		bzero(&md, sizeof (md));
+		md.nmd_type = NVMF_MEMDESC_SGL;
+		md.nmd_len = n;
+		md.nmd_u.nmd_sgl.nmd_cookies = &b->nb_ck;
+		md.nmd_u.nmd_sgl.nmd_ncookies = 1;
+		w.nw_done = B_FALSE;
+		ret = nr_xreq_submit(c, B_FALSE, off + (uint32_t)done, n, &md,
+		    NULL, nr_wait_done, &w, NULL);
+		if (ret == 0) {
+			mutex_enter(&w.nw_lock);
+			while (!w.nw_done)
+				cv_wait(&w.nw_cv, &w.nw_lock);
+			status = w.nw_status;
+			mutex_exit(&w.nw_lock);
+		} else {
+			status = NVME_CQE_SC_GEN_DATA_XFR_ERR;
+		}
+		nr_buf_free(b);
+		if (status != NVME_CQE_SC_GEN_SUCCESS && status != NVMF_MORE)
+			break;
+	}
+	cv_destroy(&w.nw_cv);
+	mutex_destroy(&w.nw_lock);
+	freemsg(mp);
+	return (status);
+}
+
 /*
  * Complete what the device will not: after the drain, and again once the
  * QP is gone.
