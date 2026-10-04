@@ -614,7 +614,8 @@ zio_wait_for_children(zio_t *zio, uint8_t childbits, enum zio_wait_type wait)
 }
 
 static void
-zio_notify_parent(zio_t *pio, zio_t *zio, enum zio_wait_type wait)
+zio_notify_parent(zio_t *pio, zio_t *zio, enum zio_wait_type wait,
+    zio_t **nextp)
 {
 	uint64_t *countp = &pio->io_children[zio->io_child_type][wait];
 	int *errorp = &pio->io_child_error[zio->io_child_type];
@@ -634,12 +635,21 @@ zio_notify_parent(zio_t *pio, zio_t *zio, enum zio_wait_type wait)
 		pio->io_stall = NULL;
 		mutex_exit(&pio->io_lock);
 		/*
-		 * Dispatch the parent zio in its own taskq so that
-		 * the child can continue to make progress. This also
-		 * prevents overflowing the stack when we have deeply nested
-		 * parent-child relationships.
+		 * If the parent has the same type as the child, or is a
+		 * zio_null() with no done callback, hand it back to
+		 * zio_execute() to run in this thread once the child is
+		 * finished. A read from disk usually completes a physical,
+		 * a logical and a null zio this way without a taskq dispatch
+		 * for each. Anything else is dispatched to its own taskq,
+		 * which also keeps deeply nested parent chains off the stack.
 		 */
-		zio_taskq_dispatch(pio, type, B_FALSE);
+		if (nextp != NULL && *nextp == NULL &&
+		    (pio->io_type == zio->io_type ||
+		    (pio->io_type == ZIO_TYPE_NULL && pio->io_done == NULL))) {
+			*nextp = pio;
+		} else {
+			zio_taskq_dispatch(pio, type, B_FALSE);
+		}
 	} else {
 		mutex_exit(&pio->io_lock);
 	}
@@ -1819,10 +1829,17 @@ zio_delay_interrupt(zio_t *zio)
  * for multiple threads to be attempting to process the same I/O.
  */
 static zio_pipe_stage_t *zio_pipeline[];
+static int zio_done_impl(zio_t *, zio_t **);
 
-void
-zio_execute(zio_t *zio)
+/*
+ * Run one zio's pipeline until it stops. Returns a parent that became runnable
+ * when this zio completed, or NULL.
+ */
+static zio_t *
+zio_execute_one(zio_t *zio)
 {
+	zio_t *next = NULL;
+
 	zio->io_executor = curthread;
 
 	ASSERT3U(zio->io_queued_timestamp, >, 0);
@@ -1856,7 +1873,7 @@ zio_execute(zio_t *zio)
 			boolean_t cut = (stage == ZIO_STAGE_VDEV_IO_START) ?
 			    zio_requeue_io_start_cut_in_line : B_FALSE;
 			zio_taskq_dispatch(zio, ZIO_TASKQ_ISSUE, cut);
-			return;
+			return (NULL);
 		}
 
 #ifdef _KERNEL
@@ -1881,7 +1898,10 @@ zio_execute(zio_t *zio)
 
 		zio->io_stage = stage;
 		zio->io_pipeline_trace |= zio->io_stage;
-		rv = zio_pipeline[highbit64(stage) - 1](zio);
+		if (stage == ZIO_STAGE_DONE)
+			rv = zio_done_impl(zio, &next);
+		else
+			rv = zio_pipeline[highbit64(stage) - 1](zio);
 
 #ifdef _KERNEL
 		if (set_pushpage) {
@@ -1890,10 +1910,19 @@ zio_execute(zio_t *zio)
 #endif
 
 		if (rv == ZIO_PIPELINE_STOP)
-			return;
+			return (next);
 
 		ASSERT(rv == ZIO_PIPELINE_CONTINUE);
 	}
+
+	return (NULL);
+}
+
+void
+zio_execute(zio_t *zio)
+{
+	while (zio != NULL)
+		zio = zio_execute_one(zio);
 }
 
 /*
@@ -4088,7 +4117,7 @@ zio_ready(zio_t *zio)
 	 */
 	for (; pio != NULL; pio = pio_next) {
 		pio_next = zio_walk_parents(zio, &zl);
-		zio_notify_parent(pio, zio, ZIO_WAIT_READY);
+		zio_notify_parent(pio, zio, ZIO_WAIT_READY, NULL);
 	}
 
 	if (zio->io_flags & ZIO_FLAG_NODATA) {
@@ -4169,8 +4198,12 @@ zio_dva_throttle_done(zio_t *zio)
 	zio_allocate_dispatch(zio->io_spa, pio->io_allocator);
 }
 
+/*
+ * If nextp is not NULL, a parent that becomes runnable may be returned through
+ * it for the caller to execute next; see zio_notify_parent().
+ */
 static int
-zio_done(zio_t *zio)
+zio_done_impl(zio_t *zio, zio_t **nextp)
 {
 	spa_t *spa = zio->io_spa;
 	zio_t *lio = zio->io_logical;
@@ -4436,7 +4469,8 @@ zio_done(zio_t *zio)
 			if ((pio->io_flags & ZIO_FLAG_GODFATHER) &&
 			    (zio->io_reexecute & ZIO_REEXECUTE_SUSPEND)) {
 				zio_remove_child(pio, zio, remove_zl);
-				zio_notify_parent(pio, zio, ZIO_WAIT_DONE);
+				zio_notify_parent(pio, zio, ZIO_WAIT_DONE,
+				    NULL);
 			}
 		}
 
@@ -4448,7 +4482,7 @@ zio_done(zio_t *zio)
 			 */
 			ASSERT(!(zio->io_flags & ZIO_FLAG_GODFATHER));
 			zio->io_flags |= ZIO_FLAG_DONT_PROPAGATE;
-			zio_notify_parent(pio, zio, ZIO_WAIT_DONE);
+			zio_notify_parent(pio, zio, ZIO_WAIT_DONE, NULL);
 		} else if (zio->io_reexecute & ZIO_REEXECUTE_SUSPEND) {
 			/*
 			 * We'd fail again if we reexecuted now, so suspend
@@ -4500,7 +4534,7 @@ zio_done(zio_t *zio)
 		zio_link_t *remove_zl = zl;
 		pio_next = zio_walk_parents(zio, &zl);
 		zio_remove_child(pio, zio, remove_zl);
-		zio_notify_parent(pio, zio, ZIO_WAIT_DONE);
+		zio_notify_parent(pio, zio, ZIO_WAIT_DONE, nextp);
 	}
 
 	if (zio->io_waiter != NULL) {
@@ -4513,6 +4547,12 @@ zio_done(zio_t *zio)
 	}
 
 	return (ZIO_PIPELINE_STOP);
+}
+
+static int
+zio_done(zio_t *zio)
+{
+	return (zio_done_impl(zio, NULL));
 }
 
 /*
