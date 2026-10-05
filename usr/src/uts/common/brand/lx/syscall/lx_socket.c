@@ -26,6 +26,7 @@
  * Copyright 2022 Joyent, Inc.
  * Copyright 2024 Carlos Neira <cneirabustos@gmail.com>
  * Copyright 2024 MNX Cloud, Inc.
+ * Copyright 2026 Edgecast Cloud LLC.
  */
 
 #include <sys/errno.h>
@@ -1489,8 +1490,11 @@ lx_socket_create(int domain, int type, int protocol, int options, file_t **fpp,
 	 * Linux programs do not tolerate errors appearing from asynchronous
 	 * events (such as ICMP messages arriving).  Setting SM_DEFERERR will
 	 * prevent checking/delivery of such errors.
+	 *
+	 * Linux also allows setsockopt() after a reset or shutdown, so
+	 * SM_NOSETOPTCHK skips the X/Open check that returns EINVAL there.
 	 */
-	so->so_mode |= SM_DEFERERR;
+	so->so_mode |= SM_DEFERERR | SM_NOSETOPTCHK;
 
 	/* Now fill in the entries that falloc reserved */
 	if (options & SOCK_NONBLOCK) {
