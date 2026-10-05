@@ -11,6 +11,7 @@
 
 #
 # Copyright 2024 OmniOS Community Edition (OmniOSce) Association.
+# Copyright 2026 Edgecast Cloud LLC.
 #
 
 BHYVE_OBJS = $(COMMON_OBJS)	\
@@ -41,4 +42,10 @@ include ../Makefile.com
 
 CPPFLAGS += -I.
 
-install: all $(ROOTUSRSBINPROG)
+# On vnext, /usr/sbin/bhyve is rshyve, delivered by the rust-bhyve project.
+ROOTBHYVEILLUMOS = $(ROOTUSRSBIN)/bhyve-illumos
+
+install: all $(ROOTBHYVEILLUMOS)
+
+$(ROOTBHYVEILLUMOS): $(PROG)
+	$(RM) $@; $(INS) -s -m $(FILEMODE) -f $(@D) $(PROG); $(MV) $(@D)/$(PROG) $@
