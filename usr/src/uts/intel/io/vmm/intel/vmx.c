@@ -2720,7 +2720,7 @@ vmx_exit_handle_possible_extintr(struct vm_exit *vmexit)
 		if ((intr_info & VMCS_INTR_VALID) == 0)
 			return;
 
-		ASSERT3U(intr_info & VMCS_INTR_T_MASK, ==, VMCS_INTR_T_HWINTR);
+		VERIFY3U(intr_info & VMCS_INTR_T_MASK, ==, VMCS_INTR_T_HWINTR);
 		vmx_trigger_hostintr(intr_info & 0xff);
 	}
 }
