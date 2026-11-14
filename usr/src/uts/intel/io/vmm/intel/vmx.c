@@ -2388,7 +2388,9 @@ vmx_exit_process(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 	case EXIT_REASON_EXT_INTR:
 		/*
 		 * External interrupts serve only to cause VM exits and allow
-		 * the host interrupt handler to run.
+		 * the host interrupt handler to run, which vmx_run() did
+		 * before it called here: see
+		 * vmx_exit_handle_possible_extintr().
 		 *
 		 * If this external interrupt triggers a virtual interrupt
 		 * to a VM, then that state will be recorded by the
@@ -2405,10 +2407,6 @@ vmx_exit_process(struct vmx_vcpu *vcpu, struct vm_exit *vmexit)
 		 */
 		if (!(intr_info & VMCS_INTR_VALID))
 			return (1);
-		KASSERT((intr_info & VMCS_INTR_VALID) != 0 &&
-		    (intr_info & VMCS_INTR_T_MASK) == VMCS_INTR_T_HWINTR,
-		    ("VM exit interruption info invalid: %x", intr_info));
-		vmx_trigger_hostintr(intr_info & 0xff);
 
 		/*
 		 * This is special. We want to treat this as an 'handled'
@@ -2707,6 +2705,36 @@ vmx_exit_handle_possible_nmi(struct vm_exit *vmexit)
 	}
 }
 
+/*
+ * Run the host handler for an external interrupt that ended guest execution.
+ *
+ * The exit controls have the processor acknowledge the interrupt as part of
+ * the VM exit, which leaves its vector in service in the local APIC.  No
+ * interrupt of the same or a lower priority class, cross-calls included, is
+ * delivered to this CPU until the handler has run and sent the EOI.  The
+ * handler must therefore run before this thread does anything that can wait
+ * on another CPU.  In particular it must come before vmc_table_exit(), which
+ * takes a lock that a thread holding the vmspace may own while it waits in a
+ * cross-call for this very CPU.
+ */
+static __inline void
+vmx_exit_handle_possible_extintr(struct vm_exit *vmexit)
+{
+	if (vmexit->u.vmx.exit_reason == EXIT_REASON_EXT_INTR) {
+		const uint32_t intr_info = vmcs_read(VMCS_EXIT_INTR_INFO);
+
+		/*
+		 * XXX: Ignore this exit if VMCS_INTR_VALID is not set.
+		 * This appears to be a bug in VMware Fusion?
+		 */
+		if ((intr_info & VMCS_INTR_VALID) == 0)
+			return;
+		KASSERT((intr_info & VMCS_INTR_T_MASK) == VMCS_INTR_T_HWINTR,
+		    ("VM exit interruption info invalid: %x", intr_info));
+		vmx_trigger_hostintr(intr_info & 0xff);
+	}
+}
+
 static __inline void
 vmx_dr_enter_guest(struct vmxctx *vmxctx)
 {
@@ -2978,6 +3006,9 @@ vmx_run(void *vcpui, uint64_t rip)
 			vmx_exit_handle_possible_nmi(vmexit);
 		}
 		enable_intr();
+		if (rc == VMX_GUEST_VMEXIT) {
+			vmx_exit_handle_possible_extintr(vmexit);
+		}
 		vmc_table_exit(vmc);
 
 		if (rc == VMX_GUEST_VMEXIT) {
