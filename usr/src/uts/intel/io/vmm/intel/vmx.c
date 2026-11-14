@@ -2723,10 +2723,7 @@ vmx_exit_handle_possible_extintr(struct vm_exit *vmexit)
 	if (vmexit->u.vmx.exit_reason == EXIT_REASON_EXT_INTR) {
 		const uint32_t intr_info = vmcs_read(VMCS_EXIT_INTR_INFO);
 
-		/*
-		 * XXX: Ignore this exit if VMCS_INTR_VALID is not set.
-		 * This appears to be a bug in VMware Fusion?
-		 */
+		/* Ignored here as it is in vmx_exit_process(). */
 		if ((intr_info & VMCS_INTR_VALID) == 0)
 			return;
 		KASSERT((intr_info & VMCS_INTR_T_MASK) == VMCS_INTR_T_HWINTR,
