@@ -2706,16 +2706,9 @@ vmx_exit_handle_possible_nmi(struct vm_exit *vmexit)
 }
 
 /*
- * Run the host handler for an external interrupt that ended guest execution.
- *
- * The exit controls have the processor acknowledge the interrupt as part of
- * the VM exit, which leaves its vector in service in the local APIC.  No
- * interrupt of the same or a lower priority class, cross-calls included, is
- * delivered to this CPU until the handler has run and sent the EOI.  The
- * handler must therefore run before this thread does anything that can wait
- * on another CPU.  In particular it must come before vmc_table_exit(), which
- * takes a lock that a thread holding the vmspace may own while it waits in a
- * cross-call for this very CPU.
+ * An external interrupt acknowledged on VM exit stays in service, blocking
+ * interrupts of equal or lower priority (cross-calls included), until its
+ * host handler runs.  That must happen before this thread can block.
  */
 static __inline void
 vmx_exit_handle_possible_extintr(struct vm_exit *vmexit)
@@ -2726,8 +2719,8 @@ vmx_exit_handle_possible_extintr(struct vm_exit *vmexit)
 		/* Ignored here as it is in vmx_exit_process(). */
 		if ((intr_info & VMCS_INTR_VALID) == 0)
 			return;
-		KASSERT((intr_info & VMCS_INTR_T_MASK) == VMCS_INTR_T_HWINTR,
-		    ("VM exit interruption info invalid: %x", intr_info));
+
+		ASSERT3U(intr_info & VMCS_INTR_T_MASK, ==, VMCS_INTR_T_HWINTR);
 		vmx_trigger_hostintr(intr_info & 0xff);
 	}
 }
