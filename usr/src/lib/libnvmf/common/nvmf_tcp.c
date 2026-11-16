@@ -295,8 +295,7 @@ nvmf_tcp_report_error(struct nvmf_association *na, nvmf_tcp_qpair_t *qp,
 	iov[1].iov_len = hlen;
 
 	(void) nvmf_tcp_write_pdu_iov(qp, iov, 2, sizeof (hdr) + hlen);
-	(void) close(qp->s);
-	qp->s = -1;
+	(void) shutdown(qp->s, SHUT_RDWR);
 }
 
 static int
@@ -321,10 +320,7 @@ nvmf_tcp_validate_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu,
 	    qp->qp.nq_association->na_controller, qp->header_digests,
 	    qp->data_digests, qp->rxpda, &data_len, &fes, &fei);
 	if (error != 0) {
-		if (error == ECONNRESET) {
-			(void) close(qp->s);
-			qp->s = -1;
-		} else {
+		if (error != ECONNRESET) {
 			nvmf_tcp_report_error(qp->qp.nq_association, qp,
 			    fes, fei, ch, pdu_len, hlen);
 		}
