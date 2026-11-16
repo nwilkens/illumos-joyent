@@ -126,9 +126,6 @@ nvmft_port_free(nvmft_port_t *np)
 	if (np->np_devid != NULL)
 		nvmft_free_scsi_devid_desc(np->np_devid);
 	id_space_destroy(np->np_ids);
-	if (np->np_active_ns != NULL)
-		kmem_free(np->np_active_ns,
-		    np->np_num_ns * sizeof (uint32_t));
 	list_destroy(&np->np_controllers);
 	cv_destroy(&np->np_cv);
 	mutex_destroy(&np->np_lock);

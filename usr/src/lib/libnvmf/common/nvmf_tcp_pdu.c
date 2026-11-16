@@ -28,6 +28,7 @@
 #include <sys/byteorder.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <assert.h>
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
