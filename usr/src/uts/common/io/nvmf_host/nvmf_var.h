@@ -20,29 +20,7 @@
  *           Written by: John Baldwin <jhb@FreeBSD.org>
  *           SPDX-License-Identifier: BSD-2-Clause
  *
- * Private state for the NVMe over Fabrics host (initiator).  The
- * transport-independent protocol state (softc, qpair, request, completion
- * status) is preserved field-for-field from the FreeBSD source; only the OS
- * glue differs:
- *
- *   FreeBSD                 illumos
- *   -------                 -------
- *   device_t dev            dev_info_t *dip
- *   struct cam_sim / path   bd_handle_t (blkdev) via the head/path model
- *   struct mtx              kmutex_t
- *   struct sx               krwlock_t
- *   struct callout          (k)timeout_id / cyclic (TODO)
- *   struct task / taskqueue ddi_taskq_t
- *   eventhandler_tag        (no equivalent; quiesce(9E)/detach paths)
- *   M_WAITOK / M_NOWAIT     KM_SLEEP / KM_NOSLEEP
- *
- * The largest structural divergence is the replacement of FreeBSD's CAM SIM
- * (nvmf_sim.c) with an illumos blkdev binding plus a native multipath layer
- * (NVMEOF.md sections 7.3 and 9.3).  Where FreeBSD presents one cam_sim per
- * association and lets nvme_xpt enumerate namespaces, illumos presents one
- * blkdev disk per *namespace head* (keyed by NGUID/EUI64/UUID), and each head
- * owns a set of paths.  An association (this softc) contributes one path per
- * head.  Keep-alive death marks paths down rather than tearing down the disk.
+ * Private state for the NVMe over Fabrics host (initiator).
  */
 
 #ifndef	_NVMF_VAR_H
@@ -52,8 +30,10 @@
 #include <sys/ddi.h>
 #include <sys/sunddi.h>
 #include <sys/list.h>
+#include <sys/avl.h>
 #include <sys/ksynch.h>
 #include <sys/taskq.h>
+#include <sys/taskq_impl.h>
 #include <sys/cpuvar.h>
 #include <sys/blkdev.h>
 #include <sys/nvme.h>
@@ -71,83 +51,126 @@ extern "C" {
 struct nvmf_aer;
 struct nvmf_capsule;
 struct nvmf_host_qpair;
-struct nvmf_namespace;
 struct nvmf_ns_head;
 struct nvmf_path;
 
-/*
- * (FreeBSD: nvmf_request_complete_t) Per-request completion callback.  The
- * FreeBSD type takes "const struct nvme_completion *"; the illumos generic CQE
- * is nvme_cqe_t.
- */
 typedef void nvmf_request_complete_t(void *, const nvme_cqe_t *);
 
 /*
- * (FreeBSD: struct nvmf_softc) One Fabrics association == one controller
- * attachment.  In the illumos multipath model this softc is a *path provider*:
- * it contributes one nvmf_path to each namespace head it can reach.
+ * Association state, changed only under nvmf_softc_t.lock.
+ *
+ * ATTACHING, RECONNECTING, DISCONNECTING and DETACHING each belong to the one
+ * ioctl or detach thread that entered the state.  RESETTING belongs to the
+ * connection worker.  A softc leaves one of those states only by the hand of
+ * its owner, so two lifecycle operations never run together.
  */
-typedef struct nvmf_softc {
-	dev_info_t		*dip;		/* FreeBSD: device_t dev */
+typedef enum nvmf_sc_state {
+	NVMF_SC_IDLE,
+	NVMF_SC_ATTACHING,
+	NVMF_SC_CONNECTED,
+	NVMF_SC_RESETTING,
+	NVMF_SC_LOST,
+	NVMF_SC_RECONNECTING,
+	NVMF_SC_FAILED,
+	NVMF_SC_DISCONNECTING,
+	NVMF_SC_DETACHING
+} nvmf_sc_state_t;
 
+typedef enum nvmf_io_action {
+	NVMF_IO_SUBMIT,
+	NVMF_IO_HOLD,
+	NVMF_IO_FAIL
+} nvmf_io_action_t;
+
+/* Connection worker events. */
+#define	NVMF_EV_KA_TX		0x01
+#define	NVMF_EV_KA_RX		0x02
+#define	NVMF_EV_LOSS		0x04
+#define	NVMF_EV_RECONNECT	0x08
+#define	NVMF_EV_DISCONNECT	0x10
+
+/* Namespace worker events. */
+#define	NVMF_NS_EV_RESCAN	0x01
+#define	NVMF_NS_EV_PURGE	0x02
+#define	NVMF_NS_EV_DETACH	0x04
+
+/*
+ * Sysevents posted with ddi_log_sysevent() under vendor DDI_VENDOR_SUNW.  Each
+ * carries the int32 "instance" and the string "subnqn".
+ */
+#define	EC_NVMF			"EC_nvmf"
+#define	ESC_NVMF_HOST_LOST	"ESC_nvmf_host_lost"
+#define	ESC_NVMF_HOST_RECONNECT	"ESC_nvmf_host_reconnect"
+#define	ESC_NVMF_HOST_FAILED	"ESC_nvmf_host_failed"
+
+typedef struct nvmf_softc {
+	dev_info_t		*dip;
+
+	kmutex_t		lock;
+	kcondvar_t		cv;		/* state changes */
+	kcondvar_t		qp_cv;		/* qp_users reached zero */
+	nvmf_sc_state_t		state;
+	boolean_t		io_enabled;
+	boolean_t		conn_error;
+
+	/*
+	 * admin and io are written under lock by the owner of the current
+	 * state.  Any other thread reads them under lock and holds qp_users
+	 * for as long as it uses a queue pair.
+	 */
 	struct nvmf_host_qpair	*admin;
 	struct nvmf_host_qpair	**io;
 	uint_t			num_io_queues;
+	uint_t			qp_users;
 	nvmf_trtype_t		trtype;
 
-	/*
-	 * FreeBSD keeps cam_sim/cam_path/sim_mtx here.  illumos replaces them
-	 * with the head/path multipath layer (nvmf_mpath.c); this softc holds
-	 * the list of paths it currently provides.  The path selector consults
-	 * per-path state (nvmf_path_t path_down), not a softc-wide flag.
-	 */
-	kmutex_t		mpath_mtx;
-	list_t			paths;		/* nvmf_path_t by this assoc */
+	list_t			held;		/* I/O awaiting a reconnect */
 
-	struct nvmf_namespace	**ns;
+	taskq_t			*conn_tq;
+	taskq_ent_t		conn_ent;
+	uint_t			conn_events;
+	boolean_t		conn_queued;
+
+	taskq_t			*ns_tq;
+	taskq_ent_t		ns_ent;
+	uint_t			ns_events;
+	boolean_t		ns_queued;
+
+	/*
+	 * Namespaces and heads are added and removed only by the namespace
+	 * worker, or by a state owner after it has drained that worker.  lock
+	 * protects the containers for every other reader.
+	 */
+	avl_tree_t		ns_tree;
+	list_t			heads;
+
+	boolean_t		detach_req;
+	boolean_t		detach_done;
+	boolean_t		detach_busy;
+	boolean_t		detach_owned;
 
 	nvme_identify_ctrl_t	*cdata;
+	boolean_t		vwc_present;
+	boolean_t		dsm_supported;
 	uint64_t		cap;
 	uint32_t		vs;
 	uint_t			max_pending_io;
 	uint64_t		max_xfer_size;
 
-	/*
-	 * Keep Alive support.  A tx timer sends KeepAlive at half the timeout
-	 * and an rx timer detects an actual timeout; ka_active_*_traffic are
-	 * touched with atomics.  FreeBSD's callout becomes a timeout(9F) id
-	 * here; the scheduling lives in nvmf_host.c (nvmf_arm_ka_timers).
-	 */
+	boolean_t		ka_enabled;
 	boolean_t		ka_traffic;	/* Using TKAS? */
 	volatile uint_t		ka_active_tx_traffic;
 	volatile uint_t		ka_active_rx_traffic;
-	hrtime_t		ka_rx_interval;	/* FreeBSD: ka_rx_sbt */
-	hrtime_t		ka_tx_interval;	/* FreeBSD: ka_tx_sbt */
+	clock_t			ka_rx_ticks;
+	clock_t			ka_tx_ticks;
 	timeout_id_t		ka_rx_timer;
 	timeout_id_t		ka_tx_timer;
 
 	uint32_t		reconnect_delay;
 	uint32_t		controller_loss_timeout;
-
-	/*
-	 * Disconnect / reconnect / controller-loss state machine.  FreeBSD
-	 * uses TIMEOUT_TASK on nvmf_tq for the reconnect-request and
-	 * controller-loss tasks; illumos uses timeout(9F) ids cancelled under
-	 * connection_lock.  cdev_attached replaces FreeBSD's sc->cdev != NULL
-	 * check (gates whether namespaces/blkdev have been brought up and may
-	 * be torn down).
-	 */
 	timeout_id_t		reconnect_timer;
 	timeout_id_t		loss_timer;
-	boolean_t		cdev_attached;
-
-	/*
-	 * FreeBSD: sx connection_lock + task disconnect_task + timeout tasks.
-	 * illumos: krwlock + a per-driver taskq (nvmf_tq) shared across softcs.
-	 */
-	krwlock_t		connection_lock;
-	boolean_t		detaching;
-	boolean_t		controller_timedout;
+	clock_t			loss_deadline;
 
 	uint_t			num_aer;
 	struct nvmf_aer		*aer;
@@ -157,10 +180,6 @@ typedef struct nvmf_softc {
 	timespec_t		last_disconnect;
 } nvmf_softc_t;
 
-/*
- * (FreeBSD: struct nvmf_request) An in-flight (or pending) command on a host
- * qpair, with its completion callback.
- */
 typedef struct nvmf_request {
 	struct nvmf_host_qpair	*qp;
 	struct nvmf_capsule	*nc;
@@ -168,53 +187,38 @@ typedef struct nvmf_request {
 	void			*cb_arg;
 	boolean_t		aer;
 
-	list_node_t		link;		/* FreeBSD: STAILQ_ENTRY */
+	list_node_t		link;
 } nvmf_request_t;
 
-/*
- * (FreeBSD: struct nvmf_completion_status) Synchronous command helper: a CQE
- * plus done/io_done flags poked by the completion callbacks and waited on by
- * nvmf_wait_for_reply().
- */
+/* State of one synchronous command, waited on by nvmf_wait_for_reply(). */
 typedef struct nvmf_completion_status {
 	nvme_cqe_t		cqe;
 	boolean_t		done;
 	boolean_t		io_done;
 	int			io_error;
+	size_t			io_xfered;
 } nvmf_completion_status_t;
 
-/*
- * (FreeBSD: nvmf_select_io_queue) Pick an I/O qpair for a command.  FreeBSD
- * indexes by curcpu; illumos uses CPU() / cpu_seqid against num_io_queues.
- */
-static inline struct nvmf_host_qpair *
-nvmf_select_io_queue(nvmf_softc_t *sc)
-{
-	uint_t idx;
+typedef struct nvmf_ns_info {
+	uint32_t		ni_nsid;
+	uint32_t		ni_blksize;
+	uint64_t		ni_size;
+	uint8_t			ni_nguid[16];
+	uint8_t			ni_eui64[8];
+} nvmf_ns_info_t;
 
-	/*
-	 * nvmf_disconnect_task zeroes num_io_queues (and frees sc->io) under
-	 * connection_lock as a writer while the softc lives.  A caller racing
-	 * that teardown must see no queue rather than divide by zero or index a
-	 * freed array; return NULL and let the caller fail the I/O with ENXIO.
-	 */
-	if (sc->io == NULL || sc->num_io_queues == 0)
-		return (NULL);
-	idx = (uint_t)(CPU->cpu_seqid) % sc->num_io_queues;
-	return (sc->io[idx]);
-}
-
-/*
- * (FreeBSD: nvmf_cqe_aborted) True if a CQE indicates the command was aborted
- * by the host due to a path/association teardown (Path Related status, Command
- * Aborted By Host).  Used by both the blkdev binding and multipath to decide
- * whether to retry on another path.
- */
+/* True if a CQE reports that the host aborted the command during teardown. */
 static inline boolean_t
 nvmf_cqe_aborted(const nvme_cqe_t *cqe)
 {
 	return (cqe->cqe_sf.sf_sct == NVME_CQE_SCT_PATH &&
 	    cqe->cqe_sf.sf_sc == NVME_CQE_SC_PATH_HOST_ABRT);
+}
+
+static inline boolean_t
+nvmf_cqe_failed(const nvme_cqe_t *cqe)
+{
+	return (cqe->cqe_sf.sf_sc != 0 || cqe->cqe_sf.sf_sct != 0);
 }
 
 static inline void
@@ -223,6 +227,7 @@ nvmf_status_init(nvmf_completion_status_t *status)
 	status->done = B_FALSE;
 	status->io_done = B_TRUE;
 	status->io_error = 0;
+	status->io_xfered = 0;
 }
 
 static inline void
@@ -231,18 +236,42 @@ nvmf_status_wait_io(nvmf_completion_status_t *status)
 	status->io_done = B_FALSE;
 }
 
-/* If B_TRUE, I/O requests fail while the host is disconnected. */
+/* If B_TRUE, I/O fails at once while the association is lost. */
 extern boolean_t nvmf_fail_disconnect;
+extern uint_t nvmf_admin_timeout;
+extern uint_t nvmf_shutdown_timeout;
+extern uint_t nvmf_max_namespaces;
 
 /* nvmf_host.c */
-extern void nvmf_complete(void *arg, const nvme_cqe_t *cqe);
-extern void nvmf_io_complete(void *arg, size_t xfered, int error);
-extern void nvmf_wait_for_reply(nvmf_completion_status_t *status);
-extern int nvmf_copyin_handoff(const struct nvmf_ioc_nv *nv, nvlist_t **nvlp);
+extern void *nvmf_state;
+
+/* nvmf_conn.c */
+extern nvmf_io_action_t nvmf_io_policy(nvmf_sc_state_t state,
+    boolean_t enabled, boolean_t gone, boolean_t fail_fast);
+extern uint64_t nvmf_max_xfer(uint64_t cap, uint8_t mdts, uint64_t transport,
+    uint64_t limit);
+extern struct nvmf_host_qpair *nvmf_admin_hold(nvmf_softc_t *sc);
+extern void nvmf_qp_rele(nvmf_softc_t *sc);
+extern void nvmf_shutdown_admin(nvmf_softc_t *sc);
 extern void nvmf_disconnect(nvmf_softc_t *sc);
+extern void nvmf_ns_post(nvmf_softc_t *sc, uint_t events);
+extern int nvmf_attach_association(nvmf_softc_t *sc, nvlist_t *nvl);
+extern int nvmf_reconnect_association(nvmf_softc_t *sc, nvlist_t *nvl);
+extern void nvmf_teardown(nvmf_softc_t *sc, boolean_t graceful);
+extern const char *nvmf_state_name(nvmf_sc_state_t state);
+
+/* nvmf_ioctl.c */
+extern int nvmf_ioctl(dev_t dev, int cmd, intptr_t arg, int mode,
+    cred_t *credp, int *rvalp);
+
+/* nvmf_scan.c */
+extern int nvmf_nslist_count(const nvme_identify_nsid_list_t *nslist,
+    uint32_t prev);
+extern boolean_t nvmf_add_namespaces(nvmf_softc_t *sc);
+extern boolean_t nvmf_revalidate_namespaces(nvmf_softc_t *sc);
 extern void nvmf_rescan_ns(nvmf_softc_t *sc, uint32_t nsid);
 extern void nvmf_rescan_all_ns(nvmf_softc_t *sc);
-extern ddi_taskq_t *nvmf_aer_taskq(nvmf_softc_t *sc);
+extern void nvmf_ns_task(void *arg);
 
 /* nvmf_aer.c */
 extern void nvmf_init_aer(nvmf_softc_t *sc);
@@ -250,6 +279,17 @@ extern int nvmf_start_aer(nvmf_softc_t *sc);
 extern void nvmf_destroy_aer(nvmf_softc_t *sc);
 
 /* nvmf_cmd.c */
+extern void nvmf_cmd_init(void);
+extern void nvmf_cmd_fini(void);
+extern void nvmf_complete(void *arg, const nvme_cqe_t *cqe);
+extern void nvmf_io_complete(void *arg, size_t xfered, int error);
+extern void nvmf_wait_for_reply(nvmf_softc_t *sc,
+    nvmf_completion_status_t *status, uint_t secs);
+extern boolean_t nvmf_status_ok(const nvmf_completion_status_t *status,
+    size_t len);
+extern int nvmf_read_property(nvmf_softc_t *sc, uint32_t offset, uint8_t size,
+    uint64_t *value, uint_t secs);
+extern void nvmf_shutdown_controller(nvmf_softc_t *sc);
 extern boolean_t nvmf_cmd_get_property(nvmf_softc_t *sc, uint32_t offset,
     uint8_t size, nvmf_request_complete_t *cb, void *cb_arg, int how);
 extern boolean_t nvmf_cmd_set_property(nvmf_softc_t *sc, uint32_t offset,
@@ -265,28 +305,27 @@ extern boolean_t nvmf_cmd_identify_namespace(nvmf_softc_t *sc, uint32_t id,
     nvme_identify_nsid_t *nsdata, nvmf_request_complete_t *req_cb,
     void *req_cb_arg, nvmf_io_complete_t *io_cb, void *io_cb_arg, int how);
 extern boolean_t nvmf_cmd_get_log_page(nvmf_softc_t *sc, uint32_t nsid,
-    uint8_t lid, uint64_t offset, void *buf, size_t len,
+    uint8_t lid, uint64_t offset, void *page, size_t len,
     nvmf_request_complete_t *req_cb, void *req_cb_arg,
     nvmf_io_complete_t *io_cb, void *io_cb_arg, int how);
 
 /* nvmf_ns.c */
+extern void nvmf_ns_init(nvmf_softc_t *sc);
+extern void nvmf_ns_fini(nvmf_softc_t *sc);
 extern boolean_t nvmf_ns_fmt(const nvme_identify_nsid_t *data, uint64_t *nblksp,
     uint32_t *blksizep, dev_info_t *dip, uint32_t nsid);
-extern struct nvmf_namespace *nvmf_init_ns(nvmf_softc_t *sc, uint32_t id,
+extern void nvmf_ns_reconcile(nvmf_softc_t *sc, uint32_t nsid,
     const nvme_identify_nsid_t *data);
-extern void nvmf_disconnect_ns(struct nvmf_namespace *ns);
-extern void nvmf_reconnect_ns(struct nvmf_namespace *ns);
-extern void nvmf_shutdown_ns(struct nvmf_namespace *ns);
-extern void nvmf_destroy_ns(struct nvmf_namespace *ns);
-extern boolean_t nvmf_update_ns(struct nvmf_namespace *ns,
+extern void nvmf_ns_purge(nvmf_softc_t *sc, uint32_t first, uint32_t end);
+extern void nvmf_ns_remove_all(nvmf_softc_t *sc);
+extern void nvmf_ns_revalidate(nvmf_softc_t *sc, uint32_t nsid,
     const nvme_identify_nsid_t *data);
-extern void nvmf_ns_get_info(struct nvmf_namespace *ns, uint32_t *nsidp,
-    uint64_t *sizep, uint32_t *blksizep, uint8_t *nguid, uint8_t *eui64,
-    boolean_t *connectedp);
+extern uint_t nvmf_ns_snapshot(nvmf_softc_t *sc, nvmf_ns_info_t *info,
+    uint_t max);
 
 /* nvmf_qpair.c */
 extern struct nvmf_host_qpair *nvmf_init_qp(nvmf_softc_t *sc,
-    nvmf_trtype_t trtype, const nvlist_t *nvl, const char *name, uint_t qid);
+    nvmf_trtype_t trtype, const nvlist_t *nvl, const char *name);
 extern void nvmf_shutdown_qp(struct nvmf_host_qpair *qp);
 extern void nvmf_destroy_qp(struct nvmf_host_qpair *qp);
 extern uint64_t nvmf_max_xfer_size_qp(struct nvmf_host_qpair *qp);
@@ -295,63 +334,41 @@ extern nvmf_request_t *nvmf_allocate_request(struct nvmf_host_qpair *qp,
 extern void nvmf_submit_request(nvmf_request_t *req);
 extern void nvmf_free_request(nvmf_request_t *req);
 
-/*
- * nvmf_blkdev.c (NEW - replaces FreeBSD nvmf_sim.c).  Per-association binding
- * to the blkdev framework via the namespace-head abstraction.  These mirror
- * the lifecycle entry points the FreeBSD core (nvmf.c) calls on the SIM.
- */
-extern int nvmf_init_bd(nvmf_softc_t *sc);
-extern void nvmf_disconnect_bd(nvmf_softc_t *sc);
-extern void nvmf_reconnect_bd(nvmf_softc_t *sc);
-extern void nvmf_shutdown_bd(nvmf_softc_t *sc);
-extern void nvmf_destroy_bd(nvmf_softc_t *sc);
-extern void nvmf_bd_rescan_ns(nvmf_softc_t *sc, uint32_t id);
+/* nvmf_blkdev.c */
+extern void nvmf_bd_init(nvmf_softc_t *sc);
+extern void nvmf_bd_fini(nvmf_softc_t *sc);
+extern void nvmf_bd_resume(nvmf_softc_t *sc);
+extern void nvmf_bd_fail_held(nvmf_softc_t *sc, int error);
+extern void nvmf_bd_path_gone(nvmf_softc_t *sc, struct nvmf_path *path);
+extern bd_handle_t nvmf_bd_alloc_handle(struct nvmf_ns_head *head);
 
-/*
- * Head <-> blkdev handle translation, consumed by nvmf_mpath.c: the head
- * carries the bd_ops "driver private" so the callbacks resolve geometry/NSID
- * through it.
- */
-extern bd_handle_t nvmf_blkdev_attach_head(struct nvmf_ns_head *head,
-    dev_info_t *dip);
-extern void nvmf_blkdev_detach_head(bd_handle_t bdh);
-
-/*
- * nvmf_mpath.c (NEW - the namespace-head / path / selector model of
- * NVMEOF.md 9.3).  These are consumed by nvmf_blkdev.c and by the core.
- */
-extern void nvmf_mpath_init(void);
-extern void nvmf_mpath_fini(void);
-extern void nvmf_mpath_softc_init(nvmf_softc_t *sc);
-extern void nvmf_mpath_softc_fini(nvmf_softc_t *sc);
-extern void nvmf_mpath_softc_down(nvmf_softc_t *sc);
-extern void nvmf_mpath_softc_up(nvmf_softc_t *sc);
-extern void nvmf_mpath_softc_remove_all(nvmf_softc_t *sc);
-struct nvmf_path *nvmf_mpath_add_path(nvmf_softc_t *sc, uint32_t nsid,
+/* nvmf_mpath.c */
+extern void nvmf_mpath_init(nvmf_softc_t *sc);
+extern void nvmf_mpath_fini(nvmf_softc_t *sc);
+extern struct nvmf_path *nvmf_mpath_add_path(nvmf_softc_t *sc, uint32_t nsid,
+    const nvme_identify_nsid_t *data, uint64_t nblks, uint32_t blksize);
+extern void nvmf_mpath_remove_path(struct nvmf_path *path);
+extern boolean_t nvmf_mpath_path_update(struct nvmf_path *path,
+    const nvme_identify_nsid_t *data, uint64_t nblks, uint32_t blksize);
+extern boolean_t nvmf_mpath_path_matches(struct nvmf_path *path,
     const nvme_identify_nsid_t *data);
-void nvmf_mpath_remove_path(struct nvmf_path *path);
-struct nvmf_ns_head *nvmf_mpath_find_head(const nvme_identify_nsid_t *data);
-struct nvmf_path *nvmf_mpath_select(struct nvmf_ns_head *head, bd_xfer_t *xfer);
-void nvmf_mpath_select_rele(struct nvmf_path *path);
-void nvmf_mpath_path_down(struct nvmf_path *path);
-void nvmf_mpath_path_up(struct nvmf_path *path);
-uint32_t nvmf_mpath_head_blksize(struct nvmf_ns_head *head);
-uint64_t nvmf_mpath_head_nblks(struct nvmf_ns_head *head);
-void nvmf_mpath_head_set_geometry(struct nvmf_ns_head *head, uint64_t nblks,
-    uint32_t blksize);
-uint32_t nvmf_mpath_path_nsid(struct nvmf_path *path);
-nvmf_softc_t *nvmf_mpath_path_sc(struct nvmf_path *path);
-
-/*
- * Head identity/devid accessors consumed by nvmf_blkdev.c to populate
- * bd_drive_t and build the path-independent devid without exposing the head
- * struct.
- */
-struct nvmf_path *nvmf_mpath_head_path(struct nvmf_ns_head *head);
-boolean_t nvmf_mpath_head_eui64(struct nvmf_ns_head *head, uint8_t *eui64);
-boolean_t nvmf_mpath_head_guid(struct nvmf_ns_head *head, uint8_t *guid);
-int nvmf_mpath_head_devid_init(struct nvmf_ns_head *head, dev_info_t *dip,
-    ddi_devid_t *devid);
+extern boolean_t nvmf_mpath_path_gone(struct nvmf_path *path);
+extern void nvmf_mpath_path_set_gone(struct nvmf_path *path);
+extern struct nvmf_path *nvmf_mpath_select(struct nvmf_ns_head *head);
+extern void nvmf_mpath_select_rele(struct nvmf_path *path);
+extern boolean_t nvmf_mpath_detach_all(nvmf_softc_t *sc);
+extern void nvmf_mpath_reap(nvmf_softc_t *sc);
+extern boolean_t nvmf_mpath_busy(nvmf_softc_t *sc);
+extern uint32_t nvmf_mpath_head_blksize(struct nvmf_ns_head *head);
+extern uint64_t nvmf_mpath_head_maxxfer(struct nvmf_ns_head *head);
+extern int nvmf_mpath_head_media(struct nvmf_ns_head *head, uint64_t *nblksp,
+    uint32_t *blksizep);
+extern void nvmf_mpath_head_ids(struct nvmf_ns_head *head, uint8_t *eui64,
+    uint8_t *guid);
+extern int nvmf_mpath_head_devid_init(struct nvmf_ns_head *head,
+    dev_info_t *dip, ddi_devid_t *devid);
+extern uint32_t nvmf_mpath_path_nsid(struct nvmf_path *path);
+extern nvmf_softc_t *nvmf_mpath_path_sc(struct nvmf_path *path);
 
 #ifdef __cplusplus
 }

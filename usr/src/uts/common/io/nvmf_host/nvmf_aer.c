@@ -20,19 +20,9 @@
  *           Written by: John Baldwin <jhb@FreeBSD.org>
  *           SPDX-License-Identifier: BSD-2-Clause
  *
- * Asynchronous Event Request handling.  When an AER completes, the controller
- * reports an event type/info/log-page in CDW0; the host reads the associated
- * log page (changed-namespace list, error log) on a background task and then
- * resubmits the AER.  The protocol state machine ports closely; OS-glue:
- *
- *   FreeBSD                 illumos
- *   -------                 -------
- *   struct task +           ddi_taskq_t (one per softc, supplied by nvmf_host.c
- *     taskqueue_thread        as nvmf_aer_taskq(sc)); each AER queues two
- *                             dispatch functions
- *   mtx_pool_find/mtx        a single kmutex per AER
- *   le16toh/le32toh          illumos is little-endian only
- *   NVMEV(field, val)        bit extraction is open-coded here
+ * Asynchronous Event Request handling.  When an AER completes, the host reads
+ * the log page the controller names on the namespace worker and then submits
+ * the AER again.
  */
 
 #include <sys/types.h>
@@ -46,6 +36,11 @@
 #include "nvmf_var.h"
 #include "../nvme/nvme_reg.h"
 
+/*
+ * One AER slot.  active is set from the submission of the AER command until
+ * the chain of completions and tasks that follows it ends, so a slot never
+ * has two commands outstanding and its taskq entry is never queued twice.
+ */
 typedef struct nvmf_aer {
 	nvmf_softc_t	*sc;
 	uint8_t		log_page_id;
@@ -55,14 +50,11 @@ typedef struct nvmf_aer {
 	uint_t		page_len;
 	void		*page;
 
-	int		error;
-	uint16_t	status;
-	int		pending;
 	kmutex_t	lock;
-	/*
-	 * FreeBSD uses two struct task instances dispatched to taskqueue_thread.
-	 * illumos dispatches the same two functions to the softc's taskq.
-	 */
+	boolean_t	active;
+	int		pending;
+	boolean_t	failed;
+	taskq_ent_t	ent;
 } nvmf_aer_t;
 
 #define	MAX_LOG_PAGE_SIZE	4096
@@ -70,45 +62,58 @@ typedef struct nvmf_aer {
 static void	nvmf_complete_aer(void *arg, const nvme_cqe_t *cqe);
 
 static void
+nvmf_aer_idle(nvmf_aer_t *aer)
+{
+	mutex_enter(&aer->lock);
+	aer->active = B_FALSE;
+	mutex_exit(&aer->lock);
+}
+
+/* Submit the AER command of a slot that the caller has marked active. */
+static void
 nvmf_submit_aer(nvmf_softc_t *sc, nvmf_aer_t *aer)
 {
+	struct nvmf_host_qpair *qp;
 	nvmf_request_t *req;
 	nvme_sqe_t cmd;
 
 	bzero(&cmd, sizeof (cmd));
 	cmd.sqe_opc = NVME_OPC_ASYNC_EVENT;
 
-	req = nvmf_allocate_request(sc->admin, &cmd, nvmf_complete_aer, aer,
-	    KM_SLEEP);
-	if (req == NULL)
+	qp = nvmf_admin_hold(sc);
+	if (qp == NULL) {
+		nvmf_aer_idle(aer);
 		return;
+	}
+	req = nvmf_allocate_request(qp, &cmd, nvmf_complete_aer, aer,
+	    KM_SLEEP);
+	if (req == NULL) {
+		nvmf_qp_rele(sc);
+		nvmf_aer_idle(aer);
+		return;
+	}
 	req->aer = B_TRUE;
 	nvmf_submit_request(req);
+	nvmf_qp_rele(sc);
 }
 
 static void
 nvmf_handle_changed_namespaces(nvmf_softc_t *sc,
     nvme_identify_nsid_list_t *ns_list)
 {
-	uint32_t nsid;
 	uint_t i, n;
 
-	/*
-	 * If more than 1024 namespaces have changed, we should probably just
-	 * rescan the entire set of namespaces.
-	 */
-	n = sizeof (ns_list->nl_nsid) / sizeof (ns_list->nl_nsid[0]);
-	if (ns_list->nl_nsid[0] == 0xffffffff) {
+	/* More than 1024 namespaces changed, so look at all of them. */
+	if (ns_list->nl_nsid[0] == NVME_NSID_BCAST) {
 		nvmf_rescan_all_ns(sc);
 		return;
 	}
 
+	n = sizeof (ns_list->nl_nsid) / sizeof (ns_list->nl_nsid[0]);
 	for (i = 0; i < n; i++) {
 		if (ns_list->nl_nsid[i] == 0)
 			break;
-
-		nsid = ns_list->nl_nsid[i];
-		nvmf_rescan_ns(sc, nsid);
+		nvmf_rescan_ns(sc, ns_list->nl_nsid[i]);
 	}
 }
 
@@ -118,73 +123,53 @@ nvmf_finish_aer_page_task(void *arg)
 	nvmf_aer_t *aer = arg;
 	nvmf_softc_t *sc = aer->sc;
 
-	switch (aer->log_page_id) {
-	case NVME_LOGPAGE_ERROR:
-		/* TODO: Should we log these? */
-		break;
-	case NVME_LOGPAGE_NSCHANGE:
+	if (aer->log_page_id == NVME_LOGPAGE_NSCHANGE)
 		nvmf_handle_changed_namespaces(sc, aer->page);
-		break;
-	}
 
-	/* Resubmit this AER command. */
 	nvmf_submit_aer(sc, aer);
 }
 
+/* Both completions of the log page read have arrived. */
 static void
-nvmf_finish_aer_page(nvmf_softc_t *sc, nvmf_aer_t *aer)
+nvmf_finish_aer_page(nvmf_softc_t *sc, nvmf_aer_t *aer, boolean_t failed)
 {
-	/* If an error occurred fetching the page, just bail. */
-	if (aer->error != 0 || aer->status != 0)
+	if (failed) {
+		nvmf_aer_idle(aer);
 		return;
+	}
 
-	(void) ddi_taskq_dispatch(nvmf_aer_taskq(sc), nvmf_finish_aer_page_task,
-	    aer, DDI_SLEEP);
+	taskq_dispatch_ent(sc->ns_tq, nvmf_finish_aer_page_task, aer, 0,
+	    &aer->ent);
+}
+
+static void
+nvmf_aer_page_done(nvmf_aer_t *aer, boolean_t failed)
+{
+	boolean_t last;
+
+	mutex_enter(&aer->lock);
+	if (failed)
+		aer->failed = B_TRUE;
+	last = --aer->pending == 0;
+	failed = aer->failed;
+	mutex_exit(&aer->lock);
+
+	if (last)
+		nvmf_finish_aer_page(aer->sc, aer, failed);
 }
 
 static void
 nvmf_io_complete_aer_page(void *arg, size_t xfered, int error)
 {
 	nvmf_aer_t *aer = arg;
-	nvmf_softc_t *sc = aer->sc;
 
-	_NOTE(ARGUNUSED(xfered));
-
-	mutex_enter(&aer->lock);
-	aer->error = error;
-	aer->pending--;
-	if (aer->pending == 0) {
-		mutex_exit(&aer->lock);
-		nvmf_finish_aer_page(sc, aer);
-	} else {
-		mutex_exit(&aer->lock);
-	}
+	nvmf_aer_page_done(aer, error != 0 || xfered != aer->page_len);
 }
 
 static void
 nvmf_complete_aer_page(void *arg, const nvme_cqe_t *cqe)
 {
-	nvmf_aer_t *aer = arg;
-	nvmf_softc_t *sc = aer->sc;
-
-	mutex_enter(&aer->lock);
-	/*
-	 * Record only the error-bearing portion of the status field.  The raw
-	 * 16-bit status word also carries the Phase Tag (sf_p), More (sf_m),
-	 * and Do Not Retry (sf_dnr) bits; folding those into the error test
-	 * (a plain "status != 0" in nvmf_finish_aer_page()) would spuriously
-	 * treat a successful GET_LOG_PAGE as failed, skipping the
-	 * changed-namespace rescan and permanently losing the AER slot.  Match
-	 * nvmf_cqe_failed().
-	 */
-	aer->status = (cqe->cqe_sf.sf_sc != 0 || cqe->cqe_sf.sf_sct != 0);
-	aer->pending--;
-	if (aer->pending == 0) {
-		mutex_exit(&aer->lock);
-		nvmf_finish_aer_page(sc, aer);
-	} else {
-		mutex_exit(&aer->lock);
-	}
+	nvmf_aer_page_done(arg, nvmf_cqe_failed(cqe));
 }
 
 static uint_t
@@ -207,18 +192,24 @@ nvmf_complete_aer_task(void *arg)
 	nvmf_aer_t *aer = arg;
 	nvmf_softc_t *sc = aer->sc;
 
-	if (aer->page_len != 0) {
-		/* Read the associated log page. */
-		aer->page_len = MIN(aer->page_len, MAX_LOG_PAGE_SIZE);
-		aer->pending = 2;
-		(void) nvmf_cmd_get_log_page(sc, NVME_NSID_BCAST,
-		    aer->log_page_id, 0, aer->page, aer->page_len,
-		    nvmf_complete_aer_page, aer, nvmf_io_complete_aer_page,
-		    aer, KM_SLEEP);
-	} else {
-		/* Resubmit this AER command. */
+	aer->page_len = MIN(nvmf_log_page_size(sc, aer->log_page_id),
+	    MAX_LOG_PAGE_SIZE);
+	if (aer->page_len == 0) {
 		nvmf_submit_aer(sc, aer);
+		return;
 	}
+
+	/* Reading the log page also clears the event on the controller. */
+	bzero(aer->page, MAX_LOG_PAGE_SIZE);
+	mutex_enter(&aer->lock);
+	aer->pending = 2;
+	aer->failed = B_FALSE;
+	mutex_exit(&aer->lock);
+
+	if (!nvmf_cmd_get_log_page(sc, NVME_NSID_BCAST, aer->log_page_id, 0,
+	    aer->page, aer->page_len, nvmf_complete_aer_page, aer,
+	    nvmf_io_complete_aer_page, aer, KM_SLEEP))
+		nvmf_aer_idle(aer);
 }
 
 static void
@@ -229,19 +220,17 @@ nvmf_complete_aer(void *arg, const nvme_cqe_t *cqe)
 	uint32_t cdw0;
 
 	/*
-	 * The only error defined for AER is an abort due to submitting too
-	 * many AER commands.  Just discard this AER without resubmitting if we
-	 * get an error.
-	 *
-	 * NB: Pending AER commands are aborted during controller shutdown, so
-	 * discard aborted commands silently.
+	 * The only error defined for AER is an abort for too many AER
+	 * commands, and the host aborts pending AERs when it shuts the queue
+	 * down.  In both cases the slot is left idle.
 	 */
-	if (cqe->cqe_sf.sf_sc != 0 || cqe->cqe_sf.sf_sct != 0) {
+	if (nvmf_cqe_failed(cqe)) {
 		if (!nvmf_cqe_aborted(cqe)) {
 			dev_err(sc->dip, CE_NOTE,
 			    "!Ignoring error 0x%x for AER",
 			    *(const uint16_t *)&cqe->cqe_sf);
 		}
+		nvmf_aer_idle(aer);
 		return;
 	}
 
@@ -253,9 +242,8 @@ nvmf_complete_aer(void *arg, const nvme_cqe_t *cqe)
 	dev_err(sc->dip, CE_NOTE, "!AER type %u, info 0x%x, page 0x%x",
 	    aer->type, aer->info, aer->log_page_id);
 
-	aer->page_len = nvmf_log_page_size(sc, aer->log_page_id);
-	(void) ddi_taskq_dispatch(nvmf_aer_taskq(sc), nvmf_complete_aer_task,
-	    aer, DDI_SLEEP);
+	taskq_dispatch_ent(sc->ns_tq, nvmf_complete_aer_task, aer, 0,
+	    &aer->ent);
 }
 
 void
@@ -268,7 +256,7 @@ nvmf_init_aer(nvmf_softc_t *sc)
 	sc->aer = kmem_zalloc(sc->num_aer * sizeof (nvmf_aer_t), KM_SLEEP);
 	for (i = 0; i < sc->num_aer; i++) {
 		sc->aer[i].sc = sc;
-		sc->aer[i].page = kmem_alloc(MAX_LOG_PAGE_SIZE, KM_SLEEP);
+		sc->aer[i].page = kmem_zalloc(MAX_LOG_PAGE_SIZE, KM_SLEEP);
 		mutex_init(&sc->aer[i].lock, NULL, MUTEX_DRIVER, NULL);
 	}
 }
@@ -278,29 +266,21 @@ nvmf_start_aer(nvmf_softc_t *sc)
 {
 	nvme_sqe_t cmd;
 	nvmf_completion_status_t status;
+	struct nvmf_host_qpair *qp;
 	nvmf_request_t *req;
 	nvme_async_event_conf_t aec;
+	nvmf_aer_t *aer;
 	uint16_t ver_major, ver_minor;
+	boolean_t submit;
 	uint_t i;
 
-	/*
-	 * Enable the SMART/health critical-warning notices that FreeBSD's
-	 * nvmf_set_async_event_config() requests: available spare, device
-	 * reliability, read-only media, and volatile-memory-backup failure.
-	 */
 	bzero(&aec, sizeof (aec));
 	aec.b.aec_avail = 1;
 	aec.b.aec_reliab = 1;
 	aec.b.aec_readonly = 1;
 	aec.b.aec_volatile = 1;
 
-	/*
-	 * From NVMe 1.2 onward the controller advertises optional async event
-	 * support in OAES; enable the Namespace Attribute Notice if the
-	 * controller supports it (FreeBSD: cdata->ver >= NVME_REV(1,2) and
-	 * cdata->oaes & NVME_ASYNC_EVENT_NS_ATTRIBUTE).  id_ver is encoded as
-	 * [31:16] major, [15:8] minor.
-	 */
+	/* The Namespace Attribute Notice exists from NVMe 1.2 onward. */
 	ver_major = (uint16_t)(sc->cdata->id_ver >> 16);
 	ver_minor = (uint16_t)((sc->cdata->id_ver >> 8) & 0xff);
 	if ((ver_major > 1 || (ver_major == 1 && ver_minor >= 2)) &&
@@ -313,50 +293,62 @@ nvmf_start_aer(nvmf_softc_t *sc)
 	cmd.sqe_cdw11 = aec.r;
 
 	nvmf_status_init(&status);
-	req = nvmf_allocate_request(sc->admin, &cmd, nvmf_complete, &status,
+	qp = nvmf_admin_hold(sc);
+	if (qp == NULL)
+		return (ECONNABORTED);
+	req = nvmf_allocate_request(qp, &cmd, nvmf_complete, &status,
 	    KM_SLEEP);
 	if (req == NULL) {
-		dev_err(sc->dip, CE_WARN,
-		    "!failed to allocate SET_FEATURES "
-		    "(ASYNC_EVENT_CONFIGURATION) command");
+		nvmf_qp_rele(sc);
 		return (ECONNABORTED);
 	}
 	nvmf_submit_request(req);
-	nvmf_wait_for_reply(&status);
+	nvmf_qp_rele(sc);
+	nvmf_wait_for_reply(sc, &status, nvmf_admin_timeout);
 
-	if (status.cqe.cqe_sf.sf_sc != 0 || status.cqe.cqe_sf.sf_sct != 0) {
+	if (nvmf_cqe_failed(&status.cqe)) {
 		dev_err(sc->dip, CE_WARN,
 		    "!SET_FEATURES (ASYNC_EVENT_CONFIGURATION) failed");
-		return (EIO);
+		return (nvmf_cqe_aborted(&status.cqe) ? ECONNABORTED : EIO);
 	}
 
-	for (i = 0; i < sc->num_aer; i++)
-		nvmf_submit_aer(sc, &sc->aer[i]);
+	/*
+	 * A slot can still be active from the previous association while its
+	 * task waits on the namespace worker.  That task submits the AER
+	 * itself when it ends.
+	 */
+	for (i = 0; i < sc->num_aer; i++) {
+		aer = &sc->aer[i];
+		mutex_enter(&aer->lock);
+		submit = !aer->active;
+		aer->active = B_TRUE;
+		mutex_exit(&aer->lock);
+		if (submit)
+			nvmf_submit_aer(sc, aer);
+	}
 
 	return (0);
 }
 
+/*
+ * Free the AER slots.  The caller has destroyed the admin queue pair and
+ * drained the namespace worker, so no slot is active.
+ */
 void
 nvmf_destroy_aer(nvmf_softc_t *sc)
 {
 	uint_t i;
 
-	/*
-	 * FreeBSD drains the two per-AER tasks here, after all qpairs
-	 * (including admin) have been destroyed.  illumos dispatches the same
-	 * two functions to the shared softc taskq; the caller MUST have
-	 * destroyed the admin qpair first so that no further AER CQE can arrive
-	 * and dispatch a task.  We then drain the taskq so no
-	 * nvmf_complete_aer_task / nvmf_finish_aer_page_task is in flight or
-	 * queued before aer->page and aer->lock are freed (use-after-free or
-	 * destroyed-mutex otherwise).
-	 */
-	ASSERT(sc->admin == NULL);
-	ddi_taskq_wait(nvmf_aer_taskq(sc));
+	if (sc->aer == NULL)
+		return;
 
+	ASSERT3P(sc->admin, ==, NULL);
 	for (i = 0; i < sc->num_aer; i++) {
+		ASSERT(!sc->aer[i].active);
 		kmem_free(sc->aer[i].page, MAX_LOG_PAGE_SIZE);
 		mutex_destroy(&sc->aer[i].lock);
 	}
 	kmem_free(sc->aer, sc->num_aer * sizeof (nvmf_aer_t));
+	sc->aer = NULL;
+	sc->num_aer = 0;
 }

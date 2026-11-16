@@ -34,7 +34,6 @@
  *                           atomic_swap_uint here, matching FreeBSD's atomics
  *                           on an int and the atomic load in nvmf_host.c.
  *   le16toh(cqe->sqhd)      illumos is little-endian only
- *   sysctl per-queue stats  TODO (see PORT-TODO below)
  *
  * The active_commands array is indexed by cid.  As in FreeBSD, the cid in the
  * SQE/CQE is deliberately NOT byte-swapped so the receive path does not have
@@ -96,16 +95,6 @@ nvmf_allocate_request(nvmf_host_qpair_t *qp, void *sqe,
 	struct nvmf_qpair *nq;
 
 	ASSERT(how == KM_SLEEP || how == KM_NOSLEEP);
-
-	/*
-	 * The AER taskq work (nvmf_aer.c) can race a disconnect that NULLs
-	 * sc->admin: both run on the single-threaded nvmf_tq, so a queued AER
-	 * resubmit can execute after disconnect has set sc->admin = NULL.  Treat a
-	 * NULL qpair like an already-destroyed one (the qp->qp == NULL case below)
-	 * and fail cleanly; every caller already handles a NULL return.
-	 */
-	if (qp == NULL)
-		return (NULL);
 
 	req = kmem_zalloc(sizeof (*req), how);
 	if (req == NULL)
@@ -208,11 +197,8 @@ nvmf_qp_error(void *arg, int error)
 	nvmf_host_qpair_t *qp = arg;
 	nvmf_softc_t *sc = qp->sc;
 
-	/* Ignore simple close of queue pairs during shutdown. */
-	if (!(sc->detaching && error == 0)) {
-		dev_err(sc->dip, CE_WARN, "!error %d on %s, disconnecting",
-		    error, qp->name);
-	}
+	dev_err(sc->dip, CE_WARN, "!error %d on %s, disconnecting", error,
+	    qp->name);
 	nvmf_disconnect(sc);
 }
 
@@ -309,16 +295,10 @@ nvmf_receive_capsule(void *arg, struct nvmf_capsule *nc)
 	nvmf_free_request(req);
 }
 
-/*
- * PORT-TODO (FreeBSD nvmf_qpair.c nvmf_sysctls_qp): FreeBSD exports per-queue
- * stats (num_entries, sq_head, sq_tail, num_cmds) through sysctl.  illumos
- * should expose the equivalent through kstats hung off the softc; not yet
- * implemented.
- */
 
 nvmf_host_qpair_t *
 nvmf_init_qp(nvmf_softc_t *sc, nvmf_trtype_t trtype, const nvlist_t *nvl,
-    const char *name, uint_t qid)
+    const char *name)
 {
 	nvmf_host_command_t *cmd;
 	nvmf_host_qpair_t *qp;
@@ -327,8 +307,6 @@ nvmf_init_qp(nvmf_softc_t *sc, nvmf_trtype_t trtype, const nvlist_t *nvl,
 	boolean_t sq_fc = B_FALSE;
 	uint64_t v64 = 0;
 	nvlist_t *m = (nvlist_t *)nvl;
-
-	_NOTE(ARGUNUSED(qid));
 
 	(void) nvlist_lookup_boolean_value(m, "admin", &admin);
 	qp = kmem_zalloc(sizeof (*qp), KM_SLEEP);
@@ -381,7 +359,6 @@ nvmf_init_qp(nvmf_softc_t *sc, nvmf_trtype_t trtype, const nvlist_t *nvl,
 		return (NULL);
 	}
 
-	/* PORT-TODO: nvmf_sysctls_qp() equivalent kstats. */
 
 	return (qp);
 }
@@ -469,7 +446,13 @@ nvmf_destroy_qp(nvmf_host_qpair_t *qp)
 uint64_t
 nvmf_max_xfer_size_qp(nvmf_host_qpair_t *qp)
 {
-	return (nvmf_max_xfer_size(qp->qp));
+	uint64_t size = 0;
+
+	mutex_enter(&qp->lock);
+	if (qp->qp != NULL)
+		size = nvmf_max_xfer_size(qp->qp);
+	mutex_exit(&qp->lock);
+	return (size);
 }
 
 void
