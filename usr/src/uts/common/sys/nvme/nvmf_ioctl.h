@@ -42,13 +42,12 @@ extern "C" {
 #endif
 
 /*
- * Control device exported by the nvmft driver.  The driver creates a single
- * pseudo minor node named "admin" (instance 0).  There is no devfsadm devlink
- * rule, so the stable path used by nvmfd(8) and nvmfadm(8) is the /devices
- * minor node itself.
+ * The control nodes of the nvmft and nvmf_host drivers, by the links that
+ * devfsadm(8) makes for the "admin" and "nvmf" minor nodes.
  */
 #define	NVMFT_DRIVER	"nvmft"
-#define	NVMFT_DEV	"/devices/pseudo/nvmft@0:admin"
+#define	NVMFT_DEV	"/dev/nvmft/admin"
+#define	NVMF_HOST_DEV	"/dev/nvmf"
 
 /*
  * (data, size) is the userspace buffer for a packed nvlist.

@@ -37,6 +37,9 @@ The driver supports one connected subsystem at a time.
 The target is not authenticated and connections are not encrypted.
 .Sh FILES
 .Bl -tag -width Pa
+.It Pa /dev/nvmf
+Control node used by
+.Xr nvmf-connect 8
 .It Pa /kernel/drv/amd64/nvmf_host
 Device driver (x86)
 .It Pa /kernel/drv/nvmf_host.conf

@@ -43,6 +43,11 @@ host has sent its Connect command.
 Hosts are not authenticated and connections are not encrypted.
 .Sh FILES
 .Bl -tag -width Pa
+.It Pa /dev/nvmft/admin
+Control node used by
+.Xr nvmfadm 8
+and
+.Xr nvmfd 8
 .It Pa /kernel/drv/amd64/nvmft
 Device driver (x86)
 .It Pa /kernel/drv/nvmft.conf
