@@ -11,6 +11,7 @@ TESTS = (
     "adopt_lifecycle.py",
     "connect_checks.py",
     "ctrlr_teardown.py",
+    "host_checks.py",
     "identify_sgls.py",
     "io_checks.py",
     "local_checks.py",
