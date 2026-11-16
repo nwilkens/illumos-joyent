@@ -203,6 +203,12 @@ struct nvmf_transport_ops {
 	    const nvlist_t *nvl);
 	void (*free_qpair)(struct nvmf_qpair *qp);
 
+	/*
+	 * Optional.  Called once the core has filled in the qpair; a
+	 * transport that has this op delivers nothing before the call.
+	 */
+	void (*start_qpair)(struct nvmf_qpair *qp);
+
 	/* Limit on I/O command capsule size. */
 	uint32_t (*max_ioccsz)(struct nvmf_qpair *qp);
 
@@ -222,6 +228,12 @@ struct nvmf_transport_ops {
 	    uint32_t data_offset, struct nvmf_io_request *io);
 	uint_t (*send_controller_data)(struct nvmf_capsule *nc,
 	    uint32_t data_offset, mblk_t *mp, size_t len);
+
+	/*
+	 * Optional; see nvmf_cancel_controller_data().  A transport whose
+	 * receives can outlast receive_controller_data() needs it.
+	 */
+	void (*cancel_controller_data)(struct nvmf_capsule *nc);
 
 	/*
 	 * Optional.  Send data and, if final_cqe is not NULL, the response

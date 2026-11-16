@@ -51,7 +51,11 @@ struct nvmf_memdesc;
     for name in ("nvmf_send_request", "nvmf_transport_ops", "nvmf_qpair",
                  "nvmf_io_request", "nvmf_capsule"):
         parts.append(struct(internal, name))
+    parts.append(struct(core, "nvmf_transport"))
+    parts.append("#define\tatomic_dec_uint(p)\t"
+                 "((void)atomic_dec_uint_nv(p))\n")
     for name in ("nvmf_memdesc_copy", "nvmf_memdesc_copyout",
+                 "nvmf_transport_rele",
                  "nvmf_allocate_response", "nvmf_free_capsule",
                  "nvmf_transmit_capsule", "nvmf_send_controller_data",
                  "nvmf_send_data_sync", "nvmf_send_controller_data_io"):

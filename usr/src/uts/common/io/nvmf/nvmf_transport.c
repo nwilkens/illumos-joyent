@@ -31,7 +31,6 @@
  *   malloc/free (M_WAITOK/...)    kmem_zalloc/kmem_free (KM_SLEEP/...)
  *   struct sx (sx_xlock/...)      krwlock_t (rw_enter(RW_WRITER)/...)
  *   refcount(9) volatile u_int    atomic_inc/dec_uint_nv with a count guard
- *   wakeup()/sx_sleep()           kcondvar_t + cv_broadcast/cv_wait
  *   SLIST                         list_t (sorted by priority)
  *   module event handler + macro  nvmf_transport_register/unregister + _init
  *
@@ -49,8 +48,6 @@
 #include <sys/cmn_err.h>
 #include <sys/list.h>
 #include <sys/atomic.h>
-#include <sys/condvar.h>
-#include <sys/mutex.h>
 #include <sys/rwlock.h>
 #include <sys/nvpair.h>
 #include <sys/stream.h>
@@ -67,16 +64,10 @@
 #include "nvmf_core.h"
 #include "nvmf_transport_internal.h"
 
-/*
- * A registered transport provider for a given trtype.  FreeBSD threads these
- * together with an SLIST; illumos uses list_t.  nt_active_qpairs is a reference
- * count of live qpairs allocated through this provider, protected (for the
- * unload wait) by the registry lock and signalled through nt_cv.
- */
 struct nvmf_transport {
 	struct nvmf_transport_ops *nt_ops;
 
-	/* Live data buffers count here too; each pins the transport. */
+	/* Live qpairs, capsules and data buffers; each pins the transport. */
 	volatile uint_t nt_active_qpairs;
 	list_node_t nt_link;
 };
@@ -85,35 +76,37 @@ struct nvmf_transport {
 static list_t nvmf_transports[NVMF_TRTYPE_TCP + 1];
 static krwlock_t nvmf_transports_lock;
 
-/*
- * Serializes the unload-wait below with qpair release.  FreeBSD reuses the sx
- * lock with sx_sleep()/wakeup(); illumos cv_wait requires a mutex, so a
- * dedicated mutex/cv pair stands in for the wakeup channel keyed on the
- * transport in the FreeBSD source.
- */
-static kmutex_t nvmf_transports_cv_lock;
-static kcondvar_t nvmf_transports_cv;
-
 static boolean_t
 nvmf_supported_trtype(nvmf_trtype_t trtype)
 {
 	return (trtype < ARRAY_SIZE(nvmf_transports));
 }
 
-struct nvmf_qpair *
-nvmf_allocate_qpair(nvmf_trtype_t trtype, boolean_t controller,
-    const nvlist_t *params, nvmf_qpair_error_t *error_cb, void *error_cb_arg,
-    nvmf_capsule_receive_t *receive_cb, void *receive_cb_arg)
+/* The module that provides a transport type, if one is known. */
+static const char *
+nvmf_transport_module(nvmf_trtype_t trtype)
+{
+	switch (trtype) {
+	case NVMF_TRTYPE_TCP:
+		return ("nvmf_tcp");
+	default:
+		return (NULL);
+	}
+}
+
+/*
+ * Ask each provider of trtype for a qpair.  *emptyp says whether there was no
+ * provider at all.  The new qpair holds its transport.
+ */
+static struct nvmf_qpair *
+nvmf_provider_allocate(nvmf_trtype_t trtype, boolean_t controller,
+    const nvlist_t *params, struct nvmf_transport **ntp, boolean_t *emptyp)
 {
 	struct nvmf_transport *nt;
-	struct nvmf_qpair *qp;
-	boolean_t admin;
+	struct nvmf_qpair *qp = NULL;
 
-	if (!nvmf_supported_trtype(trtype))
-		return (NULL);
-
-	qp = NULL;
 	rw_enter(&nvmf_transports_lock, RW_READER);
+	*emptyp = list_is_empty(&nvmf_transports[trtype]);
 	for (nt = list_head(&nvmf_transports[trtype]); nt != NULL;
 	    nt = list_next(&nvmf_transports[trtype], nt)) {
 		qp = nt->nt_ops->allocate_qpair(controller, params);
@@ -123,6 +116,30 @@ nvmf_allocate_qpair(nvmf_trtype_t trtype, boolean_t controller,
 		}
 	}
 	rw_exit(&nvmf_transports_lock);
+	*ntp = nt;
+	return (qp);
+}
+
+struct nvmf_qpair *
+nvmf_allocate_qpair(nvmf_trtype_t trtype, boolean_t controller,
+    const nvlist_t *params, nvmf_qpair_error_t *error_cb, void *error_cb_arg,
+    nvmf_capsule_receive_t *receive_cb, void *receive_cb_arg)
+{
+	struct nvmf_transport *nt;
+	struct nvmf_qpair *qp;
+	const char *module;
+	boolean_t admin = B_FALSE, empty;
+
+	if (!nvmf_supported_trtype(trtype))
+		return (NULL);
+
+	qp = nvmf_provider_allocate(trtype, controller, params, &nt, &empty);
+	if (qp == NULL && empty &&
+	    (module = nvmf_transport_module(trtype)) != NULL &&
+	    modload("misc", module) != -1) {
+		qp = nvmf_provider_allocate(trtype, controller, params, &nt,
+		    &empty);
+	}
 	if (qp == NULL)
 		return (NULL);
 
@@ -135,6 +152,8 @@ nvmf_allocate_qpair(nvmf_trtype_t trtype, boolean_t controller,
 	qp->nq_receive_arg = receive_cb_arg;
 	(void) nvlist_lookup_boolean_value((nvlist_t *)params, "admin", &admin);
 	qp->nq_admin = admin;
+	if (nt->nt_ops->start_qpair != NULL)
+		nt->nt_ops->start_qpair(qp);
 	return (qp);
 }
 
@@ -173,20 +192,11 @@ nvmf_adopt_qpair(struct nvmf_transport_ops *ops, struct nvmf_qpair *qp,
 	return (0);
 }
 
-/*
- * FreeBSD: if (refcount_release(&nt->nt_active_qpairs)) wakeup(nt);
- * refcount_release() returns true when the count reaches zero.  Mirror
- * that with an atomic decrement and broadcast the unload waiter when
- * the last qpair drains.
- */
 static void
 nvmf_transport_rele(struct nvmf_transport *nt)
 {
-	if (atomic_dec_uint_nv(&nt->nt_active_qpairs) == 0) {
-		mutex_enter(&nvmf_transports_cv_lock);
-		cv_broadcast(&nvmf_transports_cv);
-		mutex_exit(&nvmf_transports_cv_lock);
-	}
+	ASSERT3U(nt->nt_active_qpairs, >, 0);
+	atomic_dec_uint(&nt->nt_active_qpairs);
 }
 
 void
@@ -261,6 +271,7 @@ nvmf_allocate_command(struct nvmf_qpair *qp, const void *sqe, int how)
 	if (nc == NULL)
 		return (NULL);
 
+	atomic_inc_uint(&qp->nq_transport->nt_active_qpairs);
 	nc->nc_qpair = qp;
 	nc->nc_qe_len = sizeof (nvme_sqe_t);
 	bcopy(sqe, &nc->nc_sqe, nc->nc_qe_len);
@@ -280,6 +291,7 @@ nvmf_allocate_response(struct nvmf_qpair *qp, const void *cqe, int how)
 	if (nc == NULL)
 		return (NULL);
 
+	atomic_inc_uint(&qp->nq_transport->nt_active_qpairs);
 	nc->nc_qpair = qp;
 	nc->nc_qe_len = sizeof (nvme_cqe_t);
 	bcopy(cqe, &nc->nc_cqe, nc->nc_qe_len);
@@ -305,7 +317,10 @@ nvmf_capsule_append_data(struct nvmf_capsule *nc, struct nvmf_memdesc *mem,
 void
 nvmf_free_capsule(struct nvmf_capsule *nc)
 {
+	struct nvmf_transport *nt = nc->nc_qpair->nq_transport;
+
 	nc->nc_qpair->nq_ops->free_capsule(nc);
+	nvmf_transport_rele(nt);
 }
 
 void
@@ -325,6 +340,15 @@ nvmf_abort_capsule_data(struct nvmf_capsule *nc, int error)
 {
 	if (nc->nc_data.io_len != 0)
 		nvmf_complete_io_request(&nc->nc_data, 0, error);
+}
+
+void
+nvmf_cancel_controller_data(struct nvmf_capsule *nc)
+{
+	struct nvmf_transport_ops *ops = nc->nc_qpair->nq_ops;
+
+	if (ops->cancel_controller_data != NULL)
+		ops->cancel_controller_data(nc);
 }
 
 void *
@@ -627,18 +651,12 @@ nvmf_sgl_decode(const nvme_sqe_t *sqe, size_t icd_len, uint64_t max_len,
 }
 
 int
-nvmf_pack_ioc_nvlist(nvlist_t *nvl, struct nvmf_ioc_nv *nv)
+nvmf_pack_ioc_nvlist_mode(nvlist_t *nvl, struct nvmf_ioc_nv *nv, int mode)
 {
 	char *packed;
 	size_t packed_len;
 	int error;
 
-	/*
-	 * FreeBSD checks nvlist_error(nvl) here; illumos nvlists do not carry a
-	 * cumulative error, so the equivalent guard is nvlist_size() failing
-	 * below.  nvlist_size()/nvlist_pack() use NV_ENCODE_NATIVE since the
-	 * carrier is consumed by the local kernel/userland pair.
-	 */
 	if (nv->size == 0) {
 		error = nvlist_size(nvl, &nv->len, NV_ENCODE_NATIVE);
 		return (error);
@@ -654,7 +672,7 @@ nvmf_pack_ioc_nvlist(nvlist_t *nvl, struct nvmf_ioc_nv *nv)
 	nv->len = packed_len;
 	if (nv->len > nv->size) {
 		error = EFBIG;
-	} else if (ddi_copyout(packed, nv->data, nv->len, 0) != 0) {
+	} else if (ddi_copyout(packed, nv->data, nv->len, mode) != 0) {
 		error = EFAULT;
 	} else {
 		error = 0;
@@ -663,19 +681,18 @@ nvmf_pack_ioc_nvlist(nvlist_t *nvl, struct nvmf_ioc_nv *nv)
 	return (error);
 }
 
-/*
- * Upper bound on a packed ioctl nvlist.  nv->size comes verbatim from a
- * (privileged) userland struct nvmf_ioc_nv and drives the kmem_alloc() below.
- * The largest legitimate carrier is the handoff nvlist, whose binary "data"
- * member is a 1KB nvmf_fabric_connect_data_t plus a 64-byte cmd and the small
- * params sub-nvlist; 64KB is generous headroom while still preventing a
- * bogus/garbage size from triggering an arbitrarily large KM_SLEEP allocation
- * (box hang/OOM panic).
- */
+int
+nvmf_pack_ioc_nvlist(nvlist_t *nvl, struct nvmf_ioc_nv *nv)
+{
+	return (nvmf_pack_ioc_nvlist_mode(nvl, nv, 0));
+}
+
+/* Bounds the allocation that a caller's nv->size asks for. */
 #define	NVMF_IOC_NV_MAX	(64 * 1024)
 
 int
-nvmf_unpack_ioc_nvlist(const struct nvmf_ioc_nv *nv, nvlist_t **nvlp)
+nvmf_unpack_ioc_nvlist_mode(const struct nvmf_ioc_nv *nv, int mode,
+    nvlist_t **nvlp)
 {
 	char *packed;
 	nvlist_t *nvl;
@@ -685,7 +702,7 @@ nvmf_unpack_ioc_nvlist(const struct nvmf_ioc_nv *nv, nvlist_t **nvlp)
 		return (EINVAL);
 
 	packed = kmem_alloc(nv->size, KM_SLEEP);
-	if (ddi_copyin(nv->data, packed, nv->size, 0) != 0) {
+	if (ddi_copyin(nv->data, packed, nv->size, mode) != 0) {
 		kmem_free(packed, nv->size);
 		return (EFAULT);
 	}
@@ -697,6 +714,12 @@ nvmf_unpack_ioc_nvlist(const struct nvmf_ioc_nv *nv, nvlist_t **nvlp)
 
 	*nvlp = nvl;
 	return (0);
+}
+
+int
+nvmf_unpack_ioc_nvlist(const struct nvmf_ioc_nv *nv, nvlist_t **nvlp)
+{
+	return (nvmf_unpack_ioc_nvlist_mode(nv, 0, nvlp));
 }
 
 boolean_t
@@ -796,11 +819,10 @@ nvmf_transport_unregister(struct nvmf_transport_ops *ops)
 		return (0);
 
 	/*
-	 * MOD_QUIESCE in FreeBSD refuses to quiesce (EBUSY) while any qpair is
-	 * still active.  Preserve that gate before unlinking: if the provider
-	 * is busy, fail the unregister so the module stays loaded.
+	 * A reference is only taken under the lock or by the holder of
+	 * another, so a count of zero here stays zero.
 	 */
-	rw_enter(&nvmf_transports_lock, RW_READER);
+	rw_enter(&nvmf_transports_lock, RW_WRITER);
 	for (nt = list_head(&nvmf_transports[ops->trtype]); nt != NULL;
 	    nt = list_next(&nvmf_transports[ops->trtype], nt)) {
 		if (nt->nt_ops == ops)
@@ -814,33 +836,8 @@ nvmf_transport_unregister(struct nvmf_transport_ops *ops)
 		rw_exit(&nvmf_transports_lock);
 		return (EBUSY);
 	}
-	rw_exit(&nvmf_transports_lock);
-
-	/* MOD_UNLOAD: unlink, drain any racing qpairs, then free. */
-	rw_enter(&nvmf_transports_lock, RW_WRITER);
-	for (nt = list_head(&nvmf_transports[ops->trtype]); nt != NULL;
-	    nt = list_next(&nvmf_transports[ops->trtype], nt)) {
-		if (nt->nt_ops == ops)
-			break;
-	}
-	if (nt == NULL) {
-		rw_exit(&nvmf_transports_lock);
-		return (0);
-	}
-
 	list_remove(&nvmf_transports[ops->trtype], nt);
 	rw_exit(&nvmf_transports_lock);
-
-	/*
-	 * FreeBSD sleeps on the transport (sx_sleep) holding the registry lock
-	 * until nt_active_qpairs drains, releasing the lock across the sleep.
-	 * Here the provider is already unlinked, so no new qpairs can reference
-	 * it; wait on the dedicated cv for in-flight releases to finish.
-	 */
-	mutex_enter(&nvmf_transports_cv_lock);
-	while (nt->nt_active_qpairs != 0)
-		cv_wait(&nvmf_transports_cv, &nvmf_transports_cv_lock);
-	mutex_exit(&nvmf_transports_cv_lock);
 
 	kmem_free(nt, sizeof (*nt));
 	return (0);
@@ -872,13 +869,9 @@ _init(void)
 		    offsetof(struct nvmf_transport, nt_link));
 	}
 	rw_init(&nvmf_transports_lock, NULL, RW_DRIVER, NULL);
-	mutex_init(&nvmf_transports_cv_lock, NULL, MUTEX_DRIVER, NULL);
-	cv_init(&nvmf_transports_cv, NULL, CV_DRIVER, NULL);
 
 	error = mod_install(&nvmf_transport_modlinkage);
 	if (error != 0) {
-		cv_destroy(&nvmf_transports_cv);
-		mutex_destroy(&nvmf_transports_cv_lock);
 		rw_destroy(&nvmf_transports_lock);
 		for (i = 0; i < ARRAY_SIZE(nvmf_transports); i++)
 			list_destroy(&nvmf_transports[i]);
@@ -906,8 +899,6 @@ _fini(void)
 	if (error != 0)
 		return (error);
 
-	cv_destroy(&nvmf_transports_cv);
-	mutex_destroy(&nvmf_transports_cv_lock);
 	rw_destroy(&nvmf_transports_lock);
 	for (i = 0; i < ARRAY_SIZE(nvmf_transports); i++)
 		list_destroy(&nvmf_transports[i]);

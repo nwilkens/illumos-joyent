@@ -102,7 +102,9 @@ static struct nvmf_transport_ops ops = {
 	.send_controller_data = fake_send,
 };
 
-static struct nvmf_qpair qp = { .nq_ops = &ops, .nq_controller = B_TRUE };
+static struct nvmf_transport transport = { .nt_ops = &ops };
+static struct nvmf_qpair qp = { .nq_transport = &transport, .nq_ops = &ops,
+	.nq_controller = B_TRUE };
 
 static void
 on_complete(void *arg, uint_t status)
@@ -479,6 +481,7 @@ main(void)
 	nvmft_side();
 	abort_drain();
 	stress();
+	assert(transport.nt_active_qpairs == 0);
 	printf("send exactly-once passed\n");
 	return (0);
 }

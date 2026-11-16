@@ -23,10 +23,13 @@ struct nvmf_send_request;
 typedef struct { uint64_t opaque[2]; } nvme_cqe_t;
 typedef struct { uint64_t dmac_laddress; size_t dmac_size; } ddi_dma_cookie_t;
 int nvlist_lookup_boolean_value(nvlist_t *, const char *, boolean_t *);
+int modload(const char *, const char *);
+#define	atomic_dec_uint(p)	((void)atomic_dec_uint_nv(p))
 """, typedef(internal, "nvmf_seg_t"), typedef(internal, "nvmf_databuf_t"),
         struct(internal, "nvmf_transport_ops"),
         struct(internal, "nvmf_qpair"), text[start:end]]
-    for name in ("nvmf_supported_trtype", "nvmf_allocate_qpair",
+    for name in ("nvmf_supported_trtype", "nvmf_transport_module",
+                 "nvmf_provider_allocate", "nvmf_allocate_qpair",
                  "nvmf_adopt_qpair", "nvmf_transport_rele", "nvmf_free_qpair",
                  "nvmf_alloc_data_buf", "nvmf_map_data_buf",
                  "nvmf_free_data_buf",

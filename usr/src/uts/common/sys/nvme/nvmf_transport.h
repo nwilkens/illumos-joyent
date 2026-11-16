@@ -196,6 +196,16 @@ int	nvmf_receive_controller_data(struct nvmf_capsule *nc,
     nvmf_io_complete_t *complete_cb, void *cb_arg);
 
 /*
+ * Cancel every nvmf_receive_controller_data() transfer of nc that has not
+ * completed: each one's callback runs once with ECANCELED on the calling
+ * thread, and when this returns no callback of nc is running or will run and
+ * the transport no longer touches the buffers.  Do not call it from one of
+ * nc's completion callbacks or with a lock held that those callbacks take; it
+ * is valid until nc is freed, also after nvmf_free_qpair().
+ */
+void	nvmf_cancel_controller_data(struct nvmf_capsule *nc);
+
+/*
  * A controller calls this function to send data in response to a
  * command prior to sending a response capsule.  If an error occurs,
  * the function returns a generic status completion code to be sent in
@@ -258,6 +268,12 @@ int	nvmf_pack_ioc_nvlist(nvlist_t *nvl, struct nvmf_ioc_nv *nv);
  */
 int	nvmf_unpack_ioc_nvlist(const struct nvmf_ioc_nv *nv, nvlist_t **nvlp);
 
+/* As above for a caller that has the ioctl mode flags. */
+int	nvmf_pack_ioc_nvlist_mode(nvlist_t *nvl, struct nvmf_ioc_nv *nv,
+    int mode);
+int	nvmf_unpack_ioc_nvlist_mode(const struct nvmf_ioc_nv *nv, int mode,
+    nvlist_t **nvlp);
+
 /*
  * Returns B_TRUE if a qpair handoff nvlist has all the required
  * transport-independent values.
@@ -265,16 +281,9 @@ int	nvmf_unpack_ioc_nvlist(const struct nvmf_ioc_nv *nv, nvlist_t **nvlp);
 boolean_t nvmf_validate_qpair_nvlist(const nvlist_t *nvl, boolean_t controller);
 
 /*
- * Transport registration interface.
- *
- * FreeBSD registers transports declaratively through the NVMF_TRANSPORT()
- * macro, which hangs a moduledata_t off the kernel's module system and routes
- * MOD_LOAD/MOD_UNLOAD/MOD_QUIESCE to nvmf_transport_module_handler().  illumos
- * does not have an equivalent per-subsystem module event, so a transport
- * provider (a misc module, e.g. nvmf_tcp) instead calls these registration
- * functions explicitly from its own _init()/_fini() entry points.  The vtable
- * (struct nvmf_transport_ops) is defined in nvmf_transport_internal.h and is
- * identical in shape to the FreeBSD version.
+ * A transport module registers its ops from _init() and unregisters them
+ * from _fini().  Unregister fails with EBUSY while a qpair, capsule or data
+ * buffer of the transport exists.
  */
 struct nvmf_transport_ops;
 int	nvmf_transport_register(struct nvmf_transport_ops *ops);

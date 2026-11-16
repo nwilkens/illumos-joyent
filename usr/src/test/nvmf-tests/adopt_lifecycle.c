@@ -35,6 +35,29 @@ nvlist_lookup_boolean_value(nvlist_t *nvl, const char *name, boolean_t *v)
 	return (0);
 }
 
+static unsigned modloads, starts;
+static struct nvmf_transport_ops ops;
+
+/* Loading the module registers its transport, as nvmf_tcp's _init() does. */
+int
+modload(const char *dir, const char *name)
+{
+	assert(strcmp(dir, "misc") == 0 && strcmp(name, "nvmf_tcp") == 0);
+	modloads++;
+	ops.trtype = NVMF_TRTYPE_TCP;
+	assert(nvmf_transport_register(&ops) == 0);
+	return (1);
+}
+
+/* The core has filled the qpair in by the time the transport may deliver. */
+static void
+fake_start(struct nvmf_qpair *qp)
+{
+	assert(qp->nq_ops == &ops && qp->nq_transport != NULL);
+	assert(qp->nq_error != NULL && qp->nq_receive != NULL);
+	starts++;
+}
+
 static struct nvmf_qpair *
 fake_allocate(boolean_t controller, const nvlist_t *nvl)
 {
@@ -42,6 +65,14 @@ fake_allocate(boolean_t controller, const nvlist_t *nvl)
 	(void) nvl;
 	__atomic_add_fetch(&allocs, 1, __ATOMIC_SEQ_CST);
 	return (calloc(1, sizeof (struct nvmf_qpair)));
+}
+
+static struct nvmf_qpair *
+fake_refuse(boolean_t controller, const nvlist_t *nvl)
+{
+	(void) controller;
+	(void) nvl;
+	return (NULL);
 }
 
 static void
@@ -85,6 +116,7 @@ fake_free_buf(nvmf_databuf_t *db)
 static struct nvmf_transport_ops ops = {
 	.allocate_qpair = fake_allocate,
 	.free_qpair = fake_free,
+	.start_qpair = fake_start,
 	.alloc_data_buf = fake_alloc_buf,
 	.map_data_buf = fake_map_buf,
 	.free_data_buf = fake_free_buf,
@@ -277,6 +309,33 @@ unload_race(void)
 	    busy);
 }
 
+/*
+ * A TCP qpair loads the transport module when nothing provides the type, and
+ * a transport that was asked and refused is not loaded again.
+ */
+static void
+autoload(void)
+{
+	struct nvmf_qpair *qp;
+
+	assert(nvmf_allocate_qpair(NVMF_TRTYPE_RDMA, B_TRUE, NULL, on_error,
+	    &errors, on_receive, &receives) == NULL);
+	assert(modloads == 0);
+	starts = 0;
+	qp = nvmf_allocate_qpair(NVMF_TRTYPE_TCP, B_TRUE, NULL, on_error,
+	    &errors, on_receive, &receives);
+	assert(qp != NULL && modloads == 1 && starts == 1);
+	assert(nvmf_transport_unregister(&ops) == EBUSY);
+	nvmf_free_qpair(qp);
+	ops.allocate_qpair = fake_refuse;
+	assert(nvmf_allocate_qpair(NVMF_TRTYPE_TCP, B_TRUE, NULL, on_error,
+	    &errors, on_receive, &receives) == NULL);
+	assert(modloads == 1);
+	ops.allocate_qpair = fake_allocate;
+	assert(nvmf_transport_unregister(&ops) == 0);
+	ops.trtype = NVMF_TRTYPE_RDMA;
+}
+
 int
 main(void)
 {
@@ -288,12 +347,11 @@ main(void)
 		    offsetof(struct nvmf_transport, nt_link));
 	}
 	rw_init(&nvmf_transports_lock, NULL, RW_DRIVER, NULL);
-	mutex_init(&nvmf_transports_cv_lock, NULL, MUTEX_DRIVER, NULL);
-	cv_init(&nvmf_transports_cv, NULL, CV_DRIVER, NULL);
 
 	lifecycle();
 	data_buffers();
 	unload_race();
+	autoload();
 	printf("adopt lifecycle passed (%u qpairs freed)\n", frees);
 	return (0);
 }
