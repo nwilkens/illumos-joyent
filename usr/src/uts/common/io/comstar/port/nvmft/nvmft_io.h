@@ -50,6 +50,8 @@ typedef struct nvmft_task_priv {
 	boolean_t		ntp_responded;
 	/* The status of the response if the task ends without one. */
 	uint8_t			ntp_sc;
+	/* A cancel of the task's receives is queued or running; ctrlr_lock. */
+	boolean_t		ntp_cancel;
 	struct nvmft_internal_io *ntp_iio;
 } nvmft_task_priv_t;
 

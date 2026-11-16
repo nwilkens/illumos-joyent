@@ -18,7 +18,8 @@
  * op, as TCP does, for each result that op can give: the callback runs once,
  * the response goes out once, and the data is freed.  Then race nvmft's
  * submitter against the transport completion and check that STMF sees the
- * dbuf back exactly once, with the right flags.
+ * dbuf back exactly once, with the right flags.  Then abort a task whose
+ * receive the host withholds and check that the cancel ends it.
  */
 #include "send.h"
 
@@ -95,11 +96,14 @@ fake_transmit(struct nvmf_capsule *nc)
 	return (0);
 }
 
+static void fake_cancel(struct nvmf_capsule *);
+
 static struct nvmf_transport_ops ops = {
 	.allocate_capsule = fake_alloc_capsule,
 	.free_capsule = fake_free_capsule,
 	.transmit_capsule = fake_transmit,
 	.send_controller_data = fake_send,
+	.cancel_controller_data = fake_cancel,
 };
 
 static struct nvmf_transport transport = { .nt_ops = &ops };
@@ -256,6 +260,74 @@ nvmft_command_completed(struct nvmft_qpair *q, struct nvmf_capsule *nc)
 	(void) q;
 	(void) nc;
 	cid_clears++;
+}
+
+static void
+nvmft_answer_command(nvmft_controller_t *c, nvmft_task_priv_t *priv)
+{
+	(void) c;
+	(void) priv;
+	abort();
+}
+
+static void
+nvmft_post_command(nvmft_task_priv_t *priv)
+{
+	(void) priv;
+	abort();
+}
+
+static int dispatches;
+
+void
+taskq_dispatch_ent(taskq_t *tq, void (*fn)(void *), void *arg, uint_t flags,
+    taskq_ent_t *ent)
+{
+	(void) tq;
+	(void) flags;
+	assert(fn == nvmft_io_task && arg == &ctrlr);
+	assert(ent == &ctrlr.ctrlr_io_task);
+	dispatches++;
+}
+
+/* Run the work that the abort left for ns_io_taskq. */
+static void
+run_io_task(void)
+{
+	assert(dispatches == 1 && ctrlr.ctrlr_io_running);
+	dispatches = 0;
+	nvmft_io_task(&ctrlr);
+	assert(!ctrlr.ctrlr_io_running);
+	assert(list_is_empty(&ctrlr.ctrlr_io_work));
+}
+
+/* The receive that the host withholds, as the transport has it. */
+static nvmft_xfer_t *withheld;
+static int cancel_calls, cancelled;
+
+/* The transport runs the completion with ECANCELED on the calling thread. */
+static void
+fake_cancel(struct nvmf_capsule *nc)
+{
+	nvmft_task_priv_t *priv = withheld != NULL ?
+	    withheld->nx_task->task_port_private : NULL;
+	nvmft_xfer_t *nx = withheld;
+
+	assert(nc->nc_qpair == &qp);
+	cancel_calls++;
+
+	/* The caller holds no lock that the completion takes. */
+	assert(mutex_tryenter(&ctrlr.ctrlr_lock));
+	mutex_exit(&ctrlr.ctrlr_lock);
+	if (nx == NULL)
+		return;
+	assert(mutex_tryenter(&priv->ntp_lock));
+	mutex_exit(&priv->ntp_lock);
+	assert(priv->ntp_cancel && priv->ntp_aborting);
+
+	withheld = NULL;
+	cancelled++;
+	nvmft_datamove_in_cb(nx, 0, ECANCELED);
 }
 
 /* One transfer where the completion runs before, or races, the submitter. */
@@ -464,6 +536,7 @@ stress(void)
 static void
 abort_drain(void)
 {
+	struct nvmf_capsule nc = { .nc_qpair = &qp };
 	nvmft_task_priv_t priv;
 	scsi_task_t task = { .task_port_private = &priv };
 	stmf_data_buf_t dbuf[2] = { { .db_flags = C2H, .db_data_size = 512 },
@@ -472,6 +545,7 @@ abort_drain(void)
 	int i;
 
 	memset(&priv, 0, sizeof (priv));
+	priv.ntp_nc = &nc;
 	mutex_init(&priv.ntp_lock, NULL, MUTEX_DRIVER, NULL);
 	memset(nx, 0, sizeof (nx));
 	for (i = 0; i < 2; i++) {
@@ -500,6 +574,11 @@ abort_drain(void)
 	    STMF_BUSY);
 	mutex_exit(&ctrlr.ctrlr_lock);
 	assert(unlists == 0);
+
+	/* The first abort queued a cancel, which keeps the task busy. */
+	assert(nvmft_lport_abort(NULL, STMF_LPORT_ABORT_TASK, &task, 0) ==
+	    STMF_BUSY);
+	run_io_task();
 	assert(nvmft_lport_abort(NULL, STMF_LPORT_ABORT_TASK, &task, 0) ==
 	    STMF_ABORT_SUCCESS);
 	assert(unlists == 1 && priv.ntp_xfers == 0 && !priv.ntp_responded);
@@ -510,6 +589,7 @@ abort_drain(void)
 	 * the host has its completion, so the CID must be free for reuse.
 	 */
 	memset(&priv, 0, sizeof (priv));
+	priv.ntp_nc = &nc;
 	mutex_init(&priv.ntp_lock, NULL, MUTEX_DRIVER, NULL);
 	memset(nx, 0, sizeof (nx));
 	assert(nvmft_xfer_begin(&priv));
@@ -523,16 +603,88 @@ abort_drain(void)
 	nvmft_datamove_out_cb(&nx[0], NVMF_SUCCESS_SENT);
 	assert(cid_clears == 1 && priv.ntp_responded);
 	assert(xfer_dones == 0);
+	run_io_task();
 	mutex_destroy(&priv.ntp_lock);
+}
+
+/*
+ * An abort while the host withholds the data of a receive: the abort leaves
+ * a cancel to ns_io_taskq and stays busy until that has run.  The completion
+ * runs once, STMF does not see the dbuf, and the host is told of the abort.
+ */
+static void
+abort_cancel(void)
+{
+	struct nvmf_capsule nc = { .nc_qpair = &qp };
+	nvmft_task_priv_t priv;
+	scsi_task_t task = { .task_port_private = &priv };
+	stmf_data_buf_t dbuf = { .db_data_size = 512 };
+	nvmft_xfer_t nx;
+	int round;
+
+	/*
+	 * Round 0: the receive is registered before the abort.  Round 1: the
+	 * abort lands before the transport has the receive, so the first
+	 * cancel finds nothing.  Round 2: the data arrives before the cancel.
+	 */
+	for (round = 0; round < 3; round++) {
+		memset(&priv, 0, sizeof (priv));
+		priv.ntp_nc = &nc;
+		priv.ntp_sc = NVME_CQE_SC_GEN_ABORT_REQUEST;
+		mutex_init(&priv.ntp_lock, NULL, MUTEX_DRIVER, NULL);
+		memset(&nx, 0, sizeof (nx));
+		nx.nx_task = &task;
+		nx.nx_dbuf = &dbuf;
+		assert(nvmft_xfer_begin(&priv));
+		assert(!nvmft_xfer_arrive(&nx, NVMFT_XFER_SUBMITTED));
+		xfer_dones = unlists = dispatches = 0;
+		cancel_calls = cancelled = 0;
+		withheld = (round == 0) ? &nx : NULL;
+
+		assert(nvmft_lport_abort(NULL, STMF_LPORT_ABORT_TASK, &task,
+		    0) == STMF_BUSY);
+		assert(priv.ntp_cancel && dispatches == 1);
+		/* A queued cancel is not queued again. */
+		assert(nvmft_lport_abort(NULL, STMF_LPORT_ABORT_TASK, &task,
+		    0) == STMF_BUSY);
+		assert(dispatches == 1);
+
+		if (round == 2)
+			nvmft_datamove_in_cb(&nx, 512, 0);
+		run_io_task();
+		assert(cancel_calls == 1 && !priv.ntp_cancel);
+		assert(cancelled == (round == 0));
+
+		if (round == 1) {
+			assert(priv.ntp_xfers == 1);
+			withheld = &nx;
+			assert(nvmft_lport_abort(NULL, STMF_LPORT_ABORT_TASK,
+			    &task, 0) == STMF_BUSY);
+			run_io_task();
+			assert(cancel_calls == 2 && cancelled == 1);
+		}
+
+		assert(priv.ntp_xfers == 0 && xfer_dones == 0 && unlists == 0);
+		assert(priv.ntp_sc == NVME_CQE_SC_GEN_ABORT_REQUEST);
+		assert(!priv.ntp_responded);
+		assert(nvmft_lport_abort(NULL, STMF_LPORT_ABORT_TASK, &task,
+		    0) == STMF_ABORT_SUCCESS);
+		assert(unlists == 1 && dispatches == 0);
+		mutex_destroy(&priv.ntp_lock);
+	}
 }
 
 int
 main(void)
 {
 	mutex_init(&ctrlr.ctrlr_lock, NULL, MUTEX_DRIVER, NULL);
+	cv_init(&ctrlr.ctrlr_pending_cv, NULL, CV_DRIVER, NULL);
+	list_create(&ctrlr.ctrlr_io_work, sizeof (nvmft_task_priv_t),
+	    offsetof(nvmft_task_priv_t, ntp_link));
 	adapter();
 	nvmft_side();
 	abort_drain();
+	abort_cancel();
 	stress();
 	assert(transport.nt_active_qpairs == 0);
 	printf("send exactly-once passed\n");

@@ -463,9 +463,9 @@ nvmft_post_command(nvmft_task_priv_t *priv)
 }
 
 /*
- * Leave a command to ns_io_taskq: an admitted command to post, or a command
- * whose task STMF freed before the host had a response.  Called with
- * ctrlr_lock held.
+ * Leave a command to ns_io_taskq: an admitted command to post, a command
+ * whose task STMF freed before the host had a response, or an aborting
+ * command whose receives are to be cancelled.  Called with ctrlr_lock held.
  */
 static void
 nvmft_io_work(nvmft_controller_t *ctrlr, nvmft_task_priv_t *priv)
@@ -498,17 +498,36 @@ nvmft_answer_command(nvmft_controller_t *ctrlr, nvmft_task_priv_t *priv)
 	mutex_exit(&ctrlr->ctrlr_lock);
 }
 
+/*
+ * Cancel the receives that the transport holds for an aborting task.  Their
+ * completions run on this thread and take ntp_lock.  Until ntp_cancel is
+ * clear nvmft_lport_abort() reports the task busy, so STMF does not free it.
+ */
+static void
+nvmft_cancel_command(nvmft_controller_t *ctrlr, nvmft_task_priv_t *priv)
+{
+	nvmf_cancel_controller_data(priv->ntp_nc);
+
+	mutex_enter(&ctrlr->ctrlr_lock);
+	priv->ntp_cancel = B_FALSE;
+	mutex_exit(&ctrlr->ctrlr_lock);
+}
+
 static void
 nvmft_io_task(void *arg)
 {
 	nvmft_controller_t *ctrlr = arg;
 	nvmft_task_priv_t *priv;
+	boolean_t cancel;
 
 	mutex_enter(&ctrlr->ctrlr_lock);
 	while ((priv = list_remove_head(&ctrlr->ctrlr_io_work)) != NULL) {
+		cancel = priv->ntp_cancel;
 		mutex_exit(&ctrlr->ctrlr_lock);
-		/* A command that had a task is here for its response. */
-		if (priv->ntp_task != NULL)
+		/* Otherwise a command that had a task needs its response. */
+		if (cancel)
+			nvmft_cancel_command(ctrlr, priv);
+		else if (priv->ntp_task != NULL)
 			nvmft_answer_command(ctrlr, priv);
 		else
 			nvmft_post_command(priv);
@@ -783,7 +802,9 @@ nvmft_xfer_finish(nvmft_xfer_t *nx)
 			last = B_TRUE;
 		}
 	}
-	if (!good && !priv->ntp_responded)
+	/* A cancelled receive leaves the status that an abort gives. */
+	if (!good && !priv->ntp_responded &&
+	    (nx->nx_to_rport || nx->nx_status != (uint_t)ECANCELED))
 		priv->ntp_sc = NVME_CQE_SC_GEN_DATA_XFR_ERR;
 
 	if (nvmft_xfer_end(task))
@@ -1108,10 +1129,12 @@ nvmft_lport_task_free(scsi_task_t *task)
 }
 
 /*
- * STMF asks us to abort a task, with the task's lock held.  While the
- * transport still holds a transfer into one of the task's dbufs this returns
- * STMF_BUSY, because STMF frees the dbufs of an aborted task, and STMF asks
- * again.  The host gets its response when STMF frees the task.
+ * STMF asks us to abort a task, with the task's lock held, and asks again
+ * while this returns STMF_BUSY.  STMF frees the dbufs of an aborted task, so
+ * the abort waits for the transfers that the transport holds.  A receive can
+ * wait for the host for ever, so it is cancelled; its completion takes the
+ * task's lock in STMF unless the task is aborting, so the cancel runs on
+ * ns_io_taskq.  The host gets its response when STMF frees the task.
  */
 stmf_status_t
 nvmft_lport_abort(stmf_local_port_t *lport, int abort_cmd, void *arg,
@@ -1135,13 +1158,20 @@ nvmft_lport_abort(stmf_local_port_t *lport, int abort_cmd, void *arg,
 	priv->ntp_aborting = B_TRUE;
 	busy = (priv->ntp_xfers != 0);
 	mutex_exit(&priv->ntp_lock);
-	if (busy)
-		return (STMF_BUSY);
 
 	/* nvmft_abort_tasks() holds ctrlr_lock and waits for the task's. */
 	ctrlr = nvmft_task_ctrlr(priv);
 	if (!mutex_tryenter(&ctrlr->ctrlr_lock))
 		return (STMF_BUSY);
+	/* A transfer can register after a cancel, so each call asks again. */
+	if (busy && !priv->ntp_cancel) {
+		priv->ntp_cancel = B_TRUE;
+		nvmft_io_work(ctrlr, priv);
+	}
+	if (busy || priv->ntp_cancel) {
+		mutex_exit(&ctrlr->ctrlr_lock);
+		return (STMF_BUSY);
+	}
 	nvmft_task_unlist_locked(ctrlr, priv);
 	mutex_exit(&ctrlr->ctrlr_lock);
 

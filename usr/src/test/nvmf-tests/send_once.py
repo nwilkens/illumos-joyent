@@ -59,7 +59,8 @@ struct nvmf_memdesc;
                  "nvmf_transport_rele",
                  "nvmf_allocate_response", "nvmf_free_capsule",
                  "nvmf_transmit_capsule", "nvmf_send_controller_data",
-                 "nvmf_send_data_sync", "nvmf_send_controller_data_io"):
+                 "nvmf_send_data_sync", "nvmf_send_controller_data_io",
+                 "nvmf_cancel_controller_data"):
         parts.append(function(core, name))
 
     # The nvmft half: the per-dbuf transfer state and its completion.
@@ -79,7 +80,19 @@ typedef struct stmf_local_port stmf_local_port_t;
 #define	ASSERT0(x)	assert((x) == 0)
 #define	MUTEX_HELD(m)	1
 #define	mutex_tryenter(m)	(pthread_mutex_trylock(m) == 0)
-typedef struct nvmft_controller { kmutex_t ctrlr_lock; } nvmft_controller_t;
+typedef struct taskq taskq_t;
+typedef struct taskq_ent { int tqent_unused; } taskq_ent_t;
+void taskq_dispatch_ent(taskq_t *, void (*)(void *), void *, uint_t,
+    taskq_ent_t *);
+typedef struct nvmft_controller {
+	kmutex_t ctrlr_lock;
+	kcondvar_t ctrlr_pending_cv;
+	list_t ctrlr_io_work;
+	boolean_t ctrlr_io_running;
+	taskq_ent_t ctrlr_io_task;
+} nvmft_controller_t;
+static struct { taskq_t *ns_io_taskq; } nvmft_softc, *nvmft_global =
+    &nvmft_softc;
 typedef struct stmf_data_buf {
 	uint16_t db_flags;
 	stmf_status_t db_xfer_status;
@@ -108,11 +121,16 @@ nvmft_controller_t *nvmft_task_ctrlr(nvmft_task_priv_t *);
 int nvmft_send_generic_error(struct nvmft_qpair *, struct nvmf_capsule *,
     uint8_t);
 void nvmft_internal_aborted(nvmft_internal_io_t *);
+static void nvmft_io_task(void *);
+static void nvmft_answer_command(nvmft_controller_t *, nvmft_task_priv_t *);
+static void nvmft_post_command(nvmft_task_priv_t *);
 """)
     for name in ("nvmft_xfer_begin", "nvmft_xfer_end", "nvmft_xfer_done",
                  "nvmft_xfer_refuse", "nvmft_xfer_arrive",
                  "nvmft_xfer_finish", "nvmft_datamove_out_cb",
-                 "nvmft_datamove_in_cb", "nvmft_lport_abort"):
+                 "nvmft_datamove_in_cb", "nvmft_io_work",
+                 "nvmft_cancel_command", "nvmft_io_task",
+                 "nvmft_lport_abort"):
         parts.append(function(stmf, name))
     run_c(TESTDIR / "send_once.c", {"send.h": "\n".join(parts)})
 
