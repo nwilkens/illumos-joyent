@@ -137,6 +137,8 @@ nvmf_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	sc->state = NVMF_SC_DETACHING;
 	mutex_exit(&sc->lock);
 
+	/* The connection worker can still post to the namespace worker. */
+	taskq_wait(sc->conn_tq);
 	taskq_wait(sc->ns_tq);
 	nvmf_mpath_reap(sc);
 	if (nvmf_mpath_busy(sc)) {
@@ -147,8 +149,8 @@ nvmf_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	}
 
 	ddi_remove_minor_node(dip, NULL);
-	taskq_destroy(sc->ns_tq);
 	taskq_destroy(sc->conn_tq);
+	taskq_destroy(sc->ns_tq);
 	nvmf_mpath_fini(sc);
 	nvmf_ns_fini(sc);
 	nvmf_bd_fini(sc);
