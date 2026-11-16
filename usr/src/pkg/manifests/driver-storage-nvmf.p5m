@@ -1,0 +1,69 @@
+#
+# CDDL HEADER START
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+# CDDL HEADER END
+#
+
+#
+# Copyright 2026 Edgecast Cloud LLC.
+#
+
+<include global_zone_only_component>
+set name=pkg.fmri value=pkg:/driver/storage/nvmf@$(PKGVERS)
+set name=pkg.summary value="NVMe over Fabrics host and target"
+set name=pkg.description \
+    value="NVMe over Fabrics TCP transport, host driver and COMSTAR target"
+set name=info.classification value=org.opensolaris.category.2008:System/Hardware
+set name=variant.arch value=i386
+dir  path=kernel group=sys
+dir  path=kernel/drv group=sys
+dir  path=kernel/drv/$(ARCH64) group=sys
+file path=kernel/drv/$(ARCH64)/nvmf_host group=sys
+file path=kernel/drv/$(ARCH64)/nvmft group=sys
+file path=kernel/drv/nvmf_host.conf group=sys
+file path=kernel/drv/nvmft.conf group=sys
+dir  path=kernel/misc group=sys
+dir  path=kernel/misc/$(ARCH64) group=sys
+file path=kernel/misc/$(ARCH64)/nvmf group=sys mode=0755
+file path=kernel/misc/$(ARCH64)/nvmf_tcp group=sys mode=0755
+dir  path=lib
+dir  path=lib/svc
+dir  path=lib/svc/manifest group=sys
+dir  path=lib/svc/manifest/system group=sys
+dir  path=lib/svc/manifest/system/nvmf group=sys
+file path=lib/svc/manifest/system/nvmf/nvmf-target.xml group=sys mode=0444
+dir  path=lib/svc/method
+file path=lib/svc/method/svc-nvmf-target mode=0555
+dir  path=usr group=sys
+dir  path=usr/lib
+dir  path=usr/lib/$(ARCH64)
+link path=usr/lib/$(ARCH64)/libnvmf.so target=libnvmf.so.1
+file path=usr/lib/$(ARCH64)/libnvmf.so.1
+dir  path=usr/sbin
+file path=usr/sbin/nvmf-connect mode=0555
+file path=usr/sbin/nvmfadm mode=0555
+file path=usr/sbin/nvmfd mode=0555
+dir  path=usr/share
+dir  path=usr/share/man
+dir  path=usr/share/man/man4d
+file path=usr/share/man/man4d/nvmf_host.4d
+file path=usr/share/man/man4d/nvmft.4d
+dir  path=usr/share/man/man8
+file path=usr/share/man/man8/nvmf-connect.8
+file path=usr/share/man/man8/nvmfadm.8
+file path=usr/share/man/man8/nvmfd.8
+driver name=nvmf_host perms="* 0600 root sys"
+driver name=nvmft perms="* 0600 root sys"
+license lic_CDDL license=lic_CDDL
+license usr/src/uts/common/io/nvmf/THIRDPARTYLICENSE \
+    license=usr/src/uts/common/io/nvmf/THIRDPARTYLICENSE
+depend type=require fmri=storage/stmf

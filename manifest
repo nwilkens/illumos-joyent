@@ -741,6 +741,8 @@ f kernel/drv/amd64/ntxn 0755 root sys
 f kernel/drv/amd64/nulldriver 0755 root sys
 f kernel/drv/amd64/nv_sata 0755 root sys
 f kernel/drv/amd64/nvme 0755 root sys
+f kernel/drv/amd64/nvmf_host 0755 root sys
+f kernel/drv/amd64/nvmft 0755 root sys
 f kernel/drv/amd64/nxge 0755 root sys
 f kernel/drv/amd64/oce 0755 root sys
 f kernel/drv/amd64/ohci 0755 root sys
@@ -923,6 +925,8 @@ f kernel/drv/nge.conf 0644 root sys
 f kernel/drv/ntxn.conf 0644 root sys
 f kernel/drv/nv_sata.conf 0644 root sys
 f kernel/drv/nvme.conf 0644 root sys
+f kernel/drv/nvmf_host.conf 0644 root sys
+f kernel/drv/nvmft.conf 0644 root sys
 f kernel/drv/nxge.conf 0644 root sys
 f kernel/drv/ohci.conf 0644 root sys
 f kernel/drv/openeepr.conf 0644 root sys
@@ -1162,6 +1166,8 @@ f kernel/misc/amd64/net80211 0755 root sys
 f kernel/misc/amd64/neti 0755 root sys
 f kernel/misc/amd64/nfs_dlboot 0755 root sys
 f kernel/misc/amd64/nfssrv 0755 root sys
+f kernel/misc/amd64/nvmf 0755 root sys
+f kernel/misc/amd64/nvmf_tcp 0755 root sys
 f kernel/misc/amd64/pci_autoconfig 0755 root sys
 f kernel/misc/amd64/pcicfg 0755 root sys
 f kernel/misc/amd64/pcihp 0755 root sys
@@ -1808,6 +1814,8 @@ f lib/svc/manifest/system/manifest-import.xml 0444 root sys
 f lib/svc/manifest/system/mdata.xml 0444 root sys
 f lib/svc/manifest/system/name-service-cache.xml 0444 root sys
 f lib/svc/manifest/system/ndmp.xml 0444 root sys
+d lib/svc/manifest/system/nvmf 0755 root sys
+f lib/svc/manifest/system/nvmf/nvmf-target.xml 0444 root sys
 f lib/svc/manifest/system/pfexecd.xml 0444 root sys
 f lib/svc/manifest/system/picl.xml 0444 root sys
 f lib/svc/manifest/system/power.xml 0444 root sys
@@ -1908,6 +1916,7 @@ f lib/svc/method/svc-legacy-routing 0555 root bin
 f lib/svc/method/svc-ndmp 0555 root sys
 f lib/svc/method/svc-ndp 0555 root bin
 f lib/svc/method/svc-nscd 0555 root bin
+f lib/svc/method/svc-nvmf-target 0555 root bin
 f lib/svc/method/svc-power 0555 root sys
 f lib/svc/method/svc-rbac 0555 root bin
 f lib/svc/method/svc-rdisc 0555 root bin
@@ -5567,6 +5576,8 @@ f usr/lib/amd64/libnvfru.so.1 0755 root bin
 s usr/lib/amd64/libnvfru.so=libnvfru.so.1
 f usr/lib/amd64/libnvme.so.1 0755 root bin
 s usr/lib/amd64/libnvme.so=libnvme.so.1
+f usr/lib/amd64/libnvmf.so.1 0755 root bin
+s usr/lib/amd64/libnvmf.so=libnvmf.so.1
 s usr/lib/amd64/libnvpair.so.1=../../../lib/amd64/libnvpair.so.1
 s usr/lib/amd64/libnvpair.so=../../../lib/amd64/libnvpair.so.1
 s usr/lib/amd64/libpam.so.1=../../../lib/amd64/libpam.so.1
@@ -11206,6 +11217,9 @@ f usr/sbin/nlsadmin 0755 root adm
 f usr/sbin/nltest 0555 root bin
 f usr/sbin/nscd 0555 root bin
 f usr/sbin/nvmeadm 0555 root bin
+f usr/sbin/nvmf-connect 0555 root bin
+f usr/sbin/nvmfadm 0555 root bin
+f usr/sbin/nvmfd 0555 root bin
 f usr/sbin/nwamadm 0555 root bin
 f usr/sbin/nwamcfg 0555 root bin
 f usr/sbin/pbind 0555 root sys
@@ -19272,6 +19286,8 @@ f usr/share/man/man4d/null.4d 0444 root bin
 f usr/share/man/man4d/nulldriver.4d 0444 root bin
 f usr/share/man/man4d/nv_sata.4d 0444 root bin
 f usr/share/man/man4d/nvme.4d 0444 root bin
+f usr/share/man/man4d/nvmf_host.4d 0444 root bin
+f usr/share/man/man4d/nvmft.4d 0444 root bin
 f usr/share/man/man4d/nxge.4d 0444 root bin
 f usr/share/man/man4d/ohci.4d 0444 root bin
 f usr/share/man/man4d/openprom.4d 0444 root bin
@@ -20071,6 +20087,9 @@ f usr/share/man/man8/nfsstat.8 0444 root bin
 f usr/share/man/man8/nlsadmin.8 0444 root bin
 f usr/share/man/man8/nscd.8 0444 root bin
 f usr/share/man/man8/nvmeadm.8 0444 root bin
+f usr/share/man/man8/nvmf-connect.8 0444 root bin
+f usr/share/man/man8/nvmfadm.8 0444 root bin
+f usr/share/man/man8/nvmfd.8 0444 root bin
 f usr/share/man/man8/nwamd.8 0444 root bin
 f usr/share/man/man8/passmgmt.8 0444 root bin
 f usr/share/man/man8/pbind.8 0444 root bin
