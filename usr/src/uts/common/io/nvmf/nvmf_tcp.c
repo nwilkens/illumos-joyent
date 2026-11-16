@@ -2393,6 +2393,12 @@ tcp_send_controller_data(struct nvmf_capsule *nc, uint32_t data_offset,
 		return (NVME_CQE_SC_GEN_INV_FLD);
 	}
 
+	if (len == 0) {
+		freemsg(mp);
+		return (data_len == 0 ? NVME_CQE_SC_GEN_SUCCESS :
+		    NVME_CQE_SC_GEN_INV_FLD);
+	}
+
 #ifdef DEBUG
 	ASSERT3U(data_offset, ==, TCAP(nc)->tc_tx_data_offset);
 #endif
