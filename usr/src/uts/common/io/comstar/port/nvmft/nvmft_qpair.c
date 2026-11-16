@@ -98,7 +98,12 @@ struct nvmft_qpair {
 	uint16_t		qp_qid;
 	uint_t			qp_qsize;
 	uint16_t		qp_sqhd;
-	volatile uint_t		qp_refs;	/* internal refs on qp_qp */
+	/*
+	 * One reference for qp_qp itself and one for each thread using it.
+	 * nvmft_qpair_shutdown() waits for the users on qp_cv.
+	 */
+	uint_t			qp_refs;
+	kcondvar_t		qp_cv;
 	nvmf_trtype_t		qp_trtype;
 	uint32_t		qp_caps;
 
@@ -259,6 +264,7 @@ nvmft_qpair_alloc(nvmf_trtype_t trtype, uint16_t qid, const char *name,
 	qp->qp_qid = qid;
 	(void) strlcpy(qp->qp_name, name, sizeof (qp->qp_name));
 	mutex_init(&qp->qp_lock, NULL, MUTEX_DRIVER, NULL);
+	cv_init(&qp->qp_cv, NULL, CV_DRIVER, NULL);
 	return (qp);
 }
 
@@ -269,6 +275,7 @@ nvmft_qpair_free(struct nvmft_qpair *qp)
 
 	if (qp->qp_connect_data != NULL)
 		kmem_free(qp->qp_connect_data, sizeof (*qp->qp_connect_data));
+	cv_destroy(&qp->qp_cv);
 	mutex_destroy(&qp->qp_lock);
 	kmem_free(qp->qp_cids, CIDSET_WORDS * sizeof (ulong_t));
 	kmem_free(qp, sizeof (*qp));
@@ -551,19 +558,51 @@ nvmft_qpair_connect_task(void *arg)
 	nvmft_qpair_free(qp);
 }
 
+/* Take a reference on the transport qpair, unless it is shut down. */
+static struct nvmf_qpair *
+nvmft_qpair_hold(struct nvmft_qpair *qp)
+{
+	struct nvmf_qpair *nq;
+
+	mutex_enter(&qp->qp_lock);
+	nq = qp->qp_qp;
+	if (nq != NULL)
+		qp->qp_refs++;
+	mutex_exit(&qp->qp_lock);
+	return (nq);
+}
+
+static void
+nvmft_qpair_rele(struct nvmft_qpair *qp)
+{
+	mutex_enter(&qp->qp_lock);
+	ASSERT3U(qp->qp_refs, >, 1);
+	if (--qp->qp_refs == 1 && qp->qp_qp == NULL)
+		cv_broadcast(&qp->qp_cv);
+	mutex_exit(&qp->qp_lock);
+}
+
+/*
+ * Free the transport qpair.  Only this thread frees it, after the threads
+ * using it have let go, so a transport callback never frees the qpair it is
+ * running on.  When this returns no transport callback is running.
+ */
 void
 nvmft_qpair_shutdown(struct nvmft_qpair *qp)
 {
 	struct nvmf_qpair *nq;
-	boolean_t free_it;
 
 	mutex_enter(&qp->qp_lock);
 	nq = qp->qp_qp;
 	qp->qp_qp = NULL;
-	free_it = (nq != NULL && --qp->qp_refs == 0);
+	if (nq != NULL) {
+		while (qp->qp_refs > 1)
+			cv_wait(&qp->qp_cv, &qp->qp_lock);
+		qp->qp_refs = 0;
+	}
 	mutex_exit(&qp->qp_lock);
 
-	if (free_it)
+	if (nq != NULL)
 		nvmf_free_qpair(nq);
 }
 
@@ -623,7 +662,6 @@ nvmft_transmit_cqe(struct nvmft_qpair *qp, const void *cqe, boolean_t stamp)
 	nvme_cqe_t cpl;
 	struct nvmf_qpair *nq;
 	struct nvmf_capsule *rc;
-	boolean_t free_it;
 	int error, kmflag;
 
 	(void) memcpy(&cpl, cqe, sizeof (cpl));
@@ -648,11 +686,7 @@ nvmft_transmit_cqe(struct nvmft_qpair *qp, const void *cqe, boolean_t stamp)
 		error = ENOMEM;
 	}
 
-	mutex_enter(&qp->qp_lock);
-	free_it = (--qp->qp_refs == 0);
-	mutex_exit(&qp->qp_lock);
-	if (free_it)
-		nvmf_free_qpair(nq);
+	nvmft_qpair_rele(qp);
 	return (error);
 }
 
@@ -686,38 +720,19 @@ nvmft_transmit_response(struct nvmft_qpair *qp, const void *cqe)
 }
 
 /*
- * Reference handshake for an STMF data transfer (nvmft_lport_xfer_data), which
- * runs on an STMF worker thread and dereferences the transport qpair while a
- * concurrent nvmft_qpair_shutdown() may free it.  _hold() returns the transport
- * qpair to use, or NULL if the qpair has already been shut down (the caller
- * must then fail the transfer); _rele() drops the reference once the transport
- * send/receive has been issued, freeing the transport qpair if it was the last
- * reference.  Same handshake as _nvmft_send_response(), exposed for nvmft_stmf.c
- * because struct nvmft_qpair is opaque there.
+ * Keep the transport qpair while an STMF worker submits a transfer on it.
+ * _hold() returns NULL if the qpair is shut down.
  */
 struct nvmf_qpair *
 nvmft_qpair_data_hold(struct nvmft_qpair *qp)
 {
-	struct nvmf_qpair *nq;
-
-	mutex_enter(&qp->qp_lock);
-	nq = qp->qp_qp;
-	if (nq != NULL)
-		qp->qp_refs++;
-	mutex_exit(&qp->qp_lock);
-	return (nq);
+	return (nvmft_qpair_hold(qp));
 }
 
 void
-nvmft_qpair_data_rele(struct nvmft_qpair *qp, struct nvmf_qpair *nq)
+nvmft_qpair_data_rele(struct nvmft_qpair *qp)
 {
-	boolean_t free_it;
-
-	mutex_enter(&qp->qp_lock);
-	free_it = (--qp->qp_refs == 0);
-	mutex_exit(&qp->qp_lock);
-	if (free_it)
-		nvmf_free_qpair(nq);
+	nvmft_qpair_rele(qp);
 }
 
 void
@@ -807,27 +822,17 @@ nvmft_send_connect_response(struct nvmft_qpair *qp,
 {
 	struct nvmf_capsule *rc;
 	struct nvmf_qpair *nq;
-	boolean_t free_it;
 	int error;
 
-	mutex_enter(&qp->qp_lock);
-	nq = qp->qp_qp;
-	if (nq == NULL) {
-		mutex_exit(&qp->qp_lock);
+	nq = nvmft_qpair_hold(qp);
+	if (nq == NULL)
 		return (ENOTCONN);
-	}
-	qp->qp_refs++;
-	mutex_exit(&qp->qp_lock);
 
 	rc = nvmf_allocate_response(nq, rsp, KM_SLEEP);
 	error = nvmf_transmit_capsule(rc);
 	nvmf_free_capsule(rc);
 
-	mutex_enter(&qp->qp_lock);
-	free_it = (--qp->qp_refs == 0);
-	mutex_exit(&qp->qp_lock);
-	if (free_it)
-		nvmf_free_qpair(nq);
+	nvmft_qpair_rele(qp);
 	return (error);
 }
 

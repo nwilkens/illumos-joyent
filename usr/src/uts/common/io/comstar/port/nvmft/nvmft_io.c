@@ -814,7 +814,7 @@ done:
 	 * struct, so it must run while the task is still pending and the qpair is
 	 * still alive.
 	 */
-	nvmft_qpair_data_rele(qp, nq);
+	nvmft_qpair_data_rele(qp);
 	if (submitted && nvmft_xfer_arrive(nx, NVMFT_XFER_SUBMITTED))
 		nvmft_xfer_finish(nx);
 	if (do_xfer_done)

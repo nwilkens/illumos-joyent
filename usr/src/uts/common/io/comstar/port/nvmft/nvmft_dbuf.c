@@ -87,7 +87,7 @@ nvmft_dbuf_alloc(scsi_task_t *task, uint32_t size, uint32_t *pminsize,
 	if (nq != NULL) {
 		error = nvmf_alloc_data_buf(nq, size, MIN(*pminsize, size),
 		    &ndp->ndp_db);
-		nvmft_qpair_data_rele(qp, nq);
+		nvmft_qpair_data_rele(qp);
 		if (error != 0) {
 			stmf_free(dbuf);
 			return (NULL);
@@ -147,12 +147,12 @@ nvmft_dbuf_setup(scsi_task_t *task, stmf_data_buf_t *dbuf, uint32_t flags)
 		return (STMF_FAILURE);
 	ndp = kmem_zalloc(sizeof (*ndp), KM_NOSLEEP);
 	if (ndp == NULL) {
-		nvmft_qpair_data_rele(qp, nq);
+		nvmft_qpair_data_rele(qp);
 		return (STMF_FAILURE);
 	}
 	error = nvmf_map_data_buf(nq, (const nvmf_seg_t *)dbuf->db_sglist,
 	    dbuf->db_sglist_length, &ndp->ndp_db);
-	nvmft_qpair_data_rele(qp, nq);
+	nvmft_qpair_data_rele(qp);
 	if (error != 0) {
 		kmem_free(ndp, sizeof (*ndp));
 		return (STMF_FAILURE);
