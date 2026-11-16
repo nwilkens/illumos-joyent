@@ -95,8 +95,9 @@ nvmf_ns_fmt(const nvme_identify_nsid_t *data, uint64_t *nblksp,
 		return (B_FALSE);
 	}
 
-	lbaf = data->id_flbas.lba_format;
-	if (lbaf > data->id_nlbaf) {
+	/* Formats 16 and up are in a part of the data that is not read. */
+	lbaf = data->id_flbas.lba_format | (data->id_flbas.lba_fidxu << 4);
+	if (lbaf > data->id_nlbaf || lbaf >= NVME_MAX_LBAF) {
 		if (dip != NULL)
 			dev_err(dip, CE_WARN,
 			    "!ns%u: Invalid LBA format index", nsid);

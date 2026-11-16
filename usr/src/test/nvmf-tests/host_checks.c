@@ -70,6 +70,12 @@ test_ns_fmt(void)
 	d = ns_ok(12);
 	d.id_flbas.lba_format = 2;
 	assert(!nvmf_ns_fmt(&d, &nblks, &blksize, NULL, 1));
+
+	/* Format 17 must not be read as format 1. */
+	d = ns_ok(12);
+	d.id_nlbaf = 32;
+	d.id_flbas.lba_fidxu = 1;
+	assert(!nvmf_ns_fmt(&d, &nblks, &blksize, NULL, 1));
 }
 
 static void
