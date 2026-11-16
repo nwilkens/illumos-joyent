@@ -254,6 +254,7 @@ extern struct nvmf_host_qpair *nvmf_admin_hold(nvmf_softc_t *sc);
 extern void nvmf_qp_rele(nvmf_softc_t *sc);
 extern void nvmf_shutdown_admin(nvmf_softc_t *sc);
 extern void nvmf_disconnect(nvmf_softc_t *sc);
+extern void nvmf_disconnect_locked(nvmf_softc_t *sc);
 extern void nvmf_ns_post(nvmf_softc_t *sc, uint_t events);
 extern int nvmf_attach_association(nvmf_softc_t *sc, nvlist_t *nvl);
 extern int nvmf_reconnect_association(nvmf_softc_t *sc, nvlist_t *nvl);

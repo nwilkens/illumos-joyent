@@ -49,6 +49,9 @@
 #define	NVMF_RECONNECT_DELAY_MAX	3600
 #define	NVMF_LOSS_TIMEOUT_MAX	(7 * 24 * 3600)
 
+/* Seconds the disconnect ioctl waits for the namespace worker. */
+#define	NVMF_DETACH_WAIT	120
+
 #ifdef _MULTI_DATAMODEL
 typedef struct nvmf_ioc_nv32 {
 	caddr32_t	data;
@@ -284,6 +287,8 @@ static int
 nvmf_disconnect_host(nvmf_softc_t *sc)
 {
 	boolean_t graceful = B_FALSE;
+	clock_t deadline;
+	int rv;
 
 	mutex_enter(&sc->lock);
 	for (;;) {
@@ -306,26 +311,37 @@ nvmf_disconnect_host(nvmf_softc_t *sc)
 		mutex_enter(&sc->lock);
 
 		/*
-		 * The namespace worker can be waiting for the controller.  A
-		 * signal withdraws the request, whose answer is then ignored.
+		 * The namespace worker can be waiting for a controller that
+		 * no longer answers.  A signal withdraws the request.  After
+		 * NVMF_DETACH_WAIT the association is treated as lost, which
+		 * frees the worker.
 		 */
-		while (!sc->detach_done && sc->state == NVMF_SC_CONNECTED) {
-			if (cv_wait_sig(&sc->cv, &sc->lock) == 0) {
-				sc->detach_req = B_FALSE;
+		deadline = ddi_get_lbolt() +
+		    drv_usectohz((clock_t)NVMF_DETACH_WAIT * MICROSEC);
+		rv = 1;
+		while (!sc->detach_done && sc->state == NVMF_SC_CONNECTED &&
+		    rv > 0)
+			rv = cv_timedwait_sig(&sc->cv, &sc->lock, deadline);
+		sc->detach_req = B_FALSE;
+
+		if (sc->detach_done) {
+			if (sc->detach_busy) {
+				mutex_exit(&sc->lock);
+				return (EBUSY);
+			}
+			if (sc->detach_owned) {
+				sc->detach_owned = B_FALSE;
+				graceful = B_TRUE;
+				goto owned;
+			}
+		} else if (sc->state == NVMF_SC_CONNECTED) {
+			if (rv == 0) {
 				mutex_exit(&sc->lock);
 				return (EINTR);
 			}
-		}
-		sc->detach_req = B_FALSE;
-
-		if (sc->detach_done && sc->detach_busy) {
-			mutex_exit(&sc->lock);
-			return (EBUSY);
-		}
-		if (sc->detach_done && sc->detach_owned) {
-			sc->detach_owned = B_FALSE;
-			graceful = B_TRUE;
-			goto owned;
+			nvmf_disconnect_locked(sc);
+			while (sc->state == NVMF_SC_CONNECTED)
+				cv_wait(&sc->cv, &sc->lock);
 		}
 	}
 

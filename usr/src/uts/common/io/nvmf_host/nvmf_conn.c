@@ -235,6 +235,12 @@ nvmf_conn_post_locked(nvmf_softc_t *sc, uint_t events)
 }
 
 void
+nvmf_disconnect_locked(nvmf_softc_t *sc)
+{
+	nvmf_conn_post_locked(sc, NVMF_EV_DISCONNECT);
+}
+
+void
 nvmf_disconnect(nvmf_softc_t *sc)
 {
 	mutex_enter(&sc->lock);
@@ -499,6 +505,7 @@ nvmf_conn_lost(nvmf_softc_t *sc)
 	sc->state = NVMF_SC_RESETTING;
 	sc->io_enabled = B_FALSE;
 	gethrestime(&sc->last_disconnect);
+	cv_broadcast(&sc->cv);
 	mutex_exit(&sc->lock);
 
 	nvmf_ka_stop(sc);
