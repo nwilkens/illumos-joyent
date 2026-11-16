@@ -363,10 +363,14 @@ nvmf_tcp_warn_ok(void)
 	return (B_TRUE);
 }
 
-/*
- * Command-buffer allocation and reference counting.  Direct ports of the
- * FreeBSD helpers of the same name.
- */
+/* Is [off, off + len) inside [base, base + total)?  The sums can wrap. */
+static boolean_t
+nvmf_tcp_range_ok(uint32_t off, uint32_t len, uint32_t base, size_t total)
+{
+	return (off >= base && (uint64_t)off - base <= total &&
+	    len <= total - ((uint64_t)off - base));
+}
+
 static nvmf_tcp_command_buffer_t *
 tcp_alloc_command_buffer(nvmf_tcp_qpair_t *qp, const struct nvmf_io_request *io,
     uint32_t data_offset, size_t data_len, uint16_t cid)
@@ -1002,8 +1006,8 @@ nvmf_tcp_handle_h2c_data(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 	}
 
 	data_offset = LE_32(h2c->nth2c_datao);
-	if (data_offset < cb->tcb_data_offset ||
-	    data_offset + data_len > cb->tcb_data_offset + cb->tcb_data_len) {
+	if (!nvmf_tcp_range_ok(data_offset, data_len, cb->tcb_data_offset,
+	    cb->tcb_data_len)) {
 		mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
 		nvmf_tcp_report_error(qp,
 		    NVMF_TCP_TERM_REQ_FES_DATA_TRANSFER_OUT_OF_RANGE, 0,
@@ -1096,8 +1100,8 @@ nvmf_tcp_handle_c2h_data(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 	}
 
 	data_offset = LE_32(c2h->ntc2c_datao);
-	if (data_offset < cb->tcb_data_offset ||
-	    data_offset + data_len > cb->tcb_data_offset + cb->tcb_data_len) {
+	if (!nvmf_tcp_range_ok(data_offset, data_len, cb->tcb_data_offset,
+	    cb->tcb_data_len)) {
 		mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
 		nvmf_tcp_report_error(qp,
 		    NVMF_TCP_TERM_REQ_FES_DATA_TRANSFER_OUT_OF_RANGE, 0,
@@ -1209,12 +1213,8 @@ nvmf_tcp_handle_r2t(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 		return (EBADMSG);
 	}
 
-	/*
-	 * XXX: The spec does not specify how to handle R2T transfers out of
-	 * range of the original command.
-	 */
 	data_len = LE_32(r2t->ntr2t_r2tl);
-	if (data_offset + data_len > cb->tcb_data_len) {
+	if (!nvmf_tcp_range_ok(data_offset, data_len, 0, cb->tcb_data_len)) {
 		mutex_exit(&qp->tq_tx_buffers.tcbl_lock);
 		nvmf_tcp_report_error(qp,
 		    NVMF_TCP_TERM_REQ_FES_DATA_TRANSFER_OUT_OF_RANGE, 0,
@@ -2321,7 +2321,7 @@ tcp_receive_controller_data(struct nvmf_capsule *nc, uint32_t data_offset,
 
 	sgl = &nc->nc_sqe.sqe_dptr.d_sgl;
 	data_len = LE_32(sgl->sgl_len);
-	if (data_offset + io->io_len > data_len)
+	if (data_offset > data_len || io->io_len > data_len - data_offset)
 		return (EFBIG);
 
 	sgl_type = (uint8_t)((sgl->sgl_type << 4) | sgl->sgl_zero);
@@ -2378,11 +2378,11 @@ tcp_send_controller_data(struct nvmf_capsule *nc, uint32_t data_offset,
 
 	sgl = &nc->nc_sqe.sqe_dptr.d_sgl;
 	data_len = LE_32(sgl->sgl_len);
-	if (data_offset + len > data_len) {
+	if (data_offset > data_len || len > data_len - data_offset) {
 		freemsg(mp);
 		return (NVME_CQE_SC_GEN_INV_FLD);
 	}
-	last_xfer = (data_offset + len == data_len);
+	last_xfer = (len == data_len - data_offset);
 
 	sgl_type = (uint8_t)((sgl->sgl_type << 4) | sgl->sgl_zero);
 	if (sgl_type != NVME_SGL_TYPE_COMMAND_BUFFER) {
