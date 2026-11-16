@@ -31,6 +31,7 @@
 #include <sys/sunddi.h>
 #include <sys/ksynch.h>
 #include <sys/taskq.h>
+#include <sys/errno.h>
 #include <sys/nvme.h>
 
 #include "nvmf_var.h"
@@ -54,6 +55,7 @@ typedef struct nvmf_aer {
 	boolean_t	active;
 	int		pending;
 	boolean_t	failed;
+	boolean_t	aborted;
 	taskq_ent_t	ent;
 } nvmf_aer_t;
 
@@ -133,8 +135,12 @@ nvmf_finish_aer_page_task(void *arg)
 static void
 nvmf_finish_aer_page(nvmf_softc_t *sc, nvmf_aer_t *aer, boolean_t failed)
 {
+	/* A failed read on a live association must not cost the slot. */
 	if (failed) {
-		nvmf_aer_idle(aer);
+		if (aer->aborted)
+			nvmf_aer_idle(aer);
+		else
+			nvmf_submit_aer(sc, aer);
 		return;
 	}
 
@@ -143,13 +149,15 @@ nvmf_finish_aer_page(nvmf_softc_t *sc, nvmf_aer_t *aer, boolean_t failed)
 }
 
 static void
-nvmf_aer_page_done(nvmf_aer_t *aer, boolean_t failed)
+nvmf_aer_page_done(nvmf_aer_t *aer, boolean_t failed, boolean_t aborted)
 {
 	boolean_t last;
 
 	mutex_enter(&aer->lock);
 	if (failed)
 		aer->failed = B_TRUE;
+	if (aborted)
+		aer->aborted = B_TRUE;
 	last = --aer->pending == 0;
 	failed = aer->failed;
 	mutex_exit(&aer->lock);
@@ -163,13 +171,14 @@ nvmf_io_complete_aer_page(void *arg, size_t xfered, int error)
 {
 	nvmf_aer_t *aer = arg;
 
-	nvmf_aer_page_done(aer, error != 0 || xfered != aer->page_len);
+	nvmf_aer_page_done(aer, error != 0 || xfered != aer->page_len,
+	    error == ECONNABORTED);
 }
 
 static void
 nvmf_complete_aer_page(void *arg, const nvme_cqe_t *cqe)
 {
-	nvmf_aer_page_done(arg, nvmf_cqe_failed(cqe));
+	nvmf_aer_page_done(arg, nvmf_cqe_failed(cqe), nvmf_cqe_aborted(cqe));
 }
 
 static uint_t
@@ -204,6 +213,7 @@ nvmf_complete_aer_task(void *arg)
 	mutex_enter(&aer->lock);
 	aer->pending = 2;
 	aer->failed = B_FALSE;
+	aer->aborted = B_FALSE;
 	mutex_exit(&aer->lock);
 
 	if (!nvmf_cmd_get_log_page(sc, NVME_NSID_BCAST, aer->log_page_id, 0,
