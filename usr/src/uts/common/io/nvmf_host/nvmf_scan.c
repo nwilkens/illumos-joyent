@@ -121,7 +121,7 @@ nvmf_scan_namespaces(nvmf_softc_t *sc)
 	uint32_t nsid, prev = 0;
 	uint_t visited = 0;
 	boolean_t ok = B_FALSE;
-	int i, n;
+	int i, n, error;
 
 	nslist = kmem_alloc(sizeof (*nslist), KM_SLEEP);
 	data = kmem_alloc(sizeof (*data), KM_SLEEP);
@@ -146,10 +146,14 @@ nvmf_scan_namespaces(nvmf_softc_t *sc)
 				ok = B_TRUE;
 				goto out;
 			}
-			if (nvmf_identify_ns(sc, nsid, data) != 0) {
+			/* A namespace that cannot be identified is absent. */
+			error = nvmf_identify_ns(sc, nsid, data);
+			if (error == ECONNABORTED)
+				goto out;
+			if (error != 0) {
 				dev_err(sc->dip, CE_WARN,
 				    "!IDENTIFY namespace %u failed", nsid);
-				goto out;
+				bzero(data, sizeof (*data));
 			}
 
 			nvmf_ns_purge(sc, prev + 1, nsid);
