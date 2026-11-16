@@ -551,6 +551,9 @@ i386_MANFILES=			\
 		bhyve.8		\
 		bhyvectl.8	\
 		nvmeadm.8	\
+		nvmf-connect.8	\
+		nvmfadm.8	\
+		nvmfd.8		\
 		pptadm.8	\
 		rdmsr.8
 

@@ -393,9 +393,6 @@ COMMON_SUBDIRS=		\
 	split		\
 	sqlite		\
 	srchtxt		\
-	nvmf-connect	\
-	nvmfadm		\
-	nvmfd		\
 	srptadm		\
 	srptsvc		\
 	stat		\
@@ -503,6 +500,9 @@ i386_SUBDIRS=		\
 	diskscan	\
 	ficl		\
 	nvmeadm		\
+	nvmf-connect	\
+	nvmfadm		\
+	nvmfd		\
 	pptadm		\
 	rdmsr		\
 	rsrvrctl	\

@@ -210,6 +210,8 @@ i386_MANFILES=	ahci.4d		\
 		ntxn.4d		\
 		nv_sata.4d	\
 		nvme.4d		\
+		nvmf_host.4d	\
+		nvmft.4d	\
 		pchtemp.4d	\
 		pcn.4d		\
 		pvscsi.4d	\

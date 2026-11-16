@@ -938,7 +938,8 @@ SRPT_OBJS += srpt_mod.o srpt_ch.o srpt_cm.o srpt_ioc.o srpt_stp.o
 # favour of blkdev integration.  Object names track the host/ sources ported
 # from FreeBSD sys/dev/nvmf/host.
 #
-NVMF_HOST_OBJS += nvmf_host.o nvmf_qpair.o nvmf_cmd.o nvmf_aer.o nvmf_ns.o \
+NVMF_HOST_OBJS += nvmf_host.o nvmf_conn.o nvmf_scan.o nvmf_ioctl.o \
+		nvmf_qpair.o nvmf_cmd.o nvmf_aer.o nvmf_ns.o \
 		nvmf_blkdev.o nvmf_mpath.o
 
 #
@@ -946,8 +947,8 @@ NVMF_HOST_OBJS += nvmf_host.o nvmf_qpair.o nvmf_cmd.o nvmf_aer.o nvmf_ns.o \
 # names track the controller/ sources ported from FreeBSD sys/dev/nvmf, with
 # the CTL frontend replaced by an STMF port provider.
 #
-NVMFT_OBJS += nvmft.o nvmft_controller.o nvmft_qpair.o nvmft_subr.o \
-		nvmft_stmf.o nvmft_resv.o nvmft_ana.o
+NVMFT_OBJS += nvmft.o nvmft_admin.o nvmft_controller.o nvmft_dbuf.o \
+		nvmft_io.o nvmft_ns.o nvmft_port.o nvmft_qpair.o nvmft_subr.o
 
 FCOE_OBJS += fcoe.o fcoe_eth.o fcoe_fc.o
 

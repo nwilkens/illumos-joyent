@@ -436,7 +436,6 @@ HDRSUBDIRS=				\
 	libndmp		\
 	libnsl		\
 	libnvme		\
-	libnvmf		\
 	libnvpair	\
 	libnwam		\
 	libofmt		\

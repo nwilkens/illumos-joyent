@@ -72,7 +72,6 @@ extern "C" {
 struct nvmf_capsule;
 struct nvmft_controller;
 struct nvmft_qpair;
-struct nvmft_ana_group;
 
 /* NSID n is LUN n - 1, and STMF has 14-bit single level LUNs. */
 #define	NVMFT_MAX_LUN		0x3fff
@@ -148,13 +147,6 @@ typedef struct nvmft_port {
 	/* cntlid allocator (FreeBSD: struct unrhdr *ids). */
 	id_space_t		*np_ids;
 	list_t			np_controllers;	/* nvmft_controller list */
-
-	/* Never set.  Only nvmft_ana.c, which nothing calls, reads these. */
-	uint32_t		*np_active_ns;
-	uint_t			np_num_ns;
-	struct nvmft_ana_group	*np_ana_groups;
-	uint_t			np_num_ana_groups;
-	uint64_t		np_ana_changecount;
 } nvmft_port_t;
 
 /*
