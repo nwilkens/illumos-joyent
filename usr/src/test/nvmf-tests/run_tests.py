@@ -18,6 +18,7 @@ TESTS = (
     "local_checks.py",
     "log_page_len.py",
     "nvmft_defer.py",
+    "pdu_validate.py",
     "send_once.py",
     "sgl_decode.py",
     "tcp_limits.py",
