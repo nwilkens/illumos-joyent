@@ -128,7 +128,9 @@ nvmf_max_xfer(uint64_t cap, uint8_t mdts, uint64_t transport, uint64_t limit)
 	if (mdts != 0 && shift + mdts < 32)
 		limit = MIN(limit, (uint64_t)1 << (shift + mdts));
 	if (transport >= mps)
-		limit = MIN(limit, P2ALIGN(transport, mps));
+		limit = MIN(limit, transport);
+	if (limit >= mps)
+		limit = P2ALIGN(limit, mps);
 	return (limit);
 }
 
@@ -803,6 +805,12 @@ nvmf_reconnect_association(nvmf_softc_t *sc, nvlist_t *nvl)
 		goto fail;
 	}
 
+	/* The subsystem is the same, so this stands even after a failure. */
+	mutex_enter(&sc->lock);
+	nvmf_set_cdata(sc, cdata);
+	sc->cap = cap;
+	mutex_exit(&sc->lock);
+
 	if (!nvmf_revalidate_namespaces(sc)) {
 		error = ECONNABORTED;
 		goto fail;
@@ -821,9 +829,7 @@ nvmf_reconnect_association(nvmf_softc_t *sc, nvlist_t *nvl)
 		error = ECONNABORTED;
 		goto fail;
 	}
-	nvmf_set_cdata(sc, cdata);
 	nvmf_set_timeouts(sc, nvl);
-	sc->cap = cap;
 	old = sc->rparams;
 	sc->rparams = dup;
 	sc->state = NVMF_SC_CONNECTED;

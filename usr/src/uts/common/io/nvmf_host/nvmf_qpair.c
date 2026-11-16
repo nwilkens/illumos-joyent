@@ -197,8 +197,11 @@ nvmf_qp_error(void *arg, int error)
 	nvmf_host_qpair_t *qp = arg;
 	nvmf_softc_t *sc = qp->sc;
 
-	dev_err(sc->dip, CE_WARN, "!error %d on %s, disconnecting", error,
-	    qp->name);
+	/* A plain close is reported once, when the association is lost. */
+	if (error != 0) {
+		dev_err(sc->dip, CE_WARN, "!error %d on %s, disconnecting",
+		    error, qp->name);
+	}
 	nvmf_disconnect(sc);
 }
 
