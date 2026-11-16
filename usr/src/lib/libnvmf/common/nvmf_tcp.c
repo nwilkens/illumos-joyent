@@ -121,6 +121,7 @@ typedef struct nvmf_tcp_qpair {
 	uint32_t maxh2cdata;
 	uint32_t max_icd;	/* Host only */
 	uint16_t next_ttag;	/* Controller only */
+	bool terminated;	/* A termination request has been sent. */
 
 	struct nvmf_tcp_command_buffer_list tx_buffers;
 	struct nvmf_tcp_command_buffer_list rx_buffers;
@@ -241,6 +242,9 @@ nvmf_tcp_write_pdu_iov(nvmf_tcp_qpair_t *qp, struct iovec *iov, u_int iovcnt,
 	ssize_t nwritten;
 	int error;
 
+	if (qp->terminated)
+		return (ECONNRESET);
+
 	while (len != 0) {
 		(void) memset(&msg, 0, sizeof (msg));
 		msg.msg_iov = iov;
@@ -327,6 +331,7 @@ nvmf_tcp_report_error(struct nvmf_association *na, nvmf_tcp_qpair_t *qp,
 
 	(void) nvmf_tcp_write_pdu_iov(qp, iov, 2, sizeof (hdr) + hlen);
 	(void) shutdown(qp->s, SHUT_RDWR);
+	qp->terminated = true;
 }
 
 static int
@@ -335,6 +340,9 @@ nvmf_tcp_read_buffer(nvmf_tcp_qpair_t *qp, void *buf, size_t len)
 	ssize_t nread;
 	char *cp;
 	int error;
+
+	if (qp->terminated)
+		return (ECONNRESET);
 
 	cp = buf;
 	while (len != 0) {
@@ -520,6 +528,9 @@ nvmf_tcp_save_command_capsule(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 		nvmf_tcp_free_pdu(pdu);
 		return (ENOMEM);
 	}
+
+	/* Keep the PSDT the host sent so that it can be validated. */
+	(void) memcpy(&nc->nc_sqe, cmd->ntc_ccsqe, sizeof (nc->nc_sqe));
 
 	tc = TCAP(nc);
 	tc->rx_pdu = *pdu;
