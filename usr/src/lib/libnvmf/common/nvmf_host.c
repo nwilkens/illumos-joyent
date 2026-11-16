@@ -113,6 +113,15 @@ nvmf_connect(struct nvmf_association *na, const nvmf_qpair_params_t *params,
 		goto error;
 	}
 
+	if (!nvmf_nqn_valid(subnqn) || strlen(subnqn) > NVMF_NQN_MAX_LEN) {
+		na_error(na, "Invalid subsystem NQN");
+		goto error;
+	}
+	if (!nvmf_nqn_valid(hostnqn) || strlen(hostnqn) > NVMF_NQN_MAX_LEN) {
+		na_error(na, "Invalid host NQN");
+		goto error;
+	}
+
 	if (params->nqp_admin != (qid == 0)) {
 		na_error(na, "Admin queue must use Queue ID 0");
 		goto error;
@@ -177,7 +186,7 @@ nvmf_connect(struct nvmf_association *na, const nvmf_qpair_params_t *params,
 	error = nvmf_transmit_capsule(cc);
 	if (error != 0) {
 		na_error(na, "Failed to transmit CONNECT capsule: %s",
-		    strerror(errno));
+		    strerror(error));
 		goto error;
 	}
 
@@ -225,7 +234,8 @@ nvmf_connect(struct nvmf_association *na, const nvmf_qpair_params_t *params,
 	}
 
 	if (rsp->nfcr_status_code_specific.success.authreq) {
-		na_error(na, "CONNECT response requests authentication\n");
+		na_error(na, "Controller requires authentication, which is "
+		    "not supported");
 		goto error;
 	}
 
@@ -317,6 +327,7 @@ nvmf_host_receive_response(struct nvmf_qpair *qp, struct nvmf_capsule **ncp)
 	if (!TAILQ_EMPTY(&qp->nq_rx_capsules)) {
 		nc = TAILQ_FIRST(&qp->nq_rx_capsules);
 		TAILQ_REMOVE(&qp->nq_rx_capsules, nc, nc_link);
+		qp->nq_rx_count--;
 		*ncp = nc;
 		return (0);
 	}
@@ -335,6 +346,7 @@ nvmf_host_wait_for_response(struct nvmf_capsule *cc, struct nvmf_capsule **rcp)
 	TAILQ_FOREACH(rc, &qp->nq_rx_capsules, nc_link) {
 		if (rc->nc_cqe.cqe_cid == cc->nc_sqe.sqe_cid) {
 			TAILQ_REMOVE(&qp->nq_rx_capsules, rc, nc_link);
+			qp->nq_rx_count--;
 			*rcp = rc;
 			return (0);
 		}
@@ -347,7 +359,13 @@ nvmf_host_wait_for_response(struct nvmf_capsule *cc, struct nvmf_capsule **rcp)
 			return (error);
 
 		if (rc->nc_cqe.cqe_cid != cc->nc_sqe.sqe_cid) {
+			/* No more responses can be owed than the queue holds. */
+			if (qp->nq_rx_count >= qp->nq_qsize) {
+				nvmf_free_capsule(rc);
+				return (EPROTO);
+			}
 			TAILQ_INSERT_TAIL(&qp->nq_rx_capsules, rc, nc_link);
+			qp->nq_rx_count++;
 			continue;
 		}
 
@@ -652,6 +670,12 @@ nvmf_host_identify_namespace(struct nvmf_qpair *qp, uint32_t nsid,
 	return (0);
 }
 
+/*
+ * Reads of the discovery log before giving up on a controller that changes it
+ * each time.
+ */
+#define	NVMF_DISCOVERY_LOG_TRIES	8
+
 static int
 nvmf_get_discovery_log_page(struct nvmf_qpair *qp, uint64_t offset, void *buf,
     size_t len)
@@ -694,7 +718,8 @@ nvmf_get_discovery_log_page(struct nvmf_qpair *qp, uint64_t offset, void *buf,
 		return (error);
 
 	status = nvmf_cqe_status(&rc->nc_cqe);
-	if (NVMF_SC_GET_SC(status) == NVMF_FABRIC_SC_LOG_RESTART_DISCOVERY) {
+	if (NVMF_SC_GET_SCT(status) == NVME_CQE_SCT_SPECIFIC &&
+	    NVMF_SC_GET_SC(status) == NVMF_FABRIC_SC_LOG_RESTART_DISCOVERY) {
 		nvmf_free_capsule(rc);
 		return (EAGAIN);
 	}
@@ -715,20 +740,27 @@ nvmf_host_fetch_discovery_log_page(struct nvmf_qpair *qp,
 {
 	nvmf_discovery_log_page_t hdr, *log;
 	size_t payload_len;
+	uint_t tries;
 	int error;
 
 	if (!qp->nq_admin)
 		return (EINVAL);
 
 	log = NULL;
-	for (;;) {
+	for (tries = 0; ; tries++) {
+		if (tries == NVMF_DISCOVERY_LOG_TRIES) {
+			na_error(qp->nq_association,
+			    "Discovery log changed on every read");
+			free(log);
+			return (EAGAIN);
+		}
+
 		error = nvmf_get_discovery_log_page(qp, 0, &hdr, sizeof (hdr));
 		if (error != 0) {
 			free(log);
 			return (error);
 		}
 
-		/* illumos is little-endian; no byte-swap of the header. */
 		if (hdr.ndlp_recfmt != 0) {
 			na_error(qp->nq_association,
 			    "Unsupported discovery log format %u",
@@ -737,14 +769,15 @@ nvmf_host_fetch_discovery_log_page(struct nvmf_qpair *qp,
 			return (EINVAL);
 		}
 
-		if (hdr.ndlp_numrec > 1024) {
+		if (LE_64(hdr.ndlp_numrec) > 1024) {
 			na_error(qp->nq_association,
 			    "Too many discovery log entries");
 			free(log);
 			return (EFBIG);
 		}
 
-		payload_len = sizeof (log->ndlp_entries[0]) * hdr.ndlp_numrec;
+		payload_len = sizeof (log->ndlp_entries[0]) *
+		    LE_64(hdr.ndlp_numrec);
 		log = reallocf(log, sizeof (*log) + payload_len);
 		if (log == NULL)
 			return (ENOMEM);

@@ -203,6 +203,7 @@ struct nvmf_qpair {
 	int64_t nq_deadline;
 
 	TAILQ_HEAD(, nvmf_capsule) nq_rx_capsules;
+	uint_t nq_rx_count;	/* host only */
 };
 
 struct nvmf_capsule {
