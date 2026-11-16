@@ -76,18 +76,16 @@ typedef struct stmf_local_port stmf_local_port_t;
 #define	STMF_BUSY	((uint64_t)0x2000000000000000)
 #define	STMF_ABORT_SUCCESS	((uint64_t)0x3000000000000000)
 #define	STMF_LPORT_ABORT_TASK	0x40
-#define	STMF_REQUEUE_TASK_ABORT_LPORT	2
-#define	STATUS_CHECK	0x02
 #define	ASSERT0(x)	assert((x) == 0)
-void stmf_abort(int, scsi_task_t *, stmf_status_t, void *);
-void nvmf_abort_capsule_data(struct nvmf_capsule *, int);
+#define	MUTEX_HELD(m)	1
+#define	mutex_tryenter(m)	(pthread_mutex_trylock(m) == 0)
+typedef struct nvmft_controller { kmutex_t ctrlr_lock; } nvmft_controller_t;
 typedef struct stmf_data_buf {
 	uint16_t db_flags;
 	stmf_status_t db_xfer_status;
 	uint32_t db_data_size;
 } stmf_data_buf_t;
 struct nvmft_qpair;
-struct nvmft_internal_io;
 void stmf_data_xfer_done(scsi_task_t *, stmf_data_buf_t *, uint32_t);
 void nvmft_command_completed(struct nvmft_qpair *, struct nvmf_capsule *);
 uint32_t nvmft_qpair_caps(struct nvmft_qpair *);
@@ -98,12 +96,23 @@ uint32_t nvmft_qpair_caps(struct nvmft_qpair *);
             parts.append(line + "\n")
     for name in ("NVMFT_XFER_SUBMITTED", "NVMFT_XFER_COMPLETED"):
         parts.append(define(stmf_h, name))
+    parts.append(define(NVME_H, "NVME_CQE_SC_GEN_ABORT_REQUEST"))
     for name in ("nvmft_task_priv_t", "nvmft_internal_io_t", "nvmft_xfer_t"):
         parts.append(typedef(stmf_h, name))
-    for name in ("nvmft_xfer_begin", "nvmft_xfer_end", "nvmft_xfer_refused",
-                 "nvmft_xfer_arrive", "nvmft_xfer_finish",
-                 "nvmft_datamove_out_cb", "nvmft_datamove_in_cb",
-                 "nvmft_lport_abort"):
+    # What the transfer code calls in the rest of nvmft_io.c.
+    parts.append("""
+static void nvmft_task_finish(nvmft_task_priv_t *, boolean_t);
+static void nvmft_task_unlist_locked(nvmft_controller_t *,
+    nvmft_task_priv_t *);
+nvmft_controller_t *nvmft_task_ctrlr(nvmft_task_priv_t *);
+int nvmft_send_generic_error(struct nvmft_qpair *, struct nvmf_capsule *,
+    uint8_t);
+void nvmft_internal_aborted(nvmft_internal_io_t *);
+""")
+    for name in ("nvmft_xfer_begin", "nvmft_xfer_end", "nvmft_xfer_done",
+                 "nvmft_xfer_refuse", "nvmft_xfer_arrive",
+                 "nvmft_xfer_finish", "nvmft_datamove_out_cb",
+                 "nvmft_datamove_in_cb", "nvmft_lport_abort"):
         parts.append(function(stmf, name))
     run_c(TESTDIR / "send_once.c", {"send.h": "\n".join(parts)})
 

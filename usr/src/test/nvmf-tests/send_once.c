@@ -184,26 +184,55 @@ adapter(void)
 	RUN(NVME_CQE_SC_GEN_SUCCESS, 1, EINVAL, 0, 0, 0);
 }
 
-static int xfer_dones, cid_clears, requeues;
-
-void
-stmf_abort(int cmd, scsi_task_t *task, stmf_status_t s, void *arg)
-{
-	(void) task;
-	(void) s;
-	(void) arg;
-	assert(cmd == STMF_REQUEUE_TASK_ABORT_LPORT);
-	__atomic_add_fetch(&requeues, 1, __ATOMIC_SEQ_CST);
-}
-
-void
-nvmf_abort_capsule_data(struct nvmf_capsule *nc, int error)
-{
-	(void) nc;
-	assert(error == ECANCELED);
-}
+static int xfer_dones, cid_clears, finishes, unlists, errors_sent;
+static int finished_good;
+static uint8_t error_sc;
 static uint32_t last_iof;
 static stmf_status_t last_status;
+static nvmft_controller_t ctrlr;
+
+/* The port lets go of the task before STMF hears that it is done. */
+static void
+nvmft_task_finish(nvmft_task_priv_t *priv, boolean_t good)
+{
+	(void) priv;
+	assert(xfer_dones == 0);
+	finishes++;
+	finished_good = good;
+}
+
+static void
+nvmft_task_unlist_locked(nvmft_controller_t *c, nvmft_task_priv_t *priv)
+{
+	(void) priv;
+	assert(c == &ctrlr);
+	unlists++;
+}
+
+nvmft_controller_t *
+nvmft_task_ctrlr(nvmft_task_priv_t *priv)
+{
+	(void) priv;
+	return (&ctrlr);
+}
+
+int
+nvmft_send_generic_error(struct nvmft_qpair *q, struct nvmf_capsule *nc,
+    uint8_t sc)
+{
+	(void) q;
+	(void) nc;
+	errors_sent++;
+	error_sc = sc;
+	return (0);
+}
+
+void
+nvmft_internal_aborted(nvmft_internal_io_t *iio)
+{
+	(void) iio;
+	abort();
+}
 
 void
 stmf_data_xfer_done(scsi_task_t *task, stmf_data_buf_t *dbuf, uint32_t iof)
@@ -265,7 +294,7 @@ finish_case(int to_rport, int final, uint16_t flags, uint_t status,
 		nx.nx_to_rport = to_rport;
 		nx.nx_final = final;
 		nx.nx_status = status;
-		xfer_dones = cid_clears = 0;
+		xfer_dones = cid_clears = finishes = 0;
 		if (order == 0) {
 			/* The transport completes inside the submit call. */
 			complete_thread(&nx);
@@ -286,11 +315,15 @@ finish_case(int to_rport, int final, uint16_t flags, uint_t status,
 		}
 		if (xfer_dones != 1 || last_iof != want_iof ||
 		    last_status != want_status ||
-		    priv.ntp_success_sent != want_sent ||
-		    cid_clears != want_clear) {
+		    priv.ntp_responded != want_sent ||
+		    cid_clears != want_clear ||
+		    finishes != (want_iof == STMF_IOF_LPORT_DONE) ||
+		    (finishes == 1 &&
+		    finished_good != (want_status == STMF_SUCCESS))) {
 			fprintf(stderr, "line %d order %d: dones %d iof %u "
-			    "sent %d clears %d\n", line, order, xfer_dones,
-			    last_iof, priv.ntp_success_sent, cid_clears);
+			    "sent %d clears %d finishes %d\n", line, order,
+			    xfer_dones, last_iof, priv.ntp_responded,
+			    cid_clears, finishes);
 			abort();
 		}
 		assert(priv.ntp_xfers == 0);
@@ -321,8 +354,9 @@ short_write(void)
 }
 
 /*
- * A transfer the transport refuses gives its dbuf back failed, since sbd
- * waits for it; an aborting task keeps the dbuf and requeues the abort.
+ * A transfer that is not submitted gives its dbuf back failed, since sbd
+ * waits for it.  If the LU sent its status with the dbuf, the host gets the
+ * error and the port is done.  An aborting task keeps the dbuf.
  */
 static void
 refused(void)
@@ -330,28 +364,39 @@ refused(void)
 	nvmft_task_priv_t priv;
 	scsi_task_t task = { .task_port_private = &priv };
 	stmf_data_buf_t dbuf = { .db_data_size = 512 };
-	boolean_t done = B_FALSE;
-	int aborting;
+	int aborting, final;
 
 	for (aborting = 0; aborting < 2; aborting++) {
-		memset(&priv, 0, sizeof (priv));
-		mutex_init(&priv.ntp_lock, NULL, MUTEX_DRIVER, NULL);
-		assert(nvmft_xfer_begin(&priv));
-		priv.ntp_aborting = aborting;
-		dbuf.db_xfer_status = STMF_SUCCESS;
-		requeues = 0;
-		if (aborting) {
-			assert(nvmft_xfer_refused(&task, &dbuf, &done) ==
-			    STMF_ABORTED);
-			assert(!done && requeues == 1);
-		} else {
-			assert(nvmft_xfer_refused(&task, &dbuf, &done) ==
-			    STMF_SUCCESS);
-			assert(done && requeues == 0);
+		for (final = 0; final < 2; final++) {
+			stmf_status_t want = aborting ? STMF_ABORTED :
+			    STMF_SUCCESS;
+
+			memset(&priv, 0, sizeof (priv));
+			mutex_init(&priv.ntp_lock, NULL, MUTEX_DRIVER, NULL);
+			assert(nvmft_xfer_begin(&priv));
+			priv.ntp_aborting = aborting;
+			dbuf.db_xfer_status = STMF_SUCCESS;
+			xfer_dones = finishes = errors_sent = 0;
+			assert(nvmft_xfer_refuse(&task, &dbuf, final,
+			    NVME_CQE_SC_GEN_INV_DSGL_LEN) == want);
+			assert(xfer_dones == !aborting);
+			assert(errors_sent == final);
+			assert(priv.ntp_responded == final);
+			if (final)
+				assert(error_sc ==
+				    NVME_CQE_SC_GEN_INV_DSGL_LEN);
+			else
+				assert(priv.ntp_sc ==
+				    NVME_CQE_SC_GEN_INV_DSGL_LEN);
+			if (!aborting) {
+				assert(dbuf.db_xfer_status == STMF_FAILURE);
+				assert(finishes == final);
+				assert(last_iof ==
+				    (final ? STMF_IOF_LPORT_DONE : 0));
+			}
+			assert(priv.ntp_xfers == 0);
+			mutex_destroy(&priv.ntp_lock);
 		}
-		assert(dbuf.db_xfer_status == STMF_FAILURE);
-		assert(priv.ntp_xfers == 0);
-		mutex_destroy(&priv.ntp_lock);
 	}
 }
 
@@ -413,8 +458,8 @@ stress(void)
 
 /*
  * An abort while the transport holds transfers: STMF hears BUSY, the dbufs
- * never come back to STMF, each completion retries the abort, and the abort
- * succeeds once the last transfer is gone.  No new transfer starts.
+ * never come back to STMF, and the abort succeeds once the last transfer is
+ * gone and the controller's lock is free.  No new transfer starts.
  */
 static void
 abort_drain(void)
@@ -437,20 +482,27 @@ abort_drain(void)
 		nx[i].nx_status = NVME_CQE_SC_GEN_SUCCESS;
 		assert(!nvmft_xfer_arrive(&nx[i], NVMFT_XFER_SUBMITTED));
 	}
-	xfer_dones = requeues = 0;
+	xfer_dones = unlists = 0;
 	assert(nvmft_lport_abort(NULL, STMF_LPORT_ABORT_TASK, &task, 0) ==
 	    STMF_BUSY);
 	assert(!nvmft_xfer_begin(&priv));
 
 	nvmft_datamove_out_cb(&nx[0], NVME_CQE_SC_GEN_SUCCESS);
-	assert(xfer_dones == 0 && requeues == 1);
+	assert(xfer_dones == 0);
 	assert(nvmft_lport_abort(NULL, STMF_LPORT_ABORT_TASK, &task, 0) ==
 	    STMF_BUSY);
 	nvmft_datamove_in_cb(&nx[1], 512, 0);
-	assert(xfer_dones == 0 && requeues == 2);
+	assert(xfer_dones == 0 && unlists == 0);
+
+	/* The thread that aborts every task holds the controller's lock. */
+	mutex_enter(&ctrlr.ctrlr_lock);
+	assert(nvmft_lport_abort(NULL, STMF_LPORT_ABORT_TASK, &task, 0) ==
+	    STMF_BUSY);
+	mutex_exit(&ctrlr.ctrlr_lock);
+	assert(unlists == 0);
 	assert(nvmft_lport_abort(NULL, STMF_LPORT_ABORT_TASK, &task, 0) ==
 	    STMF_ABORT_SUCCESS);
-	assert(priv.ntp_xfers == 0);
+	assert(unlists == 1 && priv.ntp_xfers == 0 && !priv.ntp_responded);
 	mutex_destroy(&priv.ntp_lock);
 
 	/*
@@ -465,18 +517,19 @@ abort_drain(void)
 	nx[0].nx_dbuf = &dbuf[0];
 	nx[0].nx_to_rport = B_TRUE;
 	assert(!nvmft_xfer_arrive(&nx[0], NVMFT_XFER_SUBMITTED));
-	xfer_dones = requeues = cid_clears = 0;
+	xfer_dones = cid_clears = 0;
 	assert(nvmft_lport_abort(NULL, STMF_LPORT_ABORT_TASK, &task, 0) ==
 	    STMF_BUSY);
 	nvmft_datamove_out_cb(&nx[0], NVMF_SUCCESS_SENT);
-	assert(cid_clears == 1 && priv.ntp_success_sent);
-	assert(xfer_dones == 0 && requeues == 1);
+	assert(cid_clears == 1 && priv.ntp_responded);
+	assert(xfer_dones == 0);
 	mutex_destroy(&priv.ntp_lock);
 }
 
 int
 main(void)
 {
+	mutex_init(&ctrlr.ctrlr_lock, NULL, MUTEX_DRIVER, NULL);
 	adapter();
 	nvmft_side();
 	abort_drain();

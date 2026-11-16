@@ -11,6 +11,7 @@ TESTS = (
     "adopt_lifecycle.py",
     "connect_checks.py",
     "identify_sgls.py",
+    "io_checks.py",
     "log_page_len.py",
     "nvmft_defer.py",
     "send_once.py",

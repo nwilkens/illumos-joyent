@@ -27,48 +27,50 @@
 extern "C" {
 #endif
 
+/* NSID n is LUN n - 1, and STMF has 14-bit single level LUNs. */
+#define	NVMFT_MAX_LUN	0x3fff
+
 /*
- * Per-task scratch carried in scsi_task_t->task_port_private.  Ties an STMF task
- * back to the Fabrics capsule and qpair it was created from, so the data and
- * status phases can drive the transport.  (FreeBSD stashed nc/qp in
- * io->io_hdr.ctl_private[CTL_PRIV_FRONTEND].)
+ * The private data of an STMF task.  A host command keeps it in its capsule;
+ * an internal task keeps it in its nvmft_internal_io_t.
  */
 typedef struct nvmft_task_priv {
 	struct nvmf_capsule	*ntp_nc;
 	struct nvmft_qpair	*ntp_qp;
-	list_node_t		ntp_link;	/* ctrlr_deferred */
-	boolean_t		ntp_success_sent;
+	scsi_task_t		*ntp_task;
+	list_node_t		ntp_link;	/* deferred or io_work */
+	list_node_t		ntp_task_link;	/* ctrlr_tasks */
 	/*
 	 * Transfers the transport holds for this task.  STMF frees the dbufs
 	 * of an aborted task, so an abort waits for these to drain.
 	 */
 	kmutex_t		ntp_lock;
 	uint_t			ntp_xfers;
-	boolean_t		ntp_aborting;
 	/* Command payload length, charged against ctrlr_pending_bytes. */
 	uint32_t		ntp_data_len;
-	/*
-	 * Non-NULL for driver-issued (internal) tasks that capture their read
-	 * data into a local buffer instead of sending it to a host -- used to
-	 * query LU geometry via READ CAPACITY(16) for Identify Namespace.
-	 */
+	boolean_t		ntp_aborting;
+	/* The host has its response, or the transport sends it. */
+	boolean_t		ntp_responded;
+	/* The status of the response if the task ends without one. */
+	uint8_t			ntp_sc;
 	struct nvmft_internal_io *ntp_iio;
 } nvmft_task_priv_t;
 
 /*
- * Completion rendezvous for an internal (driver-issued) STMF task.  The issuing
- * thread blocks on iio_cv; the data phase copies into iio_buf and the status
- * phase (or a phase-collapsed final data buffer) sets iio_done and signals.
+ * A READ CAPACITY(16) that nvmft sends to an LU for Identify Namespace.  The
+ * waiter and the task each hold a reference, so either may finish first.
  */
 typedef struct nvmft_internal_io {
-	kmutex_t	iio_lock;
-	kcondvar_t	iio_cv;
-	boolean_t	iio_done;
-	uint8_t		iio_scsi_status;
-	uint8_t		iio_sense_key;
-	uint8_t		*iio_buf;
-	uint32_t	iio_buflen;
-	uint32_t	iio_xfered;
+	nvmft_task_priv_t	iio_priv;
+	nvmft_controller_t	*iio_ctrlr;
+	kmutex_t		iio_lock;
+	kcondvar_t		iio_cv;
+	uint_t			iio_refs;
+	boolean_t		iio_done;
+	uint8_t			iio_scsi_status;
+	uint8_t			iio_sense_key;
+	uint32_t		iio_xfered;
+	uint8_t			iio_buf[32];
 } nvmft_internal_io_t;
 
 /*
@@ -102,6 +104,10 @@ typedef struct nvmft_dbuf_priv {
 } nvmft_dbuf_priv_t;
 
 /* nvmft_io.c */
+nvmft_controller_t *nvmft_task_ctrlr(nvmft_task_priv_t *priv);
+void	nvmft_task_listed(nvmft_controller_t *ctrlr, nvmft_task_priv_t *priv,
+    scsi_task_t *task);
+void	nvmft_task_unlist(nvmft_controller_t *ctrlr, nvmft_task_priv_t *priv);
 stmf_status_t nvmft_lport_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf,
     uint32_t ioflags);
 stmf_status_t nvmft_lport_send_status(scsi_task_t *task, uint32_t ioflags);
@@ -109,6 +115,12 @@ void	nvmft_lport_task_free(scsi_task_t *task);
 stmf_status_t nvmft_lport_abort(stmf_local_port_t *lport, int abort_cmd,
     void *arg, uint32_t flags);
 void	nvmft_lport_task_poll(scsi_task_t *task);
+
+/* nvmft_ns.c */
+void	nvmft_internal_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf);
+void	nvmft_internal_send_status(scsi_task_t *task);
+void	nvmft_internal_aborted(nvmft_internal_io_t *iio);
+void	nvmft_internal_rele(nvmft_internal_io_t *iio);
 
 /* nvmft_dbuf.c */
 stmf_dbuf_store_t *nvmft_dbuf_store_create(void);

@@ -138,29 +138,20 @@ _init(void)
 	    offsetof(nvmft_port_t, np_link));
 
 	/*
-	 * Single-threaded to keep controller shutdown/terminate ordering
-	 * serialized.  Not TASKQ_DYNAMIC: consumers use the preallocated
-	 * taskq_dispatch_ent() path, which asserts !TASKQ_DYNAMIC.
+	 * ns_taskq has one thread, which orders shutdown, terminate and the
+	 * Connect of kernel-born queues.  taskq_dispatch_ent() needs taskqs
+	 * that are not TASKQ_DYNAMIC.
 	 */
 	nvmft_global->ns_taskq = taskq_create("nvmft", 1, minclsyspri, 1,
 	    INT_MAX, 0);
 	nvmft_global->ns_admin_taskq = taskq_create("nvmft_admin", 4,
 	    minclsyspri, 4, INT_MAX, 0);
-	if (nvmft_global->ns_taskq == NULL ||
-	    nvmft_global->ns_admin_taskq == NULL) {
-		if (nvmft_global->ns_taskq != NULL)
-			taskq_destroy(nvmft_global->ns_taskq);
-		if (nvmft_global->ns_admin_taskq != NULL)
-			taskq_destroy(nvmft_global->ns_admin_taskq);
-		list_destroy(&nvmft_global->ns_ports);
-		mutex_destroy(&nvmft_global->ns_lock);
-		kmem_free(nvmft_global, sizeof (nvmft_softc_t));
-		nvmft_global = NULL;
-		return (ENOMEM);
-	}
+	nvmft_global->ns_io_taskq = taskq_create("nvmft_io", 4, minclsyspri,
+	    4, INT_MAX, 0);
 
 	status = mod_install(&nvmft_modlinkage);
 	if (status != DDI_SUCCESS) {
+		taskq_destroy(nvmft_global->ns_io_taskq);
 		taskq_destroy(nvmft_global->ns_admin_taskq);
 		taskq_destroy(nvmft_global->ns_taskq);
 		list_destroy(&nvmft_global->ns_ports);
@@ -200,6 +191,7 @@ _fini(void)
 		return (status);
 	}
 
+	taskq_destroy(nvmft_global->ns_io_taskq);
 	taskq_destroy(nvmft_global->ns_admin_taskq);
 	taskq_destroy(nvmft_global->ns_taskq);
 	list_destroy(&nvmft_global->ns_ports);

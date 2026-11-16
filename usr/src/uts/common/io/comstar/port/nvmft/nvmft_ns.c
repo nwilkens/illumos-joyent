@@ -4,7 +4,7 @@
  * You may only use this file in accordance with the terms of version
  * 1.0 of the CDDL.
  *
- * A full copy of the text of the CDDL should have accompanied this
+ * A full copy of the CDDL should have accompanied this
  * source.  A copy of the CDDL is also available via the Internet at
  * http://www.illumos.org/license/CDDL.
  */
@@ -14,7 +14,10 @@
  */
 
 /*
- * Namespaces: NSID n is LUN n - 1 of the association's STMF session.
+ * Namespaces.  NSID n is LUN n - 1 of the association's STMF session, so the
+ * session's LUN map (stmfadm add-view) is the namespace list.  STMF does not
+ * expose an LU's geometry, so Identify Namespace sends the LU a
+ * READ CAPACITY(16) in an internal task, whose data stays in the kernel.
  */
 
 #include <sys/types.h>
@@ -40,56 +43,8 @@
 #include <sys/lpif.h>
 #include <sys/stmf_ioctl.h>
 #include <sys/portif.h>
-#include "../../stmf/stmf_impl.h"
-#include "../../stmf/lun_map.h"
 
 #include "nvmft_io.h"
-
-/*
- * Look up the controller session's LU map entry for nsid (LUN nsid-1).  Returns
- * B_TRUE if a LU is mapped, optionally copying its 16-byte identity (the LU
- * GUID) for the namespace identification descriptor.  Read under iss_lockp.
- */
-static boolean_t
-nvmft_ns_mapped(nvmft_controller_t *ctrlr, uint32_t nsid, uint8_t *guid)
-{
-	stmf_scsi_session_t *ss = ctrlr->ctrlr_session;
-	stmf_i_scsi_session_t *iss;
-	stmf_lun_map_ent_t *ent;
-	uint32_t lun_id;
-	boolean_t mapped = B_FALSE;
-
-	if (ss == NULL || nsid == 0)
-		return (B_FALSE);
-	lun_id = nsid - 1;
-	if (lun_id > 0x3fff)		/* STMF single-level LUN limit */
-		return (B_FALSE);
-
-	iss = (stmf_i_scsi_session_t *)ss->ss_stmf_private;
-	rw_enter(iss->iss_lockp, RW_READER);
-	/*
-	 * iss_sm is NULL during the session create/teardown window (stmf clears
-	 * it under iss_lockp); stmf_get_ent_from_map() would deref it.  Guard as
-	 * nvmft_build_active_nslist() does.
-	 */
-	if (iss->iss_sm != NULL) {
-		ent = (stmf_lun_map_ent_t *)stmf_get_ent_from_map(iss->iss_sm,
-		    (uint16_t)lun_id);
-		if (ent != NULL && ent->ent_lu != NULL) {
-			mapped = B_TRUE;
-			if (guid != NULL) {
-				scsi_devid_desc_t *id = ent->ent_lu->lu_id;
-
-				(void) bzero(guid, 16);
-				if (id != NULL)
-					(void) memcpy(guid, id->ident,
-					    MIN(id->ident_length, 16));
-			}
-		}
-	}
-	rw_exit(iss->iss_lockp);
-	return (mapped);
-}
 
 /*
  * How many times to reissue the internal READ CAPACITY when the LU reports a
@@ -98,132 +53,253 @@ nvmft_ns_mapped(nvmft_controller_t *ctrlr, uint32_t nsid, uint8_t *guid)
  */
 #define	NVMFT_READ_CAPACITY_UA_RETRIES	5
 
+/* Seconds that Identify Namespace waits for the LU. */
+uint_t nvmft_read_capacity_timeout = 10;
+
 /*
- * Issue an internal READ CAPACITY(16) to the LU backing nsid and return its
- * block count and block size.  Blocks until the LU completes the command on an
- * STMF worker thread (independent of this thread), so it must run in thread
- * context (it is called from the admin-command handler).
+ * Whether a LU is mapped at nsid, and optionally its 16-byte identifier (the
+ * LU GUID).
+ */
+static boolean_t
+nvmft_ns_mapped(nvmft_controller_t *ctrlr, uint32_t nsid, uint8_t *guid)
+{
+	stmf_scsi_session_t *ss = ctrlr->ctrlr_session;
+	uint16_t lun;
+
+	if (ss == NULL || nsid == 0 || nsid - 1 > NVMFT_MAX_LUN)
+		return (B_FALSE);
+	lun = (uint16_t)(nsid - 1);
+	return (stmf_session_next_lun(ss, &lun, guid, 16) == STMF_SUCCESS &&
+	    lun == nsid - 1);
+}
+
+void
+nvmft_internal_rele(nvmft_internal_io_t *iio)
+{
+	boolean_t last;
+
+	mutex_enter(&iio->iio_lock);
+	ASSERT3U(iio->iio_refs, >, 0);
+	last = (--iio->iio_refs == 0);
+	mutex_exit(&iio->iio_lock);
+	if (!last)
+		return;
+
+	cv_destroy(&iio->iio_cv);
+	mutex_destroy(&iio->iio_lock);
+	mutex_destroy(&iio->iio_priv.ntp_lock);
+	kmem_free(iio, sizeof (*iio));
+}
+
+static void
+nvmft_internal_done(nvmft_internal_io_t *iio, uint8_t status, uint8_t key)
+{
+	mutex_enter(&iio->iio_lock);
+	if (!iio->iio_done) {
+		iio->iio_scsi_status = status;
+		iio->iio_sense_key = key;
+		iio->iio_done = B_TRUE;
+		cv_broadcast(&iio->iio_cv);
+	}
+	mutex_exit(&iio->iio_lock);
+}
+
+/* The data of an internal task: keep it instead of sending it to a host. */
+void
+nvmft_internal_xfer_data(scsi_task_t *task, stmf_data_buf_t *dbuf)
+{
+	nvmft_task_priv_t *priv = task->task_port_private;
+	nvmft_internal_io_t *iio = priv->ntp_iio;
+
+	if (dbuf->db_flags & DB_DIRECTION_TO_RPORT) {
+		uint32_t off = dbuf->db_relative_offset;
+		uint32_t resid = dbuf->db_data_size;
+		uint16_t i;
+
+		mutex_enter(&iio->iio_lock);
+		for (i = 0; i < dbuf->db_sglist_length && resid != 0 &&
+		    off < sizeof (iio->iio_buf); i++) {
+			uint32_t todo = dbuf->db_sglist[i].seg_length;
+
+			if (todo > resid)
+				todo = resid;
+			if (todo > sizeof (iio->iio_buf) - off)
+				todo = sizeof (iio->iio_buf) - off;
+			bcopy(dbuf->db_sglist[i].seg_addr, iio->iio_buf + off,
+			    todo);
+			off += todo;
+			resid -= todo;
+		}
+		if (off > iio->iio_xfered)
+			iio->iio_xfered = off;
+		mutex_exit(&iio->iio_lock);
+	}
+	dbuf->db_xfer_status = STMF_SUCCESS;
+
+	/* With status in the dbuf no lport_send_status() follows. */
+	if (dbuf->db_flags & DB_SEND_STATUS_GOOD) {
+		nvmft_internal_done(iio, STATUS_GOOD, KEY_NO_SENSE);
+		nvmft_task_unlist(iio->iio_ctrlr, priv);
+		stmf_data_xfer_done(task, dbuf, STMF_IOF_LPORT_DONE);
+		return;
+	}
+	stmf_data_xfer_done(task, dbuf, 0);
+}
+
+void
+nvmft_internal_send_status(scsi_task_t *task)
+{
+	nvmft_task_priv_t *priv = task->task_port_private;
+	nvmft_internal_io_t *iio = priv->ntp_iio;
+	uint8_t key = KEY_NO_SENSE;
+
+	/* Fixed format sense data has its key in byte 2. */
+	if (task->task_scsi_status == STATUS_CHECK &&
+	    task->task_sense_data != NULL && task->task_sense_length > 2 &&
+	    (task->task_sense_data[0] & 0x7e) == 0x70)
+		key = task->task_sense_data[2] & 0x0f;
+	nvmft_internal_done(iio, task->task_scsi_status, key);
+	nvmft_task_unlist(iio->iio_ctrlr, priv);
+	stmf_send_status_done(task, STMF_SUCCESS, STMF_IOF_LPORT_DONE);
+}
+
+/* STMF aborted the task, so no status follows. */
+void
+nvmft_internal_aborted(nvmft_internal_io_t *iio)
+{
+	nvmft_internal_done(iio, STATUS_TASK_ABORT, KEY_NO_SENSE);
+}
+
+/*
+ * Send one READ CAPACITY(16) to the LU at lun_id and wait for it.  The task
+ * can outlive the wait, and frees the nvmft_internal_io_t if it does.
  */
 static int
-nvmft_lu_read_capacity(nvmft_controller_t *ctrlr, uint32_t nsid,
-    uint64_t *nblocksp, uint32_t *blksizep)
+nvmft_lu_read_capacity_once(nvmft_controller_t *ctrlr, uint32_t lun_id,
+    uint64_t *nblocksp, uint32_t *blksizep, uint8_t *keyp)
 {
+	nvmft_internal_io_t *iio;
 	scsi_task_t *task;
-	nvmft_task_priv_t *priv;
-	nvmft_internal_io_t iio;
-	uint8_t capbuf[32];
+	clock_t deadline;
 	uint8_t lun[8];
-	uint32_t lun_id = nsid - 1;
-	uint_t attempt;
 	int rc;
-
-	if (ctrlr->ctrlr_session == NULL)
-		return (ENXIO);
 
 	(void) bzero(lun, sizeof (lun));
 	lun[0] = (uint8_t)((lun_id >> 8) & 0x3f);
 	lun[1] = (uint8_t)(lun_id & 0xff);
 
-	/*
-	 * The first command on a freshly registered STMF session draws a
-	 * UNIT ATTENTION (29h/00h, power-on/reset occurred), failing with
-	 * CHECK CONDITION and no data.  A SCSI initiator clears a pending UA by
-	 * reissuing -- each command reports one UA -- so retry a bounded number
-	 * of times.  (Without this the host gets a zero-size namespace on
-	 * connect, since nvmf_host issues IDENTIFY only once.)
-	 */
-	for (attempt = 0; ; attempt++) {
-		task = stmf_task_alloc(ctrlr->ctrlr_np->np_lport,
-		    ctrlr->ctrlr_session, lun, 16, 0);
-		if (task == NULL)
-			return (ENOMEM);
-
-		(void) bzero(&iio, sizeof (iio));
-		mutex_init(&iio.iio_lock, NULL, MUTEX_DRIVER, NULL);
-		cv_init(&iio.iio_cv, NULL, CV_DRIVER, NULL);
-		iio.iio_buf = capbuf;
-		iio.iio_buflen = sizeof (capbuf);
-
-		priv = kmem_zalloc(sizeof (*priv), KM_SLEEP);
-		priv->ntp_iio = &iio;
-		task->task_port_private = priv;
-		task->task_flags |= TF_READ_DATA | TF_ATTR_SIMPLE_QUEUE;
-
-		(void) bzero(task->task_cdb, task->task_cdb_length);
-		task->task_cdb[0] = SCMD_SVC_ACTION_IN_G4;
-		task->task_cdb[1] = SSVC_ACTION_READ_CAPACITY_G4;
-		/* allocation length (bytes 10-13) */
-		task->task_cdb[13] = sizeof (capbuf);
-		task->task_expected_xfer_length = sizeof (capbuf);
-		task->task_cmd_xfer_length = sizeof (capbuf);
-		task->task_max_nbufs = 1;
-		task->task_max_xfer_len = sizeof (capbuf);
-		task->task_1st_xfer_len = sizeof (capbuf);
-
-		stmf_post_task(task, NULL);
-
-		mutex_enter(&iio.iio_lock);
-		while (!iio.iio_done)
-			cv_wait(&iio.iio_cv, &iio.iio_lock);
-		mutex_exit(&iio.iio_lock);
-
-		/*
-		 * READ CAPACITY(16): max LBA at bytes 0-7, block length at 8-11.
-		 */
-		if (iio.iio_scsi_status == STATUS_GOOD && iio.iio_xfered >= 12) {
-			*nblocksp = BE_IN64(&capbuf[0]) + 1;
-			*blksizep = BE_IN32(&capbuf[8]);
-			rc = 0;
-		} else if (iio.iio_scsi_status == STATUS_CHECK &&
-		    iio.iio_sense_key == KEY_UNIT_ATTENTION &&
-		    attempt < NVMFT_READ_CAPACITY_UA_RETRIES) {
-			rc = EAGAIN;	/* UA cleared by this command; retry */
-		} else {
-			rc = EIO;
-		}
-
-		mutex_destroy(&iio.iio_lock);
-		cv_destroy(&iio.iio_cv);
-
-		if (rc != EAGAIN)
-			return (rc);
+	/* Once the admin queue is stopped, nothing waits for the LU. */
+	mutex_enter(&ctrlr->ctrlr_lock);
+	if (ctrlr->ctrlr_admin_stopped || ctrlr->ctrlr_session == NULL) {
+		mutex_exit(&ctrlr->ctrlr_lock);
+		return (ENXIO);
 	}
+	mutex_exit(&ctrlr->ctrlr_lock);
+
+	task = stmf_task_alloc(ctrlr->ctrlr_np->np_lport, ctrlr->ctrlr_session,
+	    lun, 16, 0);
+	if (task == NULL)
+		return (ENOMEM);
+
+	iio = kmem_zalloc(sizeof (*iio), KM_SLEEP);
+	mutex_init(&iio->iio_lock, NULL, MUTEX_DRIVER, NULL);
+	cv_init(&iio->iio_cv, NULL, CV_DRIVER, NULL);
+	mutex_init(&iio->iio_priv.ntp_lock, NULL, MUTEX_DRIVER, NULL);
+	iio->iio_priv.ntp_iio = iio;
+	iio->iio_ctrlr = ctrlr;
+	iio->iio_refs = 2;
+
+	task->task_port_private = &iio->iio_priv;
+	task->task_flags |= TF_READ_DATA | TF_ATTR_SIMPLE_QUEUE;
+	(void) bzero(task->task_cdb, task->task_cdb_length);
+	task->task_cdb[0] = SCMD_SVC_ACTION_IN_G4;
+	task->task_cdb[1] = SSVC_ACTION_READ_CAPACITY_G4;
+	task->task_cdb[13] = sizeof (iio->iio_buf);	/* allocation length */
+	task->task_expected_xfer_length = sizeof (iio->iio_buf);
+	task->task_cmd_xfer_length = sizeof (iio->iio_buf);
+	task->task_max_nbufs = 1;
+	task->task_max_xfer_len = sizeof (iio->iio_buf);
+	task->task_1st_xfer_len = sizeof (iio->iio_buf);
+
+	nvmft_task_listed(ctrlr, &iio->iio_priv, task);
+	stmf_post_task(task, NULL);
+
+	deadline = ddi_get_lbolt() +
+	    drv_usectohz((clock_t)nvmft_read_capacity_timeout * MICROSEC);
+	mutex_enter(&iio->iio_lock);
+	while (!iio->iio_done) {
+		if (cv_timedwait(&iio->iio_cv, &iio->iio_lock, deadline) == -1)
+			break;
+	}
+	*keyp = iio->iio_sense_key;
+	if (!iio->iio_done) {
+		rc = ETIMEDOUT;
+	} else if (iio->iio_scsi_status == STATUS_GOOD &&
+	    iio->iio_xfered >= 12) {
+		/* The last LBA is in bytes 0-7, the block length in 8-11. */
+		*nblocksp = BE_IN64(&iio->iio_buf[0]) + 1;
+		*blksizep = BE_IN32(&iio->iio_buf[8]);
+		rc = 0;
+	} else if (iio->iio_scsi_status == STATUS_CHECK) {
+		rc = EAGAIN;
+	} else {
+		rc = EIO;
+	}
+	mutex_exit(&iio->iio_lock);
+	nvmft_internal_rele(iio);
+	return (rc);
+}
+
+/*
+ * The block count and block size of the LU behind nsid.  This waits for the
+ * LU, so it needs a thread that may block.
+ *
+ * The first command on a new STMF session draws a UNIT ATTENTION (29h/00h),
+ * and each command reports one, so the command is sent again a bounded
+ * number of times.
+ */
+static int
+nvmft_lu_read_capacity(nvmft_controller_t *ctrlr, uint32_t nsid,
+    uint64_t *nblocksp, uint32_t *blksizep)
+{
+	uint_t attempt;
+	uint8_t key;
+	int rc;
+
+	for (attempt = 0; attempt <= NVMFT_READ_CAPACITY_UA_RETRIES;
+	    attempt++) {
+		rc = nvmft_lu_read_capacity_once(ctrlr, nsid - 1, nblocksp,
+		    blksizep, &key);
+		if (rc != EAGAIN || key != KEY_UNIT_ATTENTION)
+			break;
+	}
+	return (rc == EAGAIN ? EIO : rc);
 }
 
 /*
  * Build the active-namespace list (Identify CNS 2): every mapped LUN whose NSID
- * exceeds start_nsid, in increasing order.  (Replaces the np_active_ns scan,
- * which was never populated.)
+ * exceeds start_nsid, in increasing order.
  */
 void
 nvmft_build_active_nslist(nvmft_controller_t *ctrlr, uint32_t start_nsid,
     nvme_identify_nsid_list_t *nslist)
 {
 	stmf_scsi_session_t *ss = ctrlr->ctrlr_session;
-	stmf_i_scsi_session_t *iss;
 	uint_t nitems, count = 0;
-	uint16_t i;
+	uint16_t lun;
 
 	nitems = sizeof (nslist->nl_nsid) / sizeof (nslist->nl_nsid[0]);
-	if (ss == NULL)
+	if (ss == NULL || start_nsid > NVMFT_MAX_LUN)
 		return;
-	iss = (stmf_i_scsi_session_t *)ss->ss_stmf_private;
 
-	rw_enter(iss->iss_lockp, RW_READER);
-	if (iss->iss_sm != NULL) {
-		for (i = 0; i < iss->iss_sm->lm_nentries && count < nitems; i++) {
-			stmf_lun_map_ent_t *ent =
-			    (stmf_lun_map_ent_t *)iss->iss_sm->lm_plus[i];
-			uint32_t nsid = (uint32_t)i + 1;
-
-			if (ent == NULL || ent->ent_lu == NULL)
-				continue;
-			if (nsid <= start_nsid)
-				continue;
-			nslist->nl_nsid[count++] = LE_32(nsid);
-		}
+	/* The first NSID above start_nsid is the LUN start_nsid. */
+	lun = (uint16_t)start_nsid;
+	while (count < nitems &&
+	    stmf_session_next_lun(ss, &lun, NULL, 0) == STMF_SUCCESS) {
+		nslist->nl_nsid[count++] = LE_32((uint32_t)lun + 1);
+		if (lun++ == NVMFT_MAX_LUN)
+			break;
 	}
-	rw_exit(iss->iss_lockp);
 }
 
 /*
@@ -252,13 +328,7 @@ nvmft_build_identify_nsid(nvmft_controller_t *ctrlr, uint32_t nsid,
 	nsdata->id_nlbaf = 0;			/* a single LBA format */
 	nsdata->id_flbas.lba_format = 0;	/* format 0 in use */
 	nsdata->id_lbaf[0].lbaf_lbads = (uint8_t)(highbit(blksize) - 1);
-	/*
-	 * Expose the LU GUID as the NVMe 1.2+ namespace globally-unique
-	 * identifier (NGUID).  Real controllers populate this in Identify
-	 * Namespace as well as in the Namespace Identification Descriptor (CNS
-	 * 3); the illumos host builds its devid from the Identify Namespace
-	 * NGUID, so without this the blkdev attach fails (no devid).
-	 */
+	/* The illumos host builds its devid from the NGUID. */
 	(void) memcpy(nsdata->id_nguid, guid, sizeof (guid));
 	return (B_TRUE);
 }

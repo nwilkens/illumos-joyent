@@ -583,6 +583,8 @@ update_cc(nvmft_controller_t *ctrlr, uint32_t new_cc, boolean_t *need_shutdown)
 		}
 	}
 	ctrlr->ctrlr_csts = csts.r;
+	if (*need_shutdown)
+		ctrlr->ctrlr_shutdown_pending = B_TRUE;
 	mutex_exit(&ctrlr->ctrlr_lock);
 
 	return (B_TRUE);
@@ -788,7 +790,7 @@ nvmft_handle_io_command(struct nvmft_qpair *qp, uint16_t qid,
 	 * (FreeBSD nvmft_handle_io_command does not handle the reservation
 	 * opcodes either; they are added here for the COMSTAR reservation work).
 	 */
-		nvmft_dispatch_command(qp, nc, B_FALSE);
+		nvmft_dispatch_command(qp, nc);
 		break;
 	default:
 		(void) nvmft_printf(ctrlr, "Unsupported I/O opcode 0x%x\n",

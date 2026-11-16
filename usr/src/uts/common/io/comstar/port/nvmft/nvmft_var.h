@@ -125,14 +125,24 @@ typedef struct nvmft_port {
 	uint64_t		np_cap;		/* Controller CAP property */
 	uint32_t		np_max_io_qsize;
 	uint16_t		np_portid;
-	boolean_t		np_online;
 
 	kmutex_t		np_lock;
+
+	/*
+	 * np_online is false from the offline request on.  The request is
+	 * acknowledged to STMF once the last controller is gone, which
+	 * np_offlining records as still owed.  np_offline is true once STMF
+	 * has seen the port offline, and np_cv signals that.
+	 */
+	boolean_t		np_online;
+	boolean_t		np_offlining;
+	boolean_t		np_offline;
+	kcondvar_t		np_cv;
+	boolean_t		np_deleting;	/* ns_lock */
 
 	/* cntlid allocator (FreeBSD: struct unrhdr *ids). */
 	id_space_t		*np_ids;
 	list_t			np_controllers;	/* nvmft_controller list */
-	kcondvar_t		np_controllers_cv; /* np_controllers drain, np_lock */
 
 	/*
 	 * Sorted array of active namespace IDs (== STMF LUN id + 1).  Never
@@ -170,7 +180,10 @@ typedef struct nvmft_controller {
 	nvmft_io_qpair_t	*ctrlr_io_qpairs;
 	uint_t			ctrlr_num_io_queues;
 	boolean_t		ctrlr_shutdown;
+	boolean_t		ctrlr_shutdown_pending;	/* task dispatched */
 	boolean_t		ctrlr_admin_closed;
+	uint_t			ctrlr_accepting;	/* queues in accept */
+	kcondvar_t		ctrlr_accept_cv;
 	uint16_t		ctrlr_cntlid;
 	uint32_t		ctrlr_cc;	/* Controller Configuration */
 	uint32_t		ctrlr_csts;	/* Controller Status */
@@ -216,6 +229,24 @@ typedef struct nvmft_controller {
 	 */
 	list_t			ctrlr_deferred;
 	uint32_t		ctrlr_deferred_commands;
+
+	/*
+	 * STMF tasks that the port has not let go of.  nvmft_abort_tasks()
+	 * aborts them with ctrlr_lock held, so a task leaves this list, under
+	 * ctrlr_lock, before the port tells STMF that it is done with it.
+	 * Internal tasks count in ctrlr_internal_tasks until STMF frees them.
+	 */
+	list_t			ctrlr_tasks;
+	uint_t			ctrlr_internal_tasks;
+
+	/*
+	 * Work that a completion leaves for ns_io_taskq, because it must not
+	 * run under STMF's locks: admitted commands to post, and aborted
+	 * commands to answer.  Each is counted in ctrlr_pending_commands.
+	 */
+	list_t			ctrlr_io_work;
+	boolean_t		ctrlr_io_running;
+	taskq_ent_t		ctrlr_io_task;
 
 	/* Keep-alive (FreeBSD: callout ka_timer + ka_active_traffic). */
 	volatile uint_t		ctrlr_ka_active_traffic;
@@ -274,6 +305,7 @@ typedef struct nvmft_softc {
 	/* Worker taskq for controller shutdown/terminate work. */
 	taskq_t			*ns_taskq;
 	taskq_t			*ns_admin_taskq;
+	taskq_t			*ns_io_taskq;
 
 	kmutex_t		ns_lock;	/* protects the fields below */
 	list_t			ns_ports;	/* nvmft_port list */
@@ -333,12 +365,15 @@ boolean_t nvmft_build_identify_nsid(nvmft_controller_t *ctrlr, uint32_t nsid,
 	    nvme_identify_nsid_t *nsdata);
 boolean_t nvmft_build_nsid_desc(nvmft_controller_t *ctrlr, uint32_t nsid,
 	    uint8_t *buf, size_t buflen);
+void	nvmft_port_offline_complete(nvmft_port_t *np);
 void	nvmft_dispatch_command(struct nvmft_qpair *qp,
-	    struct nvmf_capsule *nc, boolean_t admin);
+	    struct nvmf_capsule *nc);
 void	nvmft_terminate_commands(nvmft_controller_t *ctrlr);
-void	nvmft_deferred_init(nvmft_controller_t *ctrlr);
+void	nvmft_io_init(nvmft_controller_t *ctrlr);
+void	nvmft_io_fini(nvmft_controller_t *ctrlr);
 void	nvmft_deferred_drain(nvmft_controller_t *ctrlr);
-void	nvmft_deferred_fini(nvmft_controller_t *ctrlr);
+void	nvmft_io_drain(nvmft_controller_t *ctrlr);
+void	nvmft_internal_drain(nvmft_controller_t *ctrlr);
 
 /* nvmft_admin.c */
 void	nvmft_admin_init(nvmft_controller_t *ctrlr);
@@ -356,6 +391,7 @@ void	nvmft_handle_io_command(struct nvmft_qpair *qp, uint16_t qid,
 void	nvmft_controller_error(nvmft_controller_t *ctrlr,
 	    struct nvmft_qpair *qp, int error);
 void	nvmft_controller_start_shutdown(nvmft_controller_t *ctrlr);
+void	nvmft_controller_offline(nvmft_controller_t *ctrlr);
 int	nvmft_handoff_admin_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
 	    const nvlist_t *params, const nvmf_fabric_connect_cmd_t *cmd,
 	    const nvmf_fabric_connect_data_t *data);

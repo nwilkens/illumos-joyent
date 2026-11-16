@@ -69,9 +69,12 @@
 #include "nvmft_var.h"
 
 
+static void	nvmft_controller_free(nvmft_controller_t *ctrlr);
 static void	nvmft_controller_shutdown(void *arg);
 static void	nvmft_controller_terminate(void *arg);
 static void	nvmft_controller_terminate_timeout(void *arg);
+static void	nvmft_controller_fail(nvmft_controller_t *ctrlr,
+    boolean_t force);
 
 /*
  * cmn_err-style logging tagged with the controller id.  (FreeBSD: nvmft_printf
@@ -106,8 +109,9 @@ nvmft_controller_alloc(nvmft_port_t *np, uint16_t cntlid,
 	mutex_init(&ctrlr->ctrlr_lock, NULL, MUTEX_DRIVER, NULL);
 	cv_init(&ctrlr->ctrlr_pending_cv, NULL, CV_DRIVER, NULL);
 	cv_init(&ctrlr->ctrlr_admin_cv, NULL, CV_DRIVER, NULL);
+	cv_init(&ctrlr->ctrlr_accept_cv, NULL, CV_DRIVER, NULL);
 	nvmft_admin_init(ctrlr);
-	nvmft_deferred_init(ctrlr);
+	nvmft_io_init(ctrlr);
 
 	ctrlr->ctrlr_cdata = np->np_cdata;
 	ctrlr->ctrlr_cdata.id_cntlid = LE_16(cntlid);
@@ -122,21 +126,9 @@ nvmft_controller_alloc(nvmft_port_t *np, uint16_t cntlid,
 	ctrlr->ctrlr_changed_ns = kmem_zalloc(
 	    sizeof (*ctrlr->ctrlr_changed_ns), KM_SLEEP);
 
-	/*
-	 * Register the per-association STMF session now: stmf_task_alloc() in the
-	 * I/O dispatch path dereferences task_session, so the nexus must exist
-	 * before any command is handed to the LU.  Registration also enforces
-	 * that the local port is online, subsuming the np_online check below.
-	 */
+	/* This fails unless the local port is online. */
 	if (nvmft_session_register(ctrlr) != 0) {
-		kmem_free(ctrlr->ctrlr_changed_ns,
-		    sizeof (*ctrlr->ctrlr_changed_ns));
-		nvmft_deferred_fini(ctrlr);
-		nvmft_admin_fini(ctrlr);
-		cv_destroy(&ctrlr->ctrlr_admin_cv);
-		cv_destroy(&ctrlr->ctrlr_pending_cv);
-		mutex_destroy(&ctrlr->ctrlr_lock);
-		kmem_free(ctrlr, sizeof (*ctrlr));
+		nvmft_controller_free(ctrlr);
 		return (NULL);
 	}
 
@@ -148,8 +140,9 @@ nvmft_controller_free(nvmft_controller_t *ctrlr)
 {
 	ASSERT3P(ctrlr->ctrlr_io_qpairs, ==, NULL);
 	nvmft_session_deregister(ctrlr);
-	nvmft_deferred_fini(ctrlr);
+	nvmft_io_fini(ctrlr);
 	nvmft_admin_fini(ctrlr);
+	cv_destroy(&ctrlr->ctrlr_accept_cv);
 	cv_destroy(&ctrlr->ctrlr_admin_cv);
 	cv_destroy(&ctrlr->ctrlr_pending_cv);
 	mutex_destroy(&ctrlr->ctrlr_lock);
@@ -227,6 +220,21 @@ nvmft_update_cdata(nvmft_controller_t *ctrlr)
 	}
 }
 
+/*
+ * A queue being accepted is already where shutdown and terminate find it.
+ * They wait for ctrlr_accepting, so the accept can use the queue and the
+ * controller until this is called, and neither after it.
+ */
+static void
+nvmft_accept_done(nvmft_controller_t *ctrlr)
+{
+	mutex_enter(&ctrlr->ctrlr_lock);
+	ASSERT3U(ctrlr->ctrlr_accepting, >, 0);
+	if (--ctrlr->ctrlr_accepting == 0)
+		cv_broadcast(&ctrlr->ctrlr_accept_cv);
+	mutex_exit(&ctrlr->ctrlr_lock);
+}
+
 int
 nvmft_handoff_admin_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
     const nvlist_t *params, const nvmf_fabric_connect_cmd_t *cmd,
@@ -295,6 +303,7 @@ nvmft_connect_admin_queue(nvmft_port_t *np, struct nvmft_qpair *qp,
 		return (ENXIO);
 	}
 	np->np_refs++;
+	ctrlr->ctrlr_accepting = 1;
 	list_insert_tail(&np->np_controllers, ctrlr);
 
 	(void) nvmft_printf(ctrlr, "associated with %.*s\n",
@@ -325,6 +334,7 @@ nvmft_connect_admin_queue(nvmft_port_t *np, struct nvmft_qpair *qp,
 	mutex_exit(&np->np_lock);
 
 	(void) nvmft_finish_accept(qp, cmd, ctrlr);
+	nvmft_accept_done(ctrlr);
 
 	return (0);
 }
@@ -445,24 +455,34 @@ nvmft_connect_io_queue(nvmft_port_t *np, struct nvmft_qpair *qp,
 	}
 
 	ctrlr->ctrlr_io_qpairs[qid - 1].nio_qp = qp;
+	ctrlr->ctrlr_accepting++;
 	mutex_exit(&ctrlr->ctrlr_lock);
 	mutex_exit(&np->np_lock);
 	(void) nvmft_finish_accept(qp, cmd, ctrlr);
+	nvmft_accept_done(ctrlr);
 
 	return (0);
 }
 
+/*
+ * Shutdown, terminate and the Connect work of kernel-born queues all run on
+ * the one ns_taskq thread, and only that thread frees a controller or a queue
+ * that an association owns.  ctrlr_shutdown is set from the request for a
+ * shutdown until the end of this function, so the shutdown task is dispatched
+ * once at a time.
+ */
 static void
 nvmft_controller_shutdown(void *arg)
 {
 	nvmft_controller_t *ctrlr = arg;
 	nvme_reg_csts_t csts;
+	boolean_t terminate;
 
-	/*
-	 * Shutdown all I/O queues to terminate pending datamoves and stop
-	 * receiving new commands.
-	 */
 	mutex_enter(&ctrlr->ctrlr_lock);
+	while (ctrlr->ctrlr_accepting != 0)
+		cv_wait(&ctrlr->ctrlr_accept_cv, &ctrlr->ctrlr_lock);
+
+	/* Stop the I/O queues: no more commands arrive, transfers complete. */
 	for (uint_t i = 0; i < ctrlr->ctrlr_num_io_queues; i++) {
 		if (ctrlr->ctrlr_io_qpairs[i].nio_qp != NULL) {
 			ctrlr->ctrlr_io_qpairs[i].nio_shutdown = B_TRUE;
@@ -473,81 +493,46 @@ nvmft_controller_shutdown(void *arg)
 	}
 	mutex_exit(&ctrlr->ctrlr_lock);
 
-	/*
-	 * The I/O qpairs are shut down, so no new command can arrive or be
-	 * deferred.  Discard any commands still queued for backpressure (they were
-	 * never posted to STMF) before draining the in-flight ones below.
-	 */
 	nvmft_deferred_drain(ctrlr);
+	nvmft_io_drain(ctrlr);
 
-	/* Terminate active STMF tasks. */
-	nvmft_terminate_commands(ctrlr);
-
-	/* Wait for all pending STMF commands to complete. */
-	mutex_enter(&ctrlr->ctrlr_lock);
-	while (ctrlr->ctrlr_pending_commands != 0)
-		(void) cv_timedwait(&ctrlr->ctrlr_pending_cv,
-		    &ctrlr->ctrlr_lock, ddi_get_lbolt() + drv_usectohz(10000));
-	mutex_exit(&ctrlr->ctrlr_lock);
-
-	/* Delete all of the I/O queues. */
 	for (uint_t i = 0; i < ctrlr->ctrlr_num_io_queues; i++) {
 		if (ctrlr->ctrlr_io_qpairs[i].nio_qp != NULL)
 			nvmft_qpair_destroy(ctrlr->ctrlr_io_qpairs[i].nio_qp);
 	}
 	kmem_free(ctrlr->ctrlr_io_qpairs,
 	    ctrlr->ctrlr_num_io_queues * sizeof (nvmft_io_qpair_t));
-	ctrlr->ctrlr_io_qpairs = NULL;
 
+	/*
+	 * One hold of the lock from here: an error that arrives after
+	 * ctrlr_shutdown is cleared finds the terminate already decided.
+	 */
 	mutex_enter(&ctrlr->ctrlr_lock);
+	ctrlr->ctrlr_io_qpairs = NULL;
 	ctrlr->ctrlr_num_io_queues = 0;
 
 	csts.r = ctrlr->ctrlr_csts;
-	/* Mark shutdown complete if it was in progress. */
 	if (csts.b.csts_shst == NVME_CSTS_SHN_OCCURING)
 		csts.b.csts_shst = NVME_CSTS_SHN_COMPLETE;
-	/* Drop ready (and clear the shutting-down flag) unless fatal. */
 	if (csts.b.csts_cfs == 0) {
 		csts.b.csts_rdy = 0;
 		ctrlr->ctrlr_shutdown = B_FALSE;
 	}
 	ctrlr->ctrlr_csts = csts.r;
-	mutex_exit(&ctrlr->ctrlr_lock);
+	ctrlr->ctrlr_shutdown_pending = B_FALSE;
 
 	/*
-	 * If the admin queue was closed while shutting down or a fatal
-	 * controller error occurred, terminate the association immediately;
-	 * otherwise wait up to 2 minutes (NVMe-oF 1.1 section 4.6).
-	 *
-	 * The immediate path runs inline because this function already executes
-	 * on ns_taskq (thread context), so the blocking work in
-	 * nvmft_controller_terminate() is legal here.  The delayed path arms a
-	 * timeout(9F) on nvmft_controller_terminate_timeout(), which only
-	 * re-dispatches the blocking work onto ns_taskq rather than running it
-	 * in callout context.
+	 * Terminate now if the admin queue closed or the controller failed;
+	 * otherwise the host has 2 minutes to enable it again (NVMe-oF 1.1
+	 * section 4.6).
 	 */
-	mutex_enter(&ctrlr->ctrlr_lock);
 	if (ctrlr->ctrlr_admin_closed || csts.b.csts_cfs != 0) {
-		/*
-		 * Terminate immediately, inline.  Claim ctrlr_terminate_queued
-		 * first so a graceful terminate timer that fires concurrently
-		 * cannot also dispatch the terminate task (double run on the same
-		 * controller); if a terminate is already queued/running, let it
-		 * proceed rather than running a second one here.
-		 */
-		boolean_t run = !ctrlr->ctrlr_terminate_queued;
+		terminate = !ctrlr->ctrlr_terminate_queued;
 		ctrlr->ctrlr_terminate_queued = B_TRUE;
 		mutex_exit(&ctrlr->ctrlr_lock);
-		if (run)
+		if (terminate)
 			nvmft_controller_terminate(ctrlr);
 	} else {
-		/*
-		 * Arm the 2-minute graceful terminate under ctrlr_lock so the
-		 * published timer id stays synchronized with the cancel paths
-		 * (nvmft_controller_error / terminate).  An unlocked store here
-		 * races those and can leave a second, uncancelled callout ->
-		 * double nvmft_controller_terminate -> controller double-free.
-		 */
 		ctrlr->ctrlr_terminate_timer = timeout(
 		    nvmft_controller_terminate_timeout, ctrlr,
 		    drv_usectohz(2 * 60 * 1000000));
@@ -555,21 +540,15 @@ nvmft_controller_shutdown(void *arg)
 	}
 }
 
-/*
- * timeout(9F) trampoline for the delayed terminate.  Runs in callout context,
- * where blocking (taskq_wait / KM_SLEEP / nvmf_free_qpair) is illegal, so it
- * merely re-dispatches the real terminate work onto ns_taskq (thread context).
- * This mirrors FreeBSD's TIMEOUT_TASK landing on taskqueue_thread.
- */
+/* A callout cannot block, so the terminate runs on ns_taskq. */
 static void
 nvmft_controller_terminate_timeout(void *arg)
 {
 	nvmft_controller_t *ctrlr = arg;
 
 	mutex_enter(&ctrlr->ctrlr_lock);
-	ctrlr->ctrlr_terminate_timer = 0;	/* this timer has now fired */
+	ctrlr->ctrlr_terminate_timer = 0;
 	if (ctrlr->ctrlr_terminate_queued) {
-		/* A terminate is already queued/running; do not re-dispatch. */
 		mutex_exit(&ctrlr->ctrlr_lock);
 		return;
 	}
@@ -584,23 +563,30 @@ static void
 nvmft_controller_terminate(void *arg)
 {
 	nvmft_controller_t *ctrlr = arg;
-	nvmft_port_t *np;
+	nvmft_port_t *np = ctrlr->ctrlr_np;
 	nvme_reg_cc_t cc;
 	timeout_id_t ka_timer;
 	timeout_id_t term_timer;
+	boolean_t offline;
 
-	/* If the controller has been re-enabled, nothing to do. */
 	mutex_enter(&ctrlr->ctrlr_lock);
-	cc.r = ctrlr->ctrlr_cc;
-	if (cc.b.cc_en != 0) {
+	if (ctrlr->ctrlr_shutdown_pending) {
 		/*
-		 * Re-enabled: do not free.  Clear ctrlr_terminate_queued so a
-		 * later shutdown can schedule terminate again, and re-arm the
-		 * keep-alive timer under ctrlr_lock so the published id stays
-		 * synchronized with nvmft_keep_alive_timer() and the cancel
-		 * paths.
+		 * A shutdown was requested after this was queued.  It runs
+		 * after this and decides about the terminate again.
 		 */
 		ctrlr->ctrlr_terminate_queued = B_FALSE;
+		mutex_exit(&ctrlr->ctrlr_lock);
+		return;
+	}
+	cc.r = ctrlr->ctrlr_cc;
+	if (cc.b.cc_en != 0) {
+		/* The host enabled the controller again. */
+		ctrlr->ctrlr_terminate_queued = B_FALSE;
+		if (ctrlr->ctrlr_admin_closed) {
+			nvmft_controller_fail(ctrlr, B_FALSE);
+			return;
+		}
 		if (ctrlr->ctrlr_ka_ticks != 0)
 			ctrlr->ctrlr_ka_timer = timeout(nvmft_keep_alive_timer,
 			    ctrlr, ctrlr->ctrlr_ka_ticks);
@@ -608,43 +594,29 @@ nvmft_controller_terminate(void *arg)
 		return;
 	}
 
-	/* Disable updates to CC while destroying the admin qpair. */
+	/* From here CC cannot change and no shutdown can start. */
 	ctrlr->ctrlr_shutdown = B_TRUE;
+	ctrlr->ctrlr_admin_stopped = B_TRUE;
+	while (ctrlr->ctrlr_accepting != 0)
+		cv_wait(&ctrlr->ctrlr_accept_cv, &ctrlr->ctrlr_lock);
 	mutex_exit(&ctrlr->ctrlr_lock);
 
+	/* An admin command may be waiting for the LU. */
+	nvmft_terminate_commands(ctrlr);
 	nvmft_admin_stop(ctrlr);
 	nvmft_qpair_destroy(ctrlr->ctrlr_admin);
+	nvmft_internal_drain(ctrlr);
+	nvmft_session_deregister(ctrlr);
 
-	/* Remove the association (CNTLID). */
-	np = ctrlr->ctrlr_np;
 	mutex_enter(&np->np_lock);
 	list_remove(&np->np_controllers, ctrlr);
-	/*
-	 * FreeBSD wakeup(np): the STMF OFFLINE path (nvmft_lport_ctl() in
-	 * nvmft_stmf.c) faults every controller and then cv_wait()s on
-	 * np_controllers_cv under np_lock until np_controllers drains.  Wake it
-	 * here, while still holding np_lock, once the list empties on an offline
-	 * port so the waiter re-checks list_is_empty() under the same lock.
-	 *
-	 * HEADER-NEEDED: kcondvar_t np_controllers_cv must be added to
-	 * nvmft_port_t in nvmft_var.h and cv_init()/cv_destroy()'d in
-	 * nvmft_port_alloc()/nvmft_port_free() (nvmft_stmf.c), which already
-	 * references this condvar in its OFFLINE waiter.
-	 */
-	if (!np->np_online && list_is_empty(&np->np_controllers))
-		cv_broadcast(&np->np_controllers_cv);
+	offline = np->np_offlining && list_is_empty(&np->np_controllers);
+	if (offline)
+		np->np_offlining = B_FALSE;
 	mutex_exit(&np->np_lock);
 	id_free(np->np_ids, ctrlr->ctrlr_cntlid);
 
-	/*
-	 * Snapshot and clear the keep-alive and (delayed) terminate ids under
-	 * the lock before cancel.  Cancelling our own pending terminate timer
-	 * here is what prevents a still-armed 2-minute timer from later firing
-	 * on this freed controller (use-after-free / double terminate): if this
-	 * terminate was triggered inline (fatal error / admin close) or by the
-	 * keep-alive path, the graceful-shutdown timer may still be pending.
-	 * untimeout() of an already-fired id returns -1 harmlessly.
-	 */
+	/* untimeout() waits for a callout that is running. */
 	mutex_enter(&ctrlr->ctrlr_lock);
 	ka_timer = ctrlr->ctrlr_ka_timer;
 	ctrlr->ctrlr_ka_timer = 0;
@@ -658,18 +630,62 @@ nvmft_controller_terminate(void *arg)
 
 	(void) nvmft_printf(ctrlr, "association terminated\n");
 	nvmft_controller_free(ctrlr);
+	if (offline)
+		nvmft_port_offline_complete(np);
 	nvmft_port_rele(np);
 }
 
-void
-nvmft_controller_error(nvmft_controller_t *ctrlr, struct nvmft_qpair *qp,
-    int error)
+/*
+ * Fail the controller: disable it and shut it down, which ends with a
+ * terminate.  Called with ctrlr_lock held, and drops it.  With force, a
+ * shutdown already in progress ends with a terminate as well, without the
+ * time a host normally has to enable the controller again.
+ */
+static void
+nvmft_controller_fail(nvmft_controller_t *ctrlr, boolean_t force)
 {
 	nvme_reg_cc_t cc;
 	nvme_reg_csts_t csts;
 	timeout_id_t ka_timer;
 	timeout_id_t term_timer;
 
+	ASSERT(MUTEX_HELD(&ctrlr->ctrlr_lock));
+
+	csts.r = ctrlr->ctrlr_csts;
+	if (ctrlr->ctrlr_shutdown) {
+		if (force) {
+			csts.b.csts_cfs = 1;
+			ctrlr->ctrlr_csts = csts.r;
+		}
+		mutex_exit(&ctrlr->ctrlr_lock);
+		return;
+	}
+
+	csts.b.csts_cfs = 1;
+	ctrlr->ctrlr_csts = csts.r;
+	cc.r = ctrlr->ctrlr_cc;
+	cc.b.cc_en = 0;
+	ctrlr->ctrlr_cc = cc.r;
+	ctrlr->ctrlr_shutdown = B_TRUE;
+	ctrlr->ctrlr_shutdown_pending = B_TRUE;
+	ka_timer = ctrlr->ctrlr_ka_timer;
+	ctrlr->ctrlr_ka_timer = 0;
+	term_timer = ctrlr->ctrlr_terminate_timer;
+	ctrlr->ctrlr_terminate_timer = 0;
+	mutex_exit(&ctrlr->ctrlr_lock);
+
+	if (ka_timer != 0)
+		(void) untimeout(ka_timer);
+	if (term_timer != 0)
+		(void) untimeout(term_timer);
+	taskq_dispatch_ent(nvmft_global->ns_taskq, nvmft_controller_shutdown,
+	    ctrlr, 0, &ctrlr->ctrlr_shutdown_task);
+}
+
+void
+nvmft_controller_error(nvmft_controller_t *ctrlr, struct nvmft_qpair *qp,
+    int error)
+{
 	/*
 	 * If a queue pair is closed, that isn't an error per se; it just means
 	 * no more commands can be received on it.  Closing the admin queue
@@ -688,35 +704,20 @@ nvmft_controller_error(nvmft_controller_t *ctrlr, struct nvmft_qpair *qp,
 		}
 
 		if (NVMFT_CC_EN(ctrlr->ctrlr_cc) == 0) {
-			timeout_id_t old;
-
 			ASSERT3U(ctrlr->ctrlr_num_io_queues, ==, 0);
 
 			/*
-			 * Safe to schedule terminate directly: no I/O queues to
-			 * tear down.  Cannot call terminate inline here since
-			 * this is invoked from the transport layer and freeing
-			 * the admin qpair might deadlock.  Schedule via the
-			 * timeout trampoline so the blocking terminate work runs
-			 * on ns_taskq, not in callout context.
-			 *
-			 * Cancel any pending graceful-terminate timer and arm an
-			 * immediate one, keeping ctrlr_terminate_timer consistent
-			 * under ctrlr_lock so a still-armed callout is always
-			 * cancelled before a new one is published (else two live
-			 * callouts -> double terminate -> controller double-free).
-			 * untimeout() must run without the lock the callout may
-			 * block on, so snapshot-and-clear under the lock, drop it
-			 * to untimeout, then re-arm under the lock.
+			 * There are no I/O queues to shut down.  This is a
+			 * transport thread of the admin queue, which the
+			 * terminate frees, so that is left to ns_taskq.
 			 */
-			old = ctrlr->ctrlr_terminate_timer;
-			ctrlr->ctrlr_terminate_timer = 0;
-			mutex_exit(&ctrlr->ctrlr_lock);
-			if (old != 0)
-				(void) untimeout(old);
-			mutex_enter(&ctrlr->ctrlr_lock);
-			ctrlr->ctrlr_terminate_timer = timeout(
-			    nvmft_controller_terminate_timeout, ctrlr, 0);
+			ctrlr->ctrlr_admin_closed = B_TRUE;
+			if (!ctrlr->ctrlr_terminate_queued) {
+				ctrlr->ctrlr_terminate_queued = B_TRUE;
+				taskq_dispatch_ent(nvmft_global->ns_taskq,
+				    nvmft_controller_terminate, ctrlr, 0,
+				    &ctrlr->ctrlr_terminate_task);
+			}
 			mutex_exit(&ctrlr->ctrlr_lock);
 			return;
 		}
@@ -726,41 +727,15 @@ nvmft_controller_error(nvmft_controller_t *ctrlr, struct nvmft_qpair *qp,
 		mutex_enter(&ctrlr->ctrlr_lock);
 	}
 
-	/* Ignore transport errors while already shutting down. */
-	if (ctrlr->ctrlr_shutdown) {
-		mutex_exit(&ctrlr->ctrlr_lock);
-		return;
-	}
+	nvmft_controller_fail(ctrlr, B_FALSE);
+}
 
-	csts.r = ctrlr->ctrlr_csts;
-	csts.b.csts_cfs = 1;			/* fatal status */
-	ctrlr->ctrlr_csts = csts.r;
-	cc.r = ctrlr->ctrlr_cc;
-	cc.b.cc_en = 0;				/* disable */
-	ctrlr->ctrlr_cc = cc.r;
-	ctrlr->ctrlr_shutdown = B_TRUE;
-	/*
-	 * Snapshot and clear the keep-alive and any pending graceful-shutdown
-	 * terminate id under ctrlr_lock so the cancels are synchronized against
-	 * nvmft_keep_alive_timer() re-arming and against the delayed terminate
-	 * firing.  Cancelling the terminate timer here is essential: this path
-	 * is about to dispatch nvmft_controller_shutdown, which (because cfs is
-	 * now set) terminates inline and frees the controller; a still-pending
-	 * terminate timer would otherwise fire on freed memory.  Once
-	 * ctrlr_shutdown is set neither timer routine reschedules.
-	 */
-	ka_timer = ctrlr->ctrlr_ka_timer;
-	ctrlr->ctrlr_ka_timer = 0;
-	term_timer = ctrlr->ctrlr_terminate_timer;
-	ctrlr->ctrlr_terminate_timer = 0;
-	mutex_exit(&ctrlr->ctrlr_lock);
-
-	if (ka_timer != 0)
-		(void) untimeout(ka_timer);
-	if (term_timer != 0)
-		(void) untimeout(term_timer);
-	taskq_dispatch_ent(nvmft_global->ns_taskq, nvmft_controller_shutdown,
-	    ctrlr, 0, &ctrlr->ctrlr_shutdown_task);
+/* The port is going offline: end the association without a grace period. */
+void
+nvmft_controller_offline(nvmft_controller_t *ctrlr)
+{
+	mutex_enter(&ctrlr->ctrlr_lock);
+	nvmft_controller_fail(ctrlr, B_TRUE);
 }
 
 /*
