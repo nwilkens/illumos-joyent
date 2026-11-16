@@ -121,6 +121,13 @@ nvmf_ns_fmt(const nvme_identify_nsid_t *data, uint64_t *nblksp,
 		return (B_FALSE);
 	}
 
+	if (data->id_nsize > (UINT64_MAX >> lbads)) {
+		if (dip != NULL)
+			dev_err(dip, CE_WARN,
+			    "!ns%u: size does not fit in 64 bits", nsid);
+		return (B_FALSE);
+	}
+
 	*blksizep = 1U << lbads;
 	*nblksp = data->id_nsize;
 	return (B_TRUE);
