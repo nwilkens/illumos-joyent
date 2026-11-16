@@ -2717,7 +2717,7 @@ stmf_delete_all_ppds()
  */
 #define	MAX_PROTO_STR_LEN	32
 
-char *protocol_ident[PROTOCOL_ANY] = {
+char *protocol_ident[PROTOCOL_ANY + 1] = {
 	"Fibre Channel",
 	"Parallel SCSI",
 	"SSA",
@@ -2727,8 +2727,17 @@ char *protocol_ident[PROTOCOL_ANY] = {
 	"SAS",
 	"ADT",
 	"ATAPI",
-	"UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN"
+	"UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN",
+	"Unspecified"
 };
+
+static const char *
+stmf_protocol_ident(uint_t id)
+{
+	if (id > PROTOCOL_ANY)
+		id = PROTOCOL_ANY;
+	return (protocol_ident[id]);
+}
 
 /*
  * Update the lun wait/run queue count
@@ -2999,11 +3008,8 @@ stmf_create_kstat_lport(stmf_i_local_port_t *ilport)
 	kstat_named_setstr(&ks_tgt->i_tgt_alias,
 	    (const char *)ilport->ilport_lport->lport_alias);
 	/* protocol */
-	if ((id = ilport->ilport_lport->lport_id->protocol_id) > PROTOCOL_ANY) {
-		cmn_err(CE_WARN, "STMF: protocol_id out of bound");
-		id = PROTOCOL_ANY;
-	}
-	kstat_named_setstr(&ks_tgt->i_protocol, protocol_ident[id]);
+	id = ilport->ilport_lport->lport_id->protocol_id;
+	kstat_named_setstr(&ks_tgt->i_protocol, stmf_protocol_ident(id));
 	kstat_install(ilport->ilport_kstat_info);
 
 	/* create kstat lport io */
@@ -3597,7 +3603,7 @@ stmf_create_kstat_rport(stmf_i_remote_port_t *irport)
 
 	kstat_named_setstr(&ks_info->i_rport_name, ident);
 	kstat_named_setstr(&ks_info->i_protocol,
-	    protocol_ident[irport->irport_id->protocol_id]);
+	    stmf_protocol_ident(id->protocol_id));
 	irport->irport_kstat_info->ks_lock = &irport->irport_mutex;
 	irport->irport_info_dirty = B_TRUE;
 	kstat_install(irport->irport_kstat_info);
