@@ -23,8 +23,14 @@ OBJS=		nvmfd.o		\
 
 SRCS=		$(OBJS:%.o=%.c)
 
+MANIFEST=	nvmf-target.xml
+SVCMETHOD=	svc-nvmf-target
+
 include ../Makefile.cmd
 include ../Makefile.cmd.64
+
+ROOTMANIFESTDIR=	$(ROOTSVCSYSTEM)/nvmf
+$(ROOTMANIFEST) :=	FILEMODE = 444
 
 LDLIBS +=	-lnvmf -lnvpair -lsocket
 
@@ -43,7 +49,9 @@ $(PROG): $(OBJS)
 	$(LINK.c) -o $@ $(OBJS) $(LDLIBS)
 	$(POST_PROCESS)
 
-install: all $(ROOTUSRSBINPROG)
+install: all $(ROOTUSRSBINPROG) $(ROOTMANIFEST) $(ROOTSVCMETHOD)
+
+check:	$(CHKMANIFEST)
 
 clean:
 	$(RM) $(OBJS)
