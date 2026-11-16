@@ -14,21 +14,13 @@
  */
 
 /*
- * nvmf-connect: NVMe-over-Fabrics host (initiator) connect tool.
+ * nvmf-connect: the NVMe over Fabrics host connect tool.
  *
  * Ported from FreeBSD sbin/nvmecontrol (connect.c / fabrics.c, Copyright (c)
- * 2023-2024 Chelsio Communications, Inc., John Baldwin, BSD-2-Clause).  This is
- * the host-side counterpart of the target daemon nvmfd: it runs the Fabrics
- * CONNECT handshake in userland with libnvmf, enables the controller, fetches
- * Identify, negotiates I/O queues, and hands the established socket-backed
- * qpairs to the kernel nvmf_host driver via nvmf_handoff_host().  The kernel
- * then owns the association and presents each namespace as a blkdev disk.
- *
- *	nvmf-connect connect  [opts] <address:port> <subnqn>
- *	nvmf-connect discover [opts] <address[:port]>
- *
- * A standalone tool keeps this off the existing nvmeadm; the verbs mirror
- * FreeBSD 'nvmecontrol connect/discover' (and Linux 'nvme connect/discover').
+ * 2023-2024 Chelsio Communications, Inc., John Baldwin, BSD-2-Clause).  It
+ * runs the Connect exchange for the admin queue and each I/O queue with
+ * libnvmf and hands the connected sockets to the nvmf_host driver, which
+ * presents each namespace as a disk.
  */
 
 #include <sys/types.h>
@@ -38,8 +30,11 @@
 #include <netinet/tcp.h>
 #include <err.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <netdb.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,13 +44,13 @@
 
 #include <libnvmf.h>
 
-/*
- * Defaults that FreeBSD exposes via libnvmf constants the illumos headers do
- * not (yet) carry.  Values match FreeBSD nvmecontrol.
- */
-#define	NVMF_DEFAULT_IO_ENTRIES		1024
+#define	NVMF_DEFAULT_IO_ENTRIES		128
 #define	NVMF_DEFAULT_RECONNECT_DELAY	10	/* seconds */
 #define	NVMF_DEFAULT_CONTROLLER_LOSS	600	/* seconds */
+
+/* Limits on how long a target may take to answer. */
+#define	NVMF_TCP_CONNECT_TIMEOUT	10000	/* ms */
+#define	NVMF_COMMAND_TIMEOUT		30000	/* ms */
 
 static const char *progname;
 
@@ -70,8 +65,12 @@ usage(void)
 	    "             [-l ctrl_loss_tmo] [-q hostnqn] [-F] [-g] [-G]\n"
 	    "             <address:port> <subnqn>\n"
 	    "  %s discover   [-t tcp] [-q hostnqn] <address[:port]>\n"
-	    "  %s disconnect [<subnqn>]\n"
-	    "  %s list\n",
+	    "  %s disconnect -a | <subnqn>\n"
+	    "  %s list\n"
+	    "\n"
+	    "There is no authentication and no TLS.  The target is not "
+	    "verified and\n"
+	    "data crosses the network in the clear.\n",
 	    progname, progname, progname, progname);
 	exit(2);
 }
@@ -166,20 +165,72 @@ tcp_set_nodelay(int s)
 	(void) setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &on, sizeof (on));
 }
 
+/* Connect a new socket to ai, waiting no longer than the timeout. */
+static int
+tcp_connect_ai(const struct addrinfo *ai)
+{
+	struct pollfd pfd;
+	socklen_t len;
+	int error, flags, n, s;
+
+	s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+	if (s == -1)
+		return (-1);
+
+	flags = fcntl(s, F_GETFL, 0);
+	if (flags == -1 || fcntl(s, F_SETFL, flags | O_NONBLOCK) == -1)
+		goto fail;
+
+	if (connect(s, ai->ai_addr, ai->ai_addrlen) != 0) {
+		if (errno != EINPROGRESS && errno != EINTR)
+			goto fail;
+
+		pfd.fd = s;
+		pfd.events = POLLOUT;
+		do {
+			n = poll(&pfd, 1, NVMF_TCP_CONNECT_TIMEOUT);
+		} while (n == -1 && errno == EINTR);
+		if (n == 0)
+			errno = ETIMEDOUT;
+		if (n <= 0)
+			goto fail;
+
+		len = sizeof (error);
+		if (getsockopt(s, SOL_SOCKET, SO_ERROR, &error, &len) != 0)
+			goto fail;
+		if (error != 0) {
+			errno = error;
+			goto fail;
+		}
+	}
+
+	/* The kernel gets the socket in blocking mode, as it expects. */
+	if (fcntl(s, F_SETFL, flags) == -1)
+		goto fail;
+	tcp_set_nodelay(s);
+	return (s);
+
+fail:
+	error = errno;
+	(void) close(s);
+	errno = error;
+	return (-1);
+}
+
 /*
- * getaddrinfo + socket + connect.  Returns the connected fd, or -1.  When
- * ai_out/list_out are supplied the winning addrinfo and its list are returned
- * (not freed) so the same target can be reconnected for each I/O queue.
+ * Resolve and connect.  The address that worked and its list are returned so
+ * that the I/O queues can connect to the same place.
  */
 static int
-tcp_connect(int adrfam, const char *address, const char *port,
-    struct addrinfo **ai_out, struct addrinfo **list_out)
+tcp_connect(const char *address, const char *port, struct addrinfo **ai_out,
+    struct addrinfo **list_out)
 {
 	struct addrinfo hints, *ai, *list;
 	int error, s;
 
 	(void) memset(&hints, 0, sizeof (hints));
-	hints.ai_family = adrfam;
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_protocol = IPPROTO_TCP;
 	error = getaddrinfo(address, port, &hints, &list);
 	if (error != 0) {
@@ -188,43 +239,27 @@ tcp_connect(int adrfam, const char *address, const char *port,
 	}
 
 	for (ai = list; ai != NULL; ai = ai->ai_next) {
-		s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-		if (s == -1)
-			continue;
-		if (connect(s, ai->ai_addr, ai->ai_addrlen) != 0) {
-			(void) close(s);
-			continue;
-		}
-		tcp_set_nodelay(s);
-		if (ai_out != NULL)
+		s = tcp_connect_ai(ai);
+		if (s != -1) {
 			*ai_out = ai;
-		if (list_out != NULL)
 			*list_out = list;
-		else
-			freeaddrinfo(list);
-		return (s);
+			return (s);
+		}
 	}
 
+	warn("failed to connect to %s:%s", address, port);
 	freeaddrinfo(list);
-	warn("failed to connect to %s:%s", address, port ? port : "(none)");
 	return (-1);
 }
 
-/* Connect a fresh socket to a previously chosen addrinfo (for I/O queues). */
-static int
-tcp_connect_ai(struct addrinfo *ai)
+/* Print why a libnvmf call on an association failed. */
+static void
+warn_na(const struct nvmf_association *na, int error, const char *what)
 {
-	int s;
-
-	s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-	if (s == -1)
-		return (-1);
-	if (connect(s, ai->ai_addr, ai->ai_addrlen) != 0) {
-		(void) close(s);
-		return (-1);
-	}
-	tcp_set_nodelay(s);
-	return (s);
+	if (nvmf_association_error(na) != NULL)
+		warnx("%s: %s", what, nvmf_association_error(na));
+	else
+		warnc(error, "%s", what);
 }
 
 /*
@@ -245,6 +280,7 @@ enable_controller(struct nvmf_qpair *qp, const char *subnqn, uint16_t *mqesp)
 	uint_t mps, mpsmin, mpsmax;
 	int error, timo;
 
+	nvmf_qpair_set_timeout(qp, NVMF_COMMAND_TIMEOUT);
 	error = nvmf_read_property(qp, NVMF_PROP_CAP, 8, &cap);
 	if (error != 0) {
 		warnc(error, "failed to fetch CAP");
@@ -290,6 +326,7 @@ enable_controller(struct nvmf_qpair *qp, const char *subnqn, uint16_t *mqesp)
 
 	timo = (int)((cap >> 24) & 0xff);	/* CAP.TO, 500ms units */
 	for (;;) {
+		nvmf_qpair_set_timeout(qp, NVMF_COMMAND_TIMEOUT);
 		error = nvmf_read_property(qp, NVMF_PROP_CSTS, 4, &csts);
 		if (error != 0) {
 			warnc(error, "failed to fetch CSTS");
@@ -346,6 +383,27 @@ tcp_assoc_params(nvmf_association_params_t *ap, const struct conn_opts *o,
 	ap->nap_tcp.maxr2t = 1;
 }
 
+/* The host ID, and the host NQN unless the user gave one. */
+static const char *
+host_identity(const struct conn_opts *o, uint8_t hostid[16],
+    char nqn[NVMF_NQN_FIELD_SIZE])
+{
+	int error;
+
+	error = nvmf_host_id(hostid);
+	if (error != 0)
+		errc(1, error, "failed to read or create the host ID");
+	if (o->hostnqn != NULL) {
+		if (!nvmf_nqn_valid(o->hostnqn))
+			errx(2, "invalid host NQN %s", o->hostnqn);
+		return (o->hostnqn);
+	}
+	error = nvmf_host_nqn(nqn);
+	if (error != 0)
+		errc(1, error, "failed to read or create the host NQN");
+	return (nqn);
+}
+
 static int
 cmd_connect(int argc, char *argv[])
 {
@@ -358,11 +416,11 @@ cmd_connect(int argc, char *argv[])
 	struct nvmf_qpair *admin = NULL, **io = NULL;
 	struct addrinfo *ai = NULL, *list = NULL;
 	const char *address, *port, *subnqn, *hostnqn;
-	char *tofree = NULL, hostnqn_buf[NVMF_NQN_MAX_LEN];
+	char *tofree = NULL, hostnqn_buf[NVMF_NQN_FIELD_SIZE];
 	uint8_t hostid[16];
 	uint16_t mqes = 0;
 	uint_t qsize, queues, i;
-	int c, error, rc = 1, admin_fd;
+	int c, error, rc = 1, admin_fd = -1, *io_fds = NULL;
 
 	opts_defaults(&o);
 	optind = 1;
@@ -383,8 +441,8 @@ cmd_connect(int argc, char *argv[])
 			    "queue size");
 			break;
 		case 'k':
-			o.kato_sec = (uint32_t)parse_uint(optarg, UINT32_MAX,
-			    "keep-alive timeout");
+			o.kato_sec = (uint32_t)parse_uint(optarg,
+			    UINT32_MAX / 1000, "keep-alive timeout");
 			break;
 		case 'r':
 			o.reconnect_delay = (uint32_t)parse_uint(optarg,
@@ -421,57 +479,61 @@ cmd_connect(int argc, char *argv[])
 	if (port == NULL)
 		errx(2, "explicit port required for connect");
 	subnqn = argv[optind + 1];
-
-	if (nvmf_hostid_from_hostuuid(hostid) != 0)
-		errx(1, "failed to derive host id");
-	if (o.hostnqn != NULL) {
-		hostnqn = o.hostnqn;
-	} else {
-		if (nvmf_nqn_from_hostuuid(hostnqn_buf) != 0)
-			errx(1, "failed to derive host NQN");
-		hostnqn = hostnqn_buf;
-	}
+	if (!nvmf_nqn_valid(subnqn))
+		errx(2, "invalid subsystem NQN %s", subnqn);
+	hostnqn = host_identity(&o, hostid, hostnqn_buf);
 
 	tcp_assoc_params(&aparams, &o, B_FALSE);
 	na = nvmf_allocate_association(NVMF_TRTYPE_TCP, B_FALSE, &aparams);
 	if (na == NULL)
 		errx(1, "failed to create association");
 
+	io = calloc(o.num_io_queues, sizeof (*io));
+	io_fds = calloc(o.num_io_queues, sizeof (*io_fds));
+	if (io == NULL || io_fds == NULL)
+		err(1, "calloc");
+	for (i = 0; i < o.num_io_queues; i++)
+		io_fds[i] = -1;
+
 	/* Admin connection; remember the addrinfo to reuse for I/O queues. */
-	admin_fd = tcp_connect(AF_UNSPEC, address, port, &ai, &list);
+	admin_fd = tcp_connect(address, port, &ai, &list);
 	if (admin_fd == -1)
 		goto out;
 	(void) memset(&qp, 0, sizeof (qp));
 	qp.nqp_admin = B_TRUE;
+	qp.nqp_timeout_ms = NVMF_COMMAND_TIMEOUT;
 	qp.nqp_tcp.fd = admin_fd;
 	admin = nvmf_connect(na, &qp, 0, NVMF_MIN_ADMIN_MAX_SQ_SIZE, hostid,
 	    o.cntlid, subnqn, hostnqn, o.kato_sec * 1000);
 	if (admin == NULL) {
 		warnx("failed to connect admin queue: %s",
 		    nvmf_association_error(na));
-		(void) close(admin_fd);
 		goto out;
 	}
 	if (enable_controller(admin, subnqn, &mqes) != 0)
 		goto out;
+	nvmf_qpair_set_timeout(admin, NVMF_COMMAND_TIMEOUT);
 	error = nvmf_host_identify_controller(admin, &cdata);
 	if (error != 0) {
-		warnc(error, "failed to identify controller %s", subnqn);
+		warn_na(na, error, "failed to identify the controller");
 		goto out;
 	}
 	nvmf_update_association(na, &cdata);
 
 	/* I/O queue size: 0's-based MQES gives the max entries. */
 	qsize = o.queue_size;
-	if (qsize == 0)
+	if (qsize == 0) {
 		qsize = MIN(NVMF_DEFAULT_IO_ENTRIES, (uint_t)mqes + 1);
-	else if (qsize > (uint_t)mqes + 1)
-		errx(1, "I/O queue size exceeds controller maximum (%u)",
+	} else if (qsize > (uint_t)mqes + 1) {
+		warnx("I/O queue size exceeds controller maximum (%u)",
 		    mqes + 1);
+		goto out;
+	}
 
+	nvmf_qpair_set_timeout(admin, NVMF_COMMAND_TIMEOUT);
 	error = nvmf_host_request_queues(admin, o.num_io_queues, &queues);
 	if (error != 0) {
-		warnc(error, "failed to request I/O queues");
+		warn_na(na, error, "failed to request I/O queues");
 		goto out;
 	}
 	if (queues < o.num_io_queues) {
@@ -480,25 +542,21 @@ cmd_connect(int argc, char *argv[])
 		goto out;
 	}
 
-	io = calloc(o.num_io_queues, sizeof (*io));
-	if (io == NULL)
-		err(1, "calloc");
 	for (i = 0; i < o.num_io_queues; i++) {
-		int iofd = tcp_connect_ai(ai);
-
-		if (iofd == -1) {
+		io_fds[i] = tcp_connect_ai(ai);
+		if (io_fds[i] == -1) {
 			warn("failed to open I/O queue %u", i + 1);
 			goto out;
 		}
 		(void) memset(&qp, 0, sizeof (qp));
 		qp.nqp_admin = B_FALSE;
-		qp.nqp_tcp.fd = iofd;
+		qp.nqp_timeout_ms = NVMF_COMMAND_TIMEOUT;
+		qp.nqp_tcp.fd = io_fds[i];
 		io[i] = nvmf_connect(na, &qp, (uint16_t)(i + 1), qsize, hostid,
 		    nvmf_cntlid(admin), subnqn, hostnqn, 0);
 		if (io[i] == NULL) {
 			warnx("failed to connect I/O queue %u: %s", i + 1,
 			    nvmf_association_error(na));
-			(void) close(iofd);
 			goto out;
 		}
 	}
@@ -513,10 +571,8 @@ cmd_connect(int argc, char *argv[])
 	error = nvmf_handoff_host(&dle, hostnqn, admin, o.num_io_queues, io,
 	    &cdata, o.reconnect_delay, o.ctrl_loss_tmo);
 	admin = NULL;
-	if (io != NULL) {
-		for (i = 0; i < o.num_io_queues; i++)
-			io[i] = NULL;
-	}
+	for (i = 0; i < o.num_io_queues; i++)
+		io[i] = NULL;
 	if (error != 0) {
 		warnc(error, "failed to hand off association to the kernel");
 		goto out;
@@ -526,21 +582,37 @@ cmd_connect(int argc, char *argv[])
 	rc = 0;
 
 out:
-	if (io != NULL) {
-		for (i = 0; i < o.num_io_queues; i++) {
-			if (io[i] != NULL)
-				nvmf_free_qpair(io[i]);
-		}
-		free(io);
+	for (i = 0; i < o.num_io_queues; i++) {
+		if (io[i] != NULL)
+			nvmf_free_qpair(io[i]);
 	}
 	if (admin != NULL)
 		nvmf_free_qpair(admin);
-	if (na != NULL)
-		nvmf_free_association(na);
+	nvmf_free_association(na);
+
+	/* The kernel holds its own references to the sockets it took. */
+	for (i = 0; i < o.num_io_queues; i++) {
+		if (io_fds[i] != -1)
+			(void) close(io_fds[i]);
+	}
+	if (admin_fd != -1)
+		(void) close(admin_fd);
+	free(io);
+	free(io_fds);
 	if (list != NULL)
 		freeaddrinfo(list);
 	free(tofree);
 	return (rc);
+}
+
+/* Print a string field that a target supplied. */
+static void
+print_field(const char *label, const void *field, size_t len)
+{
+	char buf[NVMF_TRADDR_MAX_LEN + 1];
+
+	nvmf_printable(buf, sizeof (buf), field, len);
+	(void) printf("%s%s\n", label, buf);
 }
 
 static const char *
@@ -564,10 +636,10 @@ cmd_discover(int argc, char *argv[])
 	struct nvmf_qpair *admin = NULL;
 	struct addrinfo *ai = NULL, *list = NULL;
 	const char *address, *port, *hostnqn;
-	char *tofree = NULL, hostnqn_buf[NVMF_NQN_MAX_LEN];
+	char *tofree = NULL, hostnqn_buf[NVMF_NQN_FIELD_SIZE];
 	uint8_t hostid[16];
 	uint16_t mqes;
-	uint64_t i;
+	uint64_t i, numrec;
 	int c, error, rc = 1, fd;
 
 	opts_defaults(&o);
@@ -587,61 +659,54 @@ cmd_discover(int argc, char *argv[])
 	parse_address(argv[optind], &address, &port, &tofree);
 	if (port == NULL)
 		port = "8009";			/* 7.4.9.3 discovery default */
-
-	if (nvmf_hostid_from_hostuuid(hostid) != 0)
-		errx(1, "failed to derive host id");
-	if (o.hostnqn != NULL) {
-		hostnqn = o.hostnqn;
-	} else {
-		if (nvmf_nqn_from_hostuuid(hostnqn_buf) != 0)
-			errx(1, "failed to derive host NQN");
-		hostnqn = hostnqn_buf;
-	}
+	hostnqn = host_identity(&o, hostid, hostnqn_buf);
 
 	tcp_assoc_params(&aparams, &o, B_TRUE);
 	na = nvmf_allocate_association(NVMF_TRTYPE_TCP, B_FALSE, &aparams);
 	if (na == NULL)
 		errx(1, "failed to create discovery association");
 
-	fd = tcp_connect(AF_UNSPEC, address, port, &ai, &list);
+	fd = tcp_connect(address, port, &ai, &list);
 	if (fd == -1)
 		goto out;
 	(void) memset(&qp, 0, sizeof (qp));
 	qp.nqp_admin = B_TRUE;
+	qp.nqp_timeout_ms = NVMF_COMMAND_TIMEOUT;
 	qp.nqp_tcp.fd = fd;
 	admin = nvmf_connect(na, &qp, 0, NVMF_MIN_ADMIN_MAX_SQ_SIZE, hostid,
 	    NVMF_CNTLID_DYNAMIC, NVMF_DISCOVERY_NQN, hostnqn, 0);
 	if (admin == NULL) {
 		warnx("failed to connect discovery controller: %s",
 		    nvmf_association_error(na));
-		(void) close(fd);
 		goto out;
 	}
 	if (enable_controller(admin, NVMF_DISCOVERY_NQN, &mqes) != 0)
 		goto out;
 
+	nvmf_qpair_set_timeout(admin, NVMF_COMMAND_TIMEOUT);
 	error = nvmf_host_fetch_discovery_log_page(admin, &log);
 	if (error != 0) {
-		warnc(error, "failed to fetch discovery log page");
+		warn_na(na, error, "failed to fetch discovery log page");
 		goto out;
 	}
 
+	numrec = LE_64(log->ndlp_numrec);
 	(void) printf("Discovery log for %s:%s (%llu records)\n", address, port,
-	    (unsigned long long)log->ndlp_numrec);
-	for (i = 0; i < log->ndlp_numrec; i++) {
+	    (unsigned long long)numrec);
+	for (i = 0; i < numrec; i++) {
 		nvmf_discovery_log_page_entry_t *e = &log->ndlp_entries[i];
 
 		(void) printf("  [%llu] trtype=%s adrfam=%s\n",
 		    (unsigned long long)i,
 		    e->ndle_trtype == NVMF_TRTYPE_TCP ? "tcp" : "?",
 		    adrfam_str(e->ndle_adrfam));
-		(void) printf("        subnqn:  %.*s\n",
-		    (int)sizeof (e->ndle_subnqn), (char *)e->ndle_subnqn);
-		(void) printf("        traddr:  %.*s\n",
-		    (int)sizeof (e->ndle_traddr), (char *)e->ndle_traddr);
-		(void) printf("        trsvcid: %.*s  cntlid: %u\n",
-		    (int)sizeof (e->ndle_trsvcid), (char *)e->ndle_trsvcid,
-		    e->ndle_cntlid);
+		print_field("        subnqn:  ", e->ndle_subnqn,
+		    sizeof (e->ndle_subnqn));
+		print_field("        traddr:  ", e->ndle_traddr,
+		    sizeof (e->ndle_traddr));
+		print_field("        trsvcid: ", e->ndle_trsvcid,
+		    sizeof (e->ndle_trsvcid));
+		(void) printf("        cntlid:  %u\n", LE_16(e->ndle_cntlid));
 	}
 	rc = 0;
 
@@ -649,27 +714,37 @@ out:
 	free(log);
 	if (admin != NULL)
 		nvmf_free_qpair(admin);
-	if (na != NULL)
-		nvmf_free_association(na);
+	nvmf_free_association(na);
+	if (fd != -1)
+		(void) close(fd);
 	if (list != NULL)
 		freeaddrinfo(list);
 	free(tofree);
 	return (rc);
 }
 
+/* Print a string from the driver's list; some came from the target. */
+static void
+print_string(nvlist_t *nvl, const char *key, const char *label)
+{
+	char *s;
+
+	if (nvlist_lookup_string(nvl, key, &s) == 0 && s[0] != '\0')
+		print_field(label, s, strlen(s));
+}
+
+/* ARGSUSED */
 static int
 cmd_list(int argc, char *argv[])
 {
 	nvlist_t *nvl = NULL;
 	nvlist_t **ns = NULL;
-	char *s, *svc;
+	char addr[NVMF_TRADDR_MAX_LEN + 1], svc[NVMF_TRSVCID_MAX_LEN + 1];
+	char *s;
 	boolean_t connected = B_FALSE;
 	uint32_t u32;
 	uint_t nscnt = 0, i;
 	int error;
-
-	(void) argc;
-	(void) argv;
 
 	error = nvmf_list_controller(&nvl);
 	if (error != 0) {
@@ -686,24 +761,21 @@ cmd_list(int argc, char *argv[])
 
 	(void) printf("nvmf controller (%s)\n",
 	    connected ? "connected" : "disconnected");
-	if (nvlist_lookup_string(nvl, "subnqn", &s) == 0)
-		(void) printf("    subnqn:    %s\n", s);
+	print_string(nvl, "subnqn", "    subnqn:    ");
 	if (nvlist_lookup_string(nvl, "traddr", &s) == 0) {
-		svc = NULL;
-		(void) nvlist_lookup_string(nvl, "trsvcid", &svc);
-		(void) printf("    transport: tcp  address: %s:%s\n", s,
-		    svc != NULL ? svc : "");
+		nvmf_printable(addr, sizeof (addr), s, strlen(s));
+		svc[0] = '\0';
+		if (nvlist_lookup_string(nvl, "trsvcid", &s) == 0)
+			nvmf_printable(svc, sizeof (svc), s, strlen(s));
+		(void) printf("    transport: tcp  address: %s:%s\n", addr,
+		    svc);
 	}
-	if (nvlist_lookup_string(nvl, "hostnqn", &s) == 0)
-		(void) printf("    hostnqn:   %s\n", s);
+	print_string(nvl, "hostnqn", "    hostnqn:   ");
 	if (nvlist_lookup_uint32(nvl, "num_io_queues", &u32) == 0)
 		(void) printf("    io queues: %u\n", u32);
-	if (nvlist_lookup_string(nvl, "model", &s) == 0 && s[0] != '\0')
-		(void) printf("    model:     %s\n", s);
-	if (nvlist_lookup_string(nvl, "serial", &s) == 0 && s[0] != '\0')
-		(void) printf("    serial:    %s\n", s);
-	if (nvlist_lookup_string(nvl, "firmware", &s) == 0 && s[0] != '\0')
-		(void) printf("    firmware:  %s\n", s);
+	print_string(nvl, "model", "    model:     ");
+	print_string(nvl, "serial", "    serial:    ");
+	print_string(nvl, "firmware", "    firmware:  ");
 
 	if (nvlist_lookup_nvlist_array(nvl, "namespaces", &ns, &nscnt) == 0) {
 		for (i = 0; i < nscnt; i++) {
@@ -727,21 +799,37 @@ cmd_list(int argc, char *argv[])
 	return (0);
 }
 
+/*
+ * The driver has one association and disconnects it whatever name it is
+ * given, so the name is checked here first.
+ */
 static int
 cmd_disconnect(int argc, char *argv[])
 {
-	const char *subnqn = NULL;
+	nvlist_t *nvl;
+	char *s;
 	int error;
 
-	/*
-	 * The single-instance host disconnects its one association regardless of
-	 * the NQN, so the subnqn argument is optional and advisory; it is
-	 * accepted for symmetry with connect and forward compatibility.
-	 */
-	if (argc > 1)
-		subnqn = argv[1];
+	if (argc != 2)
+		usage();
 
-	error = nvmf_disconnect_host(subnqn != NULL ? subnqn : "");
+	if (strcmp(argv[1], "-a") == 0) {
+		error = nvmf_disconnect_all();
+	} else {
+		error = nvmf_list_controller(&nvl);
+		if (error != 0) {
+			warnc(error, "failed to list host controller");
+			return (1);
+		}
+		if (nvlist_lookup_string(nvl, "subnqn", &s) != 0 ||
+		    strcmp(s, argv[1]) != 0) {
+			warnx("not connected to %s", argv[1]);
+			nvlist_free(nvl);
+			return (1);
+		}
+		nvlist_free(nvl);
+		error = nvmf_disconnect_host(argv[1]);
+	}
 	if (error != 0) {
 		warnc(error, "failed to disconnect");
 		return (1);
@@ -754,10 +842,17 @@ cmd_disconnect(int argc, char *argv[])
 int
 main(int argc, char *argv[])
 {
+	struct sigaction sa;
+
 	progname = argv[0];
 
 	if (argc < 2)
 		usage();
+
+	(void) memset(&sa, 0, sizeof (sa));
+	(void) sigemptyset(&sa.sa_mask);
+	sa.sa_handler = SIG_IGN;
+	(void) sigaction(SIGPIPE, &sa, NULL);
 
 	if (strcmp(argv[1], "connect") == 0)
 		return (cmd_connect(argc - 1, argv + 1));
