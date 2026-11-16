@@ -27,7 +27,6 @@
  *   -------                        -------
  *   refcount(9)                    plain counter (library is single-threaded)
  *   struct nvme_command/completion nvme_sqe_t / nvme_cqe_t
- *   NVMEM/NVMEF(NVME_CMD_PSDT)     sqe_psdt bit (== NVME_PSDT_SGL)
  *   nvlist_t (sys/_nv.h)           nvlist_t (libnvpair)
  */
 
@@ -185,13 +184,8 @@ nvmf_allocate_command(struct nvmf_qpair *qp, const void *sqe)
 	nc->nc_qe_len = sizeof (nvme_sqe_t);
 	(void) memcpy(&nc->nc_sqe, sqe, nc->nc_qe_len);
 
-	/*
-	 * 4.2 of NVMe base spec: Fabrics always uses SGL.  FreeBSD clears and
-	 * sets the PSDT field with NVMEM/NVMEF(NVME_CMD_PSDT); the illumos SQE
-	 * exposes the PRP-or-SGL selector as the single sqe_psdt bit and
-	 * NVME_PSDT_SGL == 0x1.
-	 */
-	nc->nc_sqe.sqe_psdt = NVME_PSDT_SGL;
+	/* 4.2 of NVMe base spec: Fabrics always uses SGL. */
+	NVMF_SQE_SET_PSDT(&nc->nc_sqe, NVME_PSDT_SGL);
 	return (nc);
 }
 
@@ -262,7 +256,7 @@ nvmf_validate_command_capsule(const struct nvmf_capsule *nc)
 {
 	assert(nc->nc_qe_len == sizeof (nvme_sqe_t));
 
-	if (nc->nc_sqe.sqe_psdt != NVME_PSDT_SGL)
+	if (NVMF_SQE_PSDT(&nc->nc_sqe) != NVME_PSDT_SGL)
 		return (NVME_CQE_SC_GEN_INV_FLD);
 
 	return (nc->nc_qpair->nq_association->na_ops->validate_command_capsule(

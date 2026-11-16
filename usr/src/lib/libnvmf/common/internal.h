@@ -76,6 +76,14 @@ extern "C" {
 #ifndef	NVME_PSDT_SGL
 #define	NVME_PSDT_SGL		0x1
 #endif
+
+/*
+ * PSDT is bits 7:6 of an SQE's second byte; the sqe_psdt field of the
+ * illumos nvme_sqe_t is bit 7 alone.
+ */
+#define	NVMF_SQE_PSDT(sqe)	(((const uint8_t *)(sqe))[1] >> 6)
+#define	NVMF_SQE_SET_PSDT(sqe, v)	(((uint8_t *)(sqe))[1] = \
+	(((uint8_t *)(sqe))[1] & 0x3f) | (uint8_t)((v) << 6))
 #ifndef	NVME_MIN_ADMIN_ENTRIES
 #define	NVME_MIN_ADMIN_ENTRIES	2
 #endif
