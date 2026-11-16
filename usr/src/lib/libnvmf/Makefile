@@ -18,7 +18,6 @@ include ../Makefile.lib
 HDRS = libnvmf.h
 HDRDIR = common
 
-SUBDIRS = $(MACH)
 $(BUILD64)SUBDIRS += $(MACH64)
 
 all := TARGET = all
@@ -30,9 +29,10 @@ install := TARGET = install
 
 all clean clobber install: $(SUBDIRS)
 
-install: install_h $(SUBDIRS)
+install: $(SUBDIRS)
 
-install_h: $(ROOTHDRS)
+# libnvmf.h is private to the gate and is not installed.
+install_h:
 
 check: $(CHECKHDRS)
 

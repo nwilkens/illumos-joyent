@@ -58,6 +58,19 @@ nvmf_nqn_valid(const char *nqn)
 	return (true);
 }
 
+void
+nvmf_printable(char *dst, size_t dstlen, const void *src, size_t srclen)
+{
+	const uint8_t *cp = src;
+	size_t i;
+
+	if (dstlen == 0)
+		return;
+	for (i = 0; i < srclen && i < dstlen - 1 && cp[i] != '\0'; i++)
+		dst[i] = (cp[i] >= 0x20 && cp[i] < 0x7f) ? cp[i] : '?';
+	dst[i] = '\0';
+}
+
 /*
  * Compute the initial value of the Controller Capabilities (CAP) property.
  * (FreeBSD: _nvmf_controller_cap)

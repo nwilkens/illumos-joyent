@@ -29,7 +29,7 @@
 
 $mapfile_version 2
 
-SYMBOL_VERSION ILLUMOS_0.1 {
+SYMBOL_VERSION ILLUMOSprivate {
     global:
 	#
 	# Transport-independent association/qpair/capsule API.
@@ -52,6 +52,7 @@ SYMBOL_VERSION ILLUMOS_0.1 {
 	nvmf_transport_type;
 	nvmf_nqn_valid;
 	nvmf_nqn_valid_strict;
+	nvmf_printable;
 
 	#
 	# Controller-specific API.
@@ -91,8 +92,8 @@ SYMBOL_VERSION ILLUMOS_0.1 {
 	nvmf_keepalive;
 	nvmf_read_property;
 	nvmf_write_property;
-	nvmf_hostid_from_hostuuid;
-	nvmf_nqn_from_hostuuid;
+	nvmf_host_id;
+	nvmf_host_nqn;
 	nvmf_host_identify_controller;
 	nvmf_host_identify_namespace;
 	nvmf_host_fetch_discovery_log_page;

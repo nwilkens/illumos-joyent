@@ -35,13 +35,7 @@
 #include "libnvmf.h"
 #include "internal.h"
 
-/*
- * Control device for the Fabrics host (initiator) driver.  The kernel
- * nvmf_host driver creates the minor "nvmf" on its single pseudo instance
- * (nvmf_host@0); there is no /dev devlink, so the handoff/disconnect/reconnect
- * wrappers open the /devices node directly, the same way nvmfadm reaches the
- * target via /devices/pseudo/nvmft@0:admin.
- */
+/* The nvmf_host driver's control node; devfsadm makes no /dev link. */
 #define	NVMF_HOST_DEV	"/devices/pseudo/nvmf_host@0:nvmf"
 
 static bool

@@ -487,6 +487,9 @@ nvmf_init_discovery_controller_data(struct nvmf_qpair *qp,
 	cdata->id_lpa.lp_extsup = 1;
 	cdata->id_elpe = 0;
 
+	/* 1 second granularity for Keep Alive (10 * 100ms). */
+	cdata->ap_kas = LE_16(10);
+
 	cdata->id_maxcmd = LE_16(na->na_params.nap_max_admin_qsize);
 
 	/* Transport-specific? */

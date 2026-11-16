@@ -33,22 +33,11 @@ LIBS =		$(DYNLIB)
 CSTD =		$(CSTD_GNU99)
 
 #
-# The library is a userland port of FreeBSD's lib/libnvmf.  It reuses the
-# illumos NVMe-over-Fabrics on-wire definitions that the kernel transport and
-# nvmft target already carry:
-#
-#   <sys/nvme.h>		base NVMe identify/status types
-#   <sys/nvme/nvmf.h>	Fabrics + NVMe/TCP wire structures
-#   <sys/nvme/nvmf_tcp.h>	NVMe/TCP PDU-header validation helper
-#
-# The concrete generic 64-byte SQE (nvme_sqe_t) / 16-byte CQE (nvme_cqe_t) and
-# admin opcodes live in the driver-private io/nvme/nvme_reg.h.  The kernel
-# transport (uts/common/io/nvmf) includes that header directly; this library
-# does the same so the in-capsule SQE/CQE layout cannot drift from the kernel.
+# nvme_sqe_t and nvme_cqe_t come from the nvme driver's private nvme_reg.h,
+# as they do for the kernel transport.
 #
 CPPFLAGS +=	-I$(SRC)/uts/common
 CPPFLAGS +=	-I$(SRC)/uts/common/io/nvme
-CPPFLAGS +=	-I$(SRC)/uts/common/io/comstar/port/nvmft
 
 LDLIBS +=	-lsocket -lc -lnvpair -luuid -lsmbios
 

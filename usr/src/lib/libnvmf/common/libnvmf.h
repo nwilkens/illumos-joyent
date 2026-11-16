@@ -177,6 +177,13 @@ extern const char *nvmf_transport_type(uint8_t trtype);
 extern bool nvmf_nqn_valid(const char *nqn);
 extern bool nvmf_nqn_valid_strict(const char *nqn);
 
+/*
+ * Copy a string that came from a peer, which may lack a terminator, for
+ * display.  Bytes that are not printable ASCII become '?'.
+ */
+extern void nvmf_printable(char *dst, size_t dstlen, const void *src,
+    size_t srclen);
+
 /* Controller-specific APIs. */
 
 /*
@@ -361,11 +368,14 @@ extern int nvmf_read_property(struct nvmf_qpair *qp, uint32_t offset,
 extern int nvmf_write_property(struct nvmf_qpair *qp, uint32_t offset,
     uint8_t size, uint64_t value);
 
-/* Construct a 16-byte HostId from the system host uuid. */
-extern int nvmf_hostid_from_hostuuid(uint8_t hostid[16]);
-
-/* Construct a NQN from the system host uuid. */
-extern int nvmf_nqn_from_hostuuid(char nqn[NVMF_NQN_MAX_LEN]);
+/*
+ * The host ID and host NQN of this system, from /etc/nvme/hostid and
+ * /etc/nvme/hostnqn.  A missing file is created: the host ID from the
+ * SMBIOS system UUID if there is one and at random otherwise, the NQN
+ * from the host ID.
+ */
+extern int nvmf_host_id(uint8_t hostid[16]);
+extern int nvmf_host_nqn(char nqn[NVMF_NQN_FIELD_SIZE]);
 
 /* Fetch controller data via IDENTIFY. */
 extern int nvmf_host_identify_controller(struct nvmf_qpair *qp,
