@@ -20,44 +20,10 @@
  *           Written by: John Baldwin <jhb@FreeBSD.org>
  *           SPDX-License-Identifier: BSD-2-Clause
  *
- * NVMe over Fabrics TCP transport.  This is the provider half of the transport
- * contract defined in nvmf_transport_internal.h: it implements the
- * nvmf_transport_ops vtable (queue-pair lifecycle, capsule alloc/transmit, and
- * controller-side data movement) and the NVMe/TCP PDU framing on top of a
- * kernel TCP socket.
- *
- * The control plane (vtable, registration, PDU header format/parse, capsule
- * construction), the data plane (the event-driven RX PDU-framing state machine,
- * the mblk-based TX worker, and the H2C/C2H/R2T data-transfer paths), and the
- * HDGST/DDGST CRC-32C digests are all implemented and match the FreeBSD
- * structure one-for-one.  The userland socket file descriptor passed in the
- * handoff nvlist is turned into a ksocket_t in tcp_allocate_qpair() via
- * tcp_adopt_socket_fd() (getsonode() in the ioctl caller's process context,
- * SM_KERNEL + ksocket_hold(), then releasef()), after which the krecv/tx wiring
- * binds to the live connection.
- *
- * OS-glue substitutions versus the FreeBSD source:
- *
- *   FreeBSD                       illumos
- *   -------                       -------
- *   struct mbuf                   mblk_t (sys/stream.h)
- *   m_get2/m_get/m_freem          allocb/freemsg/freeb (sys/strsubr.h)
- *   m_copydata/m_apply            bcopy over b_rptr / mblk walk
- *   struct socket *so             ksocket_t (sys/ksocket.h)
- *   soupcall_set(SO_RCV)          ksocket_krecv_set() event-driven RX
- *   sosend()/soreceive()          ksocket_sendmblk()/krecv callback
- *   rx kthread                    krecv callback (accumulate) + rx taskq worker
- *   tx kthread                    persistent taskq worker (nvmf_tcp_so_tx)
- *   cv_wait/cv_signal             kcondvar_t cv_wait/cv_signal
- *   struct mtx                    kmutex_t
- *   refcount(9)                   atomic_inc/dec_uint_nv with a count guard
- *   malloc(M_NVMF_TCP)            kmem_alloc/kmem_zalloc
- *   calculate_crc32c              CRC32() over a CRC-32C (Castagnoli) table
- *   TAILQ/STAILQ                  list_t (sys/list.h)
- *   NVMF_TRANSPORT() macro        nvmf_transport_register() from _init()
- *
- * The mbuf->mblk_t substitution in the data-movement paths is the RDMA seam:
- * the shape is preserved so a future RDMA transport can reuse the contract.
+ * NVMe over Fabrics TCP transport: the NVMe/TCP PDU framing on a TCP socket
+ * that a userland daemon connected and handed off by file descriptor.  Each
+ * qpair has a receive thread that reads whole PDUs from the socket and a
+ * transmit thread that writes them.
  */
 
 #include <sys/types.h>
@@ -81,12 +47,14 @@
 #include <sys/strsun.h>
 #include <sys/socket.h>
 #include <sys/ksocket.h>
-#include <sys/file.h>		/* getf / releasef */
-#include <sys/socketvar.h>	/* getsonode, struct sonode, SM_KERNEL */
+#include <sys/file.h>
+#include <sys/socketvar.h>
+#include <netinet/in.h>
 #include <sys/cred.h>
 #include <sys/crc32.h>
 #include <sys/disp.h>
 #include <sys/taskq.h>
+#include <sys/time.h>
 
 #include <sys/nvme.h>
 #include <sys/nvme/nvmf.h>
@@ -96,45 +64,39 @@
 #include "nvmf_core.h"
 #include "nvmf_transport_internal.h"
 
-/*
- * Maximum size of the data payload in a single transmitted PDU.  FreeBSD
- * exposes this as a sysctl (kern.nvmf.tcp.max_transmit_data); illumos transports
- * conventionally use a tunable global, overridable through /etc/system.
- */
+/* Largest data payload of one transmitted PDU. */
 static uint_t nvmf_tcp_max_transmit_data = 256 * 1024;
 
-/*
- * Upper bound on a single received PDU's advertised length (ntcph_plen).  The
- * RX framing loop buffers a whole PDU before validating it, so without a
- * ceiling a peer could advertise a near-4GiB plen and force the host to
- * accumulate that much memory.  Any legitimate PDU is far smaller (in-capsule
- * data is ~16KiB and a data PDU is bounded by nvmf_tcp_max_transmit_data, plus
- * headers, digests, and PDA padding); 1MiB is a generous ceiling.  Overridable
- * through /etc/system.
- */
-static uint_t nvmf_tcp_max_receive_pdu = 1024 * 1024;
+/* Largest in-capsule data a controller accepts; IOCCSZ follows from it. */
+static uint_t nvmf_tcp_max_icd = 16 * 1024;
 
-/*
- * Minimum spacing between wire-triggered CE_WARN/CE_NOTE messages.  A malicious
- * or broken peer can drive these (digest mismatches, termination requests,
- * etc.) arbitrarily fast; rate-limiting keeps a peer from flooding the log.
- */
+/* Largest transfer of one host command; it bounds a received C2H PDU. */
+static uint_t nvmf_tcp_max_io_size = 1024 * 1024;
+
+/* How long nvmf_free_qpair() lets queued PDUs reach the socket. */
+static uint_t nvmf_tcp_drain_secs = 2;
+
+/* How long to wait for the peer to close after a termination request. */
+static uint_t nvmf_tcp_term_wait_secs = 30;
+
+/* Minimum spacing of the warnings that a peer can trigger. */
 static hrtime_t nvmf_tcp_warn_interval = 5 * (hrtime_t)NANOSEC;
 static volatile hrtime_t nvmf_tcp_warn_last;
+
+#define	NVMF_TCP_MIN_MAXH2CDATA	4096
+#define	NVMF_TCP_MIN_PDA	4
+#define	NVMF_TCP_MAX_PDA	128
 
 struct nvmf_tcp_capsule;
 struct nvmf_tcp_qpair;
 
 static void	tcp_release_capsule(struct nvmf_tcp_capsule *tc);
-static void	tcp_free_qpair(struct nvmf_qpair *nq);
 static mblk_t	*capsule_to_pdu(struct nvmf_tcp_qpair *qp,
 		    struct nvmf_tcp_capsule *tc);
 
 /*
- * A command buffer tracks an in-flight data transfer associated with a command
- * (either host-side data being sent in response to an R2T, or controller-side
- * data being received via H2C, or data received via C2H).  FreeBSD threads
- * these through TAILQs keyed by (cid, ttag); illumos uses list_t.
+ * A data transfer of a command: host data sent for an R2T, host data received
+ * by C2H, or controller data received by H2C.
  */
 typedef struct nvmf_tcp_command_buffer {
 	struct nvmf_tcp_qpair		*tcb_qp;
@@ -146,6 +108,8 @@ typedef struct nvmf_tcp_command_buffer {
 
 	volatile uint_t			tcb_refs;
 	int				tcb_error;
+	/* The callback ran at cancel; tq_rx_buffers.tcbl_lock. */
+	boolean_t			tcb_done;
 
 	uint16_t			tcb_cid;
 	uint16_t			tcb_ttag;
@@ -164,10 +128,12 @@ typedef struct nvmf_tcp_command_buffer_list {
 typedef struct nvmf_tcp_qpair {
 	struct nvmf_qpair		qp;
 
+	/* Our hold on the daemon's open file keeps the socket. */
+	file_t				*tq_fp;
 	ksocket_t			tq_so;
-	boolean_t			tq_krecv_set;	/* krecv cb installed */
+	boolean_t			tq_started;
 
-	volatile uint_t			tq_refs;	/* held by every capsule */
+	volatile uint_t			tq_refs;	/* one per capsule */
 	uint8_t				tq_txpda;
 	uint8_t				tq_rxpda;
 	boolean_t			tq_header_digests;
@@ -176,43 +142,26 @@ typedef struct nvmf_tcp_qpair {
 	uint32_t			tq_maxh2cdata;	/* controller only */
 	uint32_t			tq_max_tx_data;
 	uint32_t			tq_max_icd;	/* host only */
+	uint32_t			tq_max_rx_icd;	/* controller only */
+	uint32_t			tq_max_io;	/* host only */
+	uint32_t			tq_max_rx_pdu;
 	uint16_t			tq_next_ttag;	/* controller only */
 	uint_t				tq_num_ttags;	/* controller only */
 	uint_t				tq_active_ttags; /* controller only */
 	boolean_t			tq_send_success; /* controller only */
 
-	/*
-	 * Receive state.
-	 *
-	 * FreeBSD runs a dedicated rx kthread blocked on so_rcv.  illumos drives
-	 * RX from the ksocket_krecv_set() callback (nvmf_tcp_krecv()), which only
-	 * accumulates received bytes in tq_rx_mp and wakes a persistent rx worker
-	 * (nvmf_tcp_so_rx) on tq_rx_taskq.  Framing and dispatch run on that
-	 * worker, not in the krecv upcall: the upcall may run in a non-sleepable
-	 * socket data-arrival context, whereas the worker is a sleepable kernel
-	 * thread where KM_SLEEP allocation and blocking upstack delivery are
-	 * legal (matching FreeBSD's dedicated rx kthread).
-	 */
 	kmutex_t			tq_rx_lock;
 	kcondvar_t			tq_rx_cv;
 	boolean_t			tq_rx_shutdown;
-	boolean_t			tq_rx_ready;	/* work pending for worker */
-	mblk_t				*tq_rx_mp;	/* accumulated partial PDU */
-	boolean_t			tq_rx_have_header;
-	uint32_t			tq_rx_needed;
 	taskq_t				*tq_rx_taskq;
 
-	/*
-	 * Transmit state.
-	 *
-	 * FreeBSD runs a dedicated tx kthread that drains tx_pdus/tx_capsules.
-	 * illumos uses a persistent taskq worker (nvmf_tcp_so_tx) woken by
-	 * tq_tx_cv.
-	 */
 	kmutex_t			tq_tx_lock;
 	kcondvar_t			tq_tx_cv;
+	kcondvar_t			tq_tx_done_cv;
+	boolean_t			tq_tx_draining;
 	boolean_t			tq_tx_shutdown;
-	mblk_t				*tq_tx_pdus_head; /* mblk b_next queue */
+	boolean_t			tq_tx_exited;
+	mblk_t				*tq_tx_pdus_head;
 	mblk_t				*tq_tx_pdus_tail;
 	list_t				tq_tx_capsules;
 	taskq_t				*tq_tx_taskq;
@@ -221,12 +170,13 @@ typedef struct nvmf_tcp_qpair {
 	nvmf_tcp_command_buffer_list_t	tq_rx_buffers;
 
 	/*
-	 * For the controller, an RX command buffer is either queued on
-	 * tq_rx_buffers (waiting for an R2T slot/transfer tag) or, once it has
-	 * been assigned an active tag, lives in tq_open_ttags[] indexed by tag.
-	 * All protected by tq_rx_buffers.tcbl_lock.
+	 * A controller's receive buffer waits on tq_rx_buffers for a transfer
+	 * tag and then sits in tq_open_ttags[] under that tag.  Both, and
+	 * tc_rx_busy of every capsule, are under tq_rx_buffers.tcbl_lock.
 	 */
 	nvmf_tcp_command_buffer_t	**tq_open_ttags; /* controller only */
+	boolean_t			tq_rx_closed;
+	kcondvar_t			tq_cancel_cv;
 } nvmf_tcp_qpair_t;
 
 typedef struct nvmf_tcp_rxpdu {
@@ -244,6 +194,8 @@ typedef struct nvmf_tcp_capsule {
 	nvmf_tcp_rxpdu_t		tc_rx_pdu;
 
 	uint32_t			tc_active_r2ts;	/* controller only */
+	/* Threads copying into or completing a receive of this capsule. */
+	uint_t				tc_rx_busy;	/* controller only */
 #ifdef DEBUG
 	uint32_t			tc_tx_data_offset; /* controller only */
 	uint_t				tc_pending_r2ts;   /* controller only */
@@ -255,10 +207,6 @@ typedef struct nvmf_tcp_capsule {
 #define	TCAP(nc)	((nvmf_tcp_capsule_t *)(nc))
 #define	TQP(qp)		((nvmf_tcp_qpair_t *)(qp))
 
-/*
- * Reference-count helpers.  FreeBSD's refcount_release() returns true when the
- * count reached zero; reproduce that with atomic_dec_uint_nv.
- */
 static boolean_t
 nvmf_tcp_refcount_release(volatile uint_t *count)
 {
@@ -272,14 +220,7 @@ nvmf_tcp_refcount_acquire(volatile uint_t *count)
 	atomic_inc_uint(count);
 }
 
-/*
- * NVMe/TCP header and data digests use CRC-32C (Castagnoli): the reflected
- * polynomial is 0x82F63B78 (the bit-reversal of 0x1EDC6F41).  The generic
- * <sys/crc32.h> CRC32() macro is table-driven, so we build a CRC-32C table at
- * module init and feed it to the same macro the rest of the kernel uses for
- * the standard CRC-32.  FreeBSD performs the equivalent computation in
- * calculate_crc32c() from sys/gsb_crc32.h.
- */
+/* The header and data digests are CRC-32C, reflected polynomial. */
 #define	NVMF_TCP_CRC32C_POLY	0x82F63B78U
 static uint32_t nvmf_tcp_crc32c_table[256];
 
@@ -292,18 +233,13 @@ nvmf_tcp_crc32c(const void *buf, size_t len, uint32_t start)
 	return (crc);
 }
 
-/* mblk equivalent of FreeBSD compute_digest() over a flat buffer. */
 static uint32_t
 nvmf_tcp_compute_digest(const void *buf, size_t len)
 {
 	return (nvmf_tcp_crc32c(buf, len, 0xffffffffU) ^ 0xffffffffU);
 }
 
-/*
- * mblk equivalent of FreeBSD mbuf_crc32c(): CRC-32C over [offset, offset+len)
- * of an mblk chain.  Walks the b_cont chain accumulating the running CRC-32C
- * across block boundaries (FreeBSD uses m_apply()).
- */
+/* CRC-32C of len bytes at offset in an mblk chain. */
 static uint32_t
 nvmf_tcp_mblk_crc32c(mblk_t *mp, uint_t offset, uint_t len)
 {
@@ -323,10 +259,7 @@ nvmf_tcp_mblk_crc32c(mblk_t *mp, uint_t offset, uint_t len)
 	return (digest ^ 0xffffffffU);
 }
 
-/*
- * Copy len bytes starting at chain offset 'off' out of an mblk chain into a
- * flat buffer.  mblk equivalent of FreeBSD m_copydata().
- */
+/* Copy len bytes at off of an mblk chain into a flat buffer. */
 static void
 nvmf_tcp_mblk_copydata(mblk_t *mp, uint_t off, uint_t len, void *dst)
 {
@@ -346,12 +279,7 @@ nvmf_tcp_mblk_copydata(mblk_t *mp, uint_t off, uint_t len, void *dst)
 	}
 }
 
-/*
- * Returns B_TRUE at most once per nvmf_tcp_warn_interval, so wire-triggered
- * diagnostics can be gated to keep a peer from flooding the system log.  The
- * unsynchronized read/update can race and let an extra message through, which
- * is harmless for a rate-limited warning.
- */
+/* The unlocked update can let an extra message through. */
 static boolean_t
 nvmf_tcp_warn_ok(void)
 {
@@ -371,6 +299,43 @@ nvmf_tcp_range_ok(uint32_t off, uint32_t len, uint32_t base, size_t total)
 	    len <= total - ((uint64_t)off - base));
 }
 
+/* Check the transport's values of a qpair handoff. */
+static boolean_t
+nvmf_tcp_params_ok(uint64_t rxpda, uint64_t txpda, uint64_t maxr2t,
+    uint64_t maxh2cdata, uint64_t max_icd, uint64_t qsize)
+{
+	if (rxpda < NVMF_TCP_MIN_PDA || rxpda > NVMF_TCP_MAX_PDA ||
+	    rxpda % 4 != 0 || txpda < NVMF_TCP_MIN_PDA ||
+	    txpda > NVMF_TCP_MAX_PDA || txpda % 4 != 0)
+		return (B_FALSE);
+	/* maxr2t is 0's based. */
+	if (maxr2t >= UINT32_MAX || max_icd > UINT32_MAX)
+		return (B_FALSE);
+	if (maxh2cdata < NVMF_TCP_MIN_MAXH2CDATA || maxh2cdata > UINT32_MAX ||
+	    maxh2cdata % 4 != 0)
+		return (B_FALSE);
+	return (qsize >= 2 && qsize <= (uint64_t)UINT16_MAX + 1);
+}
+
+/*
+ * The longest PDU a peer may send when no PDU carries more than max_data
+ * bytes.  The command capsule has the longest header that precedes data.
+ */
+static uint32_t
+nvmf_tcp_rx_limit(uint32_t max_data, uint8_t rxpda, boolean_t header_digests,
+    boolean_t data_digests)
+{
+	uint64_t len = sizeof (nvmf_tcp_cmd_t);
+
+	if (header_digests)
+		len += sizeof (uint32_t);
+	len = ((len + rxpda - 1) / rxpda) * rxpda + max_data;
+	if (data_digests)
+		len += sizeof (uint32_t);
+	len = MAX(len, NVMF_TCP_TERM_REQ_PDU_MAX_SIZE);
+	return ((uint32_t)MIN(len, UINT32_MAX));
+}
+
 static nvmf_tcp_command_buffer_t *
 tcp_alloc_command_buffer(nvmf_tcp_qpair_t *qp, const struct nvmf_io_request *io,
     uint32_t data_offset, size_t data_len, uint16_t cid)
@@ -382,12 +347,8 @@ tcp_alloc_command_buffer(nvmf_tcp_qpair_t *qp, const struct nvmf_io_request *io,
 	cb->tcb_io = *io;
 	cb->tcb_data_offset = data_offset;
 	cb->tcb_data_len = data_len;
-	cb->tcb_data_xfered = 0;
 	cb->tcb_refs = 1;
-	cb->tcb_error = 0;
 	cb->tcb_cid = cid;
-	cb->tcb_ttag = 0;
-	cb->tcb_tc = NULL;
 	return (cb);
 }
 
@@ -400,8 +361,10 @@ tcp_hold_command_buffer(nvmf_tcp_command_buffer_t *cb)
 static void
 tcp_free_command_buffer(nvmf_tcp_command_buffer_t *cb)
 {
-	nvmf_complete_io_request(&cb->tcb_io, cb->tcb_data_xfered,
-	    cb->tcb_error);
+	if (!cb->tcb_done) {
+		nvmf_complete_io_request(&cb->tcb_io, cb->tcb_data_xfered,
+		    cb->tcb_error);
+	}
 	if (cb->tcb_tc != NULL)
 		tcp_release_capsule(cb->tcb_tc);
 	kmem_free(cb, sizeof (*cb));
@@ -462,17 +425,16 @@ tcp_purge_command_buffer(nvmf_tcp_command_buffer_list_t *list, uint16_t cid,
 	}
 }
 
-/*
- * TX PDU queueing.
- *
- * FreeBSD's nvmf_tcp_write_pdu() enqueues an mbuf chain on qp->tx_pdus under the
- * snd sockbuf lock and signals the tx kthread.  illumos chains PDUs via b_next
- * under tq_tx_lock and kicks the tx taskq worker.
- */
+/* Queue a PDU for the tx worker; b_next links the queue. */
 static void
 nvmf_tcp_write_pdu(nvmf_tcp_qpair_t *qp, mblk_t *mp)
 {
 	mutex_enter(&qp->tq_tx_lock);
+	if (qp->tq_tx_shutdown) {
+		mutex_exit(&qp->tq_tx_lock);
+		freemsg(mp);
+		return;
+	}
 	mp->b_next = NULL;
 	if (qp->tq_tx_pdus_tail == NULL)
 		qp->tq_tx_pdus_head = mp;
@@ -483,58 +445,59 @@ nvmf_tcp_write_pdu(nvmf_tcp_qpair_t *qp, mblk_t *mp)
 	mutex_exit(&qp->tq_tx_lock);
 }
 
+/* An mblk of len bytes; this sleeps for memory and does not fail. */
+static mblk_t *
+nvmf_tcp_allocb(size_t len)
+{
+	mblk_t *mp;
+	int error;
+
+	mp = allocb_wait(len, BPRI_MED, STR_NOSIG, &error);
+	mp->b_wptr = mp->b_rptr + len;
+	return (mp);
+}
+
 /*
- * Build and queue a termination-request PDU describing a fatal error.  This is
- * a straightforward format routine; the only OS glue is the mblk allocation and
- * the copy of the offending header bytes into the error-data region.
+ * Queue a termination request that carries the first hlen bytes of the
+ * PDU header at fault.
  */
 static void
-nvmf_tcp_report_error(nvmf_tcp_qpair_t *qp, uint16_t fes, uint32_t fei,
-    mblk_t *rx_pdu, uint_t hlen)
+nvmf_tcp_send_term_req(nvmf_tcp_qpair_t *qp, uint16_t fes, uint32_t fei,
+    const void *pdu_hdr, uint_t hlen)
 {
 	nvmf_tcp_term_req_hdr_t *hdr;
 	mblk_t *mp;
-	size_t mlen;
 
-	if (hlen != 0) {
-		hlen = MIN(hlen, NVMF_TCP_TERM_REQ_ERROR_DATA_MAX_SIZE);
-		hlen = (uint_t)MIN(hlen, msgdsize(rx_pdu));
-	}
+	hlen = MIN(hlen, NVMF_TCP_TERM_REQ_ERROR_DATA_MAX_SIZE);
 
-	mlen = sizeof (*hdr) + hlen;
-	mp = allocb(mlen, BPRI_MED);
-	if (mp == NULL)
-		return;
-	mp->b_wptr = mp->b_rptr + mlen;
+	mp = nvmf_tcp_allocb(sizeof (*hdr) + hlen);
 	hdr = (nvmf_tcp_term_req_hdr_t *)mp->b_rptr;
 	bzero(hdr, sizeof (*hdr));
 	hdr->nttr_common.ntcph_pdu_type = qp->qp.nq_controller ?
 	    NVMF_TCP_PDU_TYPE_C2H_TERM_REQ : NVMF_TCP_PDU_TYPE_H2C_TERM_REQ;
 	hdr->nttr_common.ntcph_hlen = sizeof (*hdr);
-	/*
-	 * plen is a little-endian wire field.  This LE_32() is a deliberate
-	 * divergence from FreeBSD, which assigns plen without htole32() (a latent
-	 * big-endian bug); the wrap is correct on all endiannesses here.
-	 */
 	hdr->nttr_common.ntcph_plen = LE_32((uint32_t)(sizeof (*hdr) + hlen));
 	hdr->nttr_fes = LE_16(fes);
-	/* fei is a little-endian 4-byte field. */
 	hdr->nttr_fei[0] = (uint8_t)(fei);
 	hdr->nttr_fei[1] = (uint8_t)(fei >> 8);
 	hdr->nttr_fei[2] = (uint8_t)(fei >> 16);
 	hdr->nttr_fei[3] = (uint8_t)(fei >> 24);
 
 	if (hlen != 0)
-		nvmf_tcp_mblk_copydata(rx_pdu, 0, hlen, (caddr_t)(hdr + 1));
+		bcopy(pdu_hdr, hdr + 1, hlen);
 
 	nvmf_tcp_write_pdu(qp, mp);
 }
 
-/*
- * Validate a received PDU header and (if present) its header and data digests.
- * Header parsing and digest verification are straightforward; this is a direct
- * port of FreeBSD's nvmf_tcp_validate_pdu().
- */
+/* A received PDU is one mblk. */
+static void
+nvmf_tcp_report_error(nvmf_tcp_qpair_t *qp, uint16_t fes, uint32_t fei,
+    mblk_t *rx_pdu, uint_t hlen)
+{
+	nvmf_tcp_send_term_req(qp, fes, fei, rx_pdu->b_rptr,
+	    (uint_t)MIN(hlen, MBLKL(rx_pdu)));
+}
+
 static int
 nvmf_tcp_validate_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 {
@@ -561,6 +524,10 @@ nvmf_tcp_validate_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 			nvmf_tcp_report_error(qp, fes, fei, mp, hlen);
 		return (error);
 	}
+
+	/* The header checks imply this; the handlers rely on it. */
+	if (plen != MBLKL(mp) || ch->ntcph_hlen > plen)
+		return (ECONNRESET);
 
 	/* Check header digest if present. */
 	if ((ch->ntcph_flags & NVMF_TCP_CH_FLAGS_HDGSTF) != 0) {
@@ -624,10 +591,6 @@ nvmf_tcp_handle_term_req(nvmf_tcp_rxpdu_t *pdu)
 	return (ECONNRESET);
 }
 
-/*
- * Wrap a received command capsule into an nvmf_capsule and deliver it upstack.
- * Straightforward: the SQE lives at a fixed offset in the PDU.
- */
 static int
 nvmf_tcp_save_command_capsule(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 {
@@ -636,6 +599,14 @@ nvmf_tcp_save_command_capsule(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 	nvmf_tcp_capsule_t *tc;
 
 	cmd = (const void *)pdu->rp_hdr;
+
+	if (pdu->rp_data_len > qp->tq_max_rx_icd) {
+		nvmf_tcp_report_error(qp,
+		    NVMF_TCP_TERM_REQ_FES_DATA_TRANSFER_LIMIT_EXCEEDED, 0,
+		    pdu->rp_mp, pdu->rp_hdr->ntcph_hlen);
+		nvmf_tcp_free_pdu(pdu);
+		return (EBADMSG);
+	}
 
 	nc = nvmf_allocate_command(&qp->qp, cmd->ntc_ccsqe, KM_SLEEP);
 
@@ -675,10 +646,8 @@ nvmf_tcp_save_response_capsule(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 }
 
 /*
- * Construct a PDU mblk chain containing a header, optional pad, optional data
- * payload, and optional header/data digests, filling in the common header
- * length fields.  This is a direct, mostly mechanical port of FreeBSD's
- * nvmf_tcp_construct_pdu(); the only OS glue is mblk allocation and chaining.
+ * Build a PDU: header, header digest, pad, then the data chain and its
+ * digest.  This sleeps for memory and consumes data.
  */
 static mblk_t *
 nvmf_tcp_construct_pdu(nvmf_tcp_qpair_t *qp, void *hdr, size_t hlen,
@@ -695,13 +664,8 @@ nvmf_tcp_construct_pdu(nvmf_tcp_qpair_t *qp, void *hdr, size_t hlen,
 		uint32_t pda = qp->tq_txpda;
 
 		ASSERT3U(msgdsize(data), ==, data_len);
-		/*
-		 * The negotiated PDA is peer-controlled and not guaranteed
-		 * to be a power of two, so P2ROUNDUP() cannot be used.
-		 * tcp_allocate_qpair() rejects a zero PDA; guard here as well
-		 * since it is a divisor.
-		 */
-		pdo = (pda != 0) ? ((plen + pda - 1) / pda) * pda : plen;
+		/* A PDA is a multiple of four, not always a power of two. */
+		pdo = ((plen + pda - 1) / pda) * pda;
 		pad = pdo - plen;
 		plen = pdo + data_len;
 		if (qp->tq_data_digests)
@@ -714,12 +678,7 @@ nvmf_tcp_construct_pdu(nvmf_tcp_qpair_t *qp, void *hdr, size_t hlen,
 		mlen = plen;
 	}
 
-	top = allocb(mlen, BPRI_MED);
-	if (top == NULL) {
-		freemsg(data);
-		return (NULL);
-	}
-	top->b_wptr = top->b_rptr + mlen;
+	top = nvmf_tcp_allocb(mlen);
 	ch = (nvmf_tcp_common_pdu_hdr_t *)top->b_rptr;
 	bcopy(hdr, ch, hlen);
 	ch->ntcph_hlen = (uint8_t)hlen;
@@ -754,20 +713,7 @@ nvmf_tcp_construct_pdu(nvmf_tcp_qpair_t *qp, void *hdr, size_t hlen,
 			while (dtail->b_cont != NULL)
 				dtail = dtail->b_cont;
 
-			dmp = allocb(sizeof (digest), BPRI_MED);
-			if (dmp == NULL) {
-				/*
-				 * FreeBSD uses M_WAITOK so the tail mbuf cannot
-				 * fail to allocate.  We cannot emit a short PDU
-				 * whose plen advertises a data digest that is
-				 * not present (a peer protocol error), so fail
-				 * construction; data is chained on top and freed
-				 * with it.
-				 */
-				freemsg(top);
-				return (NULL);
-			}
-			dmp->b_wptr = dmp->b_rptr + sizeof (digest);
+			dmp = nvmf_tcp_allocb(sizeof (digest));
 			bcopy(&digest, dmp->b_rptr, sizeof (digest));
 			dtail->b_cont = dmp;
 		}
@@ -776,10 +722,6 @@ nvmf_tcp_construct_pdu(nvmf_tcp_qpair_t *qp, void *hdr, size_t hlen,
 	return (top);
 }
 
-/*
- * R2T scheduling helpers (controller only).  These are pure bookkeeping over
- * tq_open_ttags[] / tq_rx_buffers and are direct ports of the FreeBSD helpers.
- */
 static nvmf_tcp_command_buffer_t *
 nvmf_tcp_next_r2t(nvmf_tcp_qpair_t *qp)
 {
@@ -849,14 +791,10 @@ tcp_send_r2t(nvmf_tcp_qpair_t *qp, uint16_t cid, uint16_t ttag,
 	r2t.ntr2t_r2tl = LE_32(data_len);
 
 	mp = nvmf_tcp_construct_pdu(qp, &r2t, sizeof (r2t), NULL, 0);
-	if (mp != NULL)
-		nvmf_tcp_write_pdu(qp, mp);
+	nvmf_tcp_write_pdu(qp, mp);
 }
 
-/*
- * Release a transfer tag and schedule another R2T.  NB: drops
- * tq_rx_buffers.tcbl_lock.  Direct port of nvmf_tcp_send_next_r2t().
- */
+/* Release cb's transfer tag and send the next R2T.  Drops tcbl_lock. */
 static void
 nvmf_tcp_send_next_r2t(nvmf_tcp_qpair_t *qp, nvmf_tcp_command_buffer_t *cb)
 {
@@ -865,28 +803,44 @@ nvmf_tcp_send_next_r2t(nvmf_tcp_qpair_t *qp, nvmf_tcp_command_buffer_t *cb)
 	ASSERT(MUTEX_HELD(&qp->tq_rx_buffers.tcbl_lock));
 	ASSERT3P(qp->tq_open_ttags[cb->tcb_ttag], ==, cb);
 
-	/* Release this transfer tag. */
 	qp->tq_open_ttags[cb->tcb_ttag] = NULL;
 	qp->tq_active_ttags--;
 	cb->tcb_tc->tc_active_r2ts--;
 
-	/* Schedule another R2T. */
 	ncb = nvmf_tcp_next_r2t(qp);
 	if (ncb != NULL) {
 		nvmf_tcp_allocate_ttag(qp, ncb);
 		mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
 		tcp_send_r2t(qp, ncb->tcb_cid, ncb->tcb_ttag,
-		    ncb->tcb_data_offset, ncb->tcb_data_len);
+		    ncb->tcb_data_offset, (uint32_t)ncb->tcb_data_len);
 	} else {
 		mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
 	}
 }
 
 /*
- * Copy len bytes starting at offset skip from an mblk chain into an I/O buffer
- * (nvmf_memdesc) at destination offset io_offset.  mblk equivalent of FreeBSD
- * mbuf_copyto_io().
+ * A thread that copies into a controller receive buffer or runs its callback
+ * outside tcbl_lock marks the capsule busy, so that a cancel can wait.
  */
+static void
+tcp_rx_busy_enter(nvmf_tcp_qpair_t *qp, nvmf_tcp_capsule_t *tc)
+{
+	ASSERT(MUTEX_HELD(&qp->tq_rx_buffers.tcbl_lock));
+	nvmf_tcp_refcount_acquire(&tc->tc_refs);
+	tc->tc_rx_busy++;
+}
+
+static void
+tcp_rx_busy_exit(nvmf_tcp_qpair_t *qp, nvmf_tcp_capsule_t *tc)
+{
+	mutex_enter(&qp->tq_rx_buffers.tcbl_lock);
+	tc->tc_rx_busy--;
+	cv_broadcast(&qp->tq_cancel_cv);
+	mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
+	tcp_release_capsule(tc);
+}
+
+/* Copy len bytes at skip of an mblk chain to io_offset of an I/O buffer. */
 static void
 nvmf_tcp_mblk_copyto_io(mblk_t *mp, uint_t skip, uint_t len,
     struct nvmf_io_request *io, uint_t io_offset)
@@ -907,89 +861,62 @@ nvmf_tcp_mblk_copyto_io(mblk_t *mp, uint_t skip, uint_t len,
 	}
 }
 
-/*
- * Wrap a [data_offset, data_offset+data_len) window of a command buffer's I/O
- * memory as a freshly-allocated mblk chain to transmit.  This is the illumos
- * equivalent of FreeBSD's nvmf_tcp_command_buffer_mbuf(): rather than building
- * zero-copy external mbufs that hold a reference on the command buffer, we copy
- * the bytes into a normal mblk.  The caller still holds its command-buffer
- * reference for the duration of the transfer, so correctness is preserved; the
- * cost is an extra copy on the TX data path (a future optimization could use
- * esballoc() to share the command buffer's pages).
- */
+/* A copy of part of a command buffer's data, to transmit. */
 static mblk_t *
 nvmf_tcp_command_buffer_mblk(nvmf_tcp_command_buffer_t *cb,
     uint32_t data_offset, uint32_t data_len)
 {
-	nvmf_memdesc_t *md = &cb->tcb_io.io_mem;
 	mblk_t *mp;
 
-	mp = allocb(data_len, BPRI_MED);
-	if (mp == NULL)
-		return (NULL);
-	mp->b_wptr = mp->b_rptr + data_len;
-	nvmf_memdesc_copyout(md, data_offset, mp->b_rptr, data_len);
+	mp = nvmf_tcp_allocb(data_len);
+	nvmf_memdesc_copyout(&cb->tcb_io.io_mem, data_offset, mp->b_rptr,
+	    data_len);
 	return (mp);
 }
 
-/*
- * Inbound data PDU handlers.
- *
- * These are the heart of the data-transfer state machine: range/sequence
- * validation, command-buffer lookup, R2T release, copy-out of the received mblk
- * into the consumer's memdesc, and the completion/CQE handoff, all preserved
- * field-for-field from FreeBSD.
- */
 static int
 nvmf_tcp_handle_h2c_data(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 {
 	const nvmf_tcp_h2c_data_hdr_t *h2c;
 	nvmf_tcp_command_buffer_t *cb;
+	nvmf_tcp_capsule_t *tc;
 	uint32_t data_len, data_offset;
-	uint16_t ttag;
+	uint16_t fes, ttag;
+	uint32_t fei = 0;
+	boolean_t copy;
 
 	h2c = (const void *)pdu->rp_hdr;
 	if (LE_32(h2c->nth2c_datal) > qp->tq_maxh2cdata) {
-		nvmf_tcp_report_error(qp,
-		    NVMF_TCP_TERM_REQ_FES_DATA_TRANSFER_LIMIT_EXCEEDED, 0,
-		    pdu->rp_mp, pdu->rp_hdr->ntcph_hlen);
-		nvmf_tcp_free_pdu(pdu);
-		return (EBADMSG);
+		fes = NVMF_TCP_TERM_REQ_FES_DATA_TRANSFER_LIMIT_EXCEEDED;
+		goto fail;
 	}
 
-	/* NB: ttag is not byte-swapped (opaque cookie). */
+	/* The transfer tag is ours and is not byte-swapped. */
 	ttag = h2c->nth2c_ttag;
 	if (ttag >= qp->tq_num_ttags) {
-		nvmf_tcp_report_error(qp,
-		    NVMF_TCP_TERM_REQ_FES_INVALID_HEADER_FIELD,
-		    offsetof(nvmf_tcp_h2c_data_hdr_t, nth2c_ttag), pdu->rp_mp,
-		    pdu->rp_hdr->ntcph_hlen);
-		nvmf_tcp_free_pdu(pdu);
-		return (EBADMSG);
+		fes = NVMF_TCP_TERM_REQ_FES_INVALID_HEADER_FIELD;
+		fei = offsetof(nvmf_tcp_h2c_data_hdr_t, nth2c_ttag);
+		goto fail;
 	}
 
 	mutex_enter(&qp->tq_rx_buffers.tcbl_lock);
 	cb = qp->tq_open_ttags[ttag];
 	if (cb == NULL) {
 		mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
-		nvmf_tcp_report_error(qp,
-		    NVMF_TCP_TERM_REQ_FES_INVALID_HEADER_FIELD,
-		    offsetof(nvmf_tcp_h2c_data_hdr_t, nth2c_ttag), pdu->rp_mp,
-		    pdu->rp_hdr->ntcph_hlen);
-		nvmf_tcp_free_pdu(pdu);
-		return (EBADMSG);
+		fes = NVMF_TCP_TERM_REQ_FES_INVALID_HEADER_FIELD;
+		fei = offsetof(nvmf_tcp_h2c_data_hdr_t, nth2c_ttag);
+		goto fail;
 	}
 	ASSERT3U(cb->tcb_ttag, ==, ttag);
+	tc = cb->tcb_tc;
 
-	/*
-	 * For a data digest mismatch, fail the I/O request.  FreeBSD reports
-	 * EINTEGRITY here; illumos has no such errno, so EIO is used to flag the
-	 * digest failure to the consumer's io_complete callback.
-	 */
+	/* For a data digest mismatch, fail the I/O request. */
 	if (pdu->rp_data_digest_mismatch) {
+		tcp_rx_busy_enter(qp, tc);
 		nvmf_tcp_send_next_r2t(qp, cb);	/* drops tcbl_lock */
 		cb->tcb_error = EIO;
 		tcp_release_command_buffer(cb);
+		tcp_rx_busy_exit(qp, tc);
 		nvmf_tcp_free_pdu(pdu);
 		return (0);
 	}
@@ -997,47 +924,33 @@ nvmf_tcp_handle_h2c_data(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 	data_len = LE_32(h2c->nth2c_datal);
 	if (data_len != pdu->rp_data_len) {
 		mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
-		nvmf_tcp_report_error(qp,
-		    NVMF_TCP_TERM_REQ_FES_INVALID_HEADER_FIELD,
-		    offsetof(nvmf_tcp_h2c_data_hdr_t, nth2c_datal), pdu->rp_mp,
-		    pdu->rp_hdr->ntcph_hlen);
-		nvmf_tcp_free_pdu(pdu);
-		return (EBADMSG);
+		fes = NVMF_TCP_TERM_REQ_FES_INVALID_HEADER_FIELD;
+		fei = offsetof(nvmf_tcp_h2c_data_hdr_t, nth2c_datal);
+		goto fail;
 	}
 
 	data_offset = LE_32(h2c->nth2c_datao);
 	if (!nvmf_tcp_range_ok(data_offset, data_len, cb->tcb_data_offset,
 	    cb->tcb_data_len)) {
 		mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
-		nvmf_tcp_report_error(qp,
-		    NVMF_TCP_TERM_REQ_FES_DATA_TRANSFER_OUT_OF_RANGE, 0,
-		    pdu->rp_mp, pdu->rp_hdr->ntcph_hlen);
-		nvmf_tcp_free_pdu(pdu);
-		return (EBADMSG);
+		fes = NVMF_TCP_TERM_REQ_FES_DATA_TRANSFER_OUT_OF_RANGE;
+		goto fail;
 	}
 
-	if (data_offset != cb->tcb_data_offset + cb->tcb_data_xfered) {
-		mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
-		nvmf_tcp_report_error(qp,
-		    NVMF_TCP_TERM_REQ_FES_PDU_SEQUENCE_ERROR, 0, pdu->rp_mp,
-		    pdu->rp_hdr->ntcph_hlen);
-		nvmf_tcp_free_pdu(pdu);
-		return (EBADMSG);
-	}
-
-	if ((cb->tcb_data_xfered + data_len == cb->tcb_data_len) !=
+	if (data_offset != cb->tcb_data_offset + cb->tcb_data_xfered ||
+	    (cb->tcb_data_xfered + data_len == cb->tcb_data_len) !=
 	    ((pdu->rp_hdr->ntcph_flags & NVMF_TCP_H2C_DATA_FLAGS_LAST_PDU) !=
 	    0)) {
 		mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
-		nvmf_tcp_report_error(qp,
-		    NVMF_TCP_TERM_REQ_FES_PDU_SEQUENCE_ERROR, 0, pdu->rp_mp,
-		    pdu->rp_hdr->ntcph_hlen);
-		nvmf_tcp_free_pdu(pdu);
-		return (EBADMSG);
+		fes = NVMF_TCP_TERM_REQ_FES_PDU_SEQUENCE_ERROR;
+		goto fail;
 	}
 
 	cb->tcb_data_xfered += data_len;
 	data_offset -= cb->tcb_data_offset;
+	/* A cancelled transfer keeps its tag and discards the data. */
+	copy = !cb->tcb_done;
+	tcp_rx_busy_enter(qp, tc);
 	if (cb->tcb_data_xfered == cb->tcb_data_len) {
 		nvmf_tcp_send_next_r2t(qp, cb);	/* drops tcbl_lock */
 	} else {
@@ -1045,12 +958,21 @@ nvmf_tcp_handle_h2c_data(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 		mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
 	}
 
-	nvmf_tcp_mblk_copyto_io(pdu->rp_mp, pdu->rp_hdr->ntcph_pdo, data_len,
-	    &cb->tcb_io, data_offset);
+	if (copy) {
+		nvmf_tcp_mblk_copyto_io(pdu->rp_mp, pdu->rp_hdr->ntcph_pdo,
+		    data_len, &cb->tcb_io, data_offset);
+	}
 
 	tcp_release_command_buffer(cb);
+	tcp_rx_busy_exit(qp, tc);
 	nvmf_tcp_free_pdu(pdu);
 	return (0);
+
+fail:
+	nvmf_tcp_report_error(qp, fes, fei, pdu->rp_mp,
+	    pdu->rp_hdr->ntcph_hlen);
+	nvmf_tcp_free_pdu(pdu);
+	return (EBADMSG);
 }
 
 static int
@@ -1066,10 +988,6 @@ nvmf_tcp_handle_c2h_data(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 	cb = tcp_find_command_buffer(&qp->tq_rx_buffers, c2h->ntc2c_cccid, 0);
 	if (cb == NULL) {
 		mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
-		/*
-		 * XXX: Could be PDU sequence error if cccid is for a command
-		 * that doesn't use a command buffer.
-		 */
 		nvmf_tcp_report_error(qp,
 		    NVMF_TCP_TERM_REQ_FES_INVALID_HEADER_FIELD,
 		    offsetof(nvmf_tcp_c2h_data_hdr_t, ntc2c_cccid), pdu->rp_mp,
@@ -1170,16 +1088,17 @@ tcp_send_h2c_pdu(nvmf_tcp_qpair_t *qp, uint16_t cid, uint16_t ttag,
 
 	bzero(&h2c, sizeof (h2c));
 	h2c.nth2c_common.ntcph_pdu_type = NVMF_TCP_PDU_TYPE_H2C_DATA;
-	if (last_pdu)
-		h2c.nth2c_common.ntcph_flags |= NVMF_TCP_H2C_DATA_FLAGS_LAST_PDU;
+	if (last_pdu) {
+		h2c.nth2c_common.ntcph_flags |=
+		    NVMF_TCP_H2C_DATA_FLAGS_LAST_PDU;
+	}
 	h2c.nth2c_cccid = cid;
 	h2c.nth2c_ttag = ttag;
 	h2c.nth2c_datao = LE_32(data_offset);
 	h2c.nth2c_datal = LE_32((uint32_t)len);
 
 	top = nvmf_tcp_construct_pdu(qp, &h2c, sizeof (h2c), mp, (uint32_t)len);
-	if (top != NULL)
-		nvmf_tcp_write_pdu(qp, top);
+	nvmf_tcp_write_pdu(qp, top);
 }
 
 static int
@@ -1237,10 +1156,6 @@ nvmf_tcp_handle_r2t(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 
 		todo = (uint32_t)MIN(data_len, qp->tq_max_tx_data);
 		mp = nvmf_tcp_command_buffer_mblk(cb, data_offset, todo);
-		if (mp == NULL) {
-			cb->tcb_error = ENOMEM;
-			break;
-		}
 		tcp_send_h2c_pdu(qp, r2t->ntr2t_cccid, r2t->ntr2t_ttag,
 		    data_offset, mp, todo, todo == data_len);
 
@@ -1253,37 +1168,10 @@ nvmf_tcp_handle_r2t(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 	return (0);
 }
 
-/*
- * Ensure the PDU header is contiguous in the lead mblk, then dispatch by PDU
- * type.  mblk equivalent of FreeBSD's pullup_pdu_hdr() + nvmf_tcp_dispatch_pdu().
- */
 static int
-nvmf_tcp_dispatch_pdu(nvmf_tcp_qpair_t *qp,
-    const nvmf_tcp_common_pdu_hdr_t *ch, nvmf_tcp_rxpdu_t *pdu)
+nvmf_tcp_dispatch_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 {
-	/*
-	 * Ensure the first mblk holds at least ch->ntcph_hlen bytes so the
-	 * type-specific header can be dereferenced contiguously (FreeBSD
-	 * pullup_pdu_hdr()).  pullupmsg() only fails on allocation failure here,
-	 * which we treat as a fatal connection error.
-	 */
-	if (MBLKL(pdu->rp_mp) < ch->ntcph_hlen) {
-		if (pullupmsg(pdu->rp_mp, ch->ntcph_hlen) == 0) {
-			nvmf_tcp_free_pdu(pdu);
-			return (ECONNRESET);
-		}
-	}
-	pdu->rp_hdr = (const nvmf_tcp_common_pdu_hdr_t *)pdu->rp_mp->b_rptr;
-
-	/*
-	 * pullupmsg() above may have reallocated the lead mblk, leaving the
-	 * caller's 'ch' pointer dangling.  Dispatch off the refreshed
-	 * pdu->rp_hdr, never 'ch', for any field read past this point.
-	 */
 	switch (pdu->rp_hdr->ntcph_pdu_type) {
-	default:
-		VERIFY(0);
-		return (ECONNRESET);
 	case NVMF_TCP_PDU_TYPE_H2C_TERM_REQ:
 	case NVMF_TCP_PDU_TYPE_C2H_TERM_REQ:
 		return (nvmf_tcp_handle_term_req(pdu));
@@ -1297,29 +1185,16 @@ nvmf_tcp_dispatch_pdu(nvmf_tcp_qpair_t *qp,
 		return (nvmf_tcp_handle_c2h_data(qp, pdu));
 	case NVMF_TCP_PDU_TYPE_R2T:
 		return (nvmf_tcp_handle_r2t(qp, pdu));
+	default:
+		nvmf_tcp_free_pdu(pdu);
+		return (ECONNRESET);
 	}
 }
 
 /*
- * Event-driven socket receive.
- *
- * This is the illumos replacement for FreeBSD's dedicated rx kthread
- * (nvmf_tcp_receive()).  ksocket_krecv_set() registers nvmf_tcp_krecv() to be
- * called with received data as mblk chains; that callback only accumulates
- * bytes into tq_rx_mp and wakes the rx worker (nvmf_tcp_so_rx), which frames out
- * whole PDUs (8-byte common header, then ntcph_plen bytes) and validates and
- * dispatches them in a sleepable context.
- */
-/*
- * Split exactly 'n' bytes off the head of the chain '*mpp', returning that
- * prefix as its own chain and leaving the remainder (if any) in '*mpp'.  If
- * 'n' falls in the middle of an mblk, that mblk is duplicated so the two halves
- * do not share a data block (the head half keeps the data, the tail half
- * references the same dblk past the split point via dupb()).  Returns NULL on
- * allocation failure, leaving '*mpp' unchanged.
- *
- * Caller guarantees msgdsize(*mpp) >= n.  This is the mblk equivalent of
- * FreeBSD's m_split() as used by the RX framing loop.
+ * Split the first n bytes off the chain *mpp and return them; the rest stays
+ * in *mpp.  Returns NULL, with *mpp unchanged, if memory is short.  The chain
+ * has at least n bytes.
  */
 static mblk_t *
 nvmf_tcp_chain_split(mblk_t **mpp, size_t n)
@@ -1337,17 +1212,12 @@ nvmf_tcp_chain_split(mblk_t **mpp, size_t n)
 	}
 
 	if (off == 0) {
-		/* Split lands on a clean mblk boundary. */
 		*mpp = mp;
 		if (prev != NULL)
 			prev->b_cont = NULL;
 		return (head);
 	}
 
-	/*
-	 * The split lands inside 'mp': duplicate it so the tail references the
-	 * bytes after the split and the head keeps the bytes before it.
-	 */
 	tail = dupb(mp);
 	if (tail == NULL)
 		return (NULL);
@@ -1362,197 +1232,192 @@ nvmf_tcp_chain_split(mblk_t **mpp, size_t n)
 }
 
 /*
- * Read the 8-byte common PDU header out of the head of the accumulated chain
- * into 'ch' (the header may be split across mblks).  Caller guarantees the
- * chain holds at least sizeof (*ch) bytes.
- */
-static void
-nvmf_tcp_peek_common_hdr(mblk_t *mp, nvmf_tcp_common_pdu_hdr_t *ch)
-{
-	nvmf_tcp_mblk_copydata(mp, 0, sizeof (*ch), ch);
-}
-
-/*
- * Frame and dispatch every complete PDU accumulated in qp->tq_rx_mp.  This is
- * the illumos port of the per-PDU framing loop in FreeBSD
- * nvmf_tcp.c:nvmf_tcp_receive():
- *
- *   1. Once at least a common header is buffered, read it to learn plen
- *      (clamped to >= the common header size); cache it in tq_rx_needed.
- *   2. Once tq_rx_needed bytes are buffered, split exactly that many bytes off
- *      tq_rx_mp into a standalone PDU chain (the rest stays buffered for the
- *      next PDU).
- *   3. Validate + dispatch the PDU; repeat while another whole PDU is buffered.
- *
- * Returns 0 to continue or an errno on a fatal framing/dispatch error.  The
- * tq_rx_lock is dropped across validate/dispatch (which call upstack) and
- * retaken; tq_rx_mp is only mutated under the lock.
+ * Read exactly len bytes.  *donep is short only at the end of the stream.
+ * A receive timeout that the daemon left on the socket is not an error.
  */
 static int
-nvmf_tcp_rx_drain(nvmf_tcp_qpair_t *qp)
+nvmf_tcp_recv(nvmf_tcp_qpair_t *qp, void *buf, size_t len, size_t *donep)
 {
-	nvmf_tcp_rxpdu_t pdu;
-	nvmf_tcp_common_pdu_hdr_t ch;
-	mblk_t *pdu_mp;
-	int error;
+	size_t done = 0, n;
+	boolean_t shutdown;
+	int error = 0;
 
-	ASSERT(MUTEX_HELD(&qp->tq_rx_lock));
-
-	for (;;) {
-		size_t avail;
-
-		if (qp->tq_rx_mp == NULL)
-			return (0);
-
-		avail = msgdsize(qp->tq_rx_mp);
-
-		if (!qp->tq_rx_have_header) {
-			if (avail < sizeof (ch))
-				return (0);
-
-			nvmf_tcp_peek_common_hdr(qp->tq_rx_mp, &ch);
-			qp->tq_rx_needed = LE_32(ch.ntcph_plen);
-
-			/*
-			 * Reject an absurd advertised length before buffering
-			 * it: the loop accumulates tq_rx_needed bytes before
-			 * any validation runs, so an over-large plen is a
-			 * memory-exhaustion vector.  Fatal to the connection.
-			 */
-			if (qp->tq_rx_needed > nvmf_tcp_max_receive_pdu)
-				return (ECONNRESET);
-
-			/*
-			 * Malformed PDUs will be reported as errors by
-			 * nvmf_tcp_validate_pdu(); just frame off a common
-			 * header's worth if the length is implausible.
-			 */
-			if (qp->tq_rx_needed < sizeof (ch) ||
-			    ch.ntcph_hlen > qp->tq_rx_needed)
-				qp->tq_rx_needed = sizeof (ch);
-
-			qp->tq_rx_have_header = B_TRUE;
-		}
-
-		if (avail < qp->tq_rx_needed)
-			return (0);
-
-		pdu_mp = nvmf_tcp_chain_split(&qp->tq_rx_mp, qp->tq_rx_needed);
-		if (pdu_mp == NULL)
-			return (ENOMEM);
-
-		qp->tq_rx_have_header = B_FALSE;
-
-		pdu.rp_mp = pdu_mp;
-		pdu.rp_hdr = NULL;
-
-		mutex_exit(&qp->tq_rx_lock);
-		/*
-		 * Make the common header contiguous so rp_hdr can be
-		 * dereferenced for validation; the type-specific pullup happens
-		 * in nvmf_tcp_dispatch_pdu().
-		 */
-		if (MBLKL(pdu.rp_mp) < sizeof (ch) &&
-		    pullupmsg(pdu.rp_mp, sizeof (ch)) == 0) {
-			nvmf_tcp_free_pdu(&pdu);
+	while (done < len) {
+		n = 0;
+		error = ksocket_recv(qp->tq_so, (uint8_t *)buf + done,
+		    len - done, MSG_WAITALL, &n, CRED());
+		if (error == EAGAIN) {
 			mutex_enter(&qp->tq_rx_lock);
-			return (ENOMEM);
+			if (!qp->tq_rx_shutdown) {
+				(void) cv_reltimedwait(&qp->tq_rx_cv,
+				    &qp->tq_rx_lock, drv_usectohz(100000),
+				    TR_CLOCK_TICK);
+			}
+			shutdown = qp->tq_rx_shutdown;
+			mutex_exit(&qp->tq_rx_lock);
+			if (shutdown)
+				break;
+			error = 0;
+			continue;
 		}
-		pdu.rp_hdr = (const nvmf_tcp_common_pdu_hdr_t *)pdu.rp_mp->b_rptr;
-
-		error = nvmf_tcp_validate_pdu(qp, &pdu);
-		if (error != 0)
-			nvmf_tcp_free_pdu(&pdu);
-		else
-			error = nvmf_tcp_dispatch_pdu(qp, pdu.rp_hdr, &pdu);
-		mutex_enter(&qp->tq_rx_lock);
-
-		if (error != 0)
-			return (error);
+		if (error != 0 || n == 0)
+			break;
+		done += n;
 	}
+	*donep = done;
+	return (error);
 }
 
 /*
- * Inbound socket worker.
- *
- * illumos replacement for FreeBSD's rx kthread (nvmf_tcp_receive()).  Frames and
- * dispatches whole PDUs out of tq_rx_mp.  This runs on a dedicated single-thread
- * taskq (a sleepable kernel-thread context), not in the krecv upcall, so the
- * KM_SLEEP allocations and blocking upstack delivery reached via
- * nvmf_tcp_rx_drain() -> nvmf_tcp_dispatch_pdu() are legal here.
+ * Read the next PDU into one mblk.  Returns 0 with rp_mp NULL if the peer
+ * closed the connection between PDUs.  *termp is set if a termination request
+ * went out.
+ */
+static int
+nvmf_tcp_recv_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu,
+    boolean_t *termp)
+{
+	nvmf_tcp_common_pdu_hdr_t ch;
+	mblk_t *mp;
+	size_t done;
+	uint32_t plen;
+	int error;
+
+	pdu->rp_mp = NULL;
+	pdu->rp_hdr = NULL;
+
+	error = nvmf_tcp_recv(qp, &ch, sizeof (ch), &done);
+	if (error != 0 || done == 0)
+		return (error);
+	if (done != sizeof (ch))
+		return (ECONNRESET);
+
+	/* nvmf_tcp_validate_pdu() reports lengths that make no sense. */
+	plen = LE_32(ch.ntcph_plen);
+	if (plen < sizeof (ch) || ch.ntcph_hlen > plen)
+		plen = sizeof (ch);
+
+	if (plen > qp->tq_max_rx_pdu) {
+		switch (ch.ntcph_pdu_type) {
+		case NVMF_TCP_PDU_TYPE_CAPSULE_CMD:
+		case NVMF_TCP_PDU_TYPE_H2C_DATA:
+		case NVMF_TCP_PDU_TYPE_C2H_DATA:
+			nvmf_tcp_send_term_req(qp,
+			    NVMF_TCP_TERM_REQ_FES_DATA_TRANSFER_LIMIT_EXCEEDED,
+			    0, &ch, sizeof (ch));
+			break;
+		default:
+			nvmf_tcp_send_term_req(qp,
+			    NVMF_TCP_TERM_REQ_FES_INVALID_HEADER_FIELD,
+			    offsetof(nvmf_tcp_common_pdu_hdr_t, ntcph_plen),
+			    &ch, sizeof (ch));
+			break;
+		}
+		*termp = B_TRUE;
+		return (EBADMSG);
+	}
+
+	mp = nvmf_tcp_allocb(plen);
+	bcopy(&ch, mp->b_rptr, sizeof (ch));
+	error = nvmf_tcp_recv(qp, mp->b_rptr + sizeof (ch),
+	    plen - sizeof (ch), &done);
+	if (error == 0 && done != plen - sizeof (ch))
+		error = ECONNRESET;
+	if (error != 0) {
+		freemsg(mp);
+		return (error);
+	}
+
+	pdu->rp_mp = mp;
+	pdu->rp_hdr = (const nvmf_tcp_common_pdu_hdr_t *)mp->b_rptr;
+	return (0);
+}
+
+/*
+ * After a termination request, give the peer time to close the connection
+ * and discard what it still sends.
+ */
+static void
+nvmf_tcp_wait_close(nvmf_tcp_qpair_t *qp)
+{
+	clock_t deadline = ddi_get_lbolt() +
+	    SEC_TO_TICK(nvmf_tcp_term_wait_secs);
+	size_t len = 4096, n;
+	uint8_t *buf;
+	int error;
+
+	buf = kmem_alloc(len, KM_SLEEP);
+	mutex_enter(&qp->tq_rx_lock);
+	while (!qp->tq_rx_shutdown && ddi_get_lbolt() < deadline) {
+		mutex_exit(&qp->tq_rx_lock);
+		n = 0;
+		error = ksocket_recv(qp->tq_so, buf, len, MSG_DONTWAIT, &n,
+		    CRED());
+		mutex_enter(&qp->tq_rx_lock);
+		if (error == 0 && n != 0)
+			continue;
+		if (error != EWOULDBLOCK)
+			break;
+		(void) cv_reltimedwait(&qp->tq_rx_cv, &qp->tq_rx_lock,
+		    drv_usectohz(100000), TR_CLOCK_TICK);
+	}
+	mutex_exit(&qp->tq_rx_lock);
+	kmem_free(buf, len);
+}
+
+/*
+ * The rx worker.  It reads and dispatches PDUs until the connection ends or
+ * fails, reports that once, and then waits for tcp_free_qpair().
  */
 static void
 nvmf_tcp_so_rx(void *arg)
 {
 	nvmf_tcp_qpair_t *qp = arg;
+	nvmf_tcp_rxpdu_t pdu;
+	boolean_t term = B_FALSE, shutdown;
 	int error;
 
-	mutex_enter(&qp->tq_rx_lock);
 	for (;;) {
-		while (!qp->tq_rx_shutdown && !qp->tq_rx_ready)
-			cv_wait(&qp->tq_rx_cv, &qp->tq_rx_lock);
-		if (qp->tq_rx_shutdown)
+		mutex_enter(&qp->tq_rx_lock);
+		shutdown = qp->tq_rx_shutdown;
+		mutex_exit(&qp->tq_rx_lock);
+		if (shutdown)
+			return;
+
+		error = nvmf_tcp_recv_pdu(qp, &pdu, &term);
+		if (error != 0 || pdu.rp_mp == NULL)
 			break;
 
-		qp->tq_rx_ready = B_FALSE;
-
-		/* nvmf_tcp_rx_drain() drops and retakes tq_rx_lock. */
-		error = nvmf_tcp_rx_drain(qp);
+		error = nvmf_tcp_validate_pdu(qp, &pdu);
+		if (error != 0)
+			nvmf_tcp_free_pdu(&pdu);
+		else
+			error = nvmf_tcp_dispatch_pdu(qp, &pdu);
 		if (error != 0) {
-			mutex_exit(&qp->tq_rx_lock);
-			/*
-			 * On a fatal framing/dispatch error, surface it to the
-			 * qpair owner and stop processing until torn down.
-			 */
-			nvmf_qpair_error(&qp->qp, error);
-			mutex_enter(&qp->tq_rx_lock);
+			/* Every error but ECONNRESET sent a request. */
+			term = (error != ECONNRESET);
 			break;
 		}
 	}
-	mutex_exit(&qp->tq_rx_lock);
-}
 
-/*
- * Event-driven socket receive upcall.  This must not assume a sleepable context:
- * it only appends the received chain to tq_rx_mp and wakes the rx worker, which
- * does the framing and (blocking) dispatch.
- */
-/* ARGSUSED */
-static boolean_t
-nvmf_tcp_krecv(ksocket_t so, mblk_t *mp, size_t msgsize, int oob, void *arg)
-{
-	nvmf_tcp_qpair_t *qp = arg;
+	if (term)
+		nvmf_tcp_wait_close(qp);
 
 	mutex_enter(&qp->tq_rx_lock);
-	if (qp->tq_rx_shutdown) {
+	if (!qp->tq_rx_shutdown) {
 		mutex_exit(&qp->tq_rx_lock);
-		freemsg(mp);
-		return (B_TRUE);
+		nvmf_qpair_error(&qp->qp, error);
+		mutex_enter(&qp->tq_rx_lock);
 	}
-
-	/* Append the newly received chain to any accumulated partial PDU. */
-	if (qp->tq_rx_mp == NULL) {
-		qp->tq_rx_mp = mp;
-	} else {
-		mblk_t *tail = qp->tq_rx_mp;
-		while (tail->b_cont != NULL)
-			tail = tail->b_cont;
-		tail->b_cont = mp;
-	}
-
-	qp->tq_rx_ready = B_TRUE;
-	cv_signal(&qp->tq_rx_cv);
+	while (!qp->tq_rx_shutdown)
+		cv_wait(&qp->tq_rx_cv, &qp->tq_rx_lock);
 	mutex_exit(&qp->tq_rx_lock);
-
-	return (B_TRUE);
 }
 
 /*
- * Outbound socket worker.
- *
- * illumos replacement for FreeBSD's tx kthread (nvmf_tcp_send()).  Drains queued
- * PDUs (tq_tx_pdus_head) and pending capsules (tq_tx_capsules), converting
- * capsules to PDUs and pushing mblks down the socket with ksocket_sendmblk().
+ * The tx worker.  It writes queued PDUs, then queued capsules, to the socket
+ * and may block there.  It exits on a send error, at shutdown, or once the
+ * queues are empty while draining.
  */
 static void
 nvmf_tcp_so_tx(void *arg)
@@ -1561,80 +1426,52 @@ nvmf_tcp_so_tx(void *arg)
 	nvmf_tcp_capsule_t *tc;
 	mblk_t *mp;
 	struct msghdr msg;
-	int rc;
+	boolean_t failed;
+	int error = 0;
 
 	mutex_enter(&qp->tq_tx_lock);
-	while (!qp->tq_tx_shutdown) {
-		/* Next ready-to-send PDU mblk, if any. */
+	while (error == 0 && !qp->tq_tx_shutdown) {
 		mp = qp->tq_tx_pdus_head;
 		if (mp != NULL) {
 			qp->tq_tx_pdus_head = mp->b_next;
 			if (qp->tq_tx_pdus_head == NULL)
 				qp->tq_tx_pdus_tail = NULL;
 			mp->b_next = NULL;
+			mutex_exit(&qp->tq_tx_lock);
 		} else {
-			/* Otherwise convert the next queued capsule to a PDU. */
 			tc = list_remove_head(&qp->tq_tx_capsules);
 			if (tc == NULL) {
+				if (qp->tq_tx_draining)
+					break;
 				cv_wait(&qp->tq_tx_cv, &qp->tq_tx_lock);
 				continue;
 			}
 			mutex_exit(&qp->tq_tx_lock);
 			mp = capsule_to_pdu(qp, tc);
 			tcp_release_capsule(tc);
-			mutex_enter(&qp->tq_tx_lock);
-			if (mp == NULL)
-				continue;
 		}
-		mutex_exit(&qp->tq_tx_lock);
 
-		/*
-		 * ksocket_sendmblk() may consume only part of the chain,
-		 * returning the unsent remainder in &mp.  This worker is a
-		 * dedicated kernel thread (not a softint/datagram context like
-		 * overlay_mux_tx()), so it is safe to block until the entire
-		 * chain has been handed to the socket: a blocking send drives
-		 * the chain out under TCP flow control without us reimplementing
-		 * the socket-buffer accounting FreeBSD's nvmf_tcp_send() does.
-		 */
-		rc = 0;
-		while (mp != NULL) {
-			/*
-			 * Bail out of the blocking send loop if teardown started,
-			 * so a flow-controlled send cannot re-park us after
-			 * tcp_free_qpair() has shut the socket down.  This is an
-			 * advisory racy read; ksocket_shutdown() is the authoritative
-			 * wakeup that makes the in-progress ksocket_sendmblk() return.
-			 */
-			if (qp->tq_tx_shutdown) {
-				freemsg(mp);
-				mp = NULL;
-				rc = 0;
-				break;
-			}
+		/* A send can take part of the chain and leave the rest. */
+		while (mp != NULL && error == 0) {
 			bzero(&msg, sizeof (msg));
-			rc = ksocket_sendmblk(qp->tq_so, &msg, 0, &mp, CRED());
-			if (rc != 0)
-				break;
+			error = ksocket_sendmblk(qp->tq_so, &msg, 0, &mp,
+			    CRED());
 		}
-		if (rc != 0) {
-			freemsg(mp);
-			nvmf_qpair_error(&qp->qp, rc);
-			mutex_enter(&qp->tq_tx_lock);
-			break;
-		}
-
+		freemsg(mp);
 		mutex_enter(&qp->tq_tx_lock);
 	}
+	failed = (error != 0 && !qp->tq_tx_shutdown);
+	mutex_exit(&qp->tq_tx_lock);
+
+	if (failed)
+		nvmf_qpair_error(&qp->qp, error);
+
+	mutex_enter(&qp->tq_tx_lock);
+	qp->tq_tx_exited = B_TRUE;
+	cv_broadcast(&qp->tq_tx_done_cv);
 	mutex_exit(&qp->tq_tx_lock);
 }
 
-/*
- * Capsule -> PDU construction (TX side).  These build the on-wire command and
- * response PDUs from an nvmf_capsule, wrapping any in-capsule data as an mblk
- * chain and registering out-of-line command buffers for later R2T/C2H/H2C
- * movement.
- */
 static mblk_t *
 tcp_command_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_capsule_t *tc)
 {
@@ -1643,12 +1480,7 @@ tcp_command_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_capsule_t *tc)
 	nvme_sqe_t sqe;
 	nvme_sgl_t *sgl;
 	nvmf_tcp_cmd_t cmd;
-	mblk_t *top, *data;
-	boolean_t use_icd;
-
-	use_icd = B_FALSE;
-	cb = NULL;
-	data = NULL;
+	mblk_t *data = NULL;
 
 	if (nc->nc_data.io_len != 0) {
 		cb = tcp_alloc_command_buffer(qp, &nc->nc_data, 0,
@@ -1657,23 +1489,8 @@ tcp_command_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_capsule_t *tc)
 		if (nc->nc_send_data && nc->nc_data.io_len <= qp->tq_max_icd) {
 			data = nvmf_tcp_command_buffer_mblk(cb, 0,
 			    (uint32_t)nc->nc_data.io_len);
-			if (data != NULL) {
-				use_icd = B_TRUE;
-				cb->tcb_data_xfered = nc->nc_data.io_len;
-				tcp_release_command_buffer(cb);
-			} else {
-				/*
-				 * FreeBSD uses M_WAITOK here so the ICD copy
-				 * cannot fail.  allocb(BPRI_MED) can, so fall
-				 * back to the out-of-line command-buffer path
-				 * (R2T/H2C) rather than emitting an ICD SGL with
-				 * no data, which a target would reject and which
-				 * would drop the write payload.
-				 */
-				mutex_enter(&qp->tq_tx_buffers.tcbl_lock);
-				tcp_add_command_buffer(&qp->tq_tx_buffers, cb);
-				mutex_exit(&qp->tq_tx_buffers.tcbl_lock);
-			}
+			cb->tcb_data_xfered = nc->nc_data.io_len;
+			tcp_release_command_buffer(cb);
 		} else if (nc->nc_send_data) {
 			mutex_enter(&qp->tq_tx_buffers.tcbl_lock);
 			tcp_add_command_buffer(&qp->tq_tx_buffers, cb);
@@ -1685,22 +1502,15 @@ tcp_command_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_capsule_t *tc)
 		}
 	}
 
-	/*
-	 * Build the SQE (with its SGL) in a properly-aligned local before
-	 * copying it into the packed PDU; ntc_ccsqe is a byte array in the
-	 * pack(1) PDU struct so it cannot be type-punned in place.
-	 */
+	/* ntc_ccsqe is unaligned in the PDU, so build the SQE apart. */
 	sqe = nc->nc_sqe;
 	sgl = &sqe.sqe_dptr.d_sgl;
 	bzero(sgl, sizeof (*sgl));
-	sgl->sgl_addr = 0;
 	sgl->sgl_len = LE_32((uint32_t)nc->nc_data.io_len);
-	if (use_icd) {
-		/* In-capsule data. */
+	if (data != NULL) {
 		sgl->sgl_type = NVME_SGL_TYPE_ICD >> 4;
 		sgl->sgl_zero = NVME_SGL_TYPE_ICD & 0xf;
 	} else {
-		/* Command buffer (out-of-line via R2T/H2C/C2H). */
 		sgl->sgl_type = NVME_SGL_TYPE_COMMAND_BUFFER >> 4;
 		sgl->sgl_zero = NVME_SGL_TYPE_COMMAND_BUFFER & 0xf;
 	}
@@ -1709,28 +1519,8 @@ tcp_command_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_capsule_t *tc)
 	cmd.ntc_common.ntcph_pdu_type = NVMF_TCP_PDU_TYPE_CAPSULE_CMD;
 	bcopy(&sqe, cmd.ntc_ccsqe, sizeof (sqe));
 
-	top = nvmf_tcp_construct_pdu(qp, &cmd, sizeof (cmd), data,
-	    data != NULL ? (uint32_t)nc->nc_data.io_len : 0);
-
-	/*
-	 * FreeBSD's M_WAITOK construct_pdu never fails; allocb(BPRI_MED) can.
-	 * If we registered an out-of-line command buffer (not ICD) but the PDU
-	 * was dropped, no R2T/C2H will ever arrive for it, so the I/O would hang
-	 * until qpair teardown.  Purge the registered buffer to complete the I/O
-	 * with the error from tcb_error rather than leaking it.
-	 */
-	if (top == NULL && cb != NULL && !use_icd) {
-		cb->tcb_error = ENOMEM;
-		if (nc->nc_send_data) {
-			tcp_purge_command_buffer(&qp->tq_tx_buffers,
-			    nc->nc_sqe.sqe_cid, 0);
-		} else {
-			tcp_purge_command_buffer(&qp->tq_rx_buffers,
-			    nc->nc_sqe.sqe_cid, 0);
-		}
-	}
-
-	return (top);
+	return (nvmf_tcp_construct_pdu(qp, &cmd, sizeof (cmd), data,
+	    data != NULL ? (uint32_t)nc->nc_data.io_len : 0));
 }
 
 static mblk_t *
@@ -1756,179 +1546,145 @@ capsule_to_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_capsule_t *tc)
 }
 
 /*
- * Adopt a userland TCP socket file descriptor as a kernel ksocket_t.
- *
- * The handoff nvlist carries an open, connected socket fd that the userland
- * Fabrics daemon created and ran the CONNECT exchange on.  getsonode() resolves
- * the fd to its sonode in the ioctl caller's process context (getf() indexes the
- * calling process's open-file table), returning with the fd held; the caller
- * must releasef() it.  A ksocket_t is an opaque handle that is, internally, just
- * the sonode pointer (io/ksocket/ksocket_impl.h: SOTOKS(so) == the cast below);
- * a sonode becomes usable through the ksocket_* KPI once SM_KERNEL is set, which
- * ksocket_socket()/ksocket_accept() do for kernel-created sockets and which we
- * must set by hand for an adopted one.
- *
- * Reference counting (see ksocket_hold/ksocket_rele/ksocket_close):
- *   - a userland socket() starts at so_count == 1 and its vnode at v_count == 1
- *     (both held by the daemon's open fd);
- *   - ksocket_hold() bumps so_count so the sonode survives releasef() and the
- *     daemon's subsequent close(fd) (which only decrements so_count, not to 0);
- *   - VN_HOLD() bumps the underlying vnode's v_count for the same reason: the
- *     daemon's close(fd) does a vn_rele(), and without our hold v_count would
- *     drop to 0, so the vn_rele() in ksocket_close() -> socket_destroy() would
- *     underflow ("vp->v_count > 0" assertion panic).  A kernel-created socket
- *     owns exactly this vnode reference; an adopted one must take it too;
- *   - tcp_free_qpair() calls ksocket_close(), which waits for so_count to drain
- *     to 1 (our hold), performs the single owning close, and releases our
- *     VN_HOLD via socket_destroy() -> vn_rele().  We therefore do NOT also call
- *     ksocket_rele(): exactly one owning close is correct, and pairing
- *     rele()+close() would either panic (so_count < 2) or race the daemon's
- *     close.
+ * Take a hold on the open file behind the daemon's connected TCP socket and
+ * mark the socket as ours.  The hold keeps the socket whether or not the
+ * daemon closes its descriptor, and closef() gives it back without waiting.
  */
 static int
-tcp_adopt_socket_fd(uint64_t fd, ksocket_t *ksp)
+tcp_adopt_socket(uint64_t fd, file_t **fpp, ksocket_t *ksp)
 {
 	struct sonode *so;
+	file_t *fp;
 	int error = 0;
 
-	*ksp = NULL;
 	if (fd > INT_MAX)
 		return (EBADF);
 
-	so = getsonode((int)fd, &error, NULL);
+	so = getsonode((int)fd, &error, &fp);
 	if (so == NULL)
 		return (error != 0 ? error : EBADF);
 
-	/* The transport only drives connection-oriented stream sockets. */
-	if (so->so_type != SOCK_STREAM) {
-		releasef((int)fd);
-		return (ENOTSOCK);
-	}
-
-	/*
-	 * NVMe/TCP runs over IP only.  getsonode() already rejects non-sockets
-	 * and the SOCK_STREAM check above rejects datagram sockets, but a
-	 * connected AF_UNIX SOCK_STREAM fd would otherwise pass; refuse any
-	 * non-INET family so the framing engine never drives a local socket.
-	 */
-	if (so->so_family != AF_INET && so->so_family != AF_INET6) {
-		releasef((int)fd);
-		return (EAFNOSUPPORT);
-	}
-
-	/*
-	 * Mark the sonode kernel-owned and take the sonode + vnode references
-	 * that outlive the userland fd, then drop the fd hold from getsonode().
-	 * Order matters: the holds must be taken while the getf() reference still
-	 * pins the sonode, so a concurrent last close cannot free it underneath
-	 * us.
-	 */
 	mutex_enter(&so->so_lock);
-	so->so_mode |= SM_KERNEL;
+	if (fp->f_vnode != SOTOV(so) || fp->f_vnode->v_stream != NULL) {
+		error = EOPNOTSUPP;
+	} else if (so->so_type != SOCK_STREAM ||
+	    (so->so_family != AF_INET && so->so_family != AF_INET6) ||
+	    (so->so_protocol != 0 && so->so_protocol != IPPROTO_TCP)) {
+		error = EPROTONOSUPPORT;
+	} else if ((so->so_state & SS_ISCONNECTED) == 0) {
+		error = ENOTCONN;
+	} else if ((so->so_state & (SS_NDELAY | SS_NONBLOCK)) != 0) {
+		error = EINVAL;
+	} else if ((so->so_mode & SM_KERNEL) != 0) {
+		error = EBUSY;
+	} else {
+		/* The ksocket interfaces refuse a socket without this. */
+		so->so_mode |= SM_KERNEL;
+	}
 	mutex_exit(&so->so_lock);
 
-	*ksp = (ksocket_t)(uintptr_t)so;
-	ksocket_hold(*ksp);
-	VN_HOLD(SOTOV(so));
-	releasef((int)fd);
+	if (error == 0) {
+		struct timeval tv = { 0, 0 };
 
-	return (0);
+		mutex_enter(&fp->f_tlock);
+		fp->f_count++;
+		mutex_exit(&fp->f_tlock);
+		*fpp = fp;
+		*ksp = (ksocket_t)(uintptr_t)so;
+
+		/* The workers block; drop the daemon's handshake timeouts. */
+		(void) ksocket_setsockopt(*ksp, SOL_SOCKET, SO_RCVTIMEO, &tv,
+		    sizeof (tv), CRED());
+		(void) ksocket_setsockopt(*ksp, SOL_SOCKET, SO_SNDTIMEO, &tv,
+		    sizeof (tv), CRED());
+	}
+	releasef((int)fd);
+	return (error);
+}
+
+static void
+tcp_release_socket(nvmf_tcp_qpair_t *qp)
+{
+	struct sonode *so = (struct sonode *)(uintptr_t)qp->tq_so;
+
+	mutex_enter(&so->so_lock);
+	so->so_mode &= ~SM_KERNEL;
+	mutex_exit(&so->so_lock);
+	(void) closef(qp->tq_fp);
 }
 
 /*
- * Queue-pair lifecycle.
+ * Everything that can fail happens before the qpair exists.  The workers
+ * start in tcp_start_qpair(), once the core has set the callbacks.
  */
 static struct nvmf_qpair *
-tcp_allocate_qpair(boolean_t controller, const nvlist_t *nvl)
+tcp_allocate_qpair(boolean_t controller, const nvlist_t *params)
 {
+	nvlist_t *nvl = (nvlist_t *)params;
 	nvmf_tcp_qpair_t *qp;
+	file_t *fp;
 	ksocket_t so;
-	uint64_t fd, scratch, rxpda, txpda;
-	boolean_t bscratch;
-	int error;
+	uint64_t fd, rxpda, txpda, maxr2t, maxh2cdata, max_icd, qsize;
+	boolean_t header_digests, data_digests, sqfc;
+	uint32_t max_data;
 
-	/*
-	 * Confirm every required TCP-transport key is present and of the right
-	 * type.  illumos has no nvlist_exists_<type>() helpers; instead each
-	 * nvlist_lookup_<type>() returns 0 only when the key exists with the
-	 * matching type, which is the same gate FreeBSD's
-	 * nvlist_exists_number()/nvlist_exists_bool() express.
-	 */
-	if (nvlist_lookup_uint64((nvlist_t *)nvl, "fd", &fd) != 0 ||
-	    nvlist_lookup_uint64((nvlist_t *)nvl, "rxpda", &scratch) != 0 ||
-	    nvlist_lookup_uint64((nvlist_t *)nvl, "txpda", &scratch) != 0 ||
-	    nvlist_lookup_boolean_value((nvlist_t *)nvl, "header_digests",
-	    &bscratch) != 0 ||
-	    nvlist_lookup_boolean_value((nvlist_t *)nvl, "data_digests",
-	    &bscratch) != 0 ||
-	    nvlist_lookup_uint64((nvlist_t *)nvl, "maxr2t", &scratch) != 0 ||
-	    nvlist_lookup_uint64((nvlist_t *)nvl, "maxh2cdata", &scratch) != 0 ||
-	    nvlist_lookup_uint64((nvlist_t *)nvl, "max_icd", &scratch) != 0)
+	if (nvlist_lookup_uint64(nvl, "fd", &fd) != 0 ||
+	    nvlist_lookup_uint64(nvl, "rxpda", &rxpda) != 0 ||
+	    nvlist_lookup_uint64(nvl, "txpda", &txpda) != 0 ||
+	    nvlist_lookup_boolean_value(nvl, "header_digests",
+	    &header_digests) != 0 ||
+	    nvlist_lookup_boolean_value(nvl, "data_digests",
+	    &data_digests) != 0 ||
+	    nvlist_lookup_uint64(nvl, "maxr2t", &maxr2t) != 0 ||
+	    nvlist_lookup_uint64(nvl, "maxh2cdata", &maxh2cdata) != 0 ||
+	    nvlist_lookup_uint64(nvl, "max_icd", &max_icd) != 0 ||
+	    nvlist_lookup_uint64(nvl, "qsize", &qsize) != 0 ||
+	    nvlist_lookup_boolean_value(nvl, "sq_flow_control", &sqfc) != 0)
 		return (NULL);
 
-	/*
-	 * The PDAs come from a (potentially malicious) handoff nvlist and are
-	 * used as a modulus when validating a peer's PDU data offset, so a zero
-	 * PDA would be a divide-by-zero panic.  tq_rxpda/tq_txpda are uint8_t, so
-	 * a value that does not fit in a byte (e.g. 256) would truncate to zero
-	 * and slip past a bare "!= 0" check; reject anything that is zero or wider
-	 * than the field.  Done up front, before the socket is adopted, so there
-	 * is nothing to unwind.
-	 */
-	rxpda = fnvlist_lookup_uint64((nvlist_t *)nvl, "rxpda");
-	txpda = fnvlist_lookup_uint64((nvlist_t *)nvl, "txpda");
-	if (rxpda == 0 || (uint8_t)rxpda != rxpda ||
-	    txpda == 0 || (uint8_t)txpda != txpda)
+	if (!nvmf_tcp_params_ok(rxpda, txpda, maxr2t, maxh2cdata, max_icd,
+	    qsize))
 		return (NULL);
 
-	/*
-	 * Turn the userland file descriptor "fd" into a ksocket_t.  This runs in
-	 * the ioctl caller's process context (getsonode()/getf() resolve against
-	 * the calling process's open-file table), which is guaranteed because the
-	 * whole handoff path -- nvmft_drv_ioctl() -> nvmft_handoff_*_queue() ->
-	 * nvmft_qpair_init() -> nvmf_allocate_qpair() -> here -- is synchronous on
-	 * the ioctl thread.  (FreeBSD nvmf_tcp.c:tcp_allocate_qpair)
-	 */
-	error = tcp_adopt_socket_fd(fd, &so);
-	if (error != 0)
+	if (tcp_adopt_socket(fd, &fp, &so) != 0)
 		return (NULL);
 
 	qp = kmem_zalloc(sizeof (*qp), KM_SLEEP);
+	qp->tq_fp = fp;
 	qp->tq_so = so;
 	qp->tq_refs = 1;
 	qp->tq_txpda = (uint8_t)txpda;
 	qp->tq_rxpda = (uint8_t)rxpda;
-	qp->tq_header_digests = fnvlist_lookup_boolean_value((nvlist_t *)nvl,
-	    "header_digests");
-	qp->tq_data_digests = fnvlist_lookup_boolean_value((nvlist_t *)nvl,
-	    "data_digests");
-	qp->tq_maxr2t = (uint32_t)fnvlist_lookup_uint64((nvlist_t *)nvl,
-	    "maxr2t");
-	if (controller) {
-		qp->tq_maxh2cdata = (uint32_t)fnvlist_lookup_uint64(
-		    (nvlist_t *)nvl, "maxh2cdata");
-	}
-	qp->tq_max_tx_data = nvmf_tcp_max_transmit_data;
-	if (!controller) {
-		qp->tq_max_tx_data = (uint32_t)MIN(qp->tq_max_tx_data,
-		    fnvlist_lookup_uint64((nvlist_t *)nvl, "maxh2cdata"));
-		qp->tq_max_icd = (uint32_t)fnvlist_lookup_uint64((nvlist_t *)nvl,
-		    "max_icd");
-	}
+	qp->tq_header_digests = header_digests;
+	qp->tq_data_digests = data_digests;
+	qp->tq_maxr2t = (uint32_t)maxr2t;
+	qp->tq_max_tx_data = MAX(nvmf_tcp_max_transmit_data,
+	    NVMF_TCP_MIN_MAXH2CDATA);
 
 	if (controller) {
+		qp->tq_maxh2cdata = (uint32_t)maxh2cdata;
+		/* The handoff's max_icd is the host's limit, not ours. */
+		qp->tq_max_rx_icd = nvmf_tcp_max_icd;
+		max_data = MAX(qp->tq_maxh2cdata, qp->tq_max_rx_icd);
+
 		/* Use the SUCCESS flag if SQ flow control is disabled. */
-		qp->tq_send_success =
-		    !fnvlist_lookup_boolean_value((nvlist_t *)nvl,
-		    "sq_flow_control");
+		qp->tq_send_success = !sqfc;
 
 		/* NB: maxr2t is 0's based. */
 		qp->tq_num_ttags = (uint_t)MIN((uint64_t)UINT16_MAX + 1,
-		    fnvlist_lookup_uint64((nvlist_t *)nvl, "qsize") *
-		    ((uint64_t)qp->tq_maxr2t + 1));
+		    qsize * (maxr2t + 1));
 		qp->tq_open_ttags = kmem_zalloc(qp->tq_num_ttags *
 		    sizeof (*qp->tq_open_ttags), KM_SLEEP);
+	} else {
+		qp->tq_max_tx_data = (uint32_t)MIN(qp->tq_max_tx_data,
+		    maxh2cdata);
+		qp->tq_max_icd = (uint32_t)max_icd;
+		qp->tq_max_io = MAX(nvmf_tcp_max_io_size,
+		    NVMF_TCP_MIN_MAXH2CDATA);
+		max_data = qp->tq_max_io;
 	}
+	qp->tq_max_rx_pdu = nvmf_tcp_rx_limit(max_data, qp->tq_rxpda,
+	    header_digests, data_digests);
 
 	list_create(&qp->tq_rx_buffers.tcbl_list,
 	    sizeof (nvmf_tcp_command_buffer_t),
@@ -1938,6 +1694,7 @@ tcp_allocate_qpair(boolean_t controller, const nvlist_t *nvl)
 	    offsetof(nvmf_tcp_command_buffer_t, tcb_link));
 	mutex_init(&qp->tq_rx_buffers.tcbl_lock, NULL, MUTEX_DRIVER, NULL);
 	mutex_init(&qp->tq_tx_buffers.tcbl_lock, NULL, MUTEX_DRIVER, NULL);
+	cv_init(&qp->tq_cancel_cv, NULL, CV_DRIVER, NULL);
 	list_create(&qp->tq_tx_capsules, sizeof (nvmf_tcp_capsule_t),
 	    offsetof(nvmf_tcp_capsule_t, tc_link));
 
@@ -1945,61 +1702,79 @@ tcp_allocate_qpair(boolean_t controller, const nvlist_t *nvl)
 	mutex_init(&qp->tq_tx_lock, NULL, MUTEX_DRIVER, NULL);
 	cv_init(&qp->tq_rx_cv, NULL, CV_DRIVER, NULL);
 	cv_init(&qp->tq_tx_cv, NULL, CV_DRIVER, NULL);
+	cv_init(&qp->tq_tx_done_cv, NULL, CV_DRIVER, NULL);
 
 	qp->tq_tx_taskq = taskq_create("nvmf_tcp_tx", 1, minclsyspri, 1, 1,
 	    TASKQ_PREPOPULATE);
 	qp->tq_rx_taskq = taskq_create("nvmf_tcp_rx", 1, minclsyspri, 1, 1,
 	    TASKQ_PREPOPULATE);
 
-	/*
-	 * Spin up the persistent tx worker and register the event-driven receive
-	 * callback, replacing FreeBSD's kthread_add()+soupcall_set(SO_RCV) pair.
-	 * The single tx worker runs for the life of the qpair (woken by tq_tx_cv)
-	 * just like FreeBSD's tx kthread, so write_pdu()/transmit_capsule() only
-	 * need to signal it.
-	 *
-	 * tq_so is now bound to the adopted socket (tcp_adopt_socket_fd() above
-	 * returned non-NULL or we would have bailed).  A TQ_SLEEP dispatch into a
-	 * single-thread taskq cannot fail; if ksocket_krecv_set() fails, tear the
-	 * qpair back down (which ksocket_close()s the adopted socket) and return
-	 * NULL.
-	 */
-	(void) taskq_dispatch(qp->tq_tx_taskq, nvmf_tcp_so_tx, qp, TQ_SLEEP);
-	(void) taskq_dispatch(qp->tq_rx_taskq, nvmf_tcp_so_rx, qp, TQ_SLEEP);
-	if (ksocket_krecv_set(qp->tq_so, nvmf_tcp_krecv, qp) != 0) {
-		tcp_free_qpair(&qp->qp);
-		return (NULL);
-	}
-	qp->tq_krecv_set = B_TRUE;
-
 	return (&qp->qp);
 }
 
 static void
-tcp_release_qpair(nvmf_tcp_qpair_t *qp)
+tcp_start_qpair(struct nvmf_qpair *nq)
 {
-	if (nvmf_tcp_refcount_release(&qp->tq_refs)) {
-		if (qp->tq_open_ttags != NULL) {
-			kmem_free(qp->tq_open_ttags, qp->tq_num_ttags *
-			    sizeof (*qp->tq_open_ttags));
-		}
-		list_destroy(&qp->tq_rx_buffers.tcbl_list);
-		list_destroy(&qp->tq_tx_buffers.tcbl_list);
-		list_destroy(&qp->tq_tx_capsules);
-		mutex_destroy(&qp->tq_rx_buffers.tcbl_lock);
-		mutex_destroy(&qp->tq_tx_buffers.tcbl_lock);
-		mutex_destroy(&qp->tq_rx_lock);
-		mutex_destroy(&qp->tq_tx_lock);
-		cv_destroy(&qp->tq_rx_cv);
-		cv_destroy(&qp->tq_tx_cv);
-		if (qp->tq_tx_taskq != NULL)
-			taskq_destroy(qp->tq_tx_taskq);
-		if (qp->tq_rx_taskq != NULL)
-			taskq_destroy(qp->tq_rx_taskq);
-		kmem_free(qp, sizeof (*qp));
-	}
+	nvmf_tcp_qpair_t *qp = TQP(nq);
+
+	mutex_enter(&qp->tq_tx_lock);
+	qp->tq_started = B_TRUE;
+	mutex_exit(&qp->tq_tx_lock);
+
+	(void) taskq_dispatch(qp->tq_tx_taskq, nvmf_tcp_so_tx, qp, TQ_SLEEP);
+	(void) taskq_dispatch(qp->tq_rx_taskq, nvmf_tcp_so_rx, qp, TQ_SLEEP);
 }
 
+/* The last reference can be a capsule's, in any context. */
+static void
+tcp_release_qpair(nvmf_tcp_qpair_t *qp)
+{
+	if (!nvmf_tcp_refcount_release(&qp->tq_refs))
+		return;
+
+	if (qp->tq_open_ttags != NULL) {
+		kmem_free(qp->tq_open_ttags, qp->tq_num_ttags *
+		    sizeof (*qp->tq_open_ttags));
+	}
+	list_destroy(&qp->tq_rx_buffers.tcbl_list);
+	list_destroy(&qp->tq_tx_buffers.tcbl_list);
+	list_destroy(&qp->tq_tx_capsules);
+	mutex_destroy(&qp->tq_rx_buffers.tcbl_lock);
+	mutex_destroy(&qp->tq_tx_buffers.tcbl_lock);
+	mutex_destroy(&qp->tq_rx_lock);
+	mutex_destroy(&qp->tq_tx_lock);
+	cv_destroy(&qp->tq_cancel_cv);
+	cv_destroy(&qp->tq_rx_cv);
+	cv_destroy(&qp->tq_tx_cv);
+	cv_destroy(&qp->tq_tx_done_cv);
+	kmem_free(qp, sizeof (*qp));
+}
+
+/*
+ * Complete a controller receive buffer that is off the lists.  Called with
+ * tcbl_lock held, which is dropped for the callback.
+ */
+static void
+tcp_abort_rx_buffer(nvmf_tcp_qpair_t *qp, nvmf_tcp_command_buffer_t *cb)
+{
+	nvmf_tcp_capsule_t *tc = cb->tcb_tc;
+
+	ASSERT(MUTEX_HELD(&qp->tq_rx_buffers.tcbl_lock));
+	if (tc != NULL)
+		tcp_rx_busy_enter(qp, tc);
+	mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
+	cb->tcb_error = ECONNABORTED;
+	tcp_release_command_buffer(cb);
+	if (tc != NULL)
+		tcp_rx_busy_exit(qp, tc);
+	mutex_enter(&qp->tq_rx_buffers.tcbl_lock);
+}
+
+/*
+ * Only the two workers use the socket.  Each is stopped and joined here
+ * before the state it uses goes away, and every transfer still registered
+ * completes before this returns.
+ */
 static void
 tcp_free_qpair(struct nvmf_qpair *nq)
 {
@@ -2007,69 +1782,40 @@ tcp_free_qpair(struct nvmf_qpair *nq)
 	nvmf_tcp_command_buffer_t *cb;
 	nvmf_tcp_capsule_t *tc;
 	mblk_t *pmp;
+	clock_t deadline;
 
-	/*
-	 * Quiesce RX, then mark shutdown and wake the rx worker so it exits
-	 * before we touch the state it consumes.  Order matters:
-	 * ksocket_krecv_unblock() releases any receive backpressure the socket
-	 * asserted, but so_krecv_unblock() VERIFYs the krecv callback is still
-	 * set, so it MUST run before ksocket_krecv_set(NULL) clears the callback.
-	 * Clearing first and then unblocking panics the kernel (so_krecv_cb ==
-	 * NULL, sockcommon_subr.c).  A krecv upcall racing between the two calls
-	 * is harmless: it only accumulates under tq_rx_lock and the worker is
-	 * shut down immediately below.
-	 *
-	 * Only unblock if the callback was actually installed: the allocate-qpair
-	 * error path frees a qpair whose ksocket_krecv_set() failed (e.g. ENOTSUP
-	 * on a fallback socket), leaving so_krecv_cb NULL -- unblocking that socket
-	 * would trip the same VERIFY.
-	 */
-	if (qp->tq_so != NULL) {
-		if (qp->tq_krecv_set)
-			ksocket_krecv_unblock(qp->tq_so);
-		(void) ksocket_krecv_set(qp->tq_so, NULL, NULL);
-
-		/*
-		 * Shut the socket down for both directions before waiting on the
-		 * workers.  The tx worker does a BLOCKING ksocket_sendmblk() and
-		 * only checks tq_tx_shutdown at its outer loop, so if the peer
-		 * vanished without a RST (e.g. keepalive timeout) it can be parked
-		 * indefinitely in so_snd_wait_qnotfull() with the send window
-		 * full; cv_signal(tq_tx_cv) does not reach it there.  socantsendmore
-		 * via shutdown broadcasts so_snd_cv, so the blocked send returns
-		 * EPIPE, the worker exits, and taskq_wait() below cannot hang the
-		 * (single-threaded) ns_taskq teardown thread.  ksocket_close() at
-		 * the end still does the owning close + vn_rele.
-		 */
-		(void) ksocket_shutdown(qp->tq_so, SHUT_RDWR, CRED());
-	}
-
+	/* The shutdown ends a receive that the rx worker sleeps in. */
 	mutex_enter(&qp->tq_rx_lock);
 	qp->tq_rx_shutdown = B_TRUE;
-	cv_signal(&qp->tq_rx_cv);
+	cv_broadcast(&qp->tq_rx_cv);
 	mutex_exit(&qp->tq_rx_lock);
-	if (qp->tq_rx_taskq != NULL)
-		taskq_wait(qp->tq_rx_taskq);
-
-	/* The rx worker has exited; free any partial PDU it left buffered. */
-	mutex_enter(&qp->tq_rx_lock);
-	freemsg(qp->tq_rx_mp);
-	qp->tq_rx_mp = NULL;
-	qp->tq_rx_have_header = B_FALSE;
-	mutex_exit(&qp->tq_rx_lock);
+	(void) ksocket_shutdown(qp->tq_so, SHUT_RD, CRED());
+	taskq_wait(qp->tq_rx_taskq);
 
 	/*
-	 * Stop the TX worker and wait for it to drain off the taskq before we
-	 * touch the tx queues it consumes.
+	 * Give the tx worker a bounded time to pass what is queued to the
+	 * socket.  The shutdown then ends a send that it still sleeps in.
 	 */
 	mutex_enter(&qp->tq_tx_lock);
+	if (qp->tq_started) {
+		qp->tq_tx_draining = B_TRUE;
+		cv_broadcast(&qp->tq_tx_cv);
+		deadline = ddi_get_lbolt() + SEC_TO_TICK(nvmf_tcp_drain_secs);
+		while (!qp->tq_tx_exited) {
+			if (cv_timedwait(&qp->tq_tx_done_cv, &qp->tq_tx_lock,
+			    deadline) == -1)
+				break;
+		}
+	}
 	qp->tq_tx_shutdown = B_TRUE;
-	cv_signal(&qp->tq_tx_cv);
+	cv_broadcast(&qp->tq_tx_cv);
 	mutex_exit(&qp->tq_tx_lock);
-	if (qp->tq_tx_taskq != NULL)
-		taskq_wait(qp->tq_tx_taskq);
+	(void) ksocket_shutdown(qp->tq_so, SHUT_WR, CRED());
+	taskq_wait(qp->tq_tx_taskq);
 
-	/* Drain any PDUs that were queued but never sent. */
+	taskq_destroy(qp->tq_rx_taskq);
+	taskq_destroy(qp->tq_tx_taskq);
+
 	mutex_enter(&qp->tq_tx_lock);
 	while ((pmp = qp->tq_tx_pdus_head) != NULL) {
 		qp->tq_tx_pdus_head = pmp->b_next;
@@ -2077,40 +1823,31 @@ tcp_free_qpair(struct nvmf_qpair *nq)
 		freemsg(pmp);
 	}
 	qp->tq_tx_pdus_tail = NULL;
-	mutex_exit(&qp->tq_tx_lock);
-
 	while ((tc = list_remove_head(&qp->tq_tx_capsules)) != NULL) {
+		mutex_exit(&qp->tq_tx_lock);
 		nvmf_abort_capsule_data(&tc->nc, ECONNABORTED);
 		tcp_release_capsule(tc);
+		mutex_enter(&qp->tq_tx_lock);
 	}
-
-	if (qp->tq_open_ttags != NULL) {
-		for (uint_t i = 0; i < qp->tq_num_ttags; i++) {
-			cb = qp->tq_open_ttags[i];
-			if (cb != NULL) {
-				cb->tcb_tc->tc_active_r2ts--;
-				cb->tcb_error = ECONNABORTED;
-				tcp_release_command_buffer(cb);
-			}
-		}
-	}
+	mutex_exit(&qp->tq_tx_lock);
 
 	mutex_enter(&qp->tq_rx_buffers.tcbl_lock);
+	qp->tq_rx_closed = B_TRUE;
+	for (uint_t i = 0; i < qp->tq_num_ttags; i++) {
+		cb = qp->tq_open_ttags[i];
+		if (cb == NULL)
+			continue;
+		qp->tq_open_ttags[i] = NULL;
+		qp->tq_active_ttags--;
+		cb->tcb_tc->tc_active_r2ts--;
+		tcp_abort_rx_buffer(qp, cb);
+	}
 	while ((cb = list_remove_head(&qp->tq_rx_buffers.tcbl_list)) != NULL) {
-		mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
-		/*
-		 * A buffer queued here by tcp_receive_r2t_data() bumped its
-		 * capsule's pending_r2ts (DEBUG-only accounting); undo that
-		 * before releasing so tcp_release_capsule()'s assert holds.
-		 * (FreeBSD nvmf_tcp.c tcp_free_qpair).
-		 */
 #ifdef DEBUG
 		if (cb->tcb_tc != NULL)
 			cb->tcb_tc->tc_pending_r2ts--;
 #endif
-		cb->tcb_error = ECONNABORTED;
-		tcp_release_command_buffer(cb);
-		mutex_enter(&qp->tq_rx_buffers.tcbl_lock);
+		tcp_abort_rx_buffer(qp, cb);
 	}
 	mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
 
@@ -2123,24 +1860,24 @@ tcp_free_qpair(struct nvmf_qpair *nq)
 	}
 	mutex_exit(&qp->tq_tx_buffers.tcbl_lock);
 
-	if (qp->tq_so != NULL)
-		(void) ksocket_close(qp->tq_so, CRED());
-
+	tcp_release_socket(qp);
 	tcp_release_qpair(qp);
 }
 
-/* ARGSUSED */
 static uint32_t
 tcp_max_ioccsz(struct nvmf_qpair *nq)
 {
-	return (0);
+	nvmf_tcp_qpair_t *qp = TQP(nq);
+
+	if (!nq->nq_controller)
+		return (0);
+	return ((uint32_t)sizeof (nvme_sqe_t) + qp->tq_max_rx_icd);
 }
 
-/* ARGSUSED */
 static uint64_t
 tcp_max_xfer_size(struct nvmf_qpair *nq)
 {
-	return (0);
+	return (TQP(nq)->tq_max_io);
 }
 
 /* ARGSUSED */
@@ -2194,8 +1931,12 @@ tcp_transmit_capsule(struct nvmf_capsule *nc)
 	nvmf_tcp_qpair_t *qp = TQP(nc->nc_qpair);
 	nvmf_tcp_capsule_t *tc = TCAP(nc);
 
-	nvmf_tcp_refcount_acquire(&tc->tc_refs);
 	mutex_enter(&qp->tq_tx_lock);
+	if (qp->tq_tx_shutdown) {
+		mutex_exit(&qp->tq_tx_lock);
+		return (ECONNABORTED);
+	}
+	nvmf_tcp_refcount_acquire(&tc->tc_refs);
 	list_insert_tail(&qp->tq_tx_capsules, tc);
 	cv_signal(&qp->tq_tx_cv);
 	mutex_exit(&qp->tq_tx_lock);
@@ -2257,11 +1998,7 @@ tcp_capsule_data_len(const struct nvmf_capsule *nc)
 	return (LE_32(nc->nc_sqe.sqe_dptr.d_sgl.sgl_len));
 }
 
-/*
- * Controller-side receive of command data (e.g. for a WRITE): either copy
- * in-capsule data already present in the received PDU, or kick off an R2T
- * to pull the data from the host.
- */
+/* Receive command data from the host with an R2T. */
 static void
 tcp_receive_r2t_data(struct nvmf_capsule *nc, uint32_t data_offset,
     struct nvmf_io_request *io)
@@ -2270,17 +2007,29 @@ tcp_receive_r2t_data(struct nvmf_capsule *nc, uint32_t data_offset,
 	nvmf_tcp_capsule_t *tc = TCAP(nc);
 	nvmf_tcp_command_buffer_t *cb;
 
+	if (io->io_len == 0) {
+		nvmf_complete_io_request(io, 0, 0);
+		return;
+	}
+
 	cb = tcp_alloc_command_buffer(qp, io, data_offset, io->io_len,
 	    nc->nc_sqe.sqe_cid);
 
 	cb->tcb_tc = tc;
 	nvmf_tcp_refcount_acquire(&tc->tc_refs);
 
+	mutex_enter(&qp->tq_rx_buffers.tcbl_lock);
+	if (qp->tq_rx_closed) {
+		mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
+		cb->tcb_error = ECONNABORTED;
+		tcp_release_command_buffer(cb);
+		return;
+	}
+
 	/*
 	 * If this command has too many active R2Ts or there are no available
 	 * transfer tags, queue the request for later.  NB: maxr2t is 0's based.
 	 */
-	mutex_enter(&qp->tq_rx_buffers.tcbl_lock);
 	if (tc->tc_active_r2ts > qp->tq_maxr2t ||
 	    qp->tq_active_ttags == qp->tq_num_ttags) {
 #ifdef DEBUG
@@ -2314,6 +2063,7 @@ static int
 tcp_receive_controller_data(struct nvmf_capsule *nc, uint32_t data_offset,
     struct nvmf_io_request *io)
 {
+	nvmf_tcp_capsule_t *tc = TCAP(nc);
 	nvme_sgl_t *sgl;
 	size_t data_len;
 	uint8_t sgl_type;
@@ -2328,11 +2078,97 @@ tcp_receive_controller_data(struct nvmf_capsule *nc, uint32_t data_offset,
 		return (EFBIG);
 
 	sgl_type = (uint8_t)((sgl->sgl_type << 4) | sgl->sgl_zero);
-	if (sgl_type == NVME_SGL_TYPE_ICD)
+	if (sgl_type == NVME_SGL_TYPE_ICD) {
+		/* The SGL length is the caller's to check against the PDU. */
+		if (data_len > tc->tc_rx_pdu.rp_data_len)
+			return (EFBIG);
 		tcp_receive_icd_data(nc, data_offset, io);
-	else
+	} else {
 		tcp_receive_r2t_data(nc, data_offset, io);
+	}
 	return (0);
+}
+
+/* An uncompleted receive buffer of tc, from either place one can be. */
+static nvmf_tcp_command_buffer_t *
+tcp_find_rx_buffer(nvmf_tcp_qpair_t *qp, nvmf_tcp_capsule_t *tc,
+    boolean_t *queuedp)
+{
+	nvmf_tcp_command_buffer_t *cb;
+
+	ASSERT(MUTEX_HELD(&qp->tq_rx_buffers.tcbl_lock));
+
+	for (cb = list_head(&qp->tq_rx_buffers.tcbl_list); cb != NULL;
+	    cb = list_next(&qp->tq_rx_buffers.tcbl_list, cb)) {
+		if (cb->tcb_tc == tc && !cb->tcb_done) {
+			*queuedp = B_TRUE;
+			return (cb);
+		}
+	}
+
+	*queuedp = B_FALSE;
+	if (tc->tc_active_r2ts == 0)
+		return (NULL);
+	for (uint_t i = 0; i < qp->tq_num_ttags; i++) {
+		cb = qp->tq_open_ttags[i];
+		if (cb != NULL && cb->tcb_tc == tc && !cb->tcb_done)
+			return (cb);
+	}
+	return (NULL);
+}
+
+/*
+ * See nvmf_cancel_controller_data().  A buffer whose R2T went out stays under
+ * its transfer tag, marked done, so that the data the host still sends for it
+ * is taken and dropped.
+ */
+static void
+tcp_cancel_controller_data(struct nvmf_capsule *nc)
+{
+	nvmf_tcp_qpair_t *qp = TQP(nc->nc_qpair);
+	nvmf_tcp_capsule_t *tc = TCAP(nc);
+	nvmf_tcp_command_buffer_t *cb;
+	struct nvmf_io_request io;
+	size_t xfered;
+	boolean_t queued;
+
+	if (nc->nc_qe_len != sizeof (nvme_sqe_t) ||
+	    !nc->nc_qpair->nq_controller)
+		return;
+
+	mutex_enter(&qp->tq_rx_buffers.tcbl_lock);
+	for (;;) {
+		/* Nobody copies into or completes a buffer of tc now. */
+		while (tc->tc_rx_busy != 0) {
+			cv_wait(&qp->tq_cancel_cv,
+			    &qp->tq_rx_buffers.tcbl_lock);
+		}
+
+		cb = tcp_find_rx_buffer(qp, tc, &queued);
+		if (cb == NULL)
+			break;
+
+		cb->tcb_done = B_TRUE;
+		io = cb->tcb_io;
+		xfered = cb->tcb_data_xfered;
+		if (queued) {
+			list_remove(&qp->tq_rx_buffers.tcbl_list, cb);
+#ifdef DEBUG
+			tc->tc_pending_r2ts--;
+#endif
+		}
+		tc->tc_rx_busy++;
+		mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
+
+		nvmf_complete_io_request(&io, xfered, ECANCELED);
+		if (queued)
+			tcp_release_command_buffer(cb);
+
+		mutex_enter(&qp->tq_rx_buffers.tcbl_lock);
+		tc->tc_rx_busy--;
+		cv_broadcast(&qp->tq_cancel_cv);
+	}
+	mutex_exit(&qp->tq_rx_buffers.tcbl_lock);
 }
 
 /* NB: cid is little-endian already. */
@@ -2345,8 +2181,10 @@ tcp_send_c2h_pdu(nvmf_tcp_qpair_t *qp, uint16_t cid, uint32_t data_offset,
 
 	bzero(&c2h, sizeof (c2h));
 	c2h.ntc2c_common.ntcph_pdu_type = NVMF_TCP_PDU_TYPE_C2H_DATA;
-	if (last_pdu)
-		c2h.ntc2c_common.ntcph_flags |= NVMF_TCP_C2H_DATA_FLAGS_LAST_PDU;
+	if (last_pdu) {
+		c2h.ntc2c_common.ntcph_flags |=
+		    NVMF_TCP_C2H_DATA_FLAGS_LAST_PDU;
+	}
 	if (success)
 		c2h.ntc2c_common.ntcph_flags |= NVMF_TCP_C2H_DATA_FLAGS_SUCCESS;
 	c2h.ntc2c_cccid = cid;
@@ -2355,15 +2193,10 @@ tcp_send_c2h_pdu(nvmf_tcp_qpair_t *qp, uint16_t cid, uint32_t data_offset,
 
 	top = nvmf_tcp_construct_pdu(qp, &c2h, sizeof (c2h), mp,
 	    (uint32_t)len);
-	if (top != NULL)
-		nvmf_tcp_write_pdu(qp, top);
+	nvmf_tcp_write_pdu(qp, top);
 }
 
-/*
- * Controller-side send of response data (e.g. for a READ), as one or more
- * C2H_DATA PDUs.  The mblk chain in 'mp' is consumed by this function even on
- * error, matching the contract in nvmf_send_controller_data().
- */
+/* Send command data to the host as C2H_DATA PDUs.  mp is always consumed. */
 static uint_t
 tcp_send_controller_data(struct nvmf_capsule *nc, uint32_t data_offset,
     mblk_t *mp, size_t len)
@@ -2403,13 +2236,6 @@ tcp_send_controller_data(struct nvmf_capsule *nc, uint32_t data_offset,
 	ASSERT3U(data_offset, ==, TCAP(nc)->tc_tx_data_offset);
 #endif
 
-	/*
-	 * Emit one or more C2H_DATA PDUs of at most tq_max_tx_data bytes each,
-	 * splitting the mblk chain at byte boundaries (FreeBSD walks the mbuf
-	 * chain with m_split()).  LAST_PDU (and the implicit-SUCCESS flag, when
-	 * tq_send_success is set) is set on the final chunk of the final
-	 * transfer.
-	 */
 	while (len > 0) {
 		mblk_t *chunk;
 		boolean_t last_pdu;
@@ -2445,13 +2271,10 @@ tcp_send_controller_data(struct nvmf_capsule *nc, uint32_t data_offset,
 		return (NVME_CQE_SC_GEN_SUCCESS);
 }
 
-/*
- * The transport-ops vtable.  Shape is identical to FreeBSD's tcp_ops; the
- * data-movement entry points carry the mblk_t seam.
- */
 static struct nvmf_transport_ops tcp_ops = {
 	.allocate_qpair = tcp_allocate_qpair,
 	.free_qpair = tcp_free_qpair,
+	.start_qpair = tcp_start_qpair,
 	.max_ioccsz = tcp_max_ioccsz,
 	.max_xfer_size = tcp_max_xfer_size,
 	.allocate_capsule = tcp_allocate_capsule,
@@ -2460,17 +2283,13 @@ static struct nvmf_transport_ops tcp_ops = {
 	.validate_command_capsule = tcp_validate_command_capsule,
 	.capsule_data_len = tcp_capsule_data_len,
 	.receive_controller_data = tcp_receive_controller_data,
+	.cancel_controller_data = tcp_cancel_controller_data,
 	.send_controller_data = tcp_send_controller_data,
 	.caps = tcp_caps,
 	.trtype = NVMF_TRTYPE_TCP,
 	.priority = 0,
 };
 
-/*
- * Module linkage.  FreeBSD hangs registration off the NVMF_TRANSPORT() macro and
- * the kernel module event handler; illumos registers explicitly from _init() and
- * unregisters from _fini() against the transport core (see nvmf_transport.c).
- */
 static struct modlmisc nvmf_tcp_modlmisc = {
 	&mod_miscops,
 	"NVMe over Fabrics TCP transport"
@@ -2486,16 +2305,16 @@ _init(void)
 {
 	int error;
 
-	/* Build the CRC-32C (Castagnoli) digest table used for HDGST/DDGST. */
 	CRC32_INIT(nvmf_tcp_crc32c_table, NVMF_TCP_CRC32C_POLY);
 
-	error = nvmf_transport_register(&tcp_ops);
+	/* Register last, so that there is nothing to undo with qpairs live. */
+	error = mod_install(&nvmf_tcp_modlinkage);
 	if (error != 0)
 		return (error);
 
-	error = mod_install(&nvmf_tcp_modlinkage);
+	error = nvmf_transport_register(&tcp_ops);
 	if (error != 0)
-		(void) nvmf_transport_unregister(&tcp_ops);
+		(void) mod_remove(&nvmf_tcp_modlinkage);
 
 	return (error);
 }
@@ -2505,12 +2324,7 @@ _fini(void)
 {
 	int error;
 
-	/*
-	 * Refuse to unload while the transport core still has live qpairs from
-	 * this provider; nvmf_transport_unregister() enforces that and returns
-	 * EBUSY if so.  Check it before mod_remove() so we do not unlink the
-	 * module while still registered.
-	 */
+	/* EBUSY while a qpair or capsule of this transport exists. */
 	error = nvmf_transport_unregister(&tcp_ops);
 	if (error != 0)
 		return (error);

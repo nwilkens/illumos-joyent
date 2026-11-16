@@ -16,6 +16,7 @@ TESTS = (
     "send_once.py",
     "sgl_decode.py",
     "tcp_limits.py",
+    "tcp_xfer.py",
 )
 
 

@@ -16,6 +16,8 @@
 /*
  * Run the NVMe/TCP transport's data range check against a model that uses
  * 128-bit arithmetic, on the R2T that wraps a 32-bit sum and on random input.
+ * Check the handoff limits and that the receive limit is the longest PDU a
+ * peer can build from the largest allowed data.
  */
 #include "tcp_limits.h"
 
@@ -52,10 +54,71 @@ pick(void)
 	return (edge[(r >> 8) % ARRAY_SIZE(edge)]);
 }
 
+/* The length of a PDU with this header that carries len bytes of data. */
+static uint64_t
+pdu_len(unsigned hlen, uint32_t len, unsigned pda, boolean_t hd, boolean_t dd)
+{
+	uint64_t plen = hlen + (hd ? 4 : 0);
+
+	if (len == 0)
+		return (plen);
+	while (plen % pda != 0)
+		plen++;
+	return (plen + len + (dd ? 4 : 0));
+}
+
+static void
+limits(void)
+{
+	static const uint32_t datas[] = { 0, 1, 4096, 16384, 262144, 1 << 20,
+	    0xfffffff0 };
+	static const unsigned hdrs[] = { 72, 24 };
+	unsigned pda, hd, dd, d, h;
+
+	assert(nvmf_tcp_params_ok(4, 4, 0, 4096, 0, 2));
+	assert(nvmf_tcp_params_ok(128, 128, 0xfffffffe, 0xfffffffc,
+	    0xffffffff, 65536));
+	assert(!nvmf_tcp_params_ok(0, 4, 0, 4096, 0, 2));
+	assert(!nvmf_tcp_params_ok(4, 0, 0, 4096, 0, 2));
+	assert(!nvmf_tcp_params_ok(256, 4, 0, 4096, 0, 2));
+	assert(!nvmf_tcp_params_ok(4, 132, 0, 4096, 0, 2));
+	assert(!nvmf_tcp_params_ok(6, 4, 0, 4096, 0, 2));
+	assert(!nvmf_tcp_params_ok(4, 4, 0xffffffff, 4096, 0, 2));
+	assert(!nvmf_tcp_params_ok(4, 4, 0, 0, 0, 2));
+	assert(!nvmf_tcp_params_ok(4, 4, 0, 4092, 0, 2));
+	assert(!nvmf_tcp_params_ok(4, 4, 0, 4098, 0, 2));
+	assert(!nvmf_tcp_params_ok(4, 4, 0, 0x100000000ULL, 0, 2));
+	assert(!nvmf_tcp_params_ok(4, 4, 0, 4096, 0x100000000ULL, 2));
+	assert(!nvmf_tcp_params_ok(4, 4, 0, 4096, 0, 1));
+	assert(!nvmf_tcp_params_ok(4, 4, 0, 4096, 0, 65537));
+
+	for (pda = 4; pda <= 128; pda += 4) {
+		for (hd = 0; hd < 2; hd++) {
+			for (dd = 0; dd < 2; dd++) {
+				for (d = 0; d < ARRAY_SIZE(datas); d++) {
+					uint32_t lim = nvmf_tcp_rx_limit(
+					    datas[d], pda, hd, dd);
+					uint64_t most = 152;
+
+					for (h = 0; h < ARRAY_SIZE(hdrs); h++) {
+						uint64_t l = pdu_len(hdrs[h],
+						    datas[d], pda, hd, dd);
+
+						most = MAX(most, l);
+					}
+					assert(lim == MIN(most, UINT32_MAX));
+				}
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
 	unsigned i;
+
+	limits();
 
 	/* An 8K write; the second R2T asks for 4 GiB less 4095 bytes. */
 	assert(nvmf_tcp_range_ok(0, 4096, 0, 8192));
