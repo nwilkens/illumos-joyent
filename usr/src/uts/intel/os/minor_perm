@@ -225,6 +225,8 @@ tavor:* 0666 root sys
 zfs:* 0600 root sys
 zfs:zfs 0666 root sys
 iscsit:* 0600 root sys
+nvmf_host:* 0600 root sys
+nvmft:* 0600 root sys
 dnet:* 0666 root sys
 clone:dnet 0666 root sys
 elxl:* 0666 root sys
