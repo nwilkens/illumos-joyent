@@ -1152,6 +1152,44 @@ stmf_get_ent_from_map(stmf_lun_map_t *sm, uint16_t lun_num)
 	return (NULL);
 }
 
+/*
+ * Find the first LUN at or above *lunp that is mapped for the session.  On
+ * success *lunp is that LUN and, if id is not NULL, the LU's identifier is
+ * copied to id, zero padded or truncated to len bytes.
+ */
+stmf_status_t
+stmf_session_next_lun(stmf_scsi_session_t *ss, uint16_t *lunp, uint8_t *id,
+    size_t len)
+{
+	stmf_i_scsi_session_t *iss = ss->ss_stmf_private;
+	stmf_lun_map_ent_t *ent;
+	stmf_lun_map_t *sm;
+	stmf_status_t ret = STMF_NOT_FOUND;
+	uint32_t n;
+
+	rw_enter(iss->iss_lockp, RW_READER);
+	sm = iss->iss_sm;
+	for (n = *lunp; sm != NULL && n < sm->lm_nentries; n++) {
+		ent = stmf_get_ent_from_map(sm, (uint16_t)n);
+		if (ent == NULL || ent->ent_lu == NULL)
+			continue;
+		if (id != NULL) {
+			scsi_devid_desc_t *lu_id = ent->ent_lu->lu_id;
+
+			bzero(id, len);
+			if (lu_id != NULL && lu_id->ident_length < len)
+				len = lu_id->ident_length;
+			if (lu_id != NULL)
+				bcopy(lu_id->ident, id, len);
+		}
+		*lunp = (uint16_t)n;
+		ret = STMF_SUCCESS;
+		break;
+	}
+	rw_exit(iss->iss_lockp);
+	return (ret);
+}
+
 int
 stmf_add_ve(uint8_t *hgname, uint16_t hgname_size,
     uint8_t *tgname, uint16_t tgname_size,
