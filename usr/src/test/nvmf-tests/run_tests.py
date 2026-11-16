@@ -10,6 +10,7 @@ TESTS = (
     "admin_queue.py",
     "adopt_lifecycle.py",
     "connect_checks.py",
+    "ctrlr_teardown.py",
     "identify_sgls.py",
     "io_checks.py",
     "local_checks.py",
