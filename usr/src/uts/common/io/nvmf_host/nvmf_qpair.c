@@ -178,7 +178,6 @@ nvmf_dispatch_command(nvmf_host_qpair_t *qp, nvmf_host_command_t *cmd)
 	 * there can never be too many commands in flight.
 	 */
 	new_sqtail = (qp->sqtail + 1) % (qp->num_commands + 1);
-	ASSERT(new_sqtail != qp->sqhd);
 	qp->sqtail = new_sqtail;
 	mutex_exit(&qp->lock);
 
@@ -241,6 +240,16 @@ nvmf_receive_capsule(void *arg, struct nvmf_capsule *nc)
 	if (cid >= qp->num_commands) {
 		dev_err(sc->dip, CE_WARN,
 		    "!received invalid CID %u, disconnecting", cid);
+		nvmf_disconnect(sc);
+		nvmf_free_capsule(nc);
+		return;
+	}
+
+	if (qp->sq_flow_control && nvmf_sqhd_valid(nc) &&
+	    cqe->cqe_sqhd > qp->num_commands) {
+		dev_err(sc->dip, CE_WARN,
+		    "!received invalid SQ head %u, disconnecting",
+		    cqe->cqe_sqhd);
 		nvmf_disconnect(sc);
 		nvmf_free_capsule(nc);
 		return;
