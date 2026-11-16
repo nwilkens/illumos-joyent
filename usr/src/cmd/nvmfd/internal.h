@@ -20,36 +20,22 @@
  * Original: Copyright (c) 2023-2024 Chelsio Communications, Inc.
  *           Written by: John Baldwin <jhb@FreeBSD.org>
  *           SPDX-License-Identifier: BSD-2-Clause
- *
- * nvmfd is the userland NVMe-over-Fabrics target daemon.  It listens on TCP
- * for both the Discovery controller and the I/O subsystem, accepts Fabrics
- * associations with libnvmf (running the CONNECT handshake in userland), then
- * hands the established association off to the kernel nvmft COMSTAR/STMF port
- * provider via /dev/nvmft/admin.
- *
- * The FreeBSD daemon could optionally serve I/O entirely in userland from a
- * block-device backend (devices.c/ctl.c).  On illumos the namespace/LU data
- * lives behind STMF (sbdadm/stmfadm), so this port drops the userland block
- * backend entirely: nvmfd always hands the I/O association to the kernel.
- * Thus there is no devices.c, and ctl.c (the FreeBSD CTL backend) is replaced
- * by nvmft.c (the STMF handoff).
  */
 
 #ifndef	_NVMFD_INTERNAL_H
 #define	_NVMFD_INTERNAL_H
 
+#include <sys/types.h>
+#include <sys/ccompile.h>
+#include <sys/socket.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <netdb.h>
 
 #include <sys/nvme.h>
 #include <sys/nvme/nvmf.h>
-#include "nvme_reg.h"		/* nvme_sqe_t / nvme_cqe_t (driver-private) */
+#include "nvme_reg.h"
 
-/*
- * The illumos NVMe/Fabrics typedefs (nvme_sqe_t, nvme_identify_ctrl_t,
- * nvmf_fabric_connect_cmd_t, nvmf_fabric_connect_data_t,
- * nvmf_association_params_t) come from the headers above.
- */
 struct controller;
 struct nvmf_capsule;
 struct nvmf_qpair;
@@ -57,38 +43,55 @@ struct nvmf_qpair;
 typedef bool handle_command(const struct nvmf_capsule *,
     const nvme_sqe_t *, void *);
 
+/* The whole of a handshake, and any one response, must finish this soon. */
+#define	NVMFD_IO_TIMEOUT	10000		/* ms */
+
+enum listen_kind {
+	LISTEN_DISCOVERY = 1,
+	LISTEN_IO = 2
+};
+
+/* One accepted connection, from accept(3SOCKET) until its thread ends. */
+typedef struct nvmfd_conn {
+	int			nc_fd;
+	enum listen_kind	nc_kind;
+	bool			nc_session;	/* discovery, past Connect */
+	struct sockaddr_storage	nc_peer;
+	char			nc_name[NI_MAXHOST];
+	struct nvmfd_conn	*nc_next;
+} nvmfd_conn_t;
+
 extern bool data_digests;
 extern bool header_digests;
 extern bool flow_control_disable;
 extern uint32_t maxh2cdata;
 
-/* nvmfd.c - concurrent-handshake admission control */
-bool	nvmfd_handshake_begin(void);
-void	nvmfd_handshake_end(void);
+/* nvmfd.c */
+void	nvmfd_log(int, const char *, ...) __PRINTFLIKE(2);
+void	nvmfd_peer_log(const nvmfd_conn_t *, const char *, ...) __PRINTFLIKE(2);
+bool	nvmfd_conn_session(nvmfd_conn_t *conn);
 
 /* controller.c */
 void	controller_handle_admin_commands(struct controller *c,
     handle_command *cb, void *cb_arg);
 struct controller *init_controller(struct nvmf_qpair *qp,
-    const nvme_identify_ctrl_t *cdata);
+    const nvme_identify_ctrl_t *cdata, uint_t idle_ms);
 void	free_controller(struct controller *c);
 
 /* discovery.c */
-void	init_discovery(void);
-void	handle_discovery_socket(int s);
-void	discovery_add_io_controller(int s, const char *subnqn);
+void	discovery_add_io_listener(int s);
+void	discovery_connection(nvmfd_conn_t *conn);
 
 /* io.c */
-void	init_io(const char *subnqn);
-void	handle_io_socket(int s);
-void	shutdown_io(void);
+void	io_connection(nvmfd_conn_t *conn);
 
-/* nvmft.c - kernel handoff to the COMSTAR/STMF port provider (replaces ctl.c) */
-void	init_nvmft(const char *subnqn,
-    const nvmf_association_params_t *params);
-void	nvmft_handoff_qpair(struct nvmf_qpair *qp,
+/* nvmft.c */
+void	init_nvmft(void);
+int	nvmft_handoff_qpair(struct nvmf_qpair *qp,
     const nvmf_fabric_connect_cmd_t *cmd,
     const nvmf_fabric_connect_data_t *data);
-void	shutdown_nvmft(const char *subnqn);
+bool	nvmft_subsystem_exists(const char *subnqn);
+int	nvmft_subsystems(char (**nqnsp)[NVMF_NQN_FIELD_SIZE], uint_t *countp,
+    uint64_t *genctrp);
 
 #endif /* _NVMFD_INTERNAL_H */

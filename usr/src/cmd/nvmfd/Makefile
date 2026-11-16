@@ -26,19 +26,8 @@ SRCS=		$(OBJS:%.o=%.c)
 include ../Makefile.cmd
 include ../Makefile.cmd.64
 
-#
-# nvmfd accepts NVMe-oF associations with libnvmf, runs the Fabrics CONNECT
-# handshake in userland, and hands the established qpair off to the kernel
-# nvmft COMSTAR/STMF port provider.  -lnvmf supplies the Fabrics protocol and
-# the handoff packer; -lnvpair carries the packed handoff nvlist; -lsocket and
-# -lnsl provide the TCP listener; -lpthread runs one accept thread per qpair.
-#
-LDLIBS +=	-lnvmf -lsocket -lpthread
+LDLIBS +=	-lnvmf -lnvpair -lsocket
 
-#
-# daemon(3C) and reallocf(3C) are guarded by __EXTENSIONS__, and the daemon
-# is multithreaded (one accept thread per qpair).
-#
 CPPFLAGS +=	-I$(SRC)/uts/common
 CPPFLAGS +=	-I$(SRC)/uts/common/io/nvme
 CPPFLAGS +=	-I$(SRC)/lib/libnvmf/common

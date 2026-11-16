@@ -21,15 +21,11 @@
  *           Written by: John Baldwin <jhb@FreeBSD.org>
  *           SPDX-License-Identifier: BSD-2-Clause
  *
- * Shared controller-property and admin-command dispatch shell.  On illumos
- * this is used only by the userland Discovery controller (discovery.c); the
- * I/O subsystem's admin queue is handled by the kernel after handoff.  The
- * logic is unchanged from FreeBSD: only the libnvmf API is consumed and that
- * API is preserved verbatim in the illumos port.
+ * Controller properties and admin command dispatch for the discovery
+ * controller.
  */
 
 #include <sys/byteorder.h>
-#include <err.h>
 #include <errno.h>
 #include <libnvmf.h>
 #include <stdlib.h>
@@ -55,6 +51,9 @@ struct controller {
 	uint32_t csts;
 
 	bool shutdown;
+
+	/* How long the host may go without sending a command. */
+	uint_t idle_ms;
 
 	nvme_identify_ctrl_t cdata;
 };
@@ -169,17 +168,14 @@ handle_fabrics_command(struct controller *c, const struct nvmf_capsule *nc,
 		    (const nvmf_fabric_prop_set_cmd_t *)fc);
 		break;
 	case NVMF_FCTYPE_CONNECT:
-		warnx("CONNECT command on connected queue");
 		(void) nvmf_send_generic_error(nc,
 		    NVME_CQE_SC_GEN_CMD_SEQ_ERR);
 		break;
 	case NVMF_FCTYPE_DISCONNECT:
-		warnx("DISCONNECT command on admin queue");
 		(void) nvmf_send_error(nc, NVME_CQE_SCT_SPECIFIC,
 		    NVMF_FABRIC_SC_INVALID_QUEUE_TYPE);
 		break;
 	default:
-		warnx("Unsupported fabrics command %#x", fc->nfc_fctype);
 		(void) nvmf_send_generic_error(nc, NVME_CQE_SC_GEN_INV_OPC);
 		break;
 	}
@@ -196,7 +192,6 @@ handle_identify_command(const struct controller *c,
 	case 1:
 		break;
 	default:
-		warnx("Unsupported CNS %#x for IDENTIFY", cns);
 		goto error;
 	}
 
@@ -217,12 +212,11 @@ controller_handle_admin_commands(struct controller *c, handle_command *cb,
 	int error;
 
 	for (;;) {
+		nvmf_qpair_set_timeout(qp, c->idle_ms);
 		error = nvmf_controller_receive_capsule(qp, &nc);
-		if (error != 0) {
-			if (error != ECONNRESET)
-				warnc(error, "Failed to read command capsule");
+		if (error != 0)
 			break;
-		}
+		nvmf_qpair_set_timeout(qp, NVMFD_IO_TIMEOUT);
 
 		cmd = nvmf_capsule_sqe(nc);
 
@@ -232,8 +226,6 @@ controller_handle_admin_commands(struct controller *c, handle_command *cb,
 		cc.r = c->cc;
 		if (cc.b.cc_en == 0 &&
 		    cmd->sqe_opc != NVME_OPC_FABRICS_COMMANDS) {
-			warnx("Unsupported admin opcode %#x while disabled",
-			    cmd->sqe_opc);
 			(void) nvmf_send_generic_error(nc,
 			    NVME_CQE_SC_GEN_CMD_SEQ_ERR);
 			nvmf_free_capsule(nc);
@@ -253,8 +245,10 @@ controller_handle_admin_commands(struct controller *c, handle_command *cb,
 		case NVME_OPC_IDENTIFY:
 			handle_identify_command(c, nc, cmd);
 			break;
+		case NVME_OPC_KEEP_ALIVE:
+			(void) nvmf_send_success(nc);
+			break;
 		default:
-			warnx("Unsupported admin opcode %#x", cmd->sqe_opc);
 			(void) nvmf_send_generic_error(nc,
 			    NVME_CQE_SC_GEN_INV_OPC);
 			break;
@@ -264,15 +258,16 @@ controller_handle_admin_commands(struct controller *c, handle_command *cb,
 }
 
 struct controller *
-init_controller(struct nvmf_qpair *qp,
-    const nvme_identify_ctrl_t *cdata)
+init_controller(struct nvmf_qpair *qp, const nvme_identify_ctrl_t *cdata,
+    uint_t idle_ms)
 {
 	struct controller *c;
 
 	c = calloc(1, sizeof (*c));
 	if (c == NULL)
-		err(1, "calloc");
+		return (NULL);
 	c->qp = qp;
+	c->idle_ms = idle_ms;
 	c->cap = nvmf_controller_cap(c->qp);
 	c->vs = cdata->id_ver;
 	c->cdata = *cdata;

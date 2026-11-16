@@ -14,34 +14,18 @@
  */
 
 /*
- * Provenance: replaces FreeBSD tools/tools/nvmf/nvmfd/ctl.c.
- *
- * FreeBSD handed an established NVMe-oF association to the in-kernel CTL
- * frontend via /dev/cam/ctl (CTL_PORT_REQ to create the port, then CTL_NVMF /
- * CTL_NVMF_HANDOFF per qpair).  On illumos the target is the nvmft COMSTAR/STMF
- * port provider, so:
- *
- *   - The subsystem port (one stmf_local_port_t per SubNQN) and its namespace
- *     (LU) view entries are created out of band with sbdadm(8)/stmfadm(8);
- *     this daemon does NOT create or remove ports.  init_nvmft() therefore only
- *     opens the control device and shutdown_nvmft() only closes it.
- *
- *   - Each accepted, CONNECT-negotiated qpair is handed off with
- *     NVMFT_IOC_HANDOFF on the nvmft control device (NVMFT_DEV).  The handoff
- *     payload is the same packed nvlist libnvmf builds for the FreeBSD path
- *     (nvmf_handoff_controller_qpair): { trtype, params, cmd, data }.  The
- *     kernel reads the SubNQN from the CONNECT "data" to find the target port
- *     and dispatches admin vs I/O on the CONNECT command's queue id.
+ * The nvmft port provider's control node: the list of subsystems it has and
+ * the handoff of a connected queue pair to it.
  */
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
-#include <assert.h>
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <libnvmf.h>
-#include <stdio.h>
+#include <libnvpair.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -52,41 +36,156 @@
 
 static int nvmft_fd = -1;
 
-static void
-open_nvmft(void)
+/*
+ * The subsystems as last read from the kernel, sorted.  The generation
+ * counts the times a read has differed from the one before.
+ */
+static pthread_mutex_t nvmft_lock = PTHREAD_MUTEX_INITIALIZER;
+static char (*nvmft_nqns)[NVMF_NQN_FIELD_SIZE];
+static uint_t nvmft_count;
+static uint64_t nvmft_genctr;
+
+static int
+nqn_compare(const void *a, const void *b)
 {
-	if (nvmft_fd >= 0)
-		return;
+	return (strcmp(a, b));
+}
+
+static int
+nvmft_read_subsystems(char (**nqnsp)[NVMF_NQN_FIELD_SIZE], uint_t *countp)
+{
+	char (*nqns)[NVMF_NQN_FIELD_SIZE] = NULL;
+	struct nvmf_ioc_nv nv;
+	nvlist_t *nvl;
+	char **names;
+	uint_t count, i;
+	int error, tries;
+
+	/* The list can grow between the call that sizes it and the next. */
+	for (tries = 0; ; tries++) {
+		(void) memset(&nv, 0, sizeof (nv));
+		if (ioctl(nvmft_fd, NVMFT_IOC_SUBSYS_LIST, &nv) != 0)
+			return (errno);
+		nv.size = nv.len;
+		nv.data = malloc(nv.size);
+		if (nv.data == NULL)
+			return (ENOMEM);
+		if (ioctl(nvmft_fd, NVMFT_IOC_SUBSYS_LIST, &nv) == 0)
+			break;
+		error = errno;
+		free(nv.data);
+		if (error != EFBIG || tries == 3)
+			return (error);
+	}
+
+	error = nvlist_unpack(nv.data, nv.len, &nvl, 0);
+	free(nv.data);
+	if (error != 0)
+		return (error);
+
+	count = 0;
+	if (nvlist_lookup_string_array(nvl, NVMFT_NV_SUBNQNS, &names,
+	    &count) != 0)
+		count = 0;
+	if (count != 0) {
+		nqns = calloc(count, sizeof (*nqns));
+		if (nqns == NULL) {
+			nvlist_free(nvl);
+			return (ENOMEM);
+		}
+		for (i = 0; i < count; i++)
+			(void) strlcpy(nqns[i], names[i], sizeof (nqns[i]));
+		qsort(nqns, count, sizeof (*nqns), nqn_compare);
+	}
+	nvlist_free(nvl);
+
+	*nqnsp = nqns;
+	*countp = count;
+	return (0);
+}
+
+/* Call with nvmft_lock held. */
+static int
+nvmft_refresh(bool first)
+{
+	char (*nqns)[NVMF_NQN_FIELD_SIZE];
+	uint_t count;
+	int error;
+
+	error = nvmft_read_subsystems(&nqns, &count);
+	if (error != 0)
+		return (error);
+
+	if (count == nvmft_count && (count == 0 ||
+	    memcmp(nqns, nvmft_nqns, count * sizeof (*nqns)) == 0)) {
+		free(nqns);
+		return (0);
+	}
+
+	free(nvmft_nqns);
+	nvmft_nqns = nqns;
+	nvmft_count = count;
+	if (!first)
+		nvmft_genctr++;
+	return (0);
+}
+
+void
+init_nvmft(void)
+{
+	int error;
 
 	nvmft_fd = open(NVMFT_DEV, O_RDWR);
 	if (nvmft_fd == -1)
-		err(1, "Failed to open %s (is the nvmft driver loaded?)",
-		    NVMFT_DEV);
+		err(1, "Failed to open %s", NVMFT_DEV);
+
+	error = nvmft_refresh(true);
+	if (error != 0)
+		errc(1, error, "Failed to list subsystems");
 }
 
-/*
- * On illumos the subsystem port is owned by STMF and created with stmfadm, so
- * there is nothing to create here.  Open the control device up front so a
- * misconfiguration (nvmft not attached) is reported at start-up rather than on
- * the first connection.
- */
-void
-init_nvmft(const char *subnqn __unused,
-    const nvmf_association_params_t *params __unused)
+bool
+nvmft_subsystem_exists(const char *subnqn)
 {
-	open_nvmft();
+	bool found;
+
+	(void) pthread_mutex_lock(&nvmft_lock);
+	(void) nvmft_refresh(false);
+	found = nvmft_count != 0 && bsearch(subnqn, nvmft_nqns, nvmft_count,
+	    sizeof (*nvmft_nqns), nqn_compare) != NULL;
+	(void) pthread_mutex_unlock(&nvmft_lock);
+	return (found);
 }
 
-void
-shutdown_nvmft(const char *subnqn __unused)
+/* A copy of the current subsystem list for the caller to free. */
+int
+nvmft_subsystems(char (**nqnsp)[NVMF_NQN_FIELD_SIZE], uint_t *countp,
+    uint64_t *genctrp)
 {
-	if (nvmft_fd >= 0) {
-		(void) close(nvmft_fd);
-		nvmft_fd = -1;
+	char (*nqns)[NVMF_NQN_FIELD_SIZE] = NULL;
+	int error;
+
+	(void) pthread_mutex_lock(&nvmft_lock);
+	error = nvmft_refresh(false);
+	if (error == 0 && nvmft_count != 0) {
+		nqns = calloc(nvmft_count, sizeof (*nqns));
+		if (nqns == NULL) {
+			error = ENOMEM;
+		} else {
+			(void) memcpy(nqns, nvmft_nqns,
+			    nvmft_count * sizeof (*nqns));
+		}
 	}
+	if (error == 0) {
+		*nqnsp = nqns;
+		*countp = nvmft_count;
+		*genctrp = nvmft_genctr;
+	}
+	(void) pthread_mutex_unlock(&nvmft_lock);
+	return (error);
 }
 
-void
+int
 nvmft_handoff_qpair(struct nvmf_qpair *qp,
     const nvmf_fabric_connect_cmd_t *cmd,
     const nvmf_fabric_connect_data_t *data)
@@ -94,27 +193,13 @@ nvmft_handoff_qpair(struct nvmf_qpair *qp,
 	struct nvmf_ioc_nv nv;
 	int error;
 
-	open_nvmft();
-
-	(void) memset(&nv, 0, sizeof (nv));
-
-	/*
-	 * libnvmf packs the qpair (socket fd + negotiated transport/CONNECT
-	 * parameters) plus the CONNECT cmd/data into a packed nvlist; nv.data
-	 * points at the malloc'd buffer and nv.size holds its length.  This is
-	 * identical to the FreeBSD CTL_NVMF_HANDOFF payload.
-	 */
 	error = nvmf_handoff_controller_qpair(qp, cmd, data, &nv);
-	if (error != 0) {
-		warnc(error, "Failed to prepare qpair for handoff");
-		return;
-	}
-
-	/* nvmf_pack_ioc_nvlist() sets both fields to the packed length. */
-	assert(nv.size == nv.len && nv.size != 0);
+	if (error != 0)
+		return (error);
 
 	if (ioctl(nvmft_fd, NVMFT_IOC_HANDOFF, &nv) != 0)
-		warn("ioctl(NVMFT_IOC_HANDOFF)");
+		error = errno;
 
 	free(nv.data);
+	return (error);
 }

@@ -21,130 +21,82 @@
  *           Written by: John Baldwin <jhb@FreeBSD.org>
  *           SPDX-License-Identifier: BSD-2-Clause
  *
- * I/O subsystem listener.  This is the always-kernel-handoff variant of the
- * FreeBSD daemon: every accepted association runs the Fabrics CONNECT
- * handshake in userland (libnvmf nvmf_accept) and is then handed to the kernel
- * nvmft COMSTAR/STMF port provider.  The FreeBSD userland I/O controller (the
- * per-association admin/I/O queue threads backed by a block device) is dropped
- * because on illumos the namespace data always lives behind STMF.
+ * Connections to the I/O port: the Connect exchange runs here and the queue
+ * pair is then handed to the nvmft port provider.
  */
 
-#include <err.h>
 #include <errno.h>
 #include <libnvmf.h>
-#include <pthread.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
-#include <unistd.h>
+#include <syslog.h>
 
 #include "internal.h"
 
-/*
- * Admin/I/O queue-size advertisements.  These are not carried in the public
- * headers; mirror the values libnvmf and the kernel nvmft port provider use
- * (FreeBSD: NVME_MAX_ADMIN_ENTRIES, NVMF_MAX_IO_ENTRIES).
- */
-#ifndef	NVME_MAX_ADMIN_ENTRIES
-#define	NVME_MAX_ADMIN_ENTRIES	4096
-#endif
-#ifndef	NVMF_MAX_IO_ENTRIES
-#define	NVMF_MAX_IO_ENTRIES	1024
-#endif
-
-static struct nvmf_association *io_na;
-static const char *nqn;
+#define	NVMFD_MAX_ADMIN_ENTRIES	4096
+#define	NVMFD_MAX_IO_ENTRIES	1024
 
 void
-init_io(const char *subnqn)
+io_connection(nvmfd_conn_t *conn)
 {
 	nvmf_association_params_t aparams;
+	nvmf_fabric_connect_data_t data;
+	nvmf_qpair_params_t qparams;
+	struct nvmf_association *na;
+	struct nvmf_capsule *nc = NULL;
+	struct nvmf_qpair *qp = NULL;
+	char nqn[NVMF_NQN_FIELD_SIZE];
+	int error;
 
 	(void) memset(&aparams, 0, sizeof (aparams));
 	aparams.nap_sq_flow_control = !flow_control_disable;
 	aparams.nap_dynamic_controller_model = true;
-	aparams.nap_max_admin_qsize = NVME_MAX_ADMIN_ENTRIES;
-	aparams.nap_max_io_qsize = NVMF_MAX_IO_ENTRIES;
+	aparams.nap_max_admin_qsize = NVMFD_MAX_ADMIN_ENTRIES;
+	aparams.nap_max_io_qsize = NVMFD_MAX_IO_ENTRIES;
 	aparams.nap_tcp.pda = 0;
 	aparams.nap_tcp.header_digests = header_digests;
 	aparams.nap_tcp.data_digests = data_digests;
 	aparams.nap_tcp.maxh2cdata = maxh2cdata;
-	io_na = nvmf_allocate_association(NVMF_TRTYPE_TCP, true, &aparams);
-	if (io_na == NULL)
-		err(1, "Failed to create I/O controller association");
+	na = nvmf_allocate_association(NVMF_TRTYPE_TCP, true, &aparams);
+	if (na == NULL) {
+		nvmfd_log(LOG_ERR, "Failed to create I/O association");
+		return;
+	}
 
-	nqn = subnqn;
-
-	init_nvmft(subnqn, &aparams);
-}
-
-void
-shutdown_io(void)
-{
-	shutdown_nvmft(nqn);
-}
-
-static void *
-io_socket_thread(void *arg)
-{
-	nvmf_fabric_connect_data_t data;
-	struct nvmf_qpair_params qparams;
-	struct nvmf_capsule *nc;
-	struct nvmf_qpair *qp;
-	int s;
-
-	(void) pthread_detach(pthread_self());
-
-	s = (int)(intptr_t)arg;
 	(void) memset(&qparams, 0, sizeof (qparams));
-	qparams.nqp_tcp.fd = s;
-
-	nc = NULL;
-	qp = nvmf_accept(io_na, &qparams, &nc, &data);
+	qparams.nqp_tcp.fd = conn->nc_fd;
+	qparams.nqp_timeout_ms = NVMFD_IO_TIMEOUT;
+	qp = nvmf_accept(na, &qparams, &nc, &data);
 	if (qp == NULL) {
-		warnx("Failed to create I/O qpair: %s",
-		    nvmf_association_error(io_na));
+		nvmfd_peer_log(conn, "I/O port handshake failed: %s",
+		    nvmf_association_error(na) != NULL ?
+		    nvmf_association_error(na) : "unknown error");
 		goto out;
 	}
 
 	/*
-	 * Hand the established association to the kernel.  The kernel looks up
-	 * the target port by the SubNQN carried in the CONNECT data, so the
-	 * daemon does not validate the SubNQN here (an unknown SubNQN is
-	 * rejected by the handoff ioctl).  The kernel adopts the socket during
-	 * the ioctl (getf/ksocket_hold/releasef), taking its own reference, so
-	 * this thread closes its userland fd afterwards regardless of outcome.
+	 * Once the kernel has the socket it sends the Connect response, so
+	 * the one refusal that is this daemon's to send goes out first.
 	 */
-	nvmft_handoff_qpair(qp, nvmf_capsule_sqe(nc), &data);
+	if (!nvmft_subsystem_exists((const char *)data.nfcd_subnqn)) {
+		nvmf_printable(nqn, sizeof (nqn), data.nfcd_subnqn,
+		    sizeof (data.nfcd_subnqn));
+		nvmfd_peer_log(conn, "Connect to unknown subsystem %s", nqn);
+		nvmf_connect_invalid_parameters(nc, true,
+		    offsetof(nvmf_fabric_connect_data_t, nfcd_subnqn));
+		goto out;
+	}
+
+	error = nvmft_handoff_qpair(qp, nvmf_capsule_sqe(nc), &data);
+	if (error != 0) {
+		nvmfd_peer_log(conn, "Handoff to the kernel failed: %s",
+		    strerror(error));
+	}
 
 out:
 	if (nc != NULL)
 		nvmf_free_capsule(nc);
 	if (qp != NULL)
 		nvmf_free_qpair(qp);
-	(void) close(s);
-	nvmfd_handshake_end();
-	return (NULL);
-}
-
-void
-handle_io_socket(int s)
-{
-	pthread_t thr;
-	int error;
-
-	if (!nvmfd_handshake_begin()) {
-		warnx("Too many concurrent connections; dropping I/O qpair");
-		(void) close(s);
-		return;
-	}
-
-	error = pthread_create(&thr, NULL, io_socket_thread,
-	    (void *)(intptr_t)s);
-	if (error != 0) {
-		warnc(error, "Failed to create I/O qpair thread");
-		(void) close(s);
-		nvmfd_handshake_end();
-	}
+	nvmf_free_association(na);
 }
