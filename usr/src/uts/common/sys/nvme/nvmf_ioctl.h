@@ -80,36 +80,31 @@ struct nvmf_ioc_nv {
  *			    no active controllers (no connected hosts).
  *			    Argument: struct nvmf_ioc_nv with a packed nvlist
  *			    { subnqn }.
- * NVMFT_IOC_SUBSYS_LIST    Copy out the list of currently registered SubNQNs.
- *			    Argument: struct nvmf_ioc_nv; on return the nvlist
- *			    holds a string array "subnqns".
+ * NVMFT_IOC_SUBSYS_LIST    Copy out the registered subsystems.  Argument:
+ *			    struct nvmf_ioc_nv; on return the nvlist holds
+ *			    the reply keys below.
  */
 #define	NVMFT_IOC_SUBSYS_CREATE	(NVMF_IOC | 100)
 #define	NVMFT_IOC_SUBSYS_DELETE	(NVMF_IOC | 101)
 #define	NVMFT_IOC_SUBSYS_LIST	(NVMF_IOC | 102)
 
 /*
- * NVMFT_IOC_HANDOFF  Hand an established controller queue pair off to the
- *		      kernel.  This is the core of the userland target daemon
- *		      (nvmfd): after accepting a TCP connection and running the
- *		      Fabrics CONNECT handshake with libnvmf, the daemon packs
- *		      the qpair (socket fd + negotiated transport/CONNECT
- *		      parameters) with nvmf_handoff_controller_qpair() and
- *		      issues this ioctl.  Argument: struct nvmf_ioc_nv with a
- *		      packed handoff nvlist (see below).  This replaces FreeBSD's
- *		      CTL_NVMF/CTL_NVMF_HANDOFF on /dev/cam/ctl.
+ * NVMFT_IOC_HANDOFF  Hand a controller queue pair to the kernel.  nvmfd(8)
+ *		      accepts the connection, receives the Connect command and
+ *		      its data with libnvmf, and packs them with the socket and
+ *		      the transport parameters in a handoff nvlist (see below).
+ *		      Argument: struct nvmf_ioc_nv.  The subsystem is the one
+ *		      that the Connect data names.
  *
- * The kernel handoff agent unpacks the nvlist, validates the "cmd"/"data"
- * binary sizes, reads the SubNQN from the CONNECT data's nfcd_subnqn field
- * (there is no separate top-level subnqn key in the handoff nvlist) to look up
- * the target subsystem's nvmft_port_t, then dispatches on the CONNECT command's
- * queue id: queue id 0 calls nvmft_handoff_admin_queue(), a nonzero queue id
- * calls nvmft_handoff_io_queue().  On success the kernel transport has taken its
- * own reference on the socket, so the daemon should close its fd (the kernel
- * reference keeps the connection alive until the qpair is torn down); on failure
- * the daemon retains ownership of the fd.
+ * If the ioctl fails, the kernel has not touched the socket, and the Connect
+ * is still the caller's to answer.  If it returns one of the values below, the
+ * kernel has its own hold on the socket and has sent the Connect response, so
+ * the caller sends nothing more and closes its descriptor.
  */
 #define	NVMFT_IOC_HANDOFF	(NVMF_IOC | 103)
+
+#define	NVMFT_HANDOFF_CONNECTED	0	/* the queue is connected */
+#define	NVMFT_HANDOFF_REFUSED	1	/* the kernel refused the Connect */
 
 /*
  * Handoff nvlist keys for NVMFT_IOC_HANDOFF.  The layout is identical to the
@@ -138,7 +133,6 @@ struct nvmf_ioc_nv {
  *   bool	data_digests
  *   number	maxr2t
  *   number	maxh2cdata
- *   number	max_icd
  */
 #define	NVMFT_NV_TRTYPE		"trtype"
 #define	NVMFT_NV_PARAMS		"params"
@@ -170,8 +164,18 @@ struct nvmf_ioc_nv {
 #define	NVMFT_NV_IORCSZ		"iorcsz"
 #define	NVMFT_NV_NN		"nn"
 
-/* Reply nvlist key for NVMFT_IOC_SUBSYS_LIST: string array of SubNQNs. */
+/*
+ * Reply nvlist keys for NVMFT_IOC_SUBSYS_LIST.  The two arrays have one
+ * element for each subsystem, in the same order.  The generation changes
+ * whenever a subsystem is created or deleted.
+ *
+ *   string array	subnqns
+ *   uint16 array	portids
+ *   number		generation
+ */
 #define	NVMFT_NV_SUBNQNS	"subnqns"
+#define	NVMFT_NV_PORTIDS	"portids"
+#define	NVMFT_NV_GENERATION	"generation"
 
 /*
  * Operations on /dev/nvmf, the control node of the nvmf_host driver.  The
@@ -200,6 +204,7 @@ struct nvmf_ioc_nv {
  * A host qpair handoff nvlist has the keys of the "params" nvlist above and
  *
  *   number	sqtail
+ *   number	max_icd		(TCP)
  *
  * The fields in the nvlist for NVMF_HANDOFF_HOST and NVMF_RECONNECT_HOST are:
  *

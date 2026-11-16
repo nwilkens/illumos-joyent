@@ -143,7 +143,6 @@ discovery_add_io_listener(int s)
 	/* TREQ bit 2: connections shall not use SQ flow control. */
 	if (flow_control_disable)
 		entry->ndle_treq.reserved |= 1;
-	entry->ndle_portid = LE_16(1);
 	entry->ndle_cntlid = LE_16(NVMF_CNTLID_DYNAMIC);
 	entry->ndle_asqsz = LE_16(NVMFD_MAX_ADMIN_ENTRIES);
 }
@@ -155,7 +154,7 @@ discovery_add_io_listener(int s)
 static int
 build_discovery_log_page(struct discovery_controller *dc)
 {
-	char (*nqns)[NVMF_NQN_FIELD_SIZE];
+	nvmft_subsys_t *subs;
 	nvmf_discovery_log_page_entry_t *entry;
 	struct sockaddr_storage ss;
 	socklen_t len;
@@ -177,7 +176,7 @@ build_discovery_log_page(struct discovery_controller *dc)
 	    NULL, 0, NULL) != 0)
 		return (EAFNOSUPPORT);
 
-	error = nvmft_subsystems(&nqns, &count, &genctr);
+	error = nvmft_subsystems(&subs, &count, &genctr);
 	if (error != 0)
 		return (error);
 
@@ -194,7 +193,7 @@ build_discovery_log_page(struct discovery_controller *dc)
 	    (size_t)nentries * sizeof (nvmf_discovery_log_page_entry_t);
 	dc->discovery_log = calloc(1, dc->discovery_log_len);
 	if (dc->discovery_log == NULL) {
-		free(nqns);
+		free(subs);
 		return (ENOMEM);
 	}
 	dc->discovery_log->ndlp_genctr = LE_64(genctr);
@@ -213,12 +212,13 @@ build_discovery_log_page(struct discovery_controller *dc)
 				(void) memcpy(entry->ndle_traddr, traddr,
 				    sizeof (entry->ndle_traddr));
 			}
-			(void) strlcpy((char *)entry->ndle_subnqn, nqns[j],
-			    sizeof (entry->ndle_subnqn));
+			entry->ndle_portid = LE_16(subs[j].ns_portid);
+			(void) strlcpy((char *)entry->ndle_subnqn,
+			    subs[j].ns_nqn, sizeof (entry->ndle_subnqn));
 			entry++;
 		}
 	}
-	free(nqns);
+	free(subs);
 	return (0);
 }
 

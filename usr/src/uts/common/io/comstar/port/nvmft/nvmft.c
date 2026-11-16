@@ -130,6 +130,8 @@ _init(void)
 	mutex_init(&nvmft_global->ns_config_lock, NULL, MUTEX_DRIVER, NULL);
 	list_create(&nvmft_global->ns_ports, sizeof (nvmft_port_t),
 	    offsetof(nvmft_port_t, np_link));
+	/* A host must not see an old value again after the module reloads. */
+	nvmft_global->ns_generation = (uint64_t)ddi_get_time() << 32;
 
 	/*
 	 * ns_taskq has one thread, which orders shutdown, terminate and the
@@ -543,10 +545,12 @@ nvmft_ioc_subsys_delete(intptr_t arg, int mode)
 		error = nvmft_port_unregister(np);
 
 	mutex_enter(&nvmft_global->ns_lock);
-	if (error == 0)
+	if (error == 0) {
 		list_remove(&nvmft_global->ns_ports, np);
-	else
+		nvmft_global->ns_generation++;
+	} else {
 		np->np_deleting = B_FALSE;
+	}
 	mutex_exit(&nvmft_global->ns_lock);
 	mutex_exit(&nvmft_global->ns_config_lock);
 
@@ -557,8 +561,8 @@ nvmft_ioc_subsys_delete(intptr_t arg, int mode)
 }
 
 /*
- * NVMFT_IOC_SUBSYS_LIST: copy out the list of registered SubNQNs as a packed
- * nvlist with a single "subnqns" string array.
+ * NVMFT_IOC_SUBSYS_LIST: copy out the SubNQN and port ID of each registered
+ * subsystem, and the generation of that list, as a packed nvlist.
  */
 static int
 nvmft_ioc_subsys_list(intptr_t arg, int mode)
@@ -567,6 +571,7 @@ nvmft_ioc_subsys_list(intptr_t arg, int mode)
 	nvlist_t *reply;
 	nvmft_port_t *np;
 	char **nqns;
+	uint16_t *portids;
 	uint_t n, i;
 	int error;
 
@@ -582,13 +587,21 @@ nvmft_ioc_subsys_list(intptr_t arg, int mode)
 		n++;
 
 	nqns = kmem_zalloc(MAX(n, 1) * sizeof (char *), KM_SLEEP);
+	portids = kmem_zalloc(MAX(n, 1) * sizeof (uint16_t), KM_SLEEP);
 	i = 0;
 	for (np = list_head(&nvmft_global->ns_ports); np != NULL;
-	    np = list_next(&nvmft_global->ns_ports, np))
-		nqns[i++] = (char *)np->np_devid->ident;
+	    np = list_next(&nvmft_global->ns_ports, np)) {
+		nqns[i] = (char *)np->np_devid->ident;
+		portids[i] = np->np_portid;
+		i++;
+	}
 	fnvlist_add_string_array(reply, NVMFT_NV_SUBNQNS, nqns, n);
+	fnvlist_add_uint16_array(reply, NVMFT_NV_PORTIDS, portids, n);
+	fnvlist_add_uint64(reply, NVMFT_NV_GENERATION,
+	    nvmft_global->ns_generation);
 	mutex_exit(&nvmft_global->ns_lock);
 
+	kmem_free(portids, MAX(n, 1) * sizeof (uint16_t));
 	kmem_free(nqns, MAX(n, 1) * sizeof (char *));
 
 	error = nvmf_pack_ioc_nvlist_mode(reply, &ionv, mode);
@@ -633,10 +646,11 @@ nvmft_handoff_valid(uint64_t trtype, boolean_t admin, uint64_t qsize,
  * nvlist is { trtype, params, cmd, data } as libnvmf's
  * nvmf_handoff_controller_qpair() packs it: the transport parameters with
  * the socket, and the Connect command and data.  The transport looks up the
- * socket in the calling process, so this runs on the ioctl thread.
+ * socket in the calling process, so this runs on the ioctl thread.  An error
+ * means that the socket is still the caller's alone.
  */
 static int
-nvmft_ioc_handoff(intptr_t arg, int mode)
+nvmft_ioc_handoff(intptr_t arg, int mode, int *rvalp)
 {
 	struct nvmf_ioc_nv ionv;
 	nvlist_t *req = NULL;
@@ -647,7 +661,7 @@ nvmft_ioc_handoff(intptr_t arg, int mode)
 	uchar_t *cmdb = NULL, *datab = NULL;
 	char subnqn[NVMF_NQN_FIELD_SIZE + 1];
 	uint64_t trtype, qsize = 0;
-	boolean_t admin = B_FALSE;
+	boolean_t admin = B_FALSE, adopted = B_FALSE;
 	uint_t cmdlen, datalen;
 	int error;
 
@@ -688,16 +702,22 @@ nvmft_ioc_handoff(intptr_t arg, int mode)
 		return (ENOENT);
 	}
 
-	/* On failure these destroy the qpair, which closes the socket. */
 	if (admin)
 		error = nvmft_handoff_admin_queue(np, (nvmf_trtype_t)trtype,
-		    params, &cmd, &data);
+		    params, &cmd, &data, &adopted);
 	else
 		error = nvmft_handoff_io_queue(np, (nvmf_trtype_t)trtype,
-		    params, &cmd, &data);
+		    params, &cmd, &data, &adopted);
 
 	nvmft_port_rele(np);
 	nvlist_free(req);
+
+	/* A queue that was adopted and then refused is gone, with its hold. */
+	if (adopted) {
+		*rvalp = (error == 0) ? NVMFT_HANDOFF_CONNECTED :
+		    NVMFT_HANDOFF_REFUSED;
+		return (0);
+	}
 	return (error);
 }
 
@@ -724,7 +744,7 @@ nvmft_drv_ioctl(dev_t dev, int cmd, intptr_t data, int mode, cred_t *cred,
 	case NVMFT_IOC_SUBSYS_LIST:
 		return (nvmft_ioc_subsys_list(data, mode));
 	case NVMFT_IOC_HANDOFF:
-		return (nvmft_ioc_handoff(data, mode));
+		return (nvmft_ioc_handoff(data, mode, rval));
 	default:
 		break;
 	}

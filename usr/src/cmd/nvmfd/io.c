@@ -46,6 +46,7 @@ io_connection(nvmfd_conn_t *conn)
 	struct nvmf_capsule *nc = NULL;
 	struct nvmf_qpair *qp = NULL;
 	char nqn[NVMF_NQN_FIELD_SIZE];
+	bool refused = false;
 	int error;
 
 	(void) memset(&aparams, 0, sizeof (aparams));
@@ -75,22 +76,24 @@ io_connection(nvmfd_conn_t *conn)
 	}
 
 	/*
-	 * Once the kernel has the socket it sends the Connect response, so
-	 * the one refusal that is this daemon's to send goes out first.
+	 * Once the kernel has the socket it sends the Connect response.  If
+	 * the handoff failed it has not touched the socket, and the refusal
+	 * is this daemon's to send.  ENOENT is for the subsystem.
 	 */
-	if (!nvmft_subsystem_exists((const char *)data.nfcd_subnqn)) {
+	error = nvmft_handoff_qpair(qp, nvmf_capsule_sqe(nc), &data, &refused);
+	if (error == ENOENT) {
 		nvmf_printable(nqn, sizeof (nqn), data.nfcd_subnqn,
 		    sizeof (data.nfcd_subnqn));
 		nvmfd_peer_log(conn, "Connect to unknown subsystem %s", nqn);
 		nvmf_connect_invalid_parameters(nc, true,
 		    offsetof(nvmf_fabric_connect_data_t, nfcd_subnqn));
-		goto out;
-	}
-
-	error = nvmft_handoff_qpair(qp, nvmf_capsule_sqe(nc), &data);
-	if (error != 0) {
+	} else if (error != 0) {
 		nvmfd_peer_log(conn, "Handoff to the kernel failed: %s",
 		    strerror(error));
+		(void) nvmf_send_generic_error(nc,
+		    NVME_CQE_SC_GEN_INTERNAL_ERR);
+	} else if (refused) {
+		nvmfd_peer_log(conn, "The kernel refused the Connect");
 	}
 
 out:

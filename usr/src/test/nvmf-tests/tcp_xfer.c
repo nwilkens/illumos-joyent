@@ -1126,8 +1126,8 @@ static void
 handoff_checks(void)
 {
 	static const char *keys[] = { "fd", "rxpda", "txpda", "maxr2t",
-	    "maxh2cdata", "max_icd", "qsize", "header_digests",
-	    "data_digests", "sq_flow_control" };
+	    "maxh2cdata", "qsize", "header_digests", "data_digests",
+	    "sq_flow_control" };
 	struct nvlist nvl;
 	unsigned i, before = closes;
 	consumer_t *c;
@@ -1148,7 +1148,6 @@ handoff_checks(void)
 	REFUSE(maxh2cdata, 4095);
 	REFUSE(maxh2cdata, 0x100000000ULL);
 	REFUSE(maxr2t, 0xffffffffULL);
-	REFUSE(max_icd, 0x100000000ULL);
 	REFUSE(qsize, 0);
 	REFUSE(qsize, 65537);
 #undef REFUSE
@@ -1156,7 +1155,18 @@ handoff_checks(void)
 		nvl = plain;
 		nvl.missing = keys[i];
 		assert(attach(sv[0], B_TRUE, &nvl) == NULL);
+		assert(attach(sv[0], B_FALSE, &nvl) == NULL);
 	}
+
+	/* max_icd is the controller's limit, which only a host is told. */
+	nvl = plain;
+	nvl.max_icd = 0x100000000ULL;
+	assert(attach(sv[0], B_FALSE, &nvl) == NULL);
+	nvl.missing = "max_icd";
+	assert(attach(sv[0], B_FALSE, &nvl) == NULL);
+	c = attach(sv[0], B_TRUE, &nvl);
+	assert(c != NULL);
+	detach(c);
 	assert(attach(NFILES - 1, B_TRUE, &plain) == NULL);
 
 	/* Not TCP, not connected, a STREAMS socket, or taken already. */

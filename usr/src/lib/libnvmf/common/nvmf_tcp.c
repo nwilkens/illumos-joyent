@@ -459,7 +459,6 @@ tcp_accept(nvmf_tcp_qpair_t *qp, struct nvmf_association *na)
 	qp->data_digests = ic_resp.nfir_dgst.bits.ddgst_enable != 0;
 	qp->maxr2t = LE_32(ic_req.nfic_maxr2t);
 	qp->maxh2cdata = params->nap_tcp.maxh2cdata;
-	qp->max_icd = 0;	/* XXX */
 	return (true);
 }
 
@@ -531,7 +530,8 @@ tcp_kernel_handoff_params(struct nvmf_qpair *nq, nvlist_t *nvl)
 	(void) nvlist_add_boolean_value(nvl, "data_digests", qp->data_digests);
 	(void) nvlist_add_uint64(nvl, "maxr2t", qp->maxr2t);
 	(void) nvlist_add_uint64(nvl, "maxh2cdata", qp->maxh2cdata);
-	(void) nvlist_add_uint64(nvl, "max_icd", qp->max_icd);
+	if (!nq->nq_association->na_controller)
+		(void) nvlist_add_uint64(nvl, "max_icd", qp->max_icd);
 }
 
 static int

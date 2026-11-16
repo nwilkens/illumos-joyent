@@ -297,6 +297,7 @@ typedef struct nvmft_softc {
 	kmutex_t		ns_config_lock;
 	kmutex_t		ns_lock;	/* protects the fields below */
 	list_t			ns_ports;	/* nvmft_port list */
+	uint64_t		ns_generation;	/* changes with ns_ports */
 	uint_t			ns_kernel_qpairs; /* adopted, not destroyed */
 	boolean_t		ns_closing;	/* _fini is unloading */
 } nvmft_softc_t;
@@ -382,10 +383,10 @@ void	nvmft_controller_start_shutdown(nvmft_controller_t *ctrlr);
 void	nvmft_controller_offline(nvmft_controller_t *ctrlr);
 int	nvmft_handoff_admin_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
 	    const nvlist_t *params, const nvmf_fabric_connect_cmd_t *cmd,
-	    const nvmf_fabric_connect_data_t *data);
+	    const nvmf_fabric_connect_data_t *data, boolean_t *adoptedp);
 int	nvmft_handoff_io_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
 	    const nvlist_t *params, const nvmf_fabric_connect_cmd_t *cmd,
-	    const nvmf_fabric_connect_data_t *data);
+	    const nvmf_fabric_connect_data_t *data, boolean_t *adoptedp);
 int	nvmft_connect_admin_queue(nvmft_port_t *np, struct nvmft_qpair *qp,
 	    const nvmf_fabric_connect_cmd_t *cmd,
 	    const nvmf_fabric_connect_data_t *data);

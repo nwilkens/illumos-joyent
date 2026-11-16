@@ -61,6 +61,12 @@ typedef struct nvmfd_conn {
 	struct nvmfd_conn	*nc_next;
 } nvmfd_conn_t;
 
+/* A subsystem of the nvmft port provider. */
+typedef struct nvmft_subsys {
+	char		ns_nqn[NVMF_NQN_FIELD_SIZE];
+	uint16_t	ns_portid;
+} nvmft_subsys_t;
+
 extern bool data_digests;
 extern bool header_digests;
 extern bool flow_control_disable;
@@ -89,9 +95,8 @@ void	io_connection(nvmfd_conn_t *conn);
 void	init_nvmft(void);
 int	nvmft_handoff_qpair(struct nvmf_qpair *qp,
     const nvmf_fabric_connect_cmd_t *cmd,
-    const nvmf_fabric_connect_data_t *data);
-bool	nvmft_subsystem_exists(const char *subnqn);
-int	nvmft_subsystems(char (**nqnsp)[NVMF_NQN_FIELD_SIZE], uint_t *countp,
+    const nvmf_fabric_connect_data_t *data, bool *refusedp);
+int	nvmft_subsystems(nvmft_subsys_t **subsp, uint_t *countp,
     uint64_t *genctrp);
 
 #endif /* _NVMFD_INTERNAL_H */

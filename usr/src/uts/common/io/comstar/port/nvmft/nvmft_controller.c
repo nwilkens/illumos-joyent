@@ -273,13 +273,18 @@ nvmft_accept_done(nvmft_controller_t *ctrlr)
 	mutex_exit(&ctrlr->ctrlr_lock);
 }
 
+/*
+ * The two handoffs set *adoptedp once the transport has the socket.  From
+ * there the queue is the kernel's, which answers the Connect on every path.
+ */
 int
 nvmft_handoff_admin_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
     const nvlist_t *params, const nvmf_fabric_connect_cmd_t *cmd,
-    const nvmf_fabric_connect_data_t *data)
+    const nvmf_fabric_connect_data_t *data, boolean_t *adoptedp)
 {
 	struct nvmft_qpair *qp;
 
+	*adoptedp = B_FALSE;
 	if (cmd->nfcc_qid != LE_16(0))
 		return (EINVAL);
 
@@ -291,6 +296,7 @@ nvmft_handoff_admin_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
 		return (ENXIO);
 	}
 
+	*adoptedp = B_TRUE;
 	return (nvmft_connect_admin_queue(np, qp, cmd, data));
 }
 
@@ -387,12 +393,13 @@ nvmft_connect_admin_queue(nvmft_port_t *np, struct nvmft_qpair *qp,
 int
 nvmft_handoff_io_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
     const nvlist_t *params, const nvmf_fabric_connect_cmd_t *cmd,
-    const nvmf_fabric_connect_data_t *data)
+    const nvmf_fabric_connect_data_t *data, boolean_t *adoptedp)
 {
 	struct nvmft_qpair *qp;
 	char name[16];
 	uint16_t qid;
 
+	*adoptedp = B_FALSE;
 	qid = LE_16(cmd->nfcc_qid);
 	if (qid == 0)
 		return (EINVAL);
@@ -406,6 +413,7 @@ nvmft_handoff_io_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
 		return (ENXIO);
 	}
 
+	*adoptedp = B_TRUE;
 	return (nvmft_connect_io_queue(np, qp, cmd, data));
 }
 

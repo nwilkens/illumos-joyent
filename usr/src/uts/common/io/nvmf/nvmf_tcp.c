@@ -1640,9 +1640,13 @@ tcp_allocate_qpair(boolean_t controller, const nvlist_t *params)
 	    &data_digests) != 0 ||
 	    nvlist_lookup_uint64(nvl, "maxr2t", &maxr2t) != 0 ||
 	    nvlist_lookup_uint64(nvl, "maxh2cdata", &maxh2cdata) != 0 ||
-	    nvlist_lookup_uint64(nvl, "max_icd", &max_icd) != 0 ||
 	    nvlist_lookup_uint64(nvl, "qsize", &qsize) != 0 ||
 	    nvlist_lookup_boolean_value(nvl, "sq_flow_control", &sqfc) != 0)
+		return (NULL);
+
+	/* A controller sets its own limit; a host has the controller's. */
+	max_icd = 0;
+	if (!controller && nvlist_lookup_uint64(nvl, "max_icd", &max_icd) != 0)
 		return (NULL);
 
 	if (!nvmf_tcp_params_ok(rxpda, txpda, maxr2t, maxh2cdata, max_icd,
@@ -1666,7 +1670,6 @@ tcp_allocate_qpair(boolean_t controller, const nvlist_t *params)
 
 	if (controller) {
 		qp->tq_maxh2cdata = (uint32_t)maxh2cdata;
-		/* The handoff's max_icd is the host's limit, not ours. */
 		qp->tq_max_rx_icd = nvmf_tcp_max_icd;
 		max_data = MAX(qp->tq_maxh2cdata, qp->tq_max_rx_icd);
 

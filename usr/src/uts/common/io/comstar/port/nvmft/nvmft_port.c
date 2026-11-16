@@ -109,6 +109,7 @@ nvmft_port_alloc(const char *subnqn, uint16_t portid, const char *serial,
 
 	mutex_enter(&nvmft_global->ns_lock);
 	list_insert_tail(&nvmft_global->ns_ports, np);
+	nvmft_global->ns_generation++;
 	mutex_exit(&nvmft_global->ns_lock);
 
 	return (np);

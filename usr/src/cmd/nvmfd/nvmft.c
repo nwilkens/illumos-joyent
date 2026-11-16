@@ -36,29 +36,30 @@
 
 static int nvmft_fd = -1;
 
-/*
- * The subsystems as last read from the kernel, sorted.  The generation
- * counts the times a read has differed from the one before.
- */
+/* The subsystems and their generation as last read from the kernel, sorted. */
 static pthread_mutex_t nvmft_lock = PTHREAD_MUTEX_INITIALIZER;
-static char (*nvmft_nqns)[NVMF_NQN_FIELD_SIZE];
+static nvmft_subsys_t *nvmft_subs;
 static uint_t nvmft_count;
 static uint64_t nvmft_genctr;
 
 static int
-nqn_compare(const void *a, const void *b)
+subsys_compare(const void *a, const void *b)
 {
-	return (strcmp(a, b));
+	const nvmft_subsys_t *sa = a, *sb = b;
+
+	return (strcmp(sa->ns_nqn, sb->ns_nqn));
 }
 
 static int
-nvmft_read_subsystems(char (**nqnsp)[NVMF_NQN_FIELD_SIZE], uint_t *countp)
+nvmft_read_subsystems(nvmft_subsys_t **subsp, uint_t *countp,
+    uint64_t *genctrp)
 {
-	char (*nqns)[NVMF_NQN_FIELD_SIZE] = NULL;
+	nvmft_subsys_t *subs = NULL;
 	struct nvmf_ioc_nv nv;
 	nvlist_t *nvl;
 	char **names;
-	uint_t count, i;
+	uint16_t *portids;
+	uint_t count, nportids, i;
 	int error, tries;
 
 	/* The list can grow between the call that sizes it and the next. */
@@ -83,50 +84,56 @@ nvmft_read_subsystems(char (**nqnsp)[NVMF_NQN_FIELD_SIZE], uint_t *countp)
 	if (error != 0)
 		return (error);
 
+	if (nvlist_lookup_uint64(nvl, NVMFT_NV_GENERATION, genctrp) != 0) {
+		nvlist_free(nvl);
+		return (EINVAL);
+	}
 	count = 0;
 	if (nvlist_lookup_string_array(nvl, NVMFT_NV_SUBNQNS, &names,
 	    &count) != 0)
 		count = 0;
 	if (count != 0) {
-		nqns = calloc(count, sizeof (*nqns));
-		if (nqns == NULL) {
+		if (nvlist_lookup_uint16_array(nvl, NVMFT_NV_PORTIDS, &portids,
+		    &nportids) != 0 || nportids != count) {
+			nvlist_free(nvl);
+			return (EINVAL);
+		}
+		subs = calloc(count, sizeof (*subs));
+		if (subs == NULL) {
 			nvlist_free(nvl);
 			return (ENOMEM);
 		}
-		for (i = 0; i < count; i++)
-			(void) strlcpy(nqns[i], names[i], sizeof (nqns[i]));
-		qsort(nqns, count, sizeof (*nqns), nqn_compare);
+		for (i = 0; i < count; i++) {
+			(void) strlcpy(subs[i].ns_nqn, names[i],
+			    sizeof (subs[i].ns_nqn));
+			subs[i].ns_portid = portids[i];
+		}
+		qsort(subs, count, sizeof (*subs), subsys_compare);
 	}
 	nvlist_free(nvl);
 
-	*nqnsp = nqns;
+	*subsp = subs;
 	*countp = count;
 	return (0);
 }
 
 /* Call with nvmft_lock held. */
 static int
-nvmft_refresh(bool first)
+nvmft_refresh(void)
 {
-	char (*nqns)[NVMF_NQN_FIELD_SIZE];
+	nvmft_subsys_t *subs;
+	uint64_t genctr;
 	uint_t count;
 	int error;
 
-	error = nvmft_read_subsystems(&nqns, &count);
+	error = nvmft_read_subsystems(&subs, &count, &genctr);
 	if (error != 0)
 		return (error);
 
-	if (count == nvmft_count && (count == 0 ||
-	    memcmp(nqns, nvmft_nqns, count * sizeof (*nqns)) == 0)) {
-		free(nqns);
-		return (0);
-	}
-
-	free(nvmft_nqns);
-	nvmft_nqns = nqns;
+	free(nvmft_subs);
+	nvmft_subs = subs;
 	nvmft_count = count;
-	if (!first)
-		nvmft_genctr++;
+	nvmft_genctr = genctr;
 	return (0);
 }
 
@@ -139,45 +146,34 @@ init_nvmft(void)
 	if (nvmft_fd == -1)
 		err(1, "Failed to open %s", NVMFT_DEV);
 
-	error = nvmft_refresh(true);
+	error = nvmft_refresh();
 	if (error != 0)
 		errc(1, error, "Failed to list subsystems");
 }
 
-bool
-nvmft_subsystem_exists(const char *subnqn)
-{
-	bool found;
-
-	(void) pthread_mutex_lock(&nvmft_lock);
-	(void) nvmft_refresh(false);
-	found = nvmft_count != 0 && bsearch(subnqn, nvmft_nqns, nvmft_count,
-	    sizeof (*nvmft_nqns), nqn_compare) != NULL;
-	(void) pthread_mutex_unlock(&nvmft_lock);
-	return (found);
-}
-
-/* A copy of the current subsystem list for the caller to free. */
+/*
+ * A copy of the current subsystem list for the caller to free, with the
+ * kernel's generation of that list.
+ */
 int
-nvmft_subsystems(char (**nqnsp)[NVMF_NQN_FIELD_SIZE], uint_t *countp,
-    uint64_t *genctrp)
+nvmft_subsystems(nvmft_subsys_t **subsp, uint_t *countp, uint64_t *genctrp)
 {
-	char (*nqns)[NVMF_NQN_FIELD_SIZE] = NULL;
+	nvmft_subsys_t *subs = NULL;
 	int error;
 
 	(void) pthread_mutex_lock(&nvmft_lock);
-	error = nvmft_refresh(false);
+	error = nvmft_refresh();
 	if (error == 0 && nvmft_count != 0) {
-		nqns = calloc(nvmft_count, sizeof (*nqns));
-		if (nqns == NULL) {
+		subs = calloc(nvmft_count, sizeof (*subs));
+		if (subs == NULL) {
 			error = ENOMEM;
 		} else {
-			(void) memcpy(nqns, nvmft_nqns,
-			    nvmft_count * sizeof (*nqns));
+			(void) memcpy(subs, nvmft_subs,
+			    nvmft_count * sizeof (*subs));
 		}
 	}
 	if (error == 0) {
-		*nqnsp = nqns;
+		*subsp = subs;
 		*countp = nvmft_count;
 		*genctrp = nvmft_genctr;
 	}
@@ -185,20 +181,28 @@ nvmft_subsystems(char (**nqnsp)[NVMF_NQN_FIELD_SIZE], uint_t *countp,
 	return (error);
 }
 
+/*
+ * Hand a queue pair to the kernel.  An error means that the kernel left the
+ * socket alone.  Otherwise the kernel has answered the Connect, and
+ * *refusedp says whether it refused it.
+ */
 int
 nvmft_handoff_qpair(struct nvmf_qpair *qp,
     const nvmf_fabric_connect_cmd_t *cmd,
-    const nvmf_fabric_connect_data_t *data)
+    const nvmf_fabric_connect_data_t *data, bool *refusedp)
 {
 	struct nvmf_ioc_nv nv;
-	int error;
+	int error, rv;
 
 	error = nvmf_handoff_controller_qpair(qp, cmd, data, &nv);
 	if (error != 0)
 		return (error);
 
-	if (ioctl(nvmft_fd, NVMFT_IOC_HANDOFF, &nv) != 0)
+	rv = ioctl(nvmft_fd, NVMFT_IOC_HANDOFF, &nv);
+	if (rv == -1)
 		error = errno;
+	else
+		*refusedp = (rv == NVMFT_HANDOFF_REFUSED);
 
 	free(nv.data);
 	return (error);
