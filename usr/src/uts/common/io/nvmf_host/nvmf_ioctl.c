@@ -52,56 +52,6 @@
 /* Seconds the disconnect ioctl waits for the namespace worker. */
 #define	NVMF_DETACH_WAIT	120
 
-#ifdef _MULTI_DATAMODEL
-typedef struct nvmf_ioc_nv32 {
-	caddr32_t	data;
-	size32_t	len;
-	size32_t	size;
-} nvmf_ioc_nv32_t;
-#endif
-
-static int
-nvmf_ioc_copyin(intptr_t arg, int mode, struct nvmf_ioc_nv *nv)
-{
-#ifdef _MULTI_DATAMODEL
-	if (ddi_model_convert_from(mode & FMODELS) == DDI_MODEL_ILP32) {
-		nvmf_ioc_nv32_t nv32;
-
-		if (ddi_copyin((void *)arg, &nv32, sizeof (nv32), mode) != 0)
-			return (EFAULT);
-		nv->data = (void *)(uintptr_t)nv32.data;
-		nv->len = nv32.len;
-		nv->size = nv32.size;
-		return (0);
-	}
-#endif
-	if (ddi_copyin((void *)arg, nv, sizeof (*nv), mode) != 0)
-		return (EFAULT);
-	return (0);
-}
-
-static int
-nvmf_ioc_copyout(const struct nvmf_ioc_nv *nv, intptr_t arg, int mode)
-{
-#ifdef _MULTI_DATAMODEL
-	if (ddi_model_convert_from(mode & FMODELS) == DDI_MODEL_ILP32) {
-		nvmf_ioc_nv32_t nv32;
-
-		if (nv->len > UINT32_MAX)
-			return (EOVERFLOW);
-		nv32.data = (caddr32_t)(uintptr_t)nv->data;
-		nv32.len = (size32_t)nv->len;
-		nv32.size = (size32_t)nv->size;
-		if (ddi_copyout(&nv32, (void *)arg, sizeof (nv32), mode) != 0)
-			return (EFAULT);
-		return (0);
-	}
-#endif
-	if (ddi_copyout(nv, (void *)arg, sizeof (*nv), mode) != 0)
-		return (EFAULT);
-	return (0);
-}
-
 /* The timeouts of a handoff, in the units and types the handoff uses. */
 static boolean_t
 nvmf_timeouts_valid(uint64_t kato, uint64_t reconnect_delay,
@@ -552,6 +502,10 @@ nvmf_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *credp,
 	    crgetzoneid(credp) != GLOBAL_ZONEID)
 		return (EPERM);
 
+	/* struct nvmf_ioc_nv is copied at its native size, as nvmft does. */
+	if (ddi_model_convert_from(mode & FMODELS) != DDI_MODEL_NONE)
+		return (ENOTSUP);
+
 	sc = ddi_get_soft_state(nvmf_state, getminor(dev));
 	if (sc == NULL)
 		return (ENXIO);
@@ -576,9 +530,8 @@ nvmf_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *credp,
 	if (cmd == NVMF_DISCONNECT_HOST || cmd == NVMF_DISCONNECT_ALL)
 		return (nvmf_disconnect_host(sc));
 
-	error = nvmf_ioc_copyin(arg, mode, &nv);
-	if (error != 0)
-		return (error);
+	if (ddi_copyin((void *)arg, &nv, sizeof (nv), mode) != 0)
+		return (EFAULT);
 
 	switch (cmd) {
 	case NVMF_HANDOFF_HOST:
@@ -596,7 +549,8 @@ nvmf_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *credp,
 		break;
 	}
 
-	if (error == 0)
-		error = nvmf_ioc_copyout(&nv, arg, mode);
+	if (error == 0 &&
+	    ddi_copyout(&nv, (void *)arg, sizeof (nv), mode) != 0)
+		error = EFAULT;
 	return (error);
 }

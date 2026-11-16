@@ -94,15 +94,6 @@ typedef enum nvmf_io_action {
 #define	NVMF_NS_EV_PURGE	0x02
 #define	NVMF_NS_EV_DETACH	0x04
 
-/*
- * Sysevents posted with ddi_log_sysevent() under vendor DDI_VENDOR_SUNW.  Each
- * carries the int32 "instance" and the string "subnqn".
- */
-#define	EC_NVMF			"EC_nvmf"
-#define	ESC_NVMF_HOST_LOST	"ESC_nvmf_host_lost"
-#define	ESC_NVMF_HOST_RECONNECT	"ESC_nvmf_host_reconnect"
-#define	ESC_NVMF_HOST_FAILED	"ESC_nvmf_host_failed"
-
 typedef struct nvmf_softc {
 	dev_info_t		*dip;
 

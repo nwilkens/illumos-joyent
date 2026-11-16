@@ -264,20 +264,6 @@ extern uint32_t nvmf_crc32c(uint32_t crc, const void *buf, size_t len);
 #define	NVMF_SC_GET_SCT(status)	(((status) >> 9) & 0x7)
 #define	NVMF_SC_GET_SC(status)	(((status) >> 1) & 0xff)
 
-/*
- * The nvmf_host driver's ioctls.  The driver defines the same numbers in its
- * private io/nvmf/nvmf_core.h.
- */
-#ifndef	NVMF_HANDOFF_HOST
-#define	NVMF_HANDOFF_HOST	(NVMF_IOC | 200)
-#define	NVMF_DISCONNECT_HOST	(NVMF_IOC | 201)
-#define	NVMF_DISCONNECT_ALL	(NVMF_IOC | 202)
-#define	NVMF_RECONNECT_PARAMS	(NVMF_IOC | 203)
-#define	NVMF_RECONNECT_HOST	(NVMF_IOC | 204)
-#define	NVMF_CONNECTION_STATUS	(NVMF_IOC | 205)
-#define	NVMF_LIST_CONTROLLER	(NVMF_IOC | 206)
-#endif
-
 /* Shared lower-level controller helpers (nvmf_subr.c). */
 extern uint64_t _nvmf_controller_cap(uint32_t max_io_qsize,
     uint8_t enable_timeout);

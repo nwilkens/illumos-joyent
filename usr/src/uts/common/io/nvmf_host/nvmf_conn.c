@@ -40,6 +40,7 @@
 #include <sys/errno.h>
 #include <sys/nvpair.h>
 #include <sys/sysevent.h>
+#include <sys/sysevent/eventdefs.h>
 #include <sys/nvme.h>
 #include <sys/nvme/nvmf.h>
 #include <sys/nvme/nvmf_transport.h>

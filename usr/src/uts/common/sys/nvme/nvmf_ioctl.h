@@ -19,7 +19,7 @@
  * the small, stable ABI that userland needs: the packed-nvlist carrier struct
  * and the ioctl command numbers.  The richer protocol structures stay in
  * <sys/nvme/nvmf.h>; the driver-private defaults stay in the kernel-only
- * io/nvmf/nvmf_core.h, which now includes this header for the carrier.
+ * io/nvmf/nvmf_core.h.
  *
  * The nvmft target control ioctls (NVMFT_IOC_*) operate on /dev/nvmft/admin.
  * NVMFT_IOC_SUBSYS_* let nvmfadm(8) create and destroy a subsystem
@@ -65,9 +65,8 @@ struct nvmf_ioc_nv {
 
 /*
  * ioctl command magic.  illumos uses a flat command-number convention for
- * driver ioctls.  The host (/dev/nvmf, /dev/nvmeX) commands keep their FreeBSD
- * ordinals (200-205, defined in io/nvmf/nvmf_core.h); the target port-provider
- * control commands (this header) start at 100 so the two ranges never collide.
+ * driver ioctls.  The host commands keep their FreeBSD ordinals, from 200;
+ * the target port-provider control commands start at 100.
  */
 #define	NVMF_IOC		(('n' << 8))
 
@@ -173,6 +172,67 @@ struct nvmf_ioc_nv {
 
 /* Reply nvlist key for NVMFT_IOC_SUBSYS_LIST: string array of SubNQNs. */
 #define	NVMFT_NV_SUBNQNS	"subnqns"
+
+/*
+ * Operations on /dev/nvmf, the control node of the nvmf_host driver.  The
+ * argument is a struct nvmf_ioc_nv with a packed nvlist, except for the two
+ * disconnects, which take none.
+ *
+ * NVMF_HANDOFF_HOST	  Hand the queue pairs of a new association to the
+ *			  kernel.
+ * NVMF_DISCONNECT_HOST,
+ * NVMF_DISCONNECT_ALL	  Disconnect the association of the node.
+ * NVMF_RECONNECT_PARAMS  Copy out the "rparams" of the last handoff.
+ * NVMF_RECONNECT_HOST	  Hand over new queue pairs for a lost association.
+ * NVMF_CONNECTION_STATUS Copy out the state of the association.
+ * NVMF_LIST_CONTROLLER	  Copy out the controller and its namespaces.  This
+ *			  one is not a FreeBSD command.
+ */
+#define	NVMF_HANDOFF_HOST	(NVMF_IOC | 200)
+#define	NVMF_DISCONNECT_HOST	(NVMF_IOC | 201)
+#define	NVMF_DISCONNECT_ALL	(NVMF_IOC | 202)
+#define	NVMF_RECONNECT_PARAMS	(NVMF_IOC | 203)
+#define	NVMF_RECONNECT_HOST	(NVMF_IOC | 204)
+#define	NVMF_CONNECTION_STATUS	(NVMF_IOC | 205)
+#define	NVMF_LIST_CONTROLLER	(NVMF_IOC | 206)
+
+/*
+ * A host qpair handoff nvlist has the keys of the "params" nvlist above and
+ *
+ *   number	sqtail
+ *
+ * The fields in the nvlist for NVMF_HANDOFF_HOST and NVMF_RECONNECT_HOST are:
+ *
+ *   number			trtype
+ *   number			kato	(optional)
+ *   number			reconnect_delay (optional)
+ *   number			controller_loss_timeout (optional)
+ *   qpair handoff nvlist	admin
+ *   qpair handoff nvlist array	io
+ *   binary			cdata	nvme_identify_ctrl_t
+ *   NVMF_RECONNECT_PARAMS nvlist	rparams
+ *
+ * The fields in the nvlist for NVMF_RECONNECT_PARAMS are:
+ *
+ *   binary			dle	nvmf_discovery_log_page_entry_t
+ *   string			hostnqn
+ *   number			num_io_queues
+ *   number			kato	(optional)
+ *   number			reconnect_delay (optional)
+ *   number			controller_loss_timeout (optional)
+ *   number			io_qsize
+ *   bool			sq_flow_control
+ *   bool			header_digests	(TCP)
+ *   bool			data_digests	(TCP)
+ *
+ * The fields in the nvlist for NVMF_CONNECTION_STATUS are:
+ *
+ *   bool			connected
+ *   string			state
+ *   timespec nvlist		last_disconnect
+ *    number			tv_sec
+ *    number			tv_nsec
+ */
 
 #ifdef __cplusplus
 }

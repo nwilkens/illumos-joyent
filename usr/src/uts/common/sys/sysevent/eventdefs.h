@@ -24,6 +24,7 @@
  * Copyright 2016 Nexenta Systems, Inc.
  * Copyright 2019 Joyent, Inc.
  * Copyright 2022 Garrett D'Amore
+ * Copyright 2026 Edgecast Cloud LLC.
  */
 
 #ifndef	_SYS_SYSEVENT_EVENTDEFS_H
@@ -56,6 +57,7 @@ extern "C" {
 #define	EC_DATALINK	"EC_datalink"	/* datalink event */
 #define	EC_VRRP		"EC_vrrp"	/* VRRP event */
 #define	EC_PCIE		"EC_pcie"	/* PCIe event */
+#define	EC_NVMF		"EC_nvmf"	/* NVMe over Fabrics event */
 
 /*
  * The following event class is reserved for exclusive use
@@ -222,6 +224,14 @@ extern "C" {
  * sys/sysevent/pcie.h.
  */
 #define	ESC_PCIE_LINK_STATE	"ESC_pcie_link_state"
+
+/*
+ * NVMe over Fabrics host subclass definitions.  Each event has the int32
+ * attribute "instance" and the string attribute "subnqn".
+ */
+#define	ESC_NVMF_HOST_LOST	"ESC_nvmf_host_lost"
+#define	ESC_NVMF_HOST_RECONNECT	"ESC_nvmf_host_reconnect"
+#define	ESC_NVMF_HOST_FAILED	"ESC_nvmf_host_failed"
 
 #ifdef	__cplusplus
 }
