@@ -94,6 +94,7 @@ typedef struct nvmf_tcp_command_buffer {
 
 	uint16_t cid;
 	uint16_t ttag;
+	bool	linked;
 
 	LIST_ENTRY(nvmf_tcp_command_buffer) link;
 } nvmf_tcp_command_buffer_t;
@@ -171,6 +172,7 @@ tcp_alloc_command_buffer(nvmf_tcp_qpair_t *qp, void *data,
 	cb->data_xfered = 0;
 	cb->cid = cid;
 	cb->ttag = ttag;
+	cb->linked = true;
 
 	if (receive)
 		LIST_INSERT_HEAD(&qp->rx_buffers, cb, link);
@@ -201,14 +203,17 @@ tcp_purge_command_buffer(nvmf_tcp_qpair_t *qp, uint16_t cid, uint16_t ttag,
 	nvmf_tcp_command_buffer_t *cb;
 
 	cb = tcp_find_command_buffer(qp, cid, ttag, receive);
-	if (cb != NULL)
+	if (cb != NULL) {
 		LIST_REMOVE(cb, link);
+		cb->linked = false;
+	}
 }
 
 static void
 tcp_free_command_buffer(nvmf_tcp_command_buffer_t *cb)
 {
-	LIST_REMOVE(cb, link);
+	if (cb->linked)
+		LIST_REMOVE(cb, link);
 	free(cb);
 }
 
