@@ -553,8 +553,11 @@ nvmf_tcp_construct_pdu(nvmf_tcp_qpair_t *qp, void *hdr, size_t hlen,
 	if (qp->header_digests)
 		plen += sizeof (header_digest);
 	if (data_len != 0) {
-		pdo = P2ROUNDUP(plen, qp->txpda);
+		/* The PDA is a multiple of 4, not always a power of 2. */
+		pdo = ((plen + qp->txpda - 1) / qp->txpda) * qp->txpda;
 		pad = pdo - plen;
+		if (pad > sizeof (zero_padding))
+			return (EINVAL);
 		plen = pdo + data_len;
 		if (qp->data_digests)
 			plen += sizeof (data_digest);
