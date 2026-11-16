@@ -463,6 +463,18 @@ nvmf_tcp_read_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 		return (EBADMSG);
 	}
 
+	/*
+	 * The controller side handles one command at a time, so a command
+	 * that arrives while it waits for H2C data is never legitimate here.
+	 */
+	if (ch.ntcph_pdu_type == NVMF_TCP_PDU_TYPE_CAPSULE_CMD &&
+	    !LIST_EMPTY(&qp->rx_buffers)) {
+		nvmf_tcp_report_error(na, qp,
+		    NVMF_TCP_TERM_REQ_FES_PDU_SEQUENCE_ERROR, 0, &ch,
+		    sizeof (ch), sizeof (ch));
+		return (EBADMSG);
+	}
+
 	plen = LE_32(ch.ntcph_plen);
 	pdu->hdr = malloc(plen);
 	if (pdu->hdr == NULL)
