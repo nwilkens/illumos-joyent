@@ -242,7 +242,8 @@ nvmf_connect(struct nvmf_association *na, const nvmf_qpair_params_t *params,
 	qp->nq_qsize = queue_size;
 	qp->nq_cntlid = LE_16(rsp->nfcr_status_code_specific.success.cntlid);
 	qp->nq_kato = kato;
-	/* XXX: Save qid in qp? */
+	nvmf_free_capsule(rc);
+	nvmf_free_capsule(cc);
 	return (qp);
 
 error:
