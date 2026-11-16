@@ -36,7 +36,7 @@
 #include "internal.h"
 
 /* The nvmf_host driver's control node; devfsadm makes no /dev link. */
-#define	NVMF_HOST_DEV	"/devices/pseudo/nvmf_host@0:nvmf"
+#define	NVMF_HOST_DEV	"/devices/nvmf_host:nvmf"
 
 static bool
 is_queue_pair_idle(struct nvmf_qpair *qp)

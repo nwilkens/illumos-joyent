@@ -31,8 +31,6 @@
 #include <sys/conf.h>
 #include <sys/ddi.h>
 #include <sys/sunddi.h>
-#include <sys/ddi_impldefs.h>
-#include <sys/autoconf.h>
 #include <sys/mkdev.h>
 #include <sys/modctl.h>
 #include <sys/cmn_err.h>
@@ -244,68 +242,6 @@ static struct dev_ops nvmf_dev_ops = {
 	.devo_quiesce = ddi_quiesce_not_needed
 };
 
-/*
- * nvmf_host is a pseudo device, and e_ddi_assign_instance() does not assign
- * instances to the children of a pseudo nexus.  This wraps blkdev's bus_ctl
- * so that INITCHILD gives each blkdev child an instance, as pseudonex does for
- * its own children.
- */
-static struct bus_ops nvmf_bus_ops;
-static int (*nvmf_bd_bus_ctl)(dev_info_t *, dev_info_t *, ddi_ctl_enum_t,
-    void *, void *);
-
-/* blkdev packs 64 partitions per instance into a 32-bit capable minor. */
-#define	NVMF_BD_MAX_INSTANCE	(MAXMIN32 / 64)
-
-/*
- * Give the child the highest blkdev instance no node has.  The instance tree,
- * which numbers every other blkdev child, does not know these numbers and
- * hands its own out from the bottom, so the two are kept apart by starting
- * at the top.
- */
-static int
-nvmf_blkdev_assign_instance(dev_info_t *child)
-{
-	major_t		maj = ddi_driver_major(child);
-	struct devnames	*dnp = &devnamesp[maj];
-	dev_info_t	*tdip;
-	int		inst;
-
-	LOCK_DEV_OPS(&dnp->dn_lock);
-	for (inst = NVMF_BD_MAX_INSTANCE; inst >= 0; inst--) {
-		for (tdip = dnp->dn_head; tdip != NULL;
-		    tdip = ddi_get_next(tdip)) {
-			if (tdip != child && ddi_get_instance(tdip) == inst)
-				break;
-		}
-		if (tdip == NULL) {
-			DEVI(child)->devi_instance = inst;
-			break;
-		}
-	}
-	UNLOCK_DEV_OPS(&dnp->dn_lock);
-	return (inst);
-}
-
-static int
-nvmf_bus_ctl(dev_info_t *dip, dev_info_t *rdip, ddi_ctl_enum_t ctlop,
-    void *arg, void *result)
-{
-	int rv = nvmf_bd_bus_ctl(dip, rdip, ctlop, arg, result);
-
-	if (ctlop == DDI_CTLOPS_INITCHILD && rv == DDI_SUCCESS) {
-		dev_info_t *child = (dev_info_t *)arg;
-
-		if (ddi_get_instance(child) == -1 &&
-		    nvmf_blkdev_assign_instance(child) < 0) {
-			(void) nvmf_bd_bus_ctl(dip, rdip,
-			    DDI_CTLOPS_UNINITCHILD, arg, result);
-			return (DDI_FAILURE);
-		}
-	}
-	return (rv);
-}
-
 static struct modldrv nvmf_modldrv = {
 	.drv_modops = &mod_driverops,
 	.drv_linkinfo = "NVMe over Fabrics host",
@@ -329,10 +265,6 @@ _init(void)
 	nvmf_cmd_init();
 
 	bd_mod_init(&nvmf_dev_ops);
-	nvmf_bus_ops = *nvmf_dev_ops.devo_bus_ops;
-	nvmf_bd_bus_ctl = nvmf_bus_ops.bus_ctl;
-	nvmf_bus_ops.bus_ctl = nvmf_bus_ctl;
-	nvmf_dev_ops.devo_bus_ops = &nvmf_bus_ops;
 
 	error = mod_install(&nvmf_modlinkage);
 	if (error != 0) {
