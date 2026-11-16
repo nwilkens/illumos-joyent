@@ -74,6 +74,10 @@ struct nvmft_controller;
 struct nvmft_qpair;
 struct nvmft_ana_group;
 
+/* NSID n is LUN n - 1, and STMF has 14-bit single level LUNs. */
+#define	NVMFT_MAX_LUN		0x3fff
+#define	NVMFT_MAX_NSID		(NVMFT_MAX_LUN + 1)
+
 /* Maximum number of outstanding AER commands tracked per controller. */
 #define	NVMFT_NUM_AER		16
 
@@ -139,6 +143,7 @@ typedef struct nvmft_port {
 	boolean_t		np_offline;
 	kcondvar_t		np_cv;
 	boolean_t		np_deleting;	/* ns_lock */
+	uint_t			np_accepting;	/* admin queues in accept */
 
 	/* cntlid allocator (FreeBSD: struct unrhdr *ids). */
 	id_space_t		*np_ids;
@@ -307,6 +312,8 @@ typedef struct nvmft_softc {
 	taskq_t			*ns_admin_taskq;
 	taskq_t			*ns_io_taskq;
 
+	/* Serializes subsystem create and delete; taken before ns_lock. */
+	kmutex_t		ns_config_lock;
 	kmutex_t		ns_lock;	/* protects the fields below */
 	list_t			ns_ports;	/* nvmft_port list */
 	uint_t			ns_kernel_qpairs; /* adopted, not destroyed */

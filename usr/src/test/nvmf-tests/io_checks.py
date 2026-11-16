@@ -35,7 +35,7 @@ def main():
                  "KEY_ILLEGAL_REQUEST", "KEY_UNIT_ATTENTION",
                  "KEY_WRITE_PROTECT", "KEY_ABORTED_COMMAND", "KEY_MISCOMPARE"):
         parts.append(define(sense_h, name))
-    parts.append(define(NVMFT / "nvmft_io.h", "NVMFT_MAX_LUN"))
+    parts.append(define(NVMFT / "nvmft_var.h", "NVMFT_MAX_LUN"))
     parts.append(function(io, "nvmft_check_io_command"))
     parts.append(function(io, "nvmft_scsi_to_nvme"))
     run_c(TESTDIR / "io_checks.c", {"io.h": "\n".join(parts)})

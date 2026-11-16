@@ -27,9 +27,6 @@
 extern "C" {
 #endif
 
-/* NSID n is LUN n - 1, and STMF has 14-bit single level LUNs. */
-#define	NVMFT_MAX_LUN	0x3fff
-
 /*
  * The private data of an STMF task.  A host command keeps it in its capsule;
  * an internal task keeps it in its nvmft_internal_io_t.

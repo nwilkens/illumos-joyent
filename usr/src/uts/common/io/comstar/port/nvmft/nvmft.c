@@ -14,19 +14,10 @@
  */
 
 /*
- * NEW file.  Module entry points and STMF port-provider registration for the
- * NVMe-over-Fabrics COMSTAR controller (target).
- *
- * This is modeled on the SRP target port provider's srpt_mod.c.  Where FreeBSD
- * registered an NVMe target frontend with CTL via CTL_FRONTEND_DECLARE() in
- * ctl_frontend_nvmf.c, illumos registers an stmf_port_provider_t with STMF here.
- * The per-subsystem stmf_local_port_t registrations happen in nvmft_stmf.c,
- * driven by the provider configuration callback (pp_cb).
- *
- * Layering: this module depends on the transport core module (nvmf) for the
- * Fabrics capsule/queue-pair API (<sys/nvme/nvmf_transport.h>) and on stmf for
- * the port-provider API (<sys/portif.h>).  The build glue must add
- * "-N misc/nvmf -N drv/stmf" to this module's LDFLAGS (NVMEOF.md 7.5).
+ * Module entry points, the STMF port provider, and the ioctls of
+ * /dev/nvmft/admin that create and delete subsystems and hand queues from
+ * nvmfd to the kernel.  Each subsystem is an STMF local port; see
+ * nvmft_port.c.
  */
 
 #include <sys/types.h>
@@ -44,6 +35,8 @@
 #include <sys/cmn_err.h>
 #include <sys/byteorder.h>	/* LE_16 */
 #include <sys/zone.h>		/* zone_get_hostid() */
+#include <sys/cred.h>
+#include <sys/systm.h>		/* delay_sig() */
 
 #include <sys/nvme/nvmf.h>
 #include <sys/nvme/nvmf_transport.h>
@@ -134,6 +127,7 @@ _init(void)
 
 	nvmft_global = kmem_zalloc(sizeof (nvmft_softc_t), KM_SLEEP);
 	mutex_init(&nvmft_global->ns_lock, NULL, MUTEX_DRIVER, NULL);
+	mutex_init(&nvmft_global->ns_config_lock, NULL, MUTEX_DRIVER, NULL);
 	list_create(&nvmft_global->ns_ports, sizeof (nvmft_port_t),
 	    offsetof(nvmft_port_t, np_link));
 
@@ -155,6 +149,7 @@ _init(void)
 		taskq_destroy(nvmft_global->ns_admin_taskq);
 		taskq_destroy(nvmft_global->ns_taskq);
 		list_destroy(&nvmft_global->ns_ports);
+		mutex_destroy(&nvmft_global->ns_config_lock);
 		mutex_destroy(&nvmft_global->ns_lock);
 		kmem_free(nvmft_global, sizeof (nvmft_softc_t));
 		nvmft_global = NULL;
@@ -195,6 +190,7 @@ _fini(void)
 	taskq_destroy(nvmft_global->ns_admin_taskq);
 	taskq_destroy(nvmft_global->ns_taskq);
 	list_destroy(&nvmft_global->ns_ports);
+	mutex_destroy(&nvmft_global->ns_config_lock);
 	mutex_destroy(&nvmft_global->ns_lock);
 	kmem_free(nvmft_global, sizeof (nvmft_softc_t));
 	nvmft_global = NULL;
@@ -289,7 +285,9 @@ nvmft_drv_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	mutex_exit(&nvmft_global->ns_lock);
 
 	if (nvmft_global->ns_pp != NULL) {
-		(void) stmf_deregister_port_provider(nvmft_global->ns_pp);
+		if (stmf_deregister_port_provider(nvmft_global->ns_pp) !=
+		    STMF_SUCCESS)
+			return (DDI_FAILURE);
 		stmf_free(nvmft_global->ns_pp);
 		nvmft_global->ns_pp = NULL;
 	}
@@ -305,7 +303,7 @@ nvmft_drv_open(dev_t *devp, int flag, int otyp, cred_t *cred)
 {
 	if (otyp != OTYP_CHR)
 		return (EINVAL);
-	if (drv_priv(cred) != 0)
+	if (drv_priv(cred) != 0 || crgetzoneid(cred) != GLOBAL_ZONEID)
 		return (EPERM);
 	return (0);
 }
@@ -318,8 +316,8 @@ nvmft_drv_close(dev_t dev, int flag, int otyp, cred_t *cred)
 }
 
 /*
- * Look up a registered subsystem port by SubNQN under ns_lock.  Returns the
- * port with a reference held (caller must nvmft_port_rele()), or NULL.
+ * Look up a subsystem by SubNQN.  Returns the port with a reference held, or
+ * NULL.  Called with ns_lock held.
  */
 static nvmft_port_t *
 nvmft_port_lookup(const char *subnqn)
@@ -342,6 +340,7 @@ nvmft_port_lookup(const char *subnqn)
 	return (NULL);
 }
 
+/* The subsystem for a new queue: one that is not being deleted. */
 nvmft_port_t *
 nvmft_port_find(const char *subnqn)
 {
@@ -349,13 +348,44 @@ nvmft_port_find(const char *subnqn)
 
 	mutex_enter(&nvmft_global->ns_lock);
 	np = nvmft_port_lookup(subnqn);
+	if (np != NULL && np->np_deleting) {
+		mutex_exit(&nvmft_global->ns_lock);
+		nvmft_port_rele(np);
+		return (NULL);
+	}
 	mutex_exit(&nvmft_global->ns_lock);
 	return (np);
 }
 
 /*
+ * The limits on the parameters of a subsystem.  A capsule size is a multiple
+ * of 16 bytes that holds at least the queue entry, and an NSID is an STMF LUN
+ * plus one.
+ */
+static boolean_t
+nvmft_port_params_valid(uint64_t portid, uint64_t max_io_qsize,
+    uint64_t ioccsz, uint64_t iorcsz, uint64_t nn)
+{
+	if (portid > UINT16_MAX)
+		return (B_FALSE);
+	if (max_io_qsize < NVME_MIN_IO_ENTRIES ||
+	    max_io_qsize > NVME_MAX_IO_ENTRIES)
+		return (B_FALSE);
+	if (ioccsz < sizeof (nvme_sqe_t) || ioccsz > UINT32_MAX ||
+	    ioccsz % 16 != 0)
+		return (B_FALSE);
+	if (iorcsz < sizeof (nvme_cqe_t) || iorcsz > UINT32_MAX ||
+	    iorcsz % 16 != 0)
+		return (B_FALSE);
+	if (nn < 1 || nn > NVMFT_MAX_NSID)
+		return (B_FALSE);
+	return (B_TRUE);
+}
+
+/*
  * NVMFT_IOC_SUBSYS_CREATE: create and register one subsystem stmf_local_port_t.
  * Only "subnqn" is required; everything else defaults to the Fabrics values.
+ * STMF must still be told to online the port (stmfadm online-target).
  */
 static int
 nvmft_ioc_subsys_create(intptr_t arg, int mode)
@@ -380,7 +410,6 @@ nvmft_ioc_subsys_create(intptr_t arg, int mode)
 		return (EINVAL);
 	}
 
-	/* Optional parameters fall back to the Fabrics defaults. */
 	if (nvlist_lookup_string(req, NVMFT_NV_SERIAL, &serial) != 0) {
 		nvmf_controller_serial(serbuf, sizeof (serbuf),
 		    zone_get_hostid(NULL));
@@ -398,34 +427,76 @@ nvmft_ioc_subsys_create(intptr_t arg, int mode)
 	if (nvlist_lookup_uint64(req, NVMFT_NV_NN, &nn) != 0)
 		nn = NVMF_NN;
 
-	if (portid > UINT16_MAX) {
+	if (!nvmft_port_params_valid(portid, max_io_qsize, ioccsz, iorcsz,
+	    nn)) {
 		nvlist_free(req);
 		return (EINVAL);
 	}
 
-	/* Reject a duplicate SubNQN. */
+	/* ns_config_lock keeps a second create of the SubNQN out. */
+	mutex_enter(&nvmft_global->ns_config_lock);
 	mutex_enter(&nvmft_global->ns_lock);
 	np = nvmft_port_lookup(subnqn);
 	mutex_exit(&nvmft_global->ns_lock);
 	if (np != NULL) {
 		nvmft_port_rele(np);
-		nvlist_free(req);
-		return (EEXIST);
+		error = EEXIST;
+	} else {
+		/* The port keeps the reference it is returned with. */
+		np = nvmft_port_alloc(subnqn, (uint16_t)portid, serial,
+		    (uint32_t)max_io_qsize, NVMF_CC_EN_TIMEOUT * 500,
+		    (uint32_t)ioccsz, (uint32_t)iorcsz, (uint32_t)nn);
+		error = (np == NULL) ? EIO : 0;
 	}
-
-	np = nvmft_port_alloc(subnqn, (uint16_t)portid, serial,
-	    (uint32_t)max_io_qsize, NVMF_CC_EN_TIMEOUT * 500, (uint32_t)ioccsz,
-	    (uint32_t)iorcsz, (uint32_t)nn);
+	mutex_exit(&nvmft_global->ns_config_lock);
 	nvlist_free(req);
-	if (np == NULL)
+	return (error);
+}
+
+/*
+ * Take the port offline, wait until STMF has seen it offline, and deregister
+ * it.  The wait can be interrupted, which leaves the port registered.
+ */
+static int
+nvmft_port_unregister(nvmft_port_t *np)
+{
+	stmf_state_change_info_t ssci;
+	stmf_status_t st;
+
+	ssci.st_rflags = 0;
+	ssci.st_additional_info = NULL;
+	for (;;) {
+		st = stmf_ctl(STMF_CMD_LPORT_OFFLINE, np->np_lport, &ssci);
+		/* STMF_BUSY: an online request is still on its way. */
+		if (st != STMF_BUSY)
+			break;
+		if (delay_sig(drv_usectohz(10000)) != 0)
+			return (EINTR);
+	}
+	if (st != STMF_SUCCESS && st != STMF_ALREADY)
 		return (EIO);
 
 	/*
-	 * nvmft_port_alloc() returns the port with the initial reference that
-	 * keeps it registered; do not release it here.  STMF must still be told
-	 * to online the port (stmfadm online-target).
+	 * A session is not registered while the port is deregistered, so
+	 * this waits for an admin queue that is being accepted as well.
 	 */
-	return (0);
+	mutex_enter(&np->np_lock);
+	while (!np->np_offline || np->np_accepting != 0) {
+		if (cv_wait_sig(&np->np_cv, &np->np_lock) == 0) {
+			mutex_exit(&np->np_lock);
+			return (EINTR);
+		}
+	}
+	mutex_exit(&np->np_lock);
+
+	for (;;) {
+		st = stmf_deregister_local_port(np->np_lport);
+		if (st != STMF_BUSY)
+			break;
+		if (delay_sig(drv_usectohz(100000)) != 0)
+			return (EINTR);
+	}
+	return (st == STMF_SUCCESS ? 0 : EIO);
 }
 
 /*
@@ -436,8 +507,6 @@ static int
 nvmft_ioc_subsys_delete(intptr_t arg, int mode)
 {
 	struct nvmf_ioc_nv ionv;
-	stmf_change_status_t cstatus;
-	stmf_status_t st;
 	nvlist_t *req = NULL;
 	nvmft_port_t *np;
 	char *subnqn = NULL;
@@ -454,58 +523,37 @@ nvmft_ioc_subsys_delete(intptr_t arg, int mode)
 		return (EINVAL);
 	}
 
+	/* From here no queue finds the port, and no one else deletes it. */
+	mutex_enter(&nvmft_global->ns_config_lock);
 	mutex_enter(&nvmft_global->ns_lock);
 	np = nvmft_port_lookup(subnqn);
+	if (np != NULL)
+		np->np_deleting = B_TRUE;
+	mutex_exit(&nvmft_global->ns_lock);
+	nvlist_free(req);
 	if (np == NULL) {
-		mutex_exit(&nvmft_global->ns_lock);
-		nvlist_free(req);
+		mutex_exit(&nvmft_global->ns_config_lock);
 		return (ENOENT);
 	}
-	mutex_exit(&nvmft_global->ns_lock);
 
 	mutex_enter(&np->np_lock);
-	if (!list_is_empty(&np->np_controllers)) {
-		mutex_exit(&np->np_lock);
-		nvmft_port_rele(np);
-		nvlist_free(req);
-		return (EBUSY);
-	}
+	error = list_is_empty(&np->np_controllers) ? 0 : EBUSY;
 	mutex_exit(&np->np_lock);
-
-	/*
-	 * Offline the port (drains any controllers, synchronously here since no
-	 * hosts are connected), then deregister.  STMF returns STMF_BUSY until
-	 * in-flight tasks drain; retry as srpt_stp_destroy_port() does.  Remove
-	 * the port from ns_ports and drop the registration reference only after
-	 * STMF accepts the deregistration.
-	 */
-	cstatus.st_completion_status = STMF_SUCCESS;
-	cstatus.st_additional_info = NULL;
-	(void) stmf_ctl(STMF_CMD_LPORT_OFFLINE, np->np_lport, &cstatus);
-
-	for (;;) {
-		st = stmf_deregister_local_port(np->np_lport);
-		if (st != STMF_BUSY)
-			break;
-		delay(drv_usectohz(1000000));
-	}
-
-	if (st != STMF_SUCCESS) {
-		/* Re-online so the port remains usable. */
-		(void) stmf_ctl(STMF_CMD_LPORT_ONLINE, np->np_lport, &cstatus);
-		nvmft_port_rele(np);
-		nvlist_free(req);
-		return (EIO);
-	}
+	if (error == 0)
+		error = nvmft_port_unregister(np);
 
 	mutex_enter(&nvmft_global->ns_lock);
-	list_remove(&nvmft_global->ns_ports, np);
+	if (error == 0)
+		list_remove(&nvmft_global->ns_ports, np);
+	else
+		np->np_deleting = B_FALSE;
 	mutex_exit(&nvmft_global->ns_lock);
+	mutex_exit(&nvmft_global->ns_config_lock);
 
-	nvmft_port_rele(np);	/* lookup reference */
-	nvmft_port_rele(np);	/* registration ref; frees the port */
-	nvlist_free(req);
-	return (0);
+	nvmft_port_rele(np);
+	if (error == 0)
+		nvmft_port_rele(np);	/* the port's own reference */
+	return (error);
 }
 
 /*
@@ -555,19 +603,37 @@ nvmft_ioc_subsys_list(intptr_t arg, int mode)
 }
 
 /*
- * NVMFT_IOC_HANDOFF: adopt a CONNECT-negotiated queue pair from the userland
- * Fabrics daemon and start the matching in-kernel controller queue.
- *
- * This is the target-side equivalent of the host NVMF_HANDOFF_HOST: the daemon
- * has run the Fabrics CONNECT exchange in userland and packed the qpair (the
- * negotiated transport "params" carrying the socket fd, plus the raw CONNECT
- * "cmd" and "data") into the handoff nvlist.  We unpack it, find the target
- * subsystem from the CONNECT data's SubNQN, and dispatch on the CONNECT command
- * queue id: queue id 0 is the admin queue (creates the association), a nonzero
- * queue id attaches a new I/O queue to an existing one.  The transport resolves
- * the socket fd to a ksocket_t in this (the ioctl caller's) process context, so
- * this must run synchronously on the ioctl thread.  (FreeBSD
- * ctl_frontend_nvmf.c:nvmft_handoff via CTL_NVMF_HANDOFF.)
+ * What the kernel requires of a handoff besides the shape of its nvlist.
+ * nvmfd made these checks when it accepted the Connect, but nvmfd is not
+ * trusted to have: the fields size kernel objects and select the queue type.
+ */
+static boolean_t
+nvmft_handoff_valid(uint64_t trtype, boolean_t admin, uint64_t qsize,
+    const nvmf_fabric_connect_cmd_t *cmd,
+    const nvmf_fabric_connect_data_t *data)
+{
+	nvmft_connect_status_t st;
+	uint16_t qid = LE_16(cmd->nfcc_qid);
+
+	if (trtype > NVMF_TRTYPE_INTRA_HOST)
+		return (B_FALSE);
+	if (admin != (qid == 0))
+		return (B_FALSE);
+	if (qsize == 0 || qsize > NVME_MAX_IO_ENTRIES)
+		return (B_FALSE);
+	if (!nvmft_connect_cmd_valid(cmd, sizeof (*data), qid,
+	    (uint16_t)(qsize - 1), NVME_MAX_ADMIN_ENTRIES, NVME_MAX_IO_ENTRIES,
+	    &st))
+		return (B_FALSE);
+	return (nvmft_connect_data_valid(cmd, data, &st));
+}
+
+/*
+ * NVMFT_IOC_HANDOFF: adopt a queue pair whose Connect nvmfd accepted.  The
+ * nvlist is { trtype, params, cmd, data } as libnvmf's
+ * nvmf_handoff_controller_qpair() packs it: the transport parameters with
+ * the socket, and the Connect command and data.  The transport looks up the
+ * socket in the calling process, so this runs on the ioctl thread.
  */
 static int
 nvmft_ioc_handoff(intptr_t arg, int mode)
@@ -580,9 +646,9 @@ nvmft_ioc_handoff(intptr_t arg, int mode)
 	nvmf_fabric_connect_data_t data;
 	uchar_t *cmdb = NULL, *datab = NULL;
 	char subnqn[NVMF_NQN_FIELD_SIZE + 1];
-	uint64_t v64;
+	uint64_t trtype, qsize = 0;
+	boolean_t admin = B_FALSE;
 	uint_t cmdlen, datalen;
-	nvmf_trtype_t trtype;
 	int error;
 
 	if (ddi_copyin((void *)arg, &ionv, sizeof (ionv), mode) != 0)
@@ -591,70 +657,44 @@ nvmft_ioc_handoff(intptr_t arg, int mode)
 	if ((error = nvmf_unpack_ioc_nvlist(&ionv, &req)) != 0)
 		return (error);
 
-	/*
-	 * The handoff nvlist shape is { trtype, params, cmd, data }, matching
-	 * libnvmf's nvmf_handoff_controller_qpair() (see <sys/nvme/nvmf_ioctl.h>).
-	 * Validate every key's presence, type, and (for the binary CONNECT
-	 * structures) exact size before dereferencing them.
-	 */
-	if (nvlist_lookup_uint64(req, NVMFT_NV_TRTYPE, &v64) != 0 ||
+	if (nvlist_lookup_uint64(req, NVMFT_NV_TRTYPE, &trtype) != 0 ||
 	    nvlist_lookup_nvlist(req, NVMFT_NV_PARAMS, &params) != 0 ||
 	    nvlist_lookup_byte_array(req, NVMFT_NV_CMD, &cmdb, &cmdlen) != 0 ||
-	    nvlist_lookup_byte_array(req, NVMFT_NV_DATA, &datab, &datalen) != 0) {
-		nvlist_free(req);
-		return (EINVAL);
-	}
-	if (cmdlen != sizeof (nvmf_fabric_connect_cmd_t) ||
-	    datalen != sizeof (nvmf_fabric_connect_data_t)) {
-		nvlist_free(req);
-		return (EINVAL);
-	}
-	if (!nvmf_validate_qpair_nvlist(params, B_TRUE)) {
+	    nvlist_lookup_byte_array(req, NVMFT_NV_DATA, &datab,
+	    &datalen) != 0 || cmdlen != sizeof (cmd) ||
+	    datalen != sizeof (data) ||
+	    !nvmf_validate_qpair_nvlist(params, B_TRUE)) {
 		nvlist_free(req);
 		return (EINVAL);
 	}
 
-	trtype = (nvmf_trtype_t)v64;
-
-	/*
-	 * Copy the CONNECT command and data out of the (byte-aligned) nvlist
-	 * byte arrays into properly aligned locals before dereferencing their
-	 * multi-byte wire fields.  The sizes were verified exactly above.
-	 */
+	/* The byte arrays of an nvlist are not aligned. */
 	(void) memcpy(&cmd, cmdb, sizeof (cmd));
 	(void) memcpy(&data, datab, sizeof (data));
 
-	/*
-	 * The SubNQN that selects the target subsystem comes from the CONNECT
-	 * data, not a separate nvlist key.  nfcd_subnqn is a fixed 256-byte
-	 * on-wire field that is not guaranteed NUL-terminated; copy exactly the
-	 * field and terminate it explicitly before validation and lookup.
-	 */
-	(void) memcpy(subnqn, data.nfcd_subnqn, sizeof (data.nfcd_subnqn));
-	subnqn[sizeof (data.nfcd_subnqn)] = '\0';
-	if (!nvmf_nqn_valid(subnqn)) {
+	(void) nvlist_lookup_boolean_value(params, "admin", &admin);
+	(void) nvlist_lookup_uint64(params, "qsize", &qsize);
+	if (!nvmft_handoff_valid(trtype, admin, qsize, &cmd, &data)) {
 		nvlist_free(req);
 		return (EINVAL);
 	}
 
+	/* The field may have no terminator. */
+	(void) memcpy(subnqn, data.nfcd_subnqn, sizeof (data.nfcd_subnqn));
+	subnqn[sizeof (data.nfcd_subnqn)] = '\0';
 	np = nvmft_port_find(subnqn);
 	if (np == NULL) {
 		nvlist_free(req);
 		return (ENOENT);
 	}
 
-	/*
-	 * Dispatch on the CONNECT queue id.  nfcc_qid is a little-endian wire
-	 * field; the handoff helpers re-check it, but select the entry point
-	 * here.  Both helpers own qpair teardown on failure (they destroy the
-	 * qpair they built, which ksocket_close()s the adopted socket), so on
-	 * error there is nothing further to clean up beyond the port reference.
-	 */
-	if (cmd.nfcc_qid == LE_16(0))
-		error = nvmft_handoff_admin_queue(np, trtype, params, &cmd,
-		    &data);
+	/* On failure these destroy the qpair, which closes the socket. */
+	if (admin)
+		error = nvmft_handoff_admin_queue(np, (nvmf_trtype_t)trtype,
+		    params, &cmd, &data);
 	else
-		error = nvmft_handoff_io_queue(np, trtype, params, &cmd, &data);
+		error = nvmft_handoff_io_queue(np, (nvmf_trtype_t)trtype,
+		    params, &cmd, &data);
 
 	nvmft_port_rele(np);
 	nvlist_free(req);
@@ -666,17 +706,12 @@ static int
 nvmft_drv_ioctl(dev_t dev, int cmd, intptr_t data, int mode, cred_t *cred,
     int *rval)
 {
-	if (drv_priv(cred) != 0)
+	if (drv_priv(cred) != 0 || crgetzoneid(cred) != GLOBAL_ZONEID)
 		return (EPERM);
 
 	/*
-	 * struct nvmf_ioc_nv embeds a pointer and two size_t fields, so its
-	 * layout differs between ILP32 and LP64.  Every handler below copies it
-	 * in at the native (LP64) size; a 32-bit caller's fields would land
-	 * misaligned, letting a garbage nv->size drive a huge KM_SLEEP
-	 * allocation in nvmf_unpack_ioc_nvlist().  nvmfd(8)/nvmfadm(8) are 64-bit
-	 * only, so reject ILP32 callers outright rather than carry a 32-bit
-	 * shadow struct.
+	 * struct nvmf_ioc_nv has a pointer and two size_t fields and is
+	 * copied in at its native size.  nvmfd(8) and nvmfadm(8) are 64-bit.
 	 */
 	if (ddi_model_convert_from(mode & FMODELS) != DDI_MODEL_NONE)
 		return (ENOTSUP);
@@ -694,26 +729,15 @@ nvmft_drv_ioctl(dev_t dev, int cmd, intptr_t data, int mode, cred_t *cred,
 		break;
 	}
 
-	/*
-	 * PORT-TODO (FreeBSD ctl_frontend_nvmf.c:nvmft_ioctl): list/terminate
-	 * associations and ANA set-group-state (nvmft_ana_ioctl, see NVMEOF.md)
-	 * are wired here as additional NVMFT_IOC_* commands.
-	 */
 	return (ENOTTY);
 }
 
 /*
- * STMF port-provider configuration callback.  Modeled on srpt_pp_cb().
- *
- * By design, nvmft subsystems are created and destroyed through the
- * NVMFT_IOC_SUBSYS_* ioctls (driven by nvmfd/nvmfadm), which call
- * nvmft_port_alloc()/nvmft_port_rele() directly.  STMF_PROVIDER_DATA_UPDATED is
- * therefore intentionally not handled here: this provider does not carry its
- * configuration in the STMF provider-data nvlist.  This callback only logs.
+ * Subsystems are configured with the ioctls above, not with STMF provider
+ * data, so there is nothing to do here.
  */
 /* ARGSUSED */
 static void
 nvmft_pp_cb(stmf_port_provider_t *pp, int cmd, void *arg, uint32_t flags)
 {
-	NVMFT_DPRINTF_L2("nvmft_pp_cb, invoked (%d)", cmd);
 }

@@ -57,14 +57,24 @@
 
 #include "nvmft_var.h"
 
+/*
+ * An NQN names an STMF port, whose identifier has a one-byte length, and it
+ * is logged, so it has no control characters.
+ */
 boolean_t
 nvmf_nqn_valid(const char *nqn)
 {
-	size_t len;
+	size_t len, i;
 
 	len = strnlen(nqn, NVMF_NQN_FIELD_SIZE);
 	if (len == 0 || len > NVMF_NQN_MAX_LEN)
 		return (B_FALSE);
+	for (i = 0; i < len; i++) {
+		uint8_t c = (uint8_t)nqn[i];
+
+		if (c < 0x20 || c == 0x7f)
+			return (B_FALSE);
+	}
 	return (B_TRUE);
 }
 
@@ -350,8 +360,9 @@ _nvmf_init_io_controller_data(uint16_t cntlid, uint32_t max_io_qsize,
 	cdata->id_ctratt.ctrat_tbkas = 1;
 
 	cdata->id_cntrltype = NVME_CNTRLTYPE_IO;	/* I/O controller */
-	cdata->id_acl = 3;				/* Abort Command Limit */
-	cdata->id_aerl = 3;				/* AER Limit */
+	/* The Abort and AER limits count from 0; this is one of each. */
+	cdata->id_acl = 0;
+	cdata->id_aerl = 0;
 
 	/* 1 read-only firmware slot. */
 	cdata->id_frmw.fw_readonly = 1;
@@ -380,7 +391,8 @@ _nvmf_init_io_controller_data(uint16_t cntlid, uint32_t max_io_qsize,
 	cdata->id_cqes.qes_max = 4;
 
 	cdata->id_nn = LE_32((uint32_t)nn);
-	cdata->id_maxcmd = LE_16((uint16_t)max_io_qsize);
+	cdata->id_maxcmd = LE_16(max_io_qsize > UINT16_MAX ? UINT16_MAX :
+	    (uint16_t)max_io_qsize);
 
 	/* Volatile write cache present. */
 	cdata->id_vwc.vwc_present = 1;

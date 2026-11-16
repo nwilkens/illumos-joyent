@@ -206,6 +206,18 @@ rules(void)
 	DATA_BAD(&c, &d, DATA_OFF(nfcd_hostnqn));
 	d.nfcd_hostnqn[0] = '\0';
 	DATA_BAD(&c, &d, DATA_OFF(nfcd_hostnqn));
+
+	/* An NQN is logged, so it has no control characters. */
+	d = data_ok(2);
+	d.nfcd_hostnqn[4] = '\n';
+	DATA_BAD(&c, &d, DATA_OFF(nfcd_hostnqn));
+	d = data_ok(2);
+	d.nfcd_subnqn[0] = 0x7f;
+	DATA_BAD(&c, &d, DATA_OFF(nfcd_subnqn));
+	d = data_ok(2);
+	d.nfcd_hostnqn[4] = 0xc3;
+	d.nfcd_hostnqn[5] = 0xa9;
+	DATA_OK(&c, &d);
 }
 
 static uint64_t rng = 0x9e3779b97f4a7c15ULL;
@@ -241,8 +253,11 @@ model_nqn(const uint8_t *p)
 {
 	size_t n = 0;
 
-	while (n < 256 && p[n] != 0)
+	while (n < 256 && p[n] != 0) {
+		if (p[n] < 0x20 || p[n] == 0x7f)
+			return (0);
 		n++;
+	}
 	return (n >= 1 && n <= 223);
 }
 

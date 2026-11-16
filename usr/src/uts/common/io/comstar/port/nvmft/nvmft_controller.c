@@ -58,6 +58,7 @@
 #include <sys/stream.h>
 #include <sys/strsubr.h>
 #include <sys/varargs.h>
+#include <sys/atomic.h>
 
 #include <sys/nvme.h>
 #include <sys/nvme/nvmf.h>
@@ -77,9 +78,39 @@ static void	nvmft_controller_fail(nvmft_controller_t *ctrlr,
     boolean_t force);
 
 /*
- * cmn_err-style logging tagged with the controller id.  (FreeBSD: nvmft_printf
- * built an sbuf; here we format into a stack buffer and call cmn_err.)
+ * A host can cause most of nvmft's messages, so there are at most
+ * nvmft_log_burst of them in each nvmft_log_interval.
  */
+hrtime_t nvmft_log_interval = 10 * (hrtime_t)NANOSEC;
+uint_t nvmft_log_burst = 20;
+static volatile hrtime_t nvmft_log_start;
+static volatile uint_t nvmft_log_count;
+static volatile uint_t nvmft_log_dropped;
+
+static boolean_t
+nvmft_log_ok(void)
+{
+	hrtime_t now = gethrtime();
+	hrtime_t start = nvmft_log_start;
+	uint_t dropped;
+
+	if (now - start >= nvmft_log_interval &&
+	    atomic_cas_64((volatile uint64_t *)&nvmft_log_start,
+	    (uint64_t)start, (uint64_t)now) == (uint64_t)start) {
+		(void) atomic_swap_uint(&nvmft_log_count, 0);
+		dropped = atomic_swap_uint(&nvmft_log_dropped, 0);
+		if (dropped != 0) {
+			cmn_err(CE_NOTE, "!nvmft: %u messages suppressed",
+			    dropped);
+		}
+	}
+	if (atomic_inc_uint_nv(&nvmft_log_count) <= nvmft_log_burst)
+		return (B_TRUE);
+	atomic_inc_uint(&nvmft_log_dropped);
+	return (B_FALSE);
+}
+
+/* Log a message tagged with the controller ID, if there is a controller. */
 int
 nvmft_printf(nvmft_controller_t *ctrlr, const char *fmt, ...)
 {
@@ -87,8 +118,15 @@ nvmft_printf(nvmft_controller_t *ctrlr, const char *fmt, ...)
 	va_list ap;
 	int n, m;
 
-	n = snprintf(buf, sizeof (buf), "nvmft%u: ",
-	    ctrlr != NULL ? ctrlr->ctrlr_cntlid : 0);
+	if (!nvmft_log_ok())
+		return (0);
+
+	if (ctrlr != NULL) {
+		n = snprintf(buf, sizeof (buf), "nvmft%u: ",
+		    ctrlr->ctrlr_cntlid);
+	} else {
+		n = snprintf(buf, sizeof (buf), "nvmft: ");
+	}
 	va_start(ap, fmt);
 	m = vsnprintf(buf + n, sizeof (buf) - n, fmt, ap);
 	va_end(ap);
@@ -247,7 +285,8 @@ nvmft_handoff_admin_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
 
 	qp = nvmft_qpair_init(trtype, params, 0, "admin queue");
 	if (qp == NULL) {
-		NVMFT_DPRINTF_L1("Failed to setup admin queue from %.*s",
+		(void) nvmft_printf(NULL,
+		    "failed to set up admin queue from %.*s\n",
 		    (int)sizeof (data->nfcd_hostnqn), data->nfcd_hostnqn);
 		return (ENXIO);
 	}
@@ -268,37 +307,43 @@ nvmft_connect_admin_queue(nvmft_port_t *np, struct nvmft_qpair *qp,
 	uint32_t kato;
 	id_t cntlid;
 
-	mutex_enter(&np->np_lock);
-	cntlid = id_alloc_nosleep(np->np_ids);
-	if (cntlid == -1) {
-		mutex_exit(&np->np_lock);
-		NVMFT_DPRINTF_L1("Unable to allocate controller for %.*s",
-		    (int)sizeof (data->nfcd_hostnqn), data->nfcd_hostnqn);
-		nvmft_connect_error(qp, cmd, NVME_CQE_SCT_SPECIFIC,
-		    NVMF_FABRIC_SC_INVALID_HOST);
-		nvmft_qpair_destroy(qp);
-		return (ENOMEM);
-	}
-	mutex_exit(&np->np_lock);
-
-	ctrlr = nvmft_controller_alloc(np, (uint16_t)cntlid, data);
-	if (ctrlr == NULL) {
-		/*
-		 * The only failure is STMF session registration, which fails
-		 * when the local port is not online; reject the association.
-		 */
-		id_free(np->np_ids, cntlid);
-		nvmft_connect_error(qp, cmd, NVME_CQE_SCT_GENERIC,
-		    NVME_CQE_SC_GEN_INTERNAL_ERR);
-		nvmft_qpair_destroy(qp);
-		return (ENXIO);
-	}
-
+	/*
+	 * np_accepting keeps the port registered with STMF while the
+	 * controller registers its session.
+	 */
 	mutex_enter(&np->np_lock);
 	if (!np->np_online) {
 		mutex_exit(&np->np_lock);
+		nvmft_connect_error(qp, cmd, NVME_CQE_SCT_SPECIFIC,
+		    NVMF_FABRIC_SC_CONTROLLER_BUSY);
+		nvmft_qpair_destroy(qp);
+		return (ENXIO);
+	}
+	np->np_accepting++;
+	mutex_exit(&np->np_lock);
+
+	cntlid = id_alloc_nosleep(np->np_ids);
+	ctrlr = NULL;
+	if (cntlid != -1) {
+		ctrlr = nvmft_controller_alloc(np, (uint16_t)cntlid, data);
+		if (ctrlr == NULL)
+			id_free(np->np_ids, cntlid);
+	}
+
+	mutex_enter(&np->np_lock);
+	if (ctrlr != NULL && !np->np_online) {
+		mutex_exit(&np->np_lock);
 		nvmft_controller_free(ctrlr);
 		id_free(np->np_ids, cntlid);
+		ctrlr = NULL;
+		mutex_enter(&np->np_lock);
+	}
+	if (--np->np_accepting == 0)
+		cv_broadcast(&np->np_cv);
+	if (ctrlr == NULL) {
+		mutex_exit(&np->np_lock);
+		nvmft_connect_error(qp, cmd, NVME_CQE_SCT_SPECIFIC,
+		    NVMF_FABRIC_SC_CONTROLLER_BUSY);
 		nvmft_qpair_destroy(qp);
 		return (ENXIO);
 	}
@@ -355,7 +400,8 @@ nvmft_handoff_io_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
 	(void) snprintf(name, sizeof (name), "I/O queue %u", qid);
 	qp = nvmft_qpair_init(trtype, params, qid, name);
 	if (qp == NULL) {
-		NVMFT_DPRINTF_L1("Failed to setup I/O queue %u from %.*s", qid,
+		(void) nvmft_printf(NULL,
+		    "failed to set up I/O queue %u from %.*s\n", qid,
 		    (int)sizeof (data->nfcd_hostnqn), data->nfcd_hostnqn);
 		return (ENXIO);
 	}
