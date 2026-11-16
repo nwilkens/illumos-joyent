@@ -19,6 +19,8 @@ OBJECTS =	nvmf_transport.o \
 		nvmf_tcp.o \
 		nvmf_controller.o \
 		nvmf_host.o \
+		nvmf_host_ioctl.o \
+		nvmf_hostid.o \
 		nvmf_subr.o \
 		nvmf_crc32c.o
 
