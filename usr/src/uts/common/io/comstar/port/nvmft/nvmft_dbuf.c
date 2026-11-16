@@ -61,7 +61,10 @@ nvmft_dbuf_qpair(scsi_task_t *task, uint32_t cap, struct nvmft_qpair **qpp)
 	return (nvmft_qpair_data_hold(priv->ntp_qp));
 }
 
-/* ARGSUSED */
+/*
+ * The LU takes any buffer of at least *pminsize bytes, so a kmem buffer
+ * shrinks toward that when memory is short.
+ */
 static stmf_data_buf_t *
 nvmft_dbuf_alloc(scsi_task_t *task, uint32_t size, uint32_t *pminsize,
     uint32_t flags)
@@ -70,6 +73,7 @@ nvmft_dbuf_alloc(scsi_task_t *task, uint32_t size, uint32_t *pminsize,
 	nvmft_dbuf_priv_t *ndp;
 	struct nvmft_qpair *qp;
 	struct nvmf_qpair *nq;
+	uint32_t minsize = MIN(*pminsize, size);
 	void *buf = NULL;
 	int error;
 
@@ -85,8 +89,7 @@ nvmft_dbuf_alloc(scsi_task_t *task, uint32_t size, uint32_t *pminsize,
 
 	nq = nvmft_dbuf_qpair(task, NVMF_QP_CAP_DATA_BUF, &qp);
 	if (nq != NULL) {
-		error = nvmf_alloc_data_buf(nq, size, MIN(*pminsize, size),
-		    &ndp->ndp_db);
+		error = nvmf_alloc_data_buf(nq, size, minsize, &ndp->ndp_db);
 		nvmft_qpair_data_rele(qp);
 		if (error != 0) {
 			stmf_free(dbuf);
@@ -96,10 +99,12 @@ nvmft_dbuf_alloc(scsi_task_t *task, uint32_t size, uint32_t *pminsize,
 		buf = ndp->ndp_db.ndb_addr;
 		size = (uint32_t)ndp->ndp_db.ndb_len;
 	} else {
-		buf = kmem_alloc(size, KM_NOSLEEP);
-		if (buf == NULL) {
-			stmf_free(dbuf);
-			return (NULL);
+		while ((buf = kmem_alloc(size, KM_NOSLEEP_LAZY)) == NULL) {
+			if (size <= MAX(minsize, 1)) {
+				stmf_free(dbuf);
+				return (NULL);
+			}
+			size = MAX(size / 2, minsize);
 		}
 		ndp->ndp_buf = buf;
 		ndp->ndp_size = size;
@@ -115,7 +120,6 @@ nvmft_dbuf_alloc(scsi_task_t *task, uint32_t size, uint32_t *pminsize,
 	return (dbuf);
 }
 
-/* ARGSUSED */
 static void
 nvmft_dbuf_free(stmf_dbuf_store_t *ds, stmf_data_buf_t *dbuf)
 {
@@ -131,7 +135,6 @@ nvmft_dbuf_free(stmf_dbuf_store_t *ds, stmf_data_buf_t *dbuf)
 }
 
 /* Let the transport map an LU buffer.  sbd leaves db_port_private to us. */
-/* ARGSUSED */
 static stmf_status_t
 nvmft_dbuf_setup(scsi_task_t *task, stmf_data_buf_t *dbuf, uint32_t flags)
 {
@@ -163,7 +166,6 @@ nvmft_dbuf_setup(scsi_task_t *task, stmf_data_buf_t *dbuf, uint32_t flags)
 	return (STMF_SUCCESS);
 }
 
-/* ARGSUSED */
 static void
 nvmft_dbuf_teardown(stmf_dbuf_store_t *ds, stmf_data_buf_t *dbuf)
 {
