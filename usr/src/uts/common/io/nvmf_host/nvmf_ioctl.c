@@ -263,6 +263,7 @@ nvmf_reconnect_host(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
 	} else {
 		sc->state = NVMF_SC_RECONNECTING;
 		sc->conn_error = B_FALSE;
+		sc->conn_events &= ~NVMF_EV_DISCONNECT;
 	}
 	mutex_exit(&sc->lock);
 
