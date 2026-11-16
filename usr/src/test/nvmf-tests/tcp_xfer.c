@@ -699,6 +699,9 @@ get(int fd, uint8_t *pdu, size_t size)
 	return (ch->ntcph_pdu_type);
 }
 
+/* Bits 7:6 of the second byte of the commands that put_command() sends. */
+static uint8_t put_psdt = NVME_PSDT_SGL;
+
 static void
 put_command(int fd, uint16_t cid, uint32_t sgl_len, uint32_t icd)
 {
@@ -712,6 +715,7 @@ put_command(int fd, uint16_t cid, uint32_t sgl_len, uint32_t icd)
 	sqe.sqe_dptr.d_sgl.sgl_len = sgl_len;
 	sqe.sqe_dptr.d_sgl.sgl_type = type >> 4;
 	sqe.sqe_dptr.d_sgl.sgl_zero = type & 0xf;
+	NVMF_SQE_SET_PSDT(&sqe, put_psdt);
 	cmd->ntc_common.ntcph_pdu_type = NVMF_TCP_PDU_TYPE_CAPSULE_CMD;
 	cmd->ntc_common.ntcph_hlen = sizeof (*cmd);
 	cmd->ntc_common.ntcph_pdo = icd != 0 ? sizeof (*cmd) : 0;
@@ -1091,6 +1095,32 @@ receive_limits(void)
 	detach(c);
 }
 
+/* A received command keeps the PSDT of the wire, so a wrong one is seen. */
+static void
+received_psdt(void)
+{
+	struct nvmf_capsule *nc;
+	consumer_t *c;
+	uint8_t psdt;
+	int peer;
+
+	c = raw(&peer, B_TRUE, &plain);
+	for (psdt = 0; psdt < 4; psdt++) {
+		put_psdt = psdt;
+		put_command(peer, psdt, 512, 512);
+		nc = next_capsule(c);
+		assert(NVMF_SQE_PSDT(&nc->nc_sqe) == psdt);
+		assert(nvmf_validate_command_capsule(nc) ==
+		    (psdt == NVME_PSDT_SGL ? NVME_CQE_SC_GEN_SUCCESS :
+		    NVME_CQE_SC_GEN_INV_FLD));
+		nvmf_free_capsule(nc);
+	}
+	put_psdt = NVME_PSDT_SGL;
+	(void) close(peer);
+	(void) wait_error(c);
+	detach(c);
+}
+
 /* Nonsense in the handoff is refused and leaves the descriptor alone. */
 static void
 handoff_checks(void)
@@ -1221,6 +1251,7 @@ main(void)
 	cancel_race();
 	r2t_wrap();
 	receive_limits();
+	received_psdt();
 	drain_at_free();
 	assert(_fini() == 0);
 	printf("tcp transfer passed\n");

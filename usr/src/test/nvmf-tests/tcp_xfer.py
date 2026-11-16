@@ -38,6 +38,7 @@ def main():
                  "nvmf_allocate_response", "nvmf_free_capsule",
                  "nvmf_capsule_append_data", "nvmf_receive_controller_data",
                  "nvmf_abort_capsule_data", "nvmf_cancel_controller_data",
+                 "nvmf_validate_command_capsule",
                  "nvmf_memdesc_copy", "nvmf_memdesc_copyin",
                  "nvmf_memdesc_copyout"):
         parts.append(function(core, name))

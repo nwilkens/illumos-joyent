@@ -610,6 +610,9 @@ nvmf_tcp_save_command_capsule(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 
 	nc = nvmf_allocate_command(&qp->qp, cmd->ntc_ccsqe, KM_SLEEP);
 
+	/* Keep the PSDT the host sent, for nvmf_validate_command_capsule(). */
+	bcopy(cmd->ntc_ccsqe, &nc->nc_sqe, sizeof (nc->nc_sqe));
+
 	tc = TCAP(nc);
 	tc->tc_rx_pdu = *pdu;
 
