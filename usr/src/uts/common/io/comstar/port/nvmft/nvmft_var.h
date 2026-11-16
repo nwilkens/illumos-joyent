@@ -149,20 +149,9 @@ typedef struct nvmft_port {
 	id_space_t		*np_ids;
 	list_t			np_controllers;	/* nvmft_controller list */
 
-	/*
-	 * Sorted array of active namespace IDs (== STMF LUN id + 1).  Never
-	 * populated today (always NULL/0); retained only because nvmft_ana.c
-	 * still reads these fields.  Their removal is part of the deferred ANA
-	 * decision and must land atomically with the nvmft_ana.c change.
-	 */
+	/* Never set.  Only nvmft_ana.c, which nothing calls, reads these. */
 	uint32_t		*np_active_ns;
 	uint_t			np_num_ns;
-
-	/*
-	 * ANA group table (NEW relative to FreeBSD; see NVMEOF.md 9.4 and
-	 * nvmft_ana.c).  Each namespace carries an ANAGRPID; the group owns the
-	 * settable ANA state advertised through the ANA log page.
-	 */
 	struct nvmft_ana_group	*np_ana_groups;
 	uint_t			np_num_ana_groups;
 	uint64_t		np_ana_changecount;
@@ -215,7 +204,7 @@ typedef struct nvmft_controller {
 	 * Each queue can have at most UINT16_MAX commands, so the total across
 	 * all queues fits in a uint32_t.  Guarded by ctrlr_lock; the shutdown
 	 * path waits on ctrlr_pending_cv for this to drain.  ctrlr_pending_bytes
-	 * is the in-flight command payload (admission control, nvmft_stmf.c).
+	 * is the in-flight command payload (admission control, nvmft_io.c).
 	 */
 	uint32_t		ctrlr_pending_commands;
 	uint64_t		ctrlr_pending_bytes;
@@ -425,8 +414,6 @@ uint32_t nvmft_qpair_caps(struct nvmft_qpair *qp);
 void	nvmft_qpair_shutdown(struct nvmft_qpair *qp);
 void	nvmft_qpair_destroy(struct nvmft_qpair *qp);
 nvmft_controller_t *nvmft_qpair_ctrlr(struct nvmft_qpair *qp);
-uint16_t nvmft_qpair_id(struct nvmft_qpair *qp);
-const char *nvmft_qpair_name(struct nvmft_qpair *qp);
 uint32_t nvmft_max_ioccsz(struct nvmft_qpair *qp);
 uint64_t nvmft_max_xfer_size(struct nvmft_qpair *qp);
 struct nvmf_qpair *nvmft_qpair_data_hold(struct nvmft_qpair *qp);

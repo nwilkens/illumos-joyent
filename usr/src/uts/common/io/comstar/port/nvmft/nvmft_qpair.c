@@ -27,12 +27,12 @@
  *   FreeBSD                       illumos
  *   -------                       -------
  *   struct mtx lock               kmutex_t lock
- *   refcount(9) qp_refs           uint_t qp_refs guarded by lock
+ *   refcount(9) qp_refs           uint_t qp_refs guarded by lock, with a cv
  *   BITSET cidset (64K bits)      uint8_t bitmap (NUM_CIDS/8 bytes), BT_* macros
  *   nvlist_get_bool/_number       nvlist_lookup_boolean_value/_uint64
  *   le16toh/htole16               LE_16
  *
- * STMF drives data transfers inline through lport_xfer_data (nvmft_stmf.c), so
+ * STMF drives data transfers inline through lport_xfer_data (nvmft_io.c), so
  * the FreeBSD per-qpair datamove queue (union ctl_io) has no counterpart here.
  */
 
@@ -617,18 +617,6 @@ nvmft_controller_t *
 nvmft_qpair_ctrlr(struct nvmft_qpair *qp)
 {
 	return (qp->qp_ctrlr);
-}
-
-uint16_t
-nvmft_qpair_id(struct nvmft_qpair *qp)
-{
-	return (qp->qp_qid);
-}
-
-const char *
-nvmft_qpair_name(struct nvmft_qpair *qp)
-{
-	return (qp->qp_name);
 }
 
 uint32_t

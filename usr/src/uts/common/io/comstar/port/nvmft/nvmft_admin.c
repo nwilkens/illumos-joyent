@@ -335,10 +335,6 @@ handle_get_log_page(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc,
 		status = nvmf_send_controller_data(nc, 0, mp, len);
 		ASSERT3U(status, !=, NVMF_MORE);
 		break;
-	/*
-	 * PORT-TODO (NVMEOF.md 9.4): add case NVME_LOGPAGE_ANA to serve the ANA
-	 * log page from nvmft_ana_build_log_page().
-	 */
 	default:
 		DTRACE_PROBE2(nvmft__log__page__unsupported,
 		    nvmft_controller_t *, ctrlr, uint8_t, lid);
@@ -380,10 +376,8 @@ handle_identify_command(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc,
 		uint32_t nsid = LE_32(cmd->sqe_nsid);
 
 		/*
-		 * Synthesize Identify Namespace from the STMF LU geometry
-		 * (nvmft_stmf.c).  An inactive/unallocated NSID returns a
-		 * zero-filled structure (the spec uses that, not an error, so
-		 * the host can probe namespace ids).
+		 * An inactive NSID returns a zero-filled structure, not an
+		 * error, so that a host can probe namespace IDs.
 		 */
 		nsdata = kmem_zalloc(sizeof (*nsdata), KM_SLEEP);
 		(void) nvmft_build_identify_nsid(ctrlr, nsid, nsdata);
@@ -781,12 +775,6 @@ nvmft_handle_io_command(struct nvmft_qpair *qp, uint16_t qid,
 	case NVME_OPC_NVM_WRITE_ZERO:
 	case NVME_OPC_NVM_DSET_MGMT:
 	case NVMFT_OPC_NVM_VERIFY:
-	/*
-	 * PORT-TODO (7.4): NVME_OPC_NVM_RESV_* (register/report/acquire/release)
-	 * should route to nvmft_resv.c rather than the generic datamove path
-	 * (FreeBSD nvmft_handle_io_command does not handle the reservation
-	 * opcodes either; they are added here for the COMSTAR reservation work).
-	 */
 		nvmft_dispatch_command(qp, nc);
 		break;
 	default:

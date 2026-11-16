@@ -307,10 +307,8 @@ nvmf_strpad(char *dst, const char *src, size_t len)
  * The FreeBSD source fills "struct nvme_controller_data"; illumos's
  * nvme_identify_ctrl_t uses different member names for the same fields.  The
  * capability fields (ctratt, frmw, lpa, kas, sqes/cqes, vwc, sgls, ...) are
- * mapped onto their nvme_identify_ctrl_t equivalents below.  oncs/fuses and the
- * firmware-slot page are set by the port-create path (nvmft_stmf.c), and CMIC/
- * ANACAP by nvmft_ana_init_identify().  The IEEE OUI is still the FreeBSD value
- * and must be replaced with an illumos/Oxide OUI.
+ * mapped onto their nvme_identify_ctrl_t equivalents below.  The IEEE OUI is
+ * still the FreeBSD value.
  */
 void
 _nvmf_init_io_controller_data(uint16_t cntlid, uint32_t max_io_qsize,
