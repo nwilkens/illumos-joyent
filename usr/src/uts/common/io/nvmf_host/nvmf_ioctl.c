@@ -305,8 +305,17 @@ nvmf_disconnect_host(nvmf_softc_t *sc)
 		nvmf_ns_post(sc, NVMF_NS_EV_DETACH);
 		mutex_enter(&sc->lock);
 
-		while (!sc->detach_done && sc->state == NVMF_SC_CONNECTED)
-			cv_wait(&sc->cv, &sc->lock);
+		/*
+		 * The namespace worker can be waiting for the controller.  A
+		 * signal withdraws the request, whose answer is then ignored.
+		 */
+		while (!sc->detach_done && sc->state == NVMF_SC_CONNECTED) {
+			if (cv_wait_sig(&sc->cv, &sc->lock) == 0) {
+				sc->detach_req = B_FALSE;
+				mutex_exit(&sc->lock);
+				return (EINTR);
+			}
+		}
 		sc->detach_req = B_FALSE;
 
 		if (sc->detach_done && sc->detach_busy) {
