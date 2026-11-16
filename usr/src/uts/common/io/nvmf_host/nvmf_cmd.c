@@ -263,7 +263,7 @@ nvmf_wait_for_reply(nvmf_softc_t *sc, nvmf_completion_status_t *status,
 			continue;
 		}
 		if (cv_timedwait(&nvmf_status_cv, &nvmf_status_lock,
-		    deadline) != -1)
+		    deadline) != -1 || (status->done && status->io_done))
 			continue;
 
 		expired = B_TRUE;
