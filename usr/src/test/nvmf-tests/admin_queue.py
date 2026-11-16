@@ -6,7 +6,7 @@ from nvmf_test import NVMFT, TESTDIR, function, run_c, typedef
 
 
 def main():
-    ctl = NVMFT / "nvmft_controller.c"
+    ctl = NVMFT / "nvmft_admin.c"
     parts = [KSHIM, """
 #define	NVMF_CAPSULE_CONSUMER_WORDS	12
 struct nvmf_capsule {

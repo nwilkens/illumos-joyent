@@ -38,7 +38,7 @@
  *   refcount(9)                      uint_t refs guarded by lock
  *
  * The CTL-specific datamove queue (struct ctl_io_hdr) has no counterpart: STMF
- * drives data transfers inline through lport_xfer_data; see nvmft_stmf.c.
+ * drives data transfers inline through lport_xfer_data; see nvmft_io.c.
  */
 
 #ifndef	_NVMFT_VAR_H
@@ -281,6 +281,11 @@ typedef struct nvmft_softc {
 	boolean_t		ns_closing;	/* _fini is unloading */
 } nvmft_softc_t;
 
+/* Fields of the CC and CSTS properties, which are kept as raw values. */
+#define	NVMFT_CC_EN(cc)		((cc) & 0x1u)
+#define	NVMFT_CC_SHN(cc)	(((cc) >> 14) & 0x3u)
+#define	NVMFT_CSTS_CFS(csts)	(((csts) >> 1) & 0x1u)
+
 /* Why a Connect was refused, in the form the Connect response carries. */
 typedef struct nvmft_connect_status {
 	uint8_t		ncs_sct;
@@ -315,9 +320,7 @@ extern uint_t nvmft_errlevel;
 #define	NVMFT_DPRINTF_L3(...)	(void)(0)
 #endif
 
-/*
- * nvmft_stmf.c - STMF binding (replaces ctl_frontend_nvmf.c).
- */
+/* nvmft_port.c, nvmft_ns.c and nvmft_io.c: the STMF binding. */
 nvmft_port_t *nvmft_port_alloc(const char *subnqn, uint16_t portid,
 	    const char *serial, uint32_t max_io_qsize, uint32_t enable_timeout,
 	    uint32_t ioccsz, uint32_t iorcsz, uint32_t nn);
@@ -337,9 +340,10 @@ void	nvmft_deferred_init(nvmft_controller_t *ctrlr);
 void	nvmft_deferred_drain(nvmft_controller_t *ctrlr);
 void	nvmft_deferred_fini(nvmft_controller_t *ctrlr);
 
-/* nvmft_controller.c */
-void	nvmft_controller_error(nvmft_controller_t *ctrlr,
-	    struct nvmft_qpair *qp, int error);
+/* nvmft_admin.c */
+void	nvmft_admin_init(nvmft_controller_t *ctrlr);
+void	nvmft_admin_fini(nvmft_controller_t *ctrlr);
+void	nvmft_admin_stop(nvmft_controller_t *ctrlr);
 void	nvmft_controller_lun_changed(nvmft_controller_t *ctrlr, int lun_id);
 void	nvmft_handle_admin_command(nvmft_controller_t *ctrlr,
 	    struct nvmf_capsule *nc);
@@ -347,6 +351,11 @@ void	nvmft_queue_admin_command(nvmft_controller_t *ctrlr,
 	    struct nvmf_capsule *nc);
 void	nvmft_handle_io_command(struct nvmft_qpair *qp, uint16_t qid,
 	    struct nvmf_capsule *nc);
+
+/* nvmft_controller.c */
+void	nvmft_controller_error(nvmft_controller_t *ctrlr,
+	    struct nvmft_qpair *qp, int error);
+void	nvmft_controller_start_shutdown(nvmft_controller_t *ctrlr);
 int	nvmft_handoff_admin_queue(nvmft_port_t *np, nvmf_trtype_t trtype,
 	    const nvlist_t *params, const nvmf_fabric_connect_cmd_t *cmd,
 	    const nvmf_fabric_connect_data_t *data);

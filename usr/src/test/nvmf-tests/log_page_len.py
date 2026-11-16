@@ -11,7 +11,7 @@ def main():
                  "NVME_CQE_SC_GEN_INV_DSGL_LEN"):
         parts.append(define(NVME_H, name))
     parts.append(define(NVMFT / "nvmft_var.h", "NVMFT_MAX_LOGPAGE_LEN"))
-    parts.append(function(NVMFT / "nvmft_controller.c",
+    parts.append(function(NVMFT / "nvmft_admin.c",
                           "nvmft_log_page_len"))
     run_c(TESTDIR / "log_page_len.c", {"logpage.h": "\n".join(parts)})
 

@@ -17,7 +17,7 @@ def main():
     if m is None:
         print("FAIL: the Connect is not deferred before its capsule is freed")
         fails += 1
-    admin = function(NVMFT / "nvmft_controller.c", "nvmft_handle_admin_command")
+    admin = function(NVMFT / "nvmft_admin.c", "nvmft_handle_admin_command")
     aer = admin[admin.index("case NVME_OPC_ASYNC_EVENT:"):]
     aer = aer[:aer.index("break;")]
     accept, _, after = aer.partition("} else {")

@@ -10,7 +10,8 @@ def main():
     core = NVMF / "nvmf_transport.c"
     internal = NVMF / "nvmf_transport_internal.h"
     public = NVMF.parents[1] / "sys/nvme/nvmf_transport.h"
-    stmf = NVMFT / "nvmft_stmf.c"
+    stmf = NVMFT / "nvmft_io.c"
+    stmf_h = NVMFT / "nvmft_io.h"
     parts = [KSHIM, """
 #define	MIN(a, b)	((a) < (b) ? (a) : (b))
 #define	panic(...)	abort()
@@ -96,9 +97,9 @@ uint32_t nvmft_qpair_caps(struct nvmft_qpair *);
         if line.startswith("#define\tNVMF_QP_CAP_"):
             parts.append(line + "\n")
     for name in ("NVMFT_XFER_SUBMITTED", "NVMFT_XFER_COMPLETED"):
-        parts.append(define(stmf, name))
+        parts.append(define(stmf_h, name))
     for name in ("nvmft_task_priv_t", "nvmft_internal_io_t", "nvmft_xfer_t"):
-        parts.append(typedef(stmf, name))
+        parts.append(typedef(stmf_h, name))
     for name in ("nvmft_xfer_begin", "nvmft_xfer_end", "nvmft_xfer_refused",
                  "nvmft_xfer_arrive", "nvmft_xfer_finish",
                  "nvmft_datamove_out_cb", "nvmft_datamove_in_cb",
