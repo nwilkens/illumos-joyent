@@ -686,8 +686,9 @@ nvmf_tcp_handle_h2c_data(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 	}
 
 	data_offset = LE_32(h2c->nth2c_datao);
-	if (data_offset < cb->data_offset ||
-	    data_offset + data_len > cb->data_offset + cb->data_len) {
+	if (data_len == 0 || data_offset < cb->data_offset ||
+	    (uint64_t)data_offset + data_len >
+	    (uint64_t)cb->data_offset + cb->data_len) {
 		nvmf_tcp_report_error(qp->qp.nq_association, qp,
 		    NVMF_TCP_TERM_REQ_FES_DATA_TRANSFER_OUT_OF_RANGE, 0,
 		    pdu->hdr, LE_32(pdu->hdr->ntcph_plen),
@@ -757,8 +758,9 @@ nvmf_tcp_handle_c2h_data(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 	}
 
 	data_offset = LE_32(c2h->ntc2c_datao);
-	if (data_offset < cb->data_offset ||
-	    data_offset + data_len > cb->data_offset + cb->data_len) {
+	if (data_len == 0 || data_offset < cb->data_offset ||
+	    (uint64_t)data_offset + data_len >
+	    (uint64_t)cb->data_offset + cb->data_len) {
 		nvmf_tcp_report_error(qp->qp.nq_association, qp,
 		    NVMF_TCP_TERM_REQ_FES_DATA_TRANSFER_OUT_OF_RANGE, 0,
 		    pdu->hdr, LE_32(pdu->hdr->ntcph_plen),
@@ -891,7 +893,8 @@ nvmf_tcp_handle_r2t(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 	 * out of range of the original command.
 	 */
 	data_len = LE_32(r2t->ntr2t_r2tl);
-	if (data_offset + data_len > cb->data_len) {
+	if (data_len == 0 ||
+	    (uint64_t)data_offset + data_len > cb->data_len) {
 		nvmf_tcp_report_error(qp->qp.nq_association, qp,
 		    NVMF_TCP_TERM_REQ_FES_DATA_TRANSFER_OUT_OF_RANGE, 0,
 		    pdu->hdr, LE_32(pdu->hdr->ntcph_plen),
@@ -1564,6 +1567,8 @@ tcp_receive_icd_data(const struct nvmf_capsule *nc, uint32_t data_offset,
 	const nvmf_tcp_capsule_t *tc = CTCAP(nc);
 	const char *icd;
 
+	if ((uint64_t)data_offset + len > tc->rx_pdu.data_len)
+		return (EFBIG);
 	icd = (const char *)tc->rx_pdu.hdr + tc->rx_pdu.hdr->ntcph_pdo +
 	    data_offset;
 	(void) memcpy(buf, icd, len);
@@ -1584,7 +1589,7 @@ tcp_receive_controller_data(const struct nvmf_capsule *nc, uint32_t data_offset,
 
 	sgl = &nc->nc_sqe.sqe_dptr.d_sgl;
 	data_len = LE_32(sgl->sgl_len);
-	if (data_offset + len > data_len)
+	if (len > UINT32_MAX || (uint64_t)data_offset + len > data_len)
 		return (EFBIG);
 
 	sgl_type = (uint8_t)((sgl->sgl_type << 4) | sgl->sgl_zero);
