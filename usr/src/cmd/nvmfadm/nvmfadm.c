@@ -14,291 +14,362 @@
  */
 
 /*
- * nvmfadm - minimal control utility for the NVMe-over-Fabrics COMSTAR target
- * port provider (nvmft).
- *
- * This creates and destroys subsystem target ports: one SubNQN maps to one STMF
- * stmf_local_port_t.  The namespace (LU) mapping itself is done with the
- * existing sbdadm/stmfadm tools (sbdadm create-lu, stmfadm add-view); see
- * CONFIG.md.  nvmfadm talks to /devices/pseudo/nvmft@0:admin via the
- * NVMFT_IOC_SUBSYS_* ioctls defined in <sys/nvme/nvmf_ioctl.h>, passing a
- * packed nvlist in a struct nvmf_ioc_nv carrier (the same convention the
- * Fabrics host control path uses).
- *
- * Usage:
- *   nvmfadm create-subsys [-s serial] [-p portid] <subnqn>
- *   nvmfadm delete-subsys <subnqn>
- *   nvmfadm list-subsys
+ * nvmfadm: create, delete and list the subsystems of the NVMe over Fabrics
+ * target port provider, nvmft.  A subsystem is one STMF target port.  The
+ * subsystems are kept in nvmft's STMF provider data, and "nvmfadm restore"
+ * creates them again from there when the target service starts.
  */
 
 #include <sys/types.h>
-#include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <err.h>
+#include <errno.h>
 #include <fcntl.h>
-#include <unistd.h>
+#include <libnvmf.h>
+#include <libnvpair.h>
+#include <libstmf.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
-#include <strings.h>
-#include <errno.h>
-#include <libnvpair.h>
+#include <unistd.h>
 
 #include <sys/nvme/nvmf_ioctl.h>
 
-#define	NVMFT_DEV	"/devices/pseudo/nvmft@0:admin"
+/* The provider data holds one nvlist, of an nvlist for each subsystem. */
+#define	NVMFADM_CFG_SUBSYSTEMS	"subsystems"
 
-static const char *progname;
+/* Attempts to save a change before giving up on a busy configuration. */
+#define	NVMFADM_CFG_TRIES	5
 
 static void
 usage(void)
 {
 	(void) fprintf(stderr,
-	    "usage:\n"
-	    "  %s create-subsys [-s serial] [-p portid] <subnqn>\n"
-	    "  %s delete-subsys <subnqn>\n"
-	    "  %s list-subsys\n",
-	    progname, progname, progname);
+	    "usage: nvmfadm create-subsys [-p portid] [-s serial] subnqn\n"
+	    "       nvmfadm delete-subsys subnqn\n"
+	    "       nvmfadm list-subsys\n"
+	    "       nvmfadm restore\n");
 	exit(2);
 }
 
 static int
 nvmft_open(void)
 {
-	int fd = open(NVMFT_DEV, O_RDONLY);
+	int fd = open(NVMFT_DEV, O_RDWR);
 
-	if (fd < 0) {
-		(void) fprintf(stderr, "%s: cannot open %s: %s\n",
-		    progname, NVMFT_DEV, strerror(errno));
-		(void) fprintf(stderr,
-		    "%s: is the nvmft driver loaded? (modload nvmft)\n",
-		    progname);
-	}
+	if (fd == -1)
+		err(1, "cannot open %s", NVMFT_DEV);
 	return (fd);
 }
 
-/*
- * Pack nvl and issue the ioctl.  No reply is expected (size == 0), so the call
- * passes the request buffer only.
- */
+/* Send a request nvlist.  Returns 0 or an errno. */
 static int
-nvmft_ioctl_send(int fd, int cmd, nvlist_t *nvl)
+nvmft_send(int fd, int cmd, nvlist_t *nvl)
 {
-	struct nvmf_ioc_nv ionv;
+	struct nvmf_ioc_nv nv;
 	char *packed = NULL;
-	size_t packed_len = 0;
-	int ret = 1;
+	size_t len = 0;
+	int error = 0;
 
-	if (nvlist_pack(nvl, &packed, &packed_len, NV_ENCODE_NATIVE, 0) != 0) {
-		(void) fprintf(stderr, "%s: failed to pack request\n",
-		    progname);
-		return (1);
-	}
+	if (nvlist_pack(nvl, &packed, &len, NV_ENCODE_NATIVE, 0) != 0)
+		return (ENOMEM);
 
-	bzero(&ionv, sizeof (ionv));
-	ionv.data = packed;
-	ionv.len = packed_len;
-	ionv.size = packed_len;
-
-	if (ioctl(fd, cmd, &ionv) != 0) {
-		(void) fprintf(stderr, "%s: ioctl failed: %s\n", progname,
-		    strerror(errno));
-	} else {
-		ret = 0;
-	}
-
+	(void) memset(&nv, 0, sizeof (nv));
+	nv.data = packed;
+	nv.len = len;
+	nv.size = len;
+	if (ioctl(fd, cmd, &nv) != 0)
+		error = errno;
 	free(packed);
-	return (ret);
+	return (error);
+}
+
+/* Create a subsystem from its saved or requested properties. */
+static int
+subsys_create(int fd, const char *subnqn, nvlist_t *props)
+{
+	nvlist_t *req;
+	char *serial;
+	uint64_t portid;
+	int error;
+
+	if (nvlist_alloc(&req, NV_UNIQUE_NAME, 0) != 0)
+		return (ENOMEM);
+	error = nvlist_add_string(req, NVMFT_NV_SUBNQN, subnqn);
+	if (error == 0 &&
+	    nvlist_lookup_string(props, NVMFT_NV_SERIAL, &serial) == 0)
+		error = nvlist_add_string(req, NVMFT_NV_SERIAL, serial);
+	if (error == 0 &&
+	    nvlist_lookup_uint64(props, NVMFT_NV_PORTID, &portid) == 0)
+		error = nvlist_add_uint64(req, NVMFT_NV_PORTID, portid);
+	if (error == 0)
+		error = nvmft_send(fd, NVMFT_IOC_SUBSYS_CREATE, req);
+	nvlist_free(req);
+	return (error);
+}
+
+static int
+subsys_delete(int fd, const char *subnqn)
+{
+	nvlist_t *req;
+	int error;
+
+	if (nvlist_alloc(&req, NV_UNIQUE_NAME, 0) != 0)
+		return (ENOMEM);
+	error = nvlist_add_string(req, NVMFT_NV_SUBNQN, subnqn);
+	if (error == 0)
+		error = nvmft_send(fd, NVMFT_IOC_SUBSYS_DELETE, req);
+	nvlist_free(req);
+	return (error);
 }
 
 /*
- * Issue a list ioctl: first call with size == 0 to learn the reply length, then
- * allocate and copy out.  Returns an unpacked nvlist in *replyp on success.
+ * Read the saved configuration.  On success *cfgp is never NULL and *subsp
+ * points at the subsystem list inside it.
  */
 static int
-nvmft_ioctl_recv(int fd, int cmd, nvlist_t **replyp)
+config_load(nvlist_t **cfgp, nvlist_t **subsp, uint64_t *tokenp)
 {
-	struct nvmf_ioc_nv ionv;
-	char *buf;
-	size_t need;
-	nvlist_t *reply = NULL;
+	nvlist_t *cfg = NULL, *subs;
+	int ret;
 
-	/* First call with size == 0 returns the required buffer length. */
-	bzero(&ionv, sizeof (ionv));
-	if (ioctl(fd, cmd, &ionv) != 0) {
-		(void) fprintf(stderr, "%s: ioctl (size query) failed: %s\n",
-		    progname, strerror(errno));
-		return (1);
-	}
-	if (ionv.len == 0) {
-		*replyp = NULL;
-		return (0);
-	}
-	need = ionv.len;
-
-	buf = malloc(need);
-	if (buf == NULL) {
-		(void) fprintf(stderr, "%s: out of memory\n", progname);
-		return (1);
+	*tokenp = 0;
+	ret = stmfGetProviderDataProt(NVMFT_DRIVER, &cfg,
+	    STMF_PORT_PROVIDER_TYPE, tokenp);
+	if (ret == STMF_ERROR_NOT_FOUND) {
+		if (nvlist_alloc(&cfg, NV_UNIQUE_NAME, 0) != 0)
+			return (ENOMEM);
+	} else if (ret != STMF_STATUS_SUCCESS) {
+		return (EIO);
 	}
 
-	/* Second call: provide the buffer (size > 0) so the kernel fills it. */
-	bzero(&ionv, sizeof (ionv));
-	ionv.data = buf;
-	ionv.size = need;
-	if (ioctl(fd, cmd, &ionv) != 0) {
-		(void) fprintf(stderr, "%s: ioctl failed: %s\n", progname,
-		    strerror(errno));
-		free(buf);
-		return (1);
-	}
-	if (nvlist_unpack(buf, ionv.len, &reply, 0) != 0) {
-		(void) fprintf(stderr, "%s: failed to unpack reply\n",
-		    progname);
-		free(buf);
-		return (1);
+	if (nvlist_lookup_nvlist(cfg, NVMFADM_CFG_SUBSYSTEMS, &subs) != 0) {
+		if (nvlist_alloc(&subs, NV_UNIQUE_NAME, 0) != 0) {
+			nvlist_free(cfg);
+			return (ENOMEM);
+		}
+		ret = nvlist_add_nvlist(cfg, NVMFADM_CFG_SUBSYSTEMS, subs);
+		nvlist_free(subs);
+		if (ret != 0 || nvlist_lookup_nvlist(cfg,
+		    NVMFADM_CFG_SUBSYSTEMS, &subs) != 0) {
+			nvlist_free(cfg);
+			return (ENOMEM);
+		}
 	}
 
-	free(buf);
-	*replyp = reply;
+	*cfgp = cfg;
+	*subsp = subs;
 	return (0);
+}
+
+/*
+ * Add a subsystem to the saved configuration, or with props NULL remove it.
+ * Removing one that is not there fails with ENOENT.
+ */
+static int
+config_update(const char *subnqn, nvlist_t *props)
+{
+	nvlist_t *cfg, *subs;
+	uint64_t token;
+	int error, ret, tries;
+
+	for (tries = 0; tries < NVMFADM_CFG_TRIES; tries++) {
+		error = config_load(&cfg, &subs, &token);
+		if (error != 0)
+			return (error);
+
+		if (props != NULL) {
+			error = nvlist_add_nvlist(subs, subnqn, props);
+		} else if (!nvlist_exists(subs, subnqn)) {
+			error = ENOENT;
+		} else {
+			error = nvlist_remove_all(subs, subnqn);
+		}
+		if (error != 0) {
+			nvlist_free(cfg);
+			return (error);
+		}
+
+		ret = stmfSetProviderDataProt(NVMFT_DRIVER, cfg,
+		    STMF_PORT_PROVIDER_TYPE, &token);
+		nvlist_free(cfg);
+		if (ret == STMF_STATUS_SUCCESS)
+			return (0);
+
+		/* Someone else changed it first: read it again. */
+		if (ret != STMF_ERROR_PROV_DATA_STALE)
+			return (EIO);
+	}
+	return (EBUSY);
 }
 
 static int
 cmd_create_subsys(int argc, char **argv)
 {
-	nvlist_t *nvl;
-	const char *subnqn, *serial = NULL;
-	long portid = -1;
-	int c, fd, ret;
+	nvlist_t *props;
+	const char *subnqn;
+	char *end;
+	unsigned long portid;
+	int c, error, fd;
 
-	while ((c = getopt(argc, argv, "s:p:")) != -1) {
+	if (nvlist_alloc(&props, NV_UNIQUE_NAME, 0) != 0)
+		errx(1, "out of memory");
+
+	while ((c = getopt(argc, argv, "p:s:")) != -1) {
 		switch (c) {
+		case 'p':
+			errno = 0;
+			portid = strtoul(optarg, &end, 0);
+			if (errno != 0 || end == optarg || *end != '\0' ||
+			    portid > UINT16_MAX)
+				errx(2, "invalid port ID %s", optarg);
+			if (nvlist_add_uint64(props, NVMFT_NV_PORTID,
+			    portid) != 0)
+				errx(1, "out of memory");
+			break;
 		case 's':
-			serial = optarg;
+			if (nvlist_add_string(props, NVMFT_NV_SERIAL,
+			    optarg) != 0)
+				errx(1, "out of memory");
 			break;
-		case 'p': {
-			char *end;
-			portid = strtol(optarg, &end, 0);
-			if (*end != '\0' || portid < 0 || portid > UINT16_MAX) {
-				(void) fprintf(stderr,
-				    "%s: invalid portid '%s'\n", progname,
-				    optarg);
-				return (2);
-			}
-			break;
-		}
 		default:
 			usage();
 		}
 	}
-
 	if (optind != argc - 1)
 		usage();
 	subnqn = argv[optind];
-
-	if (nvlist_alloc(&nvl, NV_UNIQUE_NAME, 0) != 0) {
-		(void) fprintf(stderr, "%s: out of memory\n", progname);
-		return (1);
-	}
-	(void) nvlist_add_string(nvl, NVMFT_NV_SUBNQN, subnqn);
-	if (serial != NULL)
-		(void) nvlist_add_string(nvl, NVMFT_NV_SERIAL, serial);
-	if (portid >= 0)
-		(void) nvlist_add_uint64(nvl, NVMFT_NV_PORTID,
-		    (uint64_t)portid);
+	if (!nvmf_nqn_valid_strict(subnqn))
+		errx(2, "invalid subsystem NQN %s", subnqn);
 
 	fd = nvmft_open();
-	if (fd < 0) {
-		nvlist_free(nvl);
-		return (1);
-	}
+	error = subsys_create(fd, subnqn, props);
+	if (error != 0)
+		errc(1, error, "cannot create subsystem %s", subnqn);
 
-	ret = nvmft_ioctl_send(fd, NVMFT_IOC_SUBSYS_CREATE, nvl);
-	(void) close(fd);
-	nvlist_free(nvl);
-
-	if (ret == 0) {
-		(void) printf("created subsystem %s\n", subnqn);
-		(void) printf("next: stmfadm online-target -t nvmft %s\n",
+	error = config_update(subnqn, props);
+	if (error != 0) {
+		(void) subsys_delete(fd, subnqn);
+		errc(1, error, "cannot save subsystem %s; it was not created",
 		    subnqn);
 	}
-	return (ret);
+
+	(void) close(fd);
+	nvlist_free(props);
+	return (0);
 }
 
 static int
 cmd_delete_subsys(int argc, char **argv)
 {
-	nvlist_t *nvl;
 	const char *subnqn;
-	int fd, ret;
+	int error, fd, saved;
 
 	if (argc != 2)
 		usage();
 	subnqn = argv[1];
 
-	if (nvlist_alloc(&nvl, NV_UNIQUE_NAME, 0) != 0) {
-		(void) fprintf(stderr, "%s: out of memory\n", progname);
-		return (1);
-	}
-	(void) nvlist_add_string(nvl, NVMFT_NV_SUBNQN, subnqn);
-
 	fd = nvmft_open();
-	if (fd < 0) {
-		nvlist_free(nvl);
-		return (1);
-	}
-
-	ret = nvmft_ioctl_send(fd, NVMFT_IOC_SUBSYS_DELETE, nvl);
+	error = subsys_delete(fd, subnqn);
 	(void) close(fd);
-	nvlist_free(nvl);
+	if (error != 0 && error != ENOENT)
+		errc(1, error, "cannot delete subsystem %s", subnqn);
 
-	if (ret == 0)
-		(void) printf("deleted subsystem %s\n", subnqn);
-	return (ret);
+	saved = config_update(subnqn, NULL);
+	if (saved != 0 && saved != ENOENT)
+		errc(1, saved, "cannot remove saved subsystem %s", subnqn);
+	if (error == ENOENT && saved == ENOENT)
+		errx(1, "no subsystem %s", subnqn);
+	return (0);
 }
 
 static int
-cmd_list_subsys(void)
+cmd_list_subsys(int argc)
 {
-	nvlist_t *reply = NULL;
-	char **nqns = NULL;
-	uint_t n = 0, i;
-	int fd, ret;
+	struct nvmf_ioc_nv nv;
+	nvlist_t *reply;
+	char **nqns;
+	uint_t i, n;
+	int fd;
+
+	if (argc != 1)
+		usage();
 
 	fd = nvmft_open();
-	if (fd < 0)
-		return (1);
-
-	ret = nvmft_ioctl_recv(fd, NVMFT_IOC_SUBSYS_LIST, &reply);
+	(void) memset(&nv, 0, sizeof (nv));
+	if (ioctl(fd, NVMFT_IOC_SUBSYS_LIST, &nv) != 0)
+		err(1, "cannot list subsystems");
+	nv.size = nv.len;
+	nv.data = malloc(nv.size);
+	if (nv.data == NULL)
+		errx(1, "out of memory");
+	if (ioctl(fd, NVMFT_IOC_SUBSYS_LIST, &nv) != 0)
+		err(1, "cannot list subsystems");
 	(void) close(fd);
-	if (ret != 0)
-		return (ret);
 
-	if (reply != NULL && nvlist_lookup_string_array(reply,
-	    NVMFT_NV_SUBNQNS, &nqns, &n) == 0) {
+	if (nvlist_unpack(nv.data, nv.len, &reply, 0) != 0)
+		errx(1, "cannot read the list of subsystems");
+	free(nv.data);
+
+	if (nvlist_lookup_string_array(reply, NVMFT_NV_SUBNQNS, &nqns,
+	    &n) == 0) {
 		for (i = 0; i < n; i++)
 			(void) printf("%s\n", nqns[i]);
 	}
-
 	nvlist_free(reply);
 	return (0);
+}
+
+/* Create every saved subsystem that the port provider does not have. */
+static int
+cmd_restore(int argc)
+{
+	nvlist_t *cfg, *props, *subs;
+	nvpair_t *pair;
+	uint64_t token;
+	int error, fd, ret = 0;
+
+	if (argc != 1)
+		usage();
+
+	fd = nvmft_open();
+	error = config_load(&cfg, &subs, &token);
+	if (error != 0)
+		errc(1, error, "cannot read the saved subsystems");
+
+	for (pair = nvlist_next_nvpair(subs, NULL); pair != NULL;
+	    pair = nvlist_next_nvpair(subs, pair)) {
+		if (nvpair_value_nvlist(pair, &props) != 0)
+			continue;
+		error = subsys_create(fd, nvpair_name(pair), props);
+		if (error != 0 && error != EEXIST) {
+			warnc(error, "cannot create subsystem %s",
+			    nvpair_name(pair));
+			ret = 1;
+		}
+	}
+
+	nvlist_free(cfg);
+	(void) close(fd);
+	return (ret);
 }
 
 int
 main(int argc, char **argv)
 {
-	progname = argv[0];
-
 	if (argc < 2)
 		usage();
 
-	if (strcmp(argv[1], "create-subsys") == 0)
-		return (cmd_create_subsys(argc - 1, argv + 1));
-	if (strcmp(argv[1], "delete-subsys") == 0)
-		return (cmd_delete_subsys(argc - 1, argv + 1));
-	if (strcmp(argv[1], "list-subsys") == 0)
-		return (cmd_list_subsys());
+	argc--;
+	argv++;
+	if (strcmp(argv[0], "create-subsys") == 0)
+		return (cmd_create_subsys(argc, argv));
+	if (strcmp(argv[0], "delete-subsys") == 0)
+		return (cmd_delete_subsys(argc, argv));
+	if (strcmp(argv[0], "list-subsys") == 0)
+		return (cmd_list_subsys(argc));
+	if (strcmp(argv[0], "restore") == 0)
+		return (cmd_restore(argc));
 
 	usage();
 	return (2);

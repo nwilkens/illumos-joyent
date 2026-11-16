@@ -18,9 +18,12 @@ PROG=		nvmfadm
 include ../Makefile.cmd
 include ../Makefile.cmd.64
 
-LDLIBS +=	-lnvpair
+LDLIBS +=	-lnvmf -lnvpair -lstmf
 
 CPPFLAGS +=	-I$(SRC)/uts/common
+CPPFLAGS +=	-I$(SRC)/uts/common/io/nvme
+CPPFLAGS +=	-I$(SRC)/lib/libnvmf/common
+CPPFLAGS +=	-D__EXTENSIONS__
 
 CSTD=		$(CSTD_GNU99)
 
