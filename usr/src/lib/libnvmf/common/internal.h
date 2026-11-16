@@ -29,13 +29,12 @@
  *   -------                   -------
  *   struct nvme_command       nvme_sqe_t (io/nvme/nvme_reg.h)
  *   struct nvme_completion     nvme_cqe_t (io/nvme/nvme_reg.h)
- *   refcount(9)               plain u_int under a single-threaded library
+ *   refcount(9)               <atomic.h>
  *   nvlist_t (sys/_nv.h)      nvlist_t (libnvpair)
  *
- * Like FreeBSD's libnvmf, this library is not internally thread safe; a caller
- * that shares an association or qpair across threads must serialize access.
- * The association reference count is therefore a plain counter rather than the
- * atomic refcount(9) primitive used by the FreeBSD original.
+ * Only an association's reference count is safe to touch from several threads.
+ * Its error string is not, so a controller that accepts connections in more
+ * than one thread allocates an association for each.
  */
 
 #ifndef	_LIBNVMF_INTERNAL_H
@@ -173,7 +172,7 @@ struct nvmf_association {
 	nvmf_association_params_t na_params;
 
 	/* Each qpair holds a reference on an association. */
-	u_int na_refs;
+	volatile uint_t na_refs;
 
 	char *na_last_error;
 };

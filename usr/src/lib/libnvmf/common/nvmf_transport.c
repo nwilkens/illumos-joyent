@@ -25,12 +25,13 @@
  *
  *   FreeBSD                        illumos
  *   -------                        -------
- *   refcount(9)                    plain counter (library is single-threaded)
+ *   refcount(9)                    <atomic.h>
  *   struct nvme_command/completion nvme_sqe_t / nvme_cqe_t
  *   nvlist_t (sys/_nv.h)           nvlist_t (libnvpair)
  */
 
 #include <assert.h>
+#include <atomic.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -80,8 +81,7 @@ nvmf_update_association(struct nvmf_association *na,
 void
 nvmf_free_association(struct nvmf_association *na)
 {
-	assert(na->na_refs > 0);
-	if (--na->na_refs == 0) {
+	if (atomic_dec_uint_nv(&na->na_refs) == 0) {
 		free(na->na_last_error);
 		na->na_ops->free_association(na);
 	}
@@ -126,7 +126,7 @@ nvmf_allocate_qpair(struct nvmf_association *na,
 	if (qp == NULL)
 		return (NULL);
 
-	na->na_refs++;
+	atomic_inc_uint(&na->na_refs);
 	qp->nq_association = na;
 	qp->nq_admin = params->nqp_admin;
 	TAILQ_INIT(&qp->nq_rx_capsules);

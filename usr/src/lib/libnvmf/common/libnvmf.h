@@ -107,10 +107,11 @@ typedef struct nvmf_qpair_params {
  * nvmf_update_association to update internal transport-specific
  * parameters before allocating I/O queues.
  *
- * A controller uses a single association to manage all incoming
- * queues since it is not known until after parsing the CONNECT
- * command which transport queues are admin vs I/O and which
- * controller they are created against.
+ * A controller does not know which controller a connection belongs to
+ * until it has parsed the CONNECT command, so its associations only
+ * carry the parameters to accept with.  An association's error string
+ * is not safe to share between threads: a controller that accepts in
+ * more than one thread allocates an association for each connection.
  */
 extern struct nvmf_association *nvmf_allocate_association(nvmf_trtype_t trtype,
     bool controller, const nvmf_association_params_t *params);
