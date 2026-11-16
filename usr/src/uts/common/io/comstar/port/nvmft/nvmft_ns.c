@@ -263,8 +263,8 @@ nvmft_lu_read_capacity(nvmft_controller_t *ctrlr, uint32_t nsid,
     uint64_t *nblocksp, uint32_t *blksizep)
 {
 	uint_t attempt;
-	uint8_t key;
-	int rc;
+	uint8_t key = KEY_NO_SENSE;
+	int rc = EIO;
 
 	for (attempt = 0; attempt <= NVMFT_READ_CAPACITY_UA_RETRIES;
 	    attempt++) {
