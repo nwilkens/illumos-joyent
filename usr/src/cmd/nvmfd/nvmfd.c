@@ -39,6 +39,7 @@
 #include <priv.h>
 #include <priv_utils.h>
 #include <pthread.h>
+#include <rpcsvc/daemon_utils.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -63,10 +64,6 @@
 /* Messages about peers logged in any one window; the rest are counted. */
 #define	NVMFD_PEER_LOG_BURST		20
 #define	NVMFD_PEER_LOG_WINDOW		10	/* seconds */
-
-/* The daemon user and group. */
-#define	NVMFD_UID			1
-#define	NVMFD_GID			12
 
 bool data_digests = false;
 bool header_digests = false;
@@ -546,8 +543,8 @@ main(int ac, char **av)
 	 * daemon needs sys_devices for the node's ioctls and nothing else
 	 * beyond what any process has.
 	 */
-	if (__init_daemon_priv(PU_RESETGROUPS | PU_LIMITPRIVS, NVMFD_UID,
-	    NVMFD_GID, PRIV_SYS_DEVICES, (char *)NULL) != 0)
+	if (__init_daemon_priv(PU_RESETGROUPS | PU_LIMITPRIVS, DAEMON_UID,
+	    DAEMON_GID, PRIV_SYS_DEVICES, (char *)NULL) != 0)
 		err(1, "Failed to drop privileges");
 
 	if (!foreground && daemon(0, 0) != 0)
