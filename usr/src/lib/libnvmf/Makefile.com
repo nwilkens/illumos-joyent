@@ -17,6 +17,8 @@ LIBRARY =	libnvmf.a
 VERS =		.1
 OBJECTS =	nvmf_transport.o \
 		nvmf_tcp.o \
+		nvmf_tcp_data.o \
+		nvmf_tcp_pdu.o \
 		nvmf_controller.o \
 		nvmf_host.o \
 		nvmf_host_ioctl.o \
