@@ -143,6 +143,9 @@ typedef struct nvmf_tcp_qpair {
 #define	CTCAP(nc)	((const nvmf_tcp_capsule_t *)(nc))
 #define	TQP(qp)		((nvmf_tcp_qpair_t *)(qp))
 
+/* In-capsule data accepted by a controller: 8192 bytes, as for Fabrics. */
+#define	NVMF_TCP_MAX_RX_ICD	8192
+
 static const char zero_padding[NVMF_TCP_PDU_PDO_MAX_OFFSET];
 
 static uint32_t
@@ -334,65 +337,6 @@ nvmf_tcp_report_error(struct nvmf_association *na, nvmf_tcp_qpair_t *qp,
 }
 
 static int
-nvmf_tcp_validate_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu,
-    size_t pdu_len)
-{
-	const nvmf_tcp_common_pdu_hdr_t *ch;
-	uint32_t data_len, fei, plen;
-	uint32_t digest, rx_digest;
-	u_int hlen;
-	int error;
-	uint16_t fes;
-
-	/* Determine how large of a PDU header to return for errors. */
-	ch = pdu->hdr;
-	hlen = ch->ntcph_hlen;
-	plen = LE_32(ch->ntcph_plen);
-	if (hlen < sizeof (*ch) || hlen > plen)
-		hlen = sizeof (*ch);
-
-	error = nvmf_tcp_validate_pdu_header(ch,
-	    qp->qp.nq_association->na_controller, qp->header_digests,
-	    qp->data_digests, qp->rxpda, &data_len, &fes, &fei);
-	if (error != 0) {
-		if (error != ECONNRESET) {
-			nvmf_tcp_report_error(qp->qp.nq_association, qp,
-			    fes, fei, ch, pdu_len, hlen);
-		}
-		return (error);
-	}
-
-	/* Check header digest if present. */
-	if ((ch->ntcph_flags & NVMF_TCP_CH_FLAGS_HDGSTF) != 0) {
-		digest = compute_digest(ch, ch->ntcph_hlen);
-		(void) memcpy(&rx_digest, (const char *)ch + ch->ntcph_hlen,
-		    sizeof (rx_digest));
-		if (digest != rx_digest) {
-			(void) printf("NVMe/TCP: Header digest mismatch\n");
-			nvmf_tcp_report_error(qp->qp.nq_association, qp,
-			    NVMF_TCP_TERM_REQ_FES_HDGST_ERROR, rx_digest, ch,
-			    pdu_len, hlen);
-			return (EBADMSG);
-		}
-	}
-
-	/* Check data digest if present. */
-	if ((ch->ntcph_flags & NVMF_TCP_CH_FLAGS_DDGSTF) != 0) {
-		digest = compute_digest((const char *)ch + ch->ntcph_pdo,
-		    data_len);
-		(void) memcpy(&rx_digest, (const char *)ch + plen -
-		    sizeof (rx_digest), sizeof (rx_digest));
-		if (digest != rx_digest) {
-			(void) printf("NVMe/TCP: Data digest mismatch\n");
-			return (EBADMSG);
-		}
-	}
-
-	pdu->data_len = data_len;
-	return (0);
-}
-
-static int
 nvmf_tcp_read_buffer(nvmf_tcp_qpair_t *qp, void *buf, size_t len)
 {
 	ssize_t nread;
@@ -421,10 +365,76 @@ nvmf_tcp_read_buffer(nvmf_tcp_qpair_t *qp, void *buf, size_t len)
 }
 
 static int
+nvmf_tcp_check_digests(nvmf_tcp_qpair_t *qp, const nvmf_tcp_rxpdu_t *pdu)
+{
+	const nvmf_tcp_common_pdu_hdr_t *ch = pdu->hdr;
+	uint32_t digest, plen, rx_digest;
+
+	plen = LE_32(ch->ntcph_plen);
+	if ((ch->ntcph_flags & NVMF_TCP_CH_FLAGS_HDGSTF) != 0) {
+		digest = compute_digest(ch, ch->ntcph_hlen);
+		(void) memcpy(&rx_digest, (const char *)ch + ch->ntcph_hlen,
+		    sizeof (rx_digest));
+		if (digest != rx_digest) {
+			nvmf_tcp_report_error(qp->qp.nq_association, qp,
+			    NVMF_TCP_TERM_REQ_FES_HDGST_ERROR, rx_digest, ch,
+			    plen, ch->ntcph_hlen);
+			return (EBADMSG);
+		}
+	}
+
+	if ((ch->ntcph_flags & NVMF_TCP_CH_FLAGS_DDGSTF) != 0) {
+		digest = compute_digest((const char *)ch + ch->ntcph_pdo,
+		    pdu->data_len);
+		(void) memcpy(&rx_digest, (const char *)ch + plen -
+		    sizeof (rx_digest), sizeof (rx_digest));
+		if (digest != rx_digest)
+			return (EBADMSG);
+	}
+	return (0);
+}
+
+/*
+ * The most data a PDU of this type may carry.  Data PDUs are held to what the
+ * queue's own receive buffers still expect, so the peer cannot make the
+ * library allocate more than its caller asked to read.
+ */
+static size_t
+nvmf_tcp_max_data(nvmf_tcp_qpair_t *qp, uint8_t pdu_type)
+{
+	nvmf_tcp_command_buffer_t *cb;
+	size_t max;
+
+	switch (pdu_type) {
+	case NVMF_TCP_PDU_TYPE_CAPSULE_CMD:
+		return (NVMF_TCP_MAX_RX_ICD);
+	case NVMF_TCP_PDU_TYPE_H2C_DATA:
+	case NVMF_TCP_PDU_TYPE_C2H_DATA:
+		max = 0;
+		LIST_FOREACH(cb, &qp->rx_buffers, link) {
+			if (cb->data_len - cb->data_xfered > max)
+				max = cb->data_len - cb->data_xfered;
+		}
+		return (max);
+	default:
+		return (0);
+	}
+}
+
+static bool
+nvmf_tcp_is_term_req(const nvmf_tcp_common_pdu_hdr_t *ch)
+{
+	return (ch->ntcph_pdu_type == NVMF_TCP_PDU_TYPE_H2C_TERM_REQ ||
+	    ch->ntcph_pdu_type == NVMF_TCP_PDU_TYPE_C2H_TERM_REQ);
+}
+
+static int
 nvmf_tcp_read_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 {
+	struct nvmf_association *na = qp->qp.nq_association;
 	nvmf_tcp_common_pdu_hdr_t ch;
-	uint32_t plen;
+	uint32_t data_len, fei, plen;
+	uint16_t fes;
 	int error;
 
 	(void) memset(pdu, 0, sizeof (*pdu));
@@ -432,30 +442,37 @@ nvmf_tcp_read_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 	if (error != 0)
 		return (error);
 
-	plen = LE_32(ch.ntcph_plen);
-
-	/*
-	 * Validate a header with garbage lengths to trigger an error message
-	 * without reading more.
-	 */
-	if (plen < sizeof (ch) || ch.ntcph_hlen > plen) {
-		pdu->hdr = &ch;
-		error = nvmf_tcp_validate_pdu(qp, pdu, sizeof (ch));
-		pdu->hdr = NULL;
-		assert(error != 0);
+	/* The common header is checked before plen is trusted for anything. */
+	error = nvmf_tcp_validate_pdu_header(&ch, na->na_controller,
+	    qp->header_digests, qp->data_digests, qp->rxpda, &data_len, &fes,
+	    &fei);
+	if (error != 0) {
+		if (error != ECONNRESET) {
+			nvmf_tcp_report_error(na, qp, fes, fei, &ch,
+			    sizeof (ch), sizeof (ch));
+		}
 		return (error);
 	}
 
-	/* Read the rest of the PDU.  plen is attacker-controlled off the wire. */
+	/* A termination request's length was bounded by the check above. */
+	if (!nvmf_tcp_is_term_req(&ch) &&
+	    data_len > nvmf_tcp_max_data(qp, ch.ntcph_pdu_type)) {
+		nvmf_tcp_report_error(na, qp,
+		    NVMF_TCP_TERM_REQ_FES_DATA_TRANSFER_OUT_OF_RANGE, 0, &ch,
+		    sizeof (ch), sizeof (ch));
+		return (EBADMSG);
+	}
+
+	plen = LE_32(ch.ntcph_plen);
 	pdu->hdr = malloc(plen);
 	if (pdu->hdr == NULL)
 		return (ENOMEM);
 	(void) memcpy(pdu->hdr, &ch, sizeof (ch));
+	pdu->data_len = data_len;
 	error = nvmf_tcp_read_buffer(qp, (char *)pdu->hdr + sizeof (ch),
 	    plen - sizeof (ch));
-	if (error != 0)
-		return (error);
-	error = nvmf_tcp_validate_pdu(qp, pdu, plen);
+	if (error == 0)
+		error = nvmf_tcp_check_digests(qp, pdu);
 	if (error != 0) {
 		free(pdu->hdr);
 		pdu->hdr = NULL;
@@ -494,8 +511,10 @@ nvmf_tcp_save_command_capsule(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 	cmd = (void *)pdu->hdr;
 
 	nc = nvmf_allocate_command(&qp->qp, cmd->ntc_ccsqe);
-	if (nc == NULL)
+	if (nc == NULL) {
+		nvmf_tcp_free_pdu(pdu);
 		return (ENOMEM);
+	}
 
 	tc = TCAP(nc);
 	tc->rx_pdu = *pdu;
@@ -516,8 +535,10 @@ nvmf_tcp_save_response_capsule(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 	cqe = (nvme_cqe_t *)rsp->ntr_rccqe;
 
 	nc = nvmf_allocate_response(&qp->qp, cqe);
-	if (nc == NULL)
+	if (nc == NULL) {
+		nvmf_tcp_free_pdu(pdu);
 		return (ENOMEM);
+	}
 
 	nc->nc_sqhd_valid = true;
 	tc = TCAP(nc);
@@ -891,7 +912,6 @@ nvmf_tcp_receive_pdu(nvmf_tcp_qpair_t *qp)
 
 	switch (pdu.hdr->ntcph_pdu_type) {
 	default:
-		assert(0);
 		nvmf_tcp_free_pdu(&pdu);
 		return (ECONNRESET);
 	case NVMF_TCP_PDU_TYPE_H2C_TERM_REQ:
@@ -1071,6 +1091,8 @@ tcp_allocate_association(bool controller,
 	}
 
 	ta = calloc(1, sizeof (*ta));
+	if (ta == NULL)
+		return (NULL);
 
 	return (&ta->na);
 }
@@ -1232,6 +1254,10 @@ tcp_allocate_qpair(struct nvmf_association *na,
 	}
 
 	qp = calloc(1, sizeof (*qp));
+	if (qp == NULL) {
+		na_error(na, "Out of memory");
+		return (NULL);
+	}
 	qp->s = qparams->nqp_tcp.fd;
 	qp->qp.nq_deadline = nvmf_deadline(qparams->nqp_timeout_ms);
 	LIST_INIT(&qp->rx_buffers);
@@ -1311,6 +1337,8 @@ tcp_allocate_capsule(struct nvmf_qpair *qp __unused)
 	nvmf_tcp_capsule_t *nc;
 
 	nc = calloc(1, sizeof (*nc));
+	if (nc == NULL)
+		return (NULL);
 	return (&nc->nc);
 }
 

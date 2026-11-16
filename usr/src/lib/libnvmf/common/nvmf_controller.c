@@ -181,6 +181,8 @@ nvmf_send_error(const struct nvmf_capsule *cc, uint8_t sc_type,
 	int error;
 
 	rc = nvmf_simple_response(cc, sc_type, sc_status);
+	if (rc == NULL)
+		return (ENOMEM);
 	error = nvmf_controller_transmit_response(rc);
 	nvmf_free_capsule(rc);
 	return (error);
@@ -210,6 +212,8 @@ nvmf_connect_invalid_parameters(const struct nvmf_capsule *cc, bool data,
 	rsp.nfcr_status_code_specific.invalid.ipo = LE_16(offset);
 	rsp.nfcr_status_code_specific.invalid.iattr = data ? 1 : 0;
 	rc = nvmf_allocate_response(cc->nc_qpair, &rsp);
+	if (rc == NULL)
+		return;
 	(void) nvmf_transmit_capsule(rc);
 	nvmf_free_capsule(rc);
 }
