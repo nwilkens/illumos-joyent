@@ -40,6 +40,7 @@ SYMBOL_VERSION ILLUMOS_0.1 {
 	nvmf_association_error;
 	nvmf_allocate_qpair;
 	nvmf_free_qpair;
+	nvmf_qpair_set_timeout;
 	nvmf_allocate_command;
 	nvmf_allocate_response;
 	nvmf_free_capsule;

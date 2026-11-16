@@ -192,6 +192,9 @@ struct nvmf_qpair {
 
 	uint32_t nq_kato;	/* valid on admin queue only */
 
+	/* CLOCK_MONOTONIC time in ns by which I/O must finish; 0 for never. */
+	int64_t nq_deadline;
+
 	TAILQ_HEAD(, nvmf_capsule) nq_rx_capsules;
 };
 
@@ -223,6 +226,9 @@ extern struct nvmf_transport_ops tcp_ops;
 
 extern void na_clear_error(struct nvmf_association *na);
 extern void na_error(struct nvmf_association *na, const char *fmt, ...);
+
+extern int64_t nvmf_now(void);
+extern int64_t nvmf_deadline(uint_t timeout_ms);
 
 extern int nvmf_kernel_handoff_params(struct nvmf_qpair *qp, nvlist_t **nvlp);
 extern int nvmf_populate_dle(struct nvmf_qpair *qp,

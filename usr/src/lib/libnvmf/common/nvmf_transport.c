@@ -37,6 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "libnvmf.h"
 #include "internal.h"
@@ -146,6 +147,29 @@ nvmf_free_qpair(struct nvmf_qpair *qp)
 	na = qp->nq_association;
 	na->na_ops->free_qpair(qp);
 	nvmf_free_association(na);
+}
+
+int64_t
+nvmf_now(void)
+{
+	struct timespec ts;
+
+	(void) clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ((int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec);
+}
+
+int64_t
+nvmf_deadline(uint_t timeout_ms)
+{
+	if (timeout_ms == 0)
+		return (0);
+	return (nvmf_now() + (int64_t)timeout_ms * 1000000);
+}
+
+void
+nvmf_qpair_set_timeout(struct nvmf_qpair *qp, uint_t timeout_ms)
+{
+	qp->nq_deadline = nvmf_deadline(timeout_ms);
 }
 
 struct nvmf_capsule *

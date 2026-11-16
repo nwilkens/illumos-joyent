@@ -90,6 +90,7 @@ typedef struct nvmf_association_params {
 /* Parameters specific to a single queue pair of an association. */
 typedef struct nvmf_qpair_params {
 	bool nqp_admin;			/* Host only */
+	uint_t nqp_timeout_ms;		/* For connection setup, 0 for none */
 	union {
 		struct {
 			int fd;
@@ -134,6 +135,12 @@ extern const char *nvmf_association_error(const struct nvmf_association *na);
 extern struct nvmf_qpair *nvmf_allocate_qpair(struct nvmf_association *na,
     const nvmf_qpair_params_t *params);
 extern void nvmf_free_qpair(struct nvmf_qpair *qp);
+
+/*
+ * Fail further I/O on the queue pair with ETIMEDOUT unless it finishes within
+ * timeout_ms from now.  A timeout of 0 removes the limit.
+ */
+extern void nvmf_qpair_set_timeout(struct nvmf_qpair *qp, uint_t timeout_ms);
 
 /*
  * Capsules are either commands (host -> controller) or responses

@@ -49,7 +49,9 @@
 #include <sys/uio.h>
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <netdb.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -207,47 +209,80 @@ tcp_free_command_buffer(nvmf_tcp_command_buffer_t *cb)
 	free(cb);
 }
 
+/* Wait for the socket, up to the queue's deadline. */
 static int
-nvmf_tcp_write_pdu(nvmf_tcp_qpair_t *qp, const void *pdu, size_t len)
+nvmf_tcp_wait(nvmf_tcp_qpair_t *qp, short events)
 {
-	ssize_t nwritten;
-	const char *cp;
+	struct pollfd pfd;
+	int64_t left;
+	int n, timo;
 
-	cp = pdu;
-	while (len != 0) {
-		nwritten = write(qp->s, cp, len);
-		if (nwritten < 0)
+	for (;;) {
+		timo = -1;
+		if (qp->qp.nq_deadline != 0) {
+			left = qp->qp.nq_deadline - nvmf_now();
+			if (left <= 0)
+				return (ETIMEDOUT);
+			left = left / 1000000 + 1;
+			timo = left > INT_MAX ? INT_MAX : (int)left;
+		}
+		pfd.fd = qp->s;
+		pfd.events = events;
+		pfd.revents = 0;
+		n = poll(&pfd, 1, timo);
+		if (n > 0)
+			return (0);
+		if (n == -1 && errno != EINTR)
 			return (errno);
-		len -= nwritten;
-		cp += nwritten;
 	}
-	return (0);
 }
 
 static int
 nvmf_tcp_write_pdu_iov(nvmf_tcp_qpair_t *qp, struct iovec *iov, u_int iovcnt,
     size_t len)
 {
+	struct msghdr msg;
 	ssize_t nwritten;
+	int error;
 
-	for (;;) {
-		nwritten = writev(qp->s, iov, iovcnt);
-		if (nwritten < 0)
-			return (errno);
+	while (len != 0) {
+		(void) memset(&msg, 0, sizeof (msg));
+		msg.msg_iov = iov;
+		msg.msg_iovlen = iovcnt;
+		nwritten = sendmsg(qp->s, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+		if (nwritten < 0) {
+			if (errno == EINTR)
+				continue;
+			if (errno != EAGAIN)
+				return (errno);
+			error = nvmf_tcp_wait(qp, POLLOUT);
+			if (error != 0)
+				return (error);
+			continue;
+		}
 
 		len -= nwritten;
-		if (len == 0)
-			return (0);
-
-		while (iov->iov_len <= (size_t)nwritten) {
+		while (iovcnt != 0 && iov->iov_len <= (size_t)nwritten) {
 			nwritten -= iov->iov_len;
 			iovcnt--;
 			iov++;
 		}
-
-		iov->iov_base = (char *)iov->iov_base + nwritten;
-		iov->iov_len -= nwritten;
+		if (iovcnt != 0) {
+			iov->iov_base = (char *)iov->iov_base + nwritten;
+			iov->iov_len -= nwritten;
+		}
 	}
+	return (0);
+}
+
+static int
+nvmf_tcp_write_pdu(nvmf_tcp_qpair_t *qp, const void *pdu, size_t len)
+{
+	struct iovec iov;
+
+	iov.iov_base = (void *)(uintptr_t)pdu;
+	iov.iov_len = len;
+	return (nvmf_tcp_write_pdu_iov(qp, &iov, 1, len));
 }
 
 /* Store a little-endian 32-bit value into the 4-byte fei field. */
@@ -357,21 +392,26 @@ nvmf_tcp_validate_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu,
 	return (0);
 }
 
-/*
- * Read data from a socket, retrying until the data has been fully
- * read or an error occurs.
- */
 static int
-nvmf_tcp_read_buffer(int s, void *buf, size_t len)
+nvmf_tcp_read_buffer(nvmf_tcp_qpair_t *qp, void *buf, size_t len)
 {
 	ssize_t nread;
 	char *cp;
+	int error;
 
 	cp = buf;
 	while (len != 0) {
-		nread = read(s, cp, len);
-		if (nread < 0)
-			return (errno);
+		nread = recv(qp->s, cp, len, MSG_DONTWAIT);
+		if (nread < 0) {
+			if (errno == EINTR)
+				continue;
+			if (errno != EAGAIN)
+				return (errno);
+			error = nvmf_tcp_wait(qp, POLLIN);
+			if (error != 0)
+				return (error);
+			continue;
+		}
 		if (nread == 0)
 			return (ECONNRESET);
 		len -= nread;
@@ -388,7 +428,7 @@ nvmf_tcp_read_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 	int error;
 
 	(void) memset(pdu, 0, sizeof (*pdu));
-	error = nvmf_tcp_read_buffer(qp->s, &ch, sizeof (ch));
+	error = nvmf_tcp_read_buffer(qp, &ch, sizeof (ch));
 	if (error != 0)
 		return (error);
 
@@ -411,7 +451,7 @@ nvmf_tcp_read_pdu(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 	if (pdu->hdr == NULL)
 		return (ENOMEM);
 	(void) memcpy(pdu->hdr, &ch, sizeof (ch));
-	error = nvmf_tcp_read_buffer(qp->s, (char *)pdu->hdr + sizeof (ch),
+	error = nvmf_tcp_read_buffer(qp, (char *)pdu->hdr + sizeof (ch),
 	    plen - sizeof (ch));
 	if (error != 0)
 		return (error);
@@ -986,7 +1026,7 @@ nvmf_tcp_read_ic_req(struct nvmf_association *na, nvmf_tcp_qpair_t *qp,
 {
 	int error;
 
-	error = nvmf_tcp_read_buffer(qp->s, pdu, sizeof (*pdu));
+	error = nvmf_tcp_read_buffer(qp, pdu, sizeof (*pdu));
 	if (error != 0) {
 		na_error(na, "NVMe/TCP: Failed to read IC request: %s",
 		    strerror(error));
@@ -1003,7 +1043,7 @@ nvmf_tcp_read_ic_resp(struct nvmf_association *na, nvmf_tcp_qpair_t *qp,
 {
 	int error;
 
-	error = nvmf_tcp_read_buffer(qp->s, pdu, sizeof (*pdu));
+	error = nvmf_tcp_read_buffer(qp, pdu, sizeof (*pdu));
 	if (error != 0) {
 		na_error(na, "NVMe/TCP: Failed to read IC response: %s",
 		    strerror(error));
@@ -1190,6 +1230,7 @@ tcp_allocate_qpair(struct nvmf_association *na,
 
 	qp = calloc(1, sizeof (*qp));
 	qp->s = qparams->nqp_tcp.fd;
+	qp->qp.nq_deadline = nvmf_deadline(qparams->nqp_timeout_ms);
 	LIST_INIT(&qp->rx_buffers);
 	LIST_INIT(&qp->tx_buffers);
 	TAILQ_INIT(&qp->rx_capsules);
