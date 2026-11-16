@@ -392,10 +392,10 @@ nvmf_shutdown_qp(nvmf_host_qpair_t *qp)
 	nvmf_free_qpair(nq);
 
 	/*
-	 * Abort outstanding requests.  Active requests will have their I/O
-	 * completions invoked and associated capsules freed by the transport
-	 * layer via nvmf_free_qpair.  Pending requests must have their I/O
-	 * completion invoked via nvmf_abort_capsule_data.
+	 * Abort outstanding requests.  nvmf_free_qpair() has invoked the I/O
+	 * completion of each active request, but the request still owns its
+	 * capsule.  A pending request must have its I/O completion invoked via
+	 * nvmf_abort_capsule_data().
 	 */
 	for (i = 0; i < qp->num_commands; i++) {
 		cmd = qp->active_commands[i];
@@ -406,8 +406,6 @@ nvmf_shutdown_qp(nvmf_host_qpair_t *qp)
 				    cmd->cid);
 			}
 
-			/* This was freed by nvmf_free_qpair. */
-			cmd->req->nc = NULL;
 			nvmf_abort_request(cmd->req, cmd->cid);
 			nvmf_free_request(cmd->req);
 			kmem_free(cmd, sizeof (*cmd));
