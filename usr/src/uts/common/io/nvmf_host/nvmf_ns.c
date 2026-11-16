@@ -91,19 +91,16 @@ typedef struct nvmf_namespace {
 } nvmf_namespace_t;
 
 /*
- * Validate Identify Namespace data and derive block geometry: number of blocks
- * and block size in bytes.  Ports the FreeBSD checks verbatim (no end-to-end
- * data protection, valid LBA format index, no metadata, non-zero LBA data
- * size).  Returns B_FALSE for a format we cannot present, leaving *nblksp /
- * *blksizep untouched.
- *
- * Single source of truth for the geometry parse: nvmf_mpath.c calls it (dip ==
- * NULL, no warnings) at add_path time to seed head geometry, and nvmf_ns.c
- * calls it (dip set) for init/update so the disk size and I/O block size cannot
- * desync.  Any change here (accepting metadata, honoring the NVMe 1.4 lba_fidxu
- * upper format-index bits, etc.) therefore applies to both call sites.  The
- * format index is taken from id_flbas.lba_format only, exactly as both callers
- * did before this was hoisted.
+ * blkdev addresses a transfer in blocks of at least DEV_BSIZE, and READ and
+ * WRITE carry a 16-bit block count, so only 512 byte to 64 KiB blocks are
+ * presented.
+ */
+#define	NVMF_LBADS_MIN	9
+#define	NVMF_LBADS_MAX	16
+
+/*
+ * Validate Identify Namespace data and derive the block count and block size.
+ * dip may be NULL to suppress the warnings.
  */
 boolean_t
 nvmf_ns_fmt(const nvme_identify_nsid_t *data, uint64_t *nblksp,
@@ -136,10 +133,11 @@ nvmf_ns_fmt(const nvme_identify_nsid_t *data, uint64_t *nblksp,
 	}
 
 	lbads = data->id_lbaf[lbaf].lbaf_lbads;
-	if (lbads == 0) {
+	if (lbads < NVMF_LBADS_MIN || lbads > NVMF_LBADS_MAX) {
 		if (dip != NULL)
 			dev_err(dip, CE_WARN,
-			    "!ns%u: Invalid LBA format index", nsid);
+			    "!ns%u: unsupported LBA data size 2^%u", nsid,
+			    lbads);
 		return (B_FALSE);
 	}
 
