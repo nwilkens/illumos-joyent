@@ -381,15 +381,13 @@ nvmf_accept(struct nvmf_association *na, const nvmf_qpair_params_t *params,
 
 	/* Simple validation of each NQN. */
 	if (!nvmf_nqn_valid((const char *)data->nfcd_subnqn)) {
-		na_error(na, "Invalid SubNQN %.*s",
-		    (int)sizeof (data->nfcd_subnqn), data->nfcd_subnqn);
+		na_error(na, "Invalid SubNQN");
 		nvmf_connect_invalid_parameters(cc, true,
 		    offsetof(nvmf_fabric_connect_data_t, nfcd_subnqn));
 		goto error;
 	}
 	if (!nvmf_nqn_valid((const char *)data->nfcd_hostnqn)) {
-		na_error(na, "Invalid HostNQN %.*s",
-		    (int)sizeof (data->nfcd_hostnqn), data->nfcd_hostnqn);
+		na_error(na, "Invalid HostNQN");
 		nvmf_connect_invalid_parameters(cc, true,
 		    offsetof(nvmf_fabric_connect_data_t, nfcd_hostnqn));
 		goto error;

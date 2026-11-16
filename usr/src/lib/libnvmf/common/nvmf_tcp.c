@@ -37,9 +37,7 @@
  *   __DECONST / nitems                       explicit casts / ARRAY_SIZE-style
  *
  * The on-wire PDU validation (nvmf_tcp_validate_pdu_header) is shared with the
- * kernel transport via <sys/nvme/nvmf_tcp.h>; that header's inline uses
- * cmn_err()/VERIFY in the kernel.  Because this is userland, we redefine those
- * primitives to printf()/assert() before including it (see below).
+ * kernel transport via <sys/nvme/nvmf_tcp.h>.
  */
 
 #include <sys/types.h>
@@ -52,7 +50,6 @@
 #include <limits.h>
 #include <netdb.h>
 #include <poll.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -61,24 +58,15 @@
 #include "internal.h"
 
 /*
- * <sys/nvme/nvmf_tcp.h> carries the shared nvmf_tcp_validate_pdu_header()
- * inline.  In the kernel it logs with cmn_err(); CE_WARN and the VERIFY/
- * VERIFY3U macros it also uses are provided for userland by <sys/cmn_err.h>
- * and <sys/debug.h> (which back VERIFY with libc's assfail()).  Only cmn_err()
- * itself is kernel-only, so shim just that: route the message to stderr and
- * drop the leading severity (CE_WARN) argument.  The kernel headers are pulled
- * in first so CE_WARN/VERIFY come from their canonical definitions.
+ * nvmf_tcp_validate_pdu_header() reports through cmn_err().  The library
+ * writes nothing on its own, so the messages are dropped here.
  */
 #include <sys/cmn_err.h>
 #include <sys/debug.h>
 
 #ifndef	_KERNEL
-#define	cmn_err(level, ...)	do {					\
-	(void) (level);							\
-	(void) fprintf(stderr, __VA_ARGS__);				\
-	(void) fputc('\n', stderr);					\
-} while (0)
-#endif /* !_KERNEL */
+#define	cmn_err(level, ...)	((void)0)
+#endif
 
 #include <sys/nvme/nvmf_tcp.h>
 
@@ -505,14 +493,14 @@ nvmf_tcp_free_pdu(nvmf_tcp_rxpdu_t *pdu)
 }
 
 static int
-nvmf_tcp_handle_term_req(nvmf_tcp_rxpdu_t *pdu)
+nvmf_tcp_handle_term_req(nvmf_tcp_qpair_t *qp, nvmf_tcp_rxpdu_t *pdu)
 {
 	nvmf_tcp_term_req_hdr_t *hdr;
 
 	hdr = (void *)pdu->hdr;
 
-	(void) printf(
-	    "NVMe/TCP: Received termination request: fes %#x fei %#x\n",
+	na_error(qp->qp.nq_association,
+	    "Received termination request: fes %#x fei %#x",
 	    LE_16(hdr->nttr_fes), tcp_fei_dec(hdr->nttr_fei));
 	nvmf_tcp_free_pdu(pdu);
 	return (ECONNRESET);
@@ -936,7 +924,7 @@ nvmf_tcp_receive_pdu(nvmf_tcp_qpair_t *qp)
 		return (ECONNRESET);
 	case NVMF_TCP_PDU_TYPE_H2C_TERM_REQ:
 	case NVMF_TCP_PDU_TYPE_C2H_TERM_REQ:
-		return (nvmf_tcp_handle_term_req(&pdu));
+		return (nvmf_tcp_handle_term_req(qp, &pdu));
 	case NVMF_TCP_PDU_TYPE_CAPSULE_CMD:
 		return (nvmf_tcp_save_command_capsule(qp, &pdu));
 	case NVMF_TCP_PDU_TYPE_CAPSULE_RESP:
@@ -1480,29 +1468,19 @@ tcp_validate_command_capsule(const struct nvmf_capsule *nc)
 	sgl_type = (uint8_t)((sgl->sgl_type << 4) | sgl->sgl_zero);
 	switch (sgl_type) {
 	case NVME_SGL_TYPE_ICD:
-		if (tc->rx_pdu.data_len != LE_32(sgl->sgl_len)) {
-			(void) printf("NVMe/TCP: Command Capsule with "
-			    "mismatched ICD length\n");
+		if (tc->rx_pdu.data_len != LE_32(sgl->sgl_len))
 			return (NVME_CQE_SC_GEN_INV_DSGL_LEN);
-		}
 		break;
 	case NVME_SGL_TYPE_COMMAND_BUFFER:
-		if (tc->rx_pdu.data_len != 0) {
-			(void) printf("NVMe/TCP: Command Buffer SGL with ICD\n");
+		if (tc->rx_pdu.data_len != 0)
 			return (NVME_CQE_SC_GEN_INV_FLD);
-		}
 		break;
 	default:
-		(void) printf("NVMe/TCP: Invalid SGL type in Command "
-		    "Capsule\n");
 		return (NVME_CQE_SC_GEN_INV_SGL_DESC);
 	}
 
-	if (sgl->sgl_addr != 0) {
-		(void) printf("NVMe/TCP: Invalid SGL offset in Command "
-		    "Capsule\n");
+	if (sgl->sgl_addr != 0)
 		return (NVME_CQE_SC_GEN_INV_SGL_OFF);
-	}
 
 	return (NVME_CQE_SC_GEN_SUCCESS);
 }

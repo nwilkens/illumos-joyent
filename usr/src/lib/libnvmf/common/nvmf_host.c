@@ -423,7 +423,7 @@ nvmf_read_property(struct nvmf_qpair *qp, uint32_t offset, uint8_t size,
 	rsp = (const nvmf_fabric_prop_get_rsp_t *)&rc->nc_cqe;
 	status = nvmf_cqe_status(&rc->nc_cqe);
 	if (status != 0) {
-		(void) printf("NVMF: PROPERTY_GET failed, status %#x\n",
+		na_error(qp->nq_association, "PROPERTY_GET failed, status %#x",
 		    status);
 		nvmf_free_capsule(rc);
 		return (EIO);
@@ -490,7 +490,7 @@ nvmf_write_property(struct nvmf_qpair *qp, uint32_t offset, uint8_t size,
 
 	status = nvmf_cqe_status(&rc->nc_cqe);
 	if (status != 0) {
-		(void) printf("NVMF: PROPERTY_SET failed, status %#x\n",
+		na_error(qp->nq_association, "PROPERTY_SET failed, status %#x",
 		    status);
 		nvmf_free_capsule(rc);
 		return (EIO);
@@ -591,7 +591,8 @@ nvmf_host_identify_controller(struct nvmf_qpair *qp,
 
 	status = nvmf_cqe_status(&rc->nc_cqe);
 	if (status != 0) {
-		(void) printf("NVMF: IDENTIFY failed, status %#x\n", status);
+		na_error(qp->nq_association, "IDENTIFY failed, status %#x",
+		    status);
 		nvmf_free_capsule(rc);
 		return (EIO);
 	}
@@ -641,7 +642,8 @@ nvmf_host_identify_namespace(struct nvmf_qpair *qp, uint32_t nsid,
 
 	status = nvmf_cqe_status(&rc->nc_cqe);
 	if (status != 0) {
-		(void) printf("NVMF: IDENTIFY failed, status %#x\n", status);
+		na_error(qp->nq_association, "IDENTIFY failed, status %#x",
+		    status);
 		nvmf_free_capsule(rc);
 		return (EIO);
 	}
@@ -697,7 +699,7 @@ nvmf_get_discovery_log_page(struct nvmf_qpair *qp, uint64_t offset, void *buf,
 		return (EAGAIN);
 	}
 	if (status != 0) {
-		(void) printf("NVMF: GET_LOG_PAGE failed, status %#x\n",
+		na_error(qp->nq_association, "GET_LOG_PAGE failed, status %#x",
 		    status);
 		nvmf_free_capsule(rc);
 		return (EIO);
@@ -728,17 +730,16 @@ nvmf_host_fetch_discovery_log_page(struct nvmf_qpair *qp,
 
 		/* illumos is little-endian; no byte-swap of the header. */
 		if (hdr.ndlp_recfmt != 0) {
-			(void) printf(
-			    "NVMF: Unsupported discovery log format: %d\n",
-			    hdr.ndlp_recfmt);
+			na_error(qp->nq_association,
+			    "Unsupported discovery log format %u",
+			    LE_16(hdr.ndlp_recfmt));
 			free(log);
 			return (EINVAL);
 		}
 
 		if (hdr.ndlp_numrec > 1024) {
-			(void) printf(
-			    "NVMF: Too many discovery log entries: %ju\n",
-			    (uintmax_t)hdr.ndlp_numrec);
+			na_error(qp->nq_association,
+			    "Too many discovery log entries");
 			free(log);
 			return (EFBIG);
 		}
@@ -842,7 +843,7 @@ nvmf_host_request_queues(struct nvmf_qpair *qp, u_int requested, u_int *actual)
 
 	status = nvmf_cqe_status(&rc->nc_cqe);
 	if (status != 0) {
-		(void) printf("NVMF: SET_FEATURES failed, status %#x\n",
+		na_error(qp->nq_association, "SET_FEATURES failed, status %#x",
 		    status);
 		nvmf_free_capsule(rc);
 		return (EIO);
