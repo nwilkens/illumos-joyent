@@ -1,0 +1,120 @@
+.\"
+.\" This file and its contents are supplied under the terms of the
+.\" Common Development and Distribution License ("CDDL"), version 1.0.
+.\" You may only use this file in accordance with the terms of version
+.\" 1.0 of the CDDL.
+.\"
+.\" A full copy of the text of the CDDL should have accompanied this
+.\" source.  A copy of the CDDL is also available via the Internet at
+.\" http://www.illumos.org/license/CDDL.
+.\"
+.\"
+.\" Copyright 2026 Edgecast Cloud LLC.
+.\"
+.Dd November 16, 2026
+.Dt NVMFADM 8
+.Os
+.Sh NAME
+.Nm nvmfadm
+.Nd administer NVMe over Fabrics target subsystems
+.Sh SYNOPSIS
+.Nm
+.Cm create-subsys
+.Op Fl p Ar portid
+.Op Fl s Ar serial
+.Ar subnqn
+.Nm
+.Cm delete-subsys
+.Ar subnqn
+.Nm
+.Cm list-subsys
+.Nm
+.Cm restore
+.Sh DESCRIPTION
+The
+.Nm
+utility creates, deletes and lists the NVM subsystems of the
+.Xr nvmft 4D
+target port provider.
+Each subsystem is one STMF target port, named by its subsystem NQN.
+A logical unit that has a view on that target is a namespace of the
+subsystem; the namespace ID is the view's logical unit number plus one.
+Logical units, views, host groups and target groups are managed with
+.Xr sbdadm 8
+and
+.Xr stmfadm 8 .
+.Pp
+Subsystems are saved in the STMF configuration, so the
+.Sy svc:/system/stmf:default
+service must be online.
+The
+.Sy svc:/system/nvmf/target:default
+service creates the saved subsystems again each time it starts.
+.Sh COMMANDS
+.Bl -tag -width Ar
+.It Xo
+.Cm create-subsys
+.Op Fl p Ar portid
+.Op Fl s Ar serial
+.Ar subnqn
+.Xc
+Create the subsystem
+.Ar subnqn
+and save it.
+The name must be a valid NQN, for example
+.Sy nqn.2026-01.com.example:storage:disk0 .
+The new target port comes online if STMF brings new target ports online,
+which is its default.
+.Bl -tag -width Ar
+.It Fl p Ar portid
+The port ID reported to hosts, from 0 to 65535.
+The default is 1.
+.It Fl s Ar serial
+The serial number reported by the subsystem's controllers, up to 20
+characters.
+The default is derived from the system's host ID.
+.El
+.It Cm delete-subsys Ar subnqn
+Delete the subsystem
+.Ar subnqn
+and remove it from the saved configuration.
+The command fails while any host is connected to the subsystem.
+.It Cm list-subsys
+Print the NQN of each subsystem, one to a line.
+.It Cm restore
+Create each saved subsystem that does not already exist.
+The target service runs this command when it starts.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh EXAMPLES
+.Sy Example 1
+Exporting a ZFS volume as namespace 1 of a new subsystem
+.Bd -literal -offset indent
+# zfs create -V 10G tank/vol0
+# stmfadm create-lu /dev/zvol/rdsk/tank/vol0
+Logical unit created: 600144F0C73A8B0000005F1D3F5B0001
+# nvmfadm create-subsys nqn.2026-01.com.example:storage:vol0
+# stmfadm create-tg vol0-tg
+# stmfadm offline-target nqn.2026-01.com.example:storage:vol0
+# stmfadm add-tg-member -g vol0-tg \e
+    nqn.2026-01.com.example:storage:vol0
+# stmfadm online-target nqn.2026-01.com.example:storage:vol0
+# stmfadm add-view -t vol0-tg -n 0 600144F0C73A8B0000005F1D3F5B0001
+# svcadm enable svc:/system/nvmf/target:default
+.Ed
+.Sh INTERFACE STABILITY
+The command line interface of
+.Nm
+is
+.Sy Uncommitted .
+The output of
+.Nm
+is
+.Sy Not-An-Interface
+and may change at any time.
+.Sh SEE ALSO
+.Xr nvmft 4D ,
+.Xr nvmfd 8 ,
+.Xr sbdadm 8 ,
+.Xr stmfadm 8

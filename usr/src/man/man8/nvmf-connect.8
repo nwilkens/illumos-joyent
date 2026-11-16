@@ -1,0 +1,189 @@
+.\"
+.\" This file and its contents are supplied under the terms of the
+.\" Common Development and Distribution License ("CDDL"), version 1.0.
+.\" You may only use this file in accordance with the terms of version
+.\" 1.0 of the CDDL.
+.\"
+.\" A full copy of the text of the CDDL should have accompanied this
+.\" source.  A copy of the CDDL is also available via the Internet at
+.\" http://www.illumos.org/license/CDDL.
+.\"
+.\"
+.\" Copyright 2026 Edgecast Cloud LLC.
+.\"
+.Dd November 16, 2026
+.Dt NVMF-CONNECT 8
+.Os
+.Sh NAME
+.Nm nvmf-connect
+.Nd connect to NVMe over Fabrics subsystems
+.Sh SYNOPSIS
+.Nm
+.Cm connect
+.Op Fl FGg
+.Op Fl c Ar cntlid
+.Op Fl i Ar queues
+.Op Fl k Ar seconds
+.Op Fl l Ar seconds
+.Op Fl Q Ar entries
+.Op Fl q Ar hostnqn
+.Op Fl r Ar seconds
+.Op Fl t Ar transport
+.Ar address : Ns Ar port
+.Ar subnqn
+.Nm
+.Cm discover
+.Op Fl q Ar hostnqn
+.Op Fl t Ar transport
+.Ar address Ns Op : Ns Ar port
+.Nm
+.Cm disconnect
+.Fl a | Ar subnqn
+.Nm
+.Cm list
+.Sh DESCRIPTION
+The
+.Nm
+utility connects this system, as a host, to a remote NVM subsystem over
+TCP and hands the connection to the
+.Xr nvmf_host 4D
+driver.
+The driver then presents each namespace of the subsystem as a disk
+through
+.Xr blkdev 4D .
+.Pp
+The system can be connected to one subsystem at a time.
+A connection that is lost is not re-established: use
+.Cm disconnect
+and then
+.Cm connect
+again.
+.Pp
+An
+.Ar address
+is a host name, an IPv4 address or an IPv6 address.
+An IPv6 address that is followed by a port must be enclosed in square
+brackets.
+.Pp
+The host identifies itself with a host NQN and a host ID.
+They are read from
+.Pa /etc/nvme/hostnqn
+and
+.Pa /etc/nvme/hostid .
+A file that does not exist is created the first time it is needed: the
+host ID from the system's SMBIOS UUID, or at random if the system has
+none, and the host NQN from the host ID.
+.Sh COMMANDS
+.Bl -tag -width Ar
+.It Cm connect
+Connect to the subsystem
+.Ar subnqn
+at
+.Ar address
+and
+.Ar port .
+I/O controllers usually listen on port 4420.
+.Bl -tag -width Ar
+.It Fl c Ar cntlid
+The controller to ask for:
+.Sy dynamic ,
+.Sy static ,
+or a controller ID.
+The default is
+.Sy dynamic .
+.It Fl F
+Require submission queue flow control.
+.It Fl G
+Request data digests.
+.It Fl g
+Request header digests.
+.It Fl i Ar queues
+The number of I/O queues.
+The default is 1.
+.It Fl k Ar seconds
+The Keep Alive timeout.
+The default is 120 seconds.
+.It Fl l Ar seconds
+How long the driver waits for a lost connection to be re-established
+before it gives up on the controller.
+The default is 600 seconds.
+.It Fl Q Ar entries
+The size of each I/O queue.
+The default is 128, or the controller's maximum if that is smaller.
+.It Fl q Ar hostnqn
+Use
+.Ar hostnqn
+as the host NQN instead of the one in
+.Pa /etc/nvme/hostnqn .
+.It Fl r Ar seconds
+How often the driver asks for a lost connection to be re-established.
+The default is 10 seconds.
+.It Fl t Ar transport
+The transport.
+Only
+.Sy tcp
+is supported.
+.El
+.It Cm discover
+Print the discovery log of the discovery controller at
+.Ar address .
+The default
+.Ar port
+is 8009.
+The
+.Fl q
+and
+.Fl t
+options are as for
+.Cm connect .
+.It Cm disconnect
+Disconnect from the subsystem
+.Ar subnqn
+and remove its disks.
+The command fails if the system is not connected to that subsystem.
+With
+.Fl a ,
+disconnect whatever is connected.
+.It Cm list
+Print the connected controller, its address and its namespaces.
+.El
+.Sh SECURITY
+There is no authentication and no TLS.
+.Nm
+cannot verify that the system it reaches is the intended target, it
+cannot connect to a target that requires authentication, and data
+crosses the network unencrypted.
+Use it only on networks where every system that can reach or
+impersonate the target is trusted.
+.Sh FILES
+.Bl -tag -width Pa
+.It Pa /etc/nvme/hostid
+The host ID, as a UUID.
+.It Pa /etc/nvme/hostnqn
+The host NQN.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh EXAMPLES
+.Sy Example 1
+Finding and connecting to a subsystem
+.Bd -literal -offset indent
+# nvmf-connect discover 192.168.10.5
+# nvmf-connect connect -i 4 192.168.10.5:4420 \e
+    nqn.2026-01.com.example:storage:vol0
+# nvmf-connect list
+.Ed
+.Sh INTERFACE STABILITY
+The command line interface of
+.Nm
+is
+.Sy Uncommitted .
+The output of
+.Nm
+is
+.Sy Not-An-Interface
+and may change at any time.
+.Sh SEE ALSO
+.Xr blkdev 4D ,
+.Xr nvmf_host 4D ,
+.Xr nvmfd 8

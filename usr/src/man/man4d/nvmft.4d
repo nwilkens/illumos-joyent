@@ -1,0 +1,55 @@
+.\"
+.\" This file and its contents are supplied under the terms of the
+.\" Common Development and Distribution License ("CDDL"), version 1.0.
+.\" You may only use this file in accordance with the terms of version
+.\" 1.0 of the CDDL.
+.\"
+.\" A full copy of the text of the CDDL should have accompanied this
+.\" source.  A copy of the CDDL is also available via the Internet at
+.\" http://www.illumos.org/license/CDDL.
+.\"
+.\"
+.\" Copyright 2026 Edgecast Cloud LLC.
+.\"
+.Dd November 16, 2026
+.Dt NVMFT 4D
+.Os
+.Sh NAME
+.Nm nvmft
+.Nd NVMe over Fabrics target port provider
+.Sh DESCRIPTION
+The
+.Nm
+driver is a port provider for the SCSI Target Mode Framework (STMF).
+It lets NVMe over Fabrics hosts use STMF logical units as NVMe
+namespaces over TCP.
+.Pp
+Each NVM subsystem is an STMF target port named by its subsystem NQN.
+Subsystems are created and deleted with
+.Xr nvmfadm 8 .
+A logical unit is a namespace of every subsystem whose target port has
+a view of it, and its namespace ID is the logical unit number of that
+view plus one.
+A host is known to STMF by its host NQN, so host groups made of host
+NQNs control which hosts see which namespaces; see
+.Xr stmfadm 8 .
+.Pp
+The driver does not listen on the network.
+The
+.Xr nvmfd 8
+daemon accepts each connection and passes it to the driver once the
+host has sent its Connect command.
+.Pp
+Hosts are not authenticated and connections are not encrypted.
+.Sh FILES
+.Bl -tag -width Pa
+.It Pa /kernel/drv/amd64/nvmft
+Device driver (x86)
+.It Pa /kernel/drv/nvmft.conf
+Driver configuration file
+.El
+.Sh SEE ALSO
+.Xr nvmfadm 8 ,
+.Xr nvmfd 8 ,
+.Xr sbdadm 8 ,
+.Xr stmfadm 8

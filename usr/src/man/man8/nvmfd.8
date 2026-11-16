@@ -1,0 +1,150 @@
+.\"
+.\" This file and its contents are supplied under the terms of the
+.\" Common Development and Distribution License ("CDDL"), version 1.0.
+.\" You may only use this file in accordance with the terms of version
+.\" 1.0 of the CDDL.
+.\"
+.\" A full copy of the text of the CDDL should have accompanied this
+.\" source.  A copy of the CDDL is also available via the Internet at
+.\" http://www.illumos.org/license/CDDL.
+.\"
+.\"
+.\" Copyright 2026 Edgecast Cloud LLC.
+.\"
+.Dd November 16, 2026
+.Dt NVMFD 8
+.Os
+.Sh NAME
+.Nm nvmfd
+.Nd NVMe over Fabrics target daemon
+.Sh SYNOPSIS
+.Nm
+.Op Fl dFfGg
+.Oo Fl a Ar address Oc Ns ...
+.Op Fl H Ar maxh2cdata
+.Op Fl P Ar discovery_port
+.Op Fl p Ar io_port
+.Op Fl t Ar transport
+.Sh DESCRIPTION
+The
+.Nm
+daemon accepts NVMe over Fabrics connections over TCP for the
+.Xr nvmft 4D
+target port provider.
+It listens on two ports.
+On the I/O port it completes the Connect command of each new queue and
+then hands the connection to
+.Xr nvmft 4D ,
+which serves the subsystem's namespaces from then on.
+On the discovery port it runs a discovery controller whose log page
+lists every subsystem created with
+.Xr nvmfadm 8 ,
+once for each address that the I/O port listens on.
+.Pp
+The daemon is normally run by the
+.Xr smf 7
+service
+.Sy svc:/system/nvmf/target:default .
+The service first creates the subsystems that
+.Xr nvmfadm 8
+has saved and then starts
+.Nm .
+Its
+.Sy config/discovery_port ,
+.Sy config/io_port
+and
+.Sy config/listen_addresses
+properties supply the
+.Fl P ,
+.Fl p
+and
+.Fl a
+options.
+Disabling the service stops new connections.
+Queues already handed to
+.Xr nvmft 4D
+stay connected until their subsystem is taken offline or deleted.
+.Pp
+.Nm
+must be started with all privileges.
+Once it has opened the
+.Xr nvmft 4D
+control node and bound its ports it runs as user
+.Sy daemon
+with the basic privilege set and
+.Sy sys_devices .
+.Sh OPTIONS
+.Bl -tag -width Ar
+.It Fl a Ar address
+Listen on
+.Ar address
+only.
+The option may be repeated.
+By default
+.Nm
+listens on every IPv4 and IPv6 address of the system.
+.It Fl d
+Stay in the foreground and write log messages to standard error
+instead of
+.Xr syslog 3C .
+.It Fl F
+Permit hosts to turn off submission queue flow control.
+.It Fl f
+Stay in the foreground.
+.It Fl G
+Permit data digests.
+.It Fl g
+Permit header digests.
+.It Fl H Ar maxh2cdata
+The largest data payload, in bytes, that a host may send in one PDU.
+The value must be a multiple of 4 and at least 4096.
+The default is 262144.
+.It Fl P Ar discovery_port
+The TCP port of the discovery controller.
+The default is 8009.
+.It Fl p Ar io_port
+The TCP port for I/O controllers.
+The default is 4420.
+.It Fl t Ar transport
+The transport.
+Only
+.Sy tcp
+is supported.
+.El
+.Sh SECURITY
+.Nm
+does not authenticate hosts and does not encrypt.
+In-band authentication (DH-HMAC-CHAP) and TLS are not implemented.
+Any host that can reach the ports can read the discovery log and
+connect to any subsystem.
+Use
+.Fl a
+and packet filtering to limit which hosts can reach the daemon, and
+STMF host groups and views to limit which logical units a host NQN can
+see; see
+.Xr stmfadm 8 .
+A host NQN is whatever the host claims and is not proof of identity.
+.Sh EXIT STATUS
+.Ex -std
+.Sh EXAMPLES
+.Sy Example 1
+Enabling the target service on one address
+.Bd -literal -offset indent
+# svccfg -s svc:/system/nvmf/target:default \e
+    setprop config/listen_addresses = astring: 192.168.10.5
+# svcadm refresh svc:/system/nvmf/target:default
+# svcadm enable svc:/system/nvmf/target:default
+.Ed
+.Sh INTERFACE STABILITY
+The command line interface of
+.Nm
+is
+.Sy Uncommitted .
+.Sh SEE ALSO
+.Xr syslog 3C ,
+.Xr nvmft 4D ,
+.Xr privileges 7 ,
+.Xr smf 7 ,
+.Xr nvmf-connect 8 ,
+.Xr nvmfadm 8 ,
+.Xr stmfadm 8

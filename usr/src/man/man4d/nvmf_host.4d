@@ -1,0 +1,47 @@
+.\"
+.\" This file and its contents are supplied under the terms of the
+.\" Common Development and Distribution License ("CDDL"), version 1.0.
+.\" You may only use this file in accordance with the terms of version
+.\" 1.0 of the CDDL.
+.\"
+.\" A full copy of the text of the CDDL should have accompanied this
+.\" source.  A copy of the CDDL is also available via the Internet at
+.\" http://www.illumos.org/license/CDDL.
+.\"
+.\"
+.\" Copyright 2026 Edgecast Cloud LLC.
+.\"
+.Dd November 16, 2026
+.Dt NVMF_HOST 4D
+.Os
+.Sh NAME
+.Nm nvmf_host
+.Nd NVMe over Fabrics host driver
+.Sh DESCRIPTION
+The
+.Nm
+driver is the host side of NVMe over Fabrics over TCP.
+It uses the
+.Xr blkdev 4D
+framework to present each namespace of a remote NVM subsystem as a
+disk.
+.Pp
+The driver does not connect to a subsystem by itself.
+The
+.Xr nvmf-connect 8
+utility opens the connections and passes them to the driver.
+The driver does not re-establish a connection that is lost.
+.Pp
+The driver supports one connected subsystem at a time.
+.Pp
+The target is not authenticated and connections are not encrypted.
+.Sh FILES
+.Bl -tag -width Pa
+.It Pa /kernel/drv/amd64/nvmf_host
+Device driver (x86)
+.It Pa /kernel/drv/nvmf_host.conf
+Driver configuration file
+.El
+.Sh SEE ALSO
+.Xr blkdev 4D ,
+.Xr nvmf-connect 8
