@@ -130,6 +130,11 @@ void	nvmf_capsule_defer_response(struct nvmf_capsule *nc);
 int	nvmf_capsule_append_data(struct nvmf_capsule *nc,
     struct nvmf_memdesc *mem, size_t len, boolean_t send,
     nvmf_io_complete_t *complete_cb, void *cb_arg);
+/*
+ * A nonzero return, such as ECONNABORTED from a qpair that is being freed,
+ * means the transport did not take the capsule.  It then never completes
+ * the capsule's data; the caller does that with nvmf_abort_capsule_data().
+ */
 int	nvmf_transmit_capsule(struct nvmf_capsule *nc);
 void	nvmf_abort_capsule_data(struct nvmf_capsule *nc, int error);
 void	*nvmf_capsule_sqe(struct nvmf_capsule *nc);

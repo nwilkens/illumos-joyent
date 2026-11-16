@@ -43,6 +43,15 @@ typedef struct dev_info dev_info_t;
 
     run_c(TESTDIR / "host_checks.c", {"host.h": "\n".join(parts)})
 
+    # A capsule the transport refused has its data completed by the host,
+    # while the request is still held against a queue pair shutdown.
+    dispatch = function(HOST / "nvmf_qpair.c", "nvmf_dispatch_command")
+    sent = dispatch.index("nvmf_transmit_capsule(nc)")
+    done = dispatch.find("nvmf_abort_capsule_data(nc, error)", sent)
+    if done == -1 or done > dispatch.index("qp->allocating--", sent):
+        raise SystemExit("FAIL: a failed transmit leaves the data "
+                         "completion of the request pending")
+
 
 if __name__ == "__main__":
     main()

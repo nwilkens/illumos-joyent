@@ -184,6 +184,10 @@ nvmf_dispatch_command(nvmf_host_qpair_t *qp, nvmf_host_command_t *cmd)
 
 	error = nvmf_transmit_capsule(nc);
 
+	/* The transport did not take the capsule, so it completes no data. */
+	if (error != 0)
+		nvmf_abort_capsule_data(nc, error);
+
 	mutex_enter(&qp->lock);
 	qp->allocating--;
 	if (qp->allocating == 0 && qp->shutting_down)
@@ -402,10 +406,10 @@ nvmf_shutdown_qp(nvmf_host_qpair_t *qp)
 	nvmf_free_qpair(nq);
 
 	/*
-	 * Abort outstanding requests.  nvmf_free_qpair() has invoked the I/O
-	 * completion of each active request, but the request still owns its
-	 * capsule.  A pending request must have its I/O completion invoked via
-	 * nvmf_abort_capsule_data().
+	 * Abort outstanding requests.  The I/O completion of each active
+	 * request has run, in nvmf_free_qpair() or when its transmit failed,
+	 * but the request still owns its capsule.  A pending request must have
+	 * its I/O completion invoked via nvmf_abort_capsule_data().
 	 */
 	for (i = 0; i < qp->num_commands; i++) {
 		cmd = qp->active_commands[i];
