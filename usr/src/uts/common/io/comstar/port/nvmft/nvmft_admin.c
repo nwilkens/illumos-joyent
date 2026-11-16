@@ -38,6 +38,7 @@
 #include <sys/stream.h>
 #include <sys/strsubr.h>
 #include <sys/varargs.h>
+#include <sys/sdt.h>
 
 #include <sys/nvme.h>
 #include <sys/nvme/nvmf.h>
@@ -267,9 +268,10 @@ handle_get_log_page(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc,
 		 * hrtime_t nanoseconds; the low 64 bits of the 128-bit fields are
 		 * sufficient.
 		 */
-		hip.hl_ctrl_busy.lo = (ctrlr->ctrlr_busy_total / NANOSEC) / 60;
-		hip.hl_power_on_hours.lo =
-		    ((gethrtime() - ctrlr->ctrlr_create_time) / NANOSEC) / 3600;
+		hip.hl_ctrl_busy.lo =
+		    LE_64((ctrlr->ctrlr_busy_total / NANOSEC) / 60);
+		hip.hl_power_on_hours.lo = LE_64(((gethrtime() -
+		    ctrlr->ctrlr_create_time) / NANOSEC) / 3600);
 		mutex_exit(&ctrlr->ctrlr_lock);
 
 		mp = nvmft_alloc_data((char *)&hip + offset, todo, len);
@@ -338,8 +340,8 @@ handle_get_log_page(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc,
 	 * log page from nvmft_ana_build_log_page().
 	 */
 	default:
-		(void) nvmft_printf(ctrlr,
-		    "Unsupported page 0x%x for GET_LOG_PAGE\n", lid);
+		DTRACE_PROBE2(nvmft__log__page__unsupported,
+		    nvmft_controller_t *, ctrlr, uint8_t, lid);
 		status = NVME_CQE_SC_GEN_INV_FLD;
 		break;
 	}
@@ -364,9 +366,8 @@ handle_identify_command(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc,
 	cns = LE_32(cmd->sqe_cdw10) & 0xFF;
 	data_len = nvmf_capsule_data_len(nc);
 	if (data_len != sizeof (ctrlr->ctrlr_cdata)) {
-		(void) nvmft_printf(ctrlr,
-		    "Invalid length %zu for IDENTIFY with CNS 0x%x\n", data_len,
-		    cns);
+		DTRACE_PROBE3(nvmft__identify__length, nvmft_controller_t *,
+		    ctrlr, uint8_t, cns, size_t, data_len);
 		(void) nvmft_send_generic_error(ctrlr->ctrlr_admin, nc,
 		    NVME_CQE_SC_GEN_INV_OPC);
 		nvmf_free_capsule(nc);
@@ -452,8 +453,8 @@ handle_identify_command(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc,
 		break;
 	}
 	default:
-		(void) nvmft_printf(ctrlr,
-		    "Unsupported CNS 0x%x for IDENTIFY\n", cns);
+		DTRACE_PROBE2(nvmft__identify__unsupported,
+		    nvmft_controller_t *, ctrlr, uint8_t, cns);
 		status = NVME_CQE_SC_GEN_INV_FLD;
 		break;
 	}
@@ -524,8 +525,8 @@ handle_set_features(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc,
 		return;
 	}
 	default:
-		(void) nvmft_printf(ctrlr,
-		    "Unsupported feature ID %u for SET_FEATURES\n", fid);
+		DTRACE_PROBE2(nvmft__feature__unsupported,
+		    nvmft_controller_t *, ctrlr, uint8_t, fid);
 		goto error;
 	}
 
@@ -671,19 +672,16 @@ handle_admin_fabrics_command(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc,
 		    (const nvmf_fabric_prop_set_cmd_t *)fc);
 		break;
 	case NVMF_FCTYPE_CONNECT:
-		(void) nvmft_printf(ctrlr,
-		    "CONNECT command on connected admin queue\n");
 		(void) nvmft_send_generic_error(ctrlr->ctrlr_admin, nc,
 		    NVME_CQE_SC_GEN_CMD_SEQ_ERR);
 		break;
 	case NVMF_FCTYPE_DISCONNECT:
-		(void) nvmft_printf(ctrlr, "DISCONNECT command on admin queue\n");
 		(void) nvmft_send_error(ctrlr->ctrlr_admin, nc,
 		    NVME_CQE_SCT_SPECIFIC, NVMF_FABRIC_SC_INVALID_QUEUE_TYPE);
 		break;
 	default:
-		(void) nvmft_printf(ctrlr, "Unsupported fabrics command 0x%x\n",
-		    fc->nfc_fctype);
+		DTRACE_PROBE2(nvmft__fabrics__unsupported,
+		    nvmft_controller_t *, ctrlr, uint8_t, fc->nfc_fctype);
 		(void) nvmft_send_generic_error(ctrlr->ctrlr_admin, nc,
 		    NVME_CQE_SC_GEN_INV_OPC);
 		break;
@@ -699,9 +697,8 @@ nvmft_handle_admin_command(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc)
 	/* Only permit Fabrics commands while the controller is disabled. */
 	if (NVMFT_CC_EN(ctrlr->ctrlr_cc) == 0 &&
 	    cmd->sqe_opc != NVMFT_OPC_FABRICS) {
-		(void) nvmft_printf(ctrlr,
-		    "Unsupported admin opcode 0x%x while disabled\n",
-		    cmd->sqe_opc);
+		DTRACE_PROBE2(nvmft__admin__disabled, nvmft_controller_t *,
+		    ctrlr, uint8_t, cmd->sqe_opc);
 		(void) nvmft_send_generic_error(ctrlr->ctrlr_admin, nc,
 		    NVME_CQE_SC_GEN_CMD_SEQ_ERR);
 		nvmf_free_capsule(nc);
@@ -722,7 +719,7 @@ nvmft_handle_admin_command(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc)
 		break;
 	case NVME_OPC_ASYNC_EVENT:
 		mutex_enter(&ctrlr->ctrlr_lock);
-		if (ctrlr->ctrlr_aer_pending == NVMFT_NUM_AER) {
+		if (ctrlr->ctrlr_aer_pending > ctrlr->ctrlr_cdata.id_aerl) {
 			mutex_exit(&ctrlr->ctrlr_lock);
 			(void) nvmft_send_error(ctrlr->ctrlr_admin, nc,
 			    NVME_CQE_SCT_SPECIFIC,
@@ -748,8 +745,8 @@ nvmft_handle_admin_command(nvmft_controller_t *ctrlr, struct nvmf_capsule *nc)
 		    (const nvmf_fabric_cmd_t *)cmd);
 		break;
 	default:
-		(void) nvmft_printf(ctrlr, "Unsupported admin opcode 0x%x\n",
-		    cmd->sqe_opc);
+		DTRACE_PROBE2(nvmft__admin__unsupported, nvmft_controller_t *,
+		    ctrlr, uint8_t, cmd->sqe_opc);
 		(void) nvmft_send_generic_error(ctrlr->ctrlr_admin, nc,
 		    NVME_CQE_SC_GEN_INV_OPC);
 		nvmf_free_capsule(nc);
@@ -793,8 +790,8 @@ nvmft_handle_io_command(struct nvmft_qpair *qp, uint16_t qid,
 		nvmft_dispatch_command(qp, nc);
 		break;
 	default:
-		(void) nvmft_printf(ctrlr, "Unsupported I/O opcode 0x%x\n",
-		    cmd->sqe_opc);
+		DTRACE_PROBE2(nvmft__io__unsupported, nvmft_controller_t *,
+		    ctrlr, uint8_t, cmd->sqe_opc);
 		(void) nvmft_send_generic_error(qp, nc, NVME_CQE_SC_GEN_INV_OPC);
 		nvmf_free_capsule(nc);
 		break;
@@ -816,9 +813,8 @@ nvmft_report_aer(nvmft_controller_t *ctrlr, uint32_t aer_mask, uint_t type,
 	}
 	if (ctrlr->ctrlr_aer_pending == 0) {
 		mutex_exit(&ctrlr->ctrlr_lock);
-		(void) nvmft_printf(ctrlr,
-		    "dropping AER type %u, info 0x%x, page 0x%x\n", type, info,
-		    log_page_id);
+		DTRACE_PROBE4(nvmft__aer__dropped, nvmft_controller_t *, ctrlr,
+		    uint_t, type, uint8_t, info, uint8_t, log_page_id);
 		return;
 	}
 
