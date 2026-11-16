@@ -42,7 +42,9 @@ def main():
                  "nvmf_memdesc_copy", "nvmf_memdesc_copyin",
                  "nvmf_memdesc_copyout"):
         parts.append(function(core, name))
-    parts.append(body(NVMF / "nvmf_tcp.c"))
+    for name in ("nvmf_tcp_impl.h", "nvmf_tcp_pdu.c", "nvmf_tcp_data.c",
+                 "nvmf_tcp_conn.c", "nvmf_tcp.c"):
+        parts.append(body(NVMF / name))
     run_c(TESTDIR / "tcp_xfer.c", {"tcp_xfer.h": "\n".join(parts)},
           timeout=240)
 

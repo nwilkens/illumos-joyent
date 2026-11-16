@@ -2008,7 +2008,7 @@ NVMF_OBJS += nvmf_transport.o
 # from FreeBSD sys/dev/nvmf/nvmf_tcp.c; registers the TCP transport vtable
 # with the misc/nvmf core and frames NVMe/TCP PDUs over a kernel TCP socket.
 #
-NVMF_TCP_OBJS += nvmf_tcp.o
+NVMF_TCP_OBJS += nvmf_tcp.o nvmf_tcp_conn.o nvmf_tcp_data.o nvmf_tcp_pdu.o
 
 PVSCSI_OBJS = pvscsi.o
 

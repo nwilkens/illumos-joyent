@@ -16,8 +16,8 @@ typedef struct { uint8_t b[72]; } nvmf_tcp_cmd_t;
     for name in ("NVMF_TCP_MIN_MAXH2CDATA", "NVMF_TCP_MIN_PDA",
                  "NVMF_TCP_MAX_PDA"):
         parts.append(define(tcp, name))
-    for name in ("nvmf_tcp_range_ok", "nvmf_tcp_params_ok",
-                 "nvmf_tcp_rx_limit"):
+    parts.append(function(NVMF / "nvmf_tcp_data.c", "nvmf_tcp_range_ok"))
+    for name in ("nvmf_tcp_params_ok", "nvmf_tcp_rx_limit"):
         parts.append(function(tcp, name))
     run_c(TESTDIR / "tcp_limits.c", {"tcp_limits.h": "\n".join(parts)})
 
