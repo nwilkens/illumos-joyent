@@ -168,6 +168,9 @@ nvmf_dispatch_command(nvmf_host_qpair_t *qp, nvmf_host_command_t *cmd)
 	 */
 	new_sqtail = (qp->sqtail + 1) % (qp->num_commands + 1);
 	qp->sqtail = new_sqtail;
+
+	/* Keeps nvmf_shutdown_qp() from freeing the queue pair under us. */
+	qp->allocating++;
 	mutex_exit(&qp->lock);
 
 	nc = cmd->req->nc;
@@ -180,6 +183,13 @@ nvmf_dispatch_command(nvmf_host_qpair_t *qp, nvmf_host_command_t *cmd)
 	sqe->sqe_cid = cmd->cid;
 
 	error = nvmf_transmit_capsule(nc);
+
+	mutex_enter(&qp->lock);
+	qp->allocating--;
+	if (qp->allocating == 0 && qp->shutting_down)
+		cv_broadcast(&qp->cv);
+	mutex_exit(&qp->lock);
+
 	if (error != 0) {
 		dev_err(sc->dip, CE_WARN,
 		    "!failed to transmit capsule: %d, disconnecting", error);
