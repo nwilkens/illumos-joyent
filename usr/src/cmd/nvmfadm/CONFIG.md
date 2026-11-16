@@ -20,6 +20,7 @@ becomes namespace 1.
 | `nvmfadm create-subsys <subnqn>` | `NVMFT_IOC_SUBSYS_CREATE` | `nvmft_port_alloc()` -> `stmf_register_local_port()` |
 | `nvmfadm delete-subsys <subnqn>` | `NVMFT_IOC_SUBSYS_DELETE` | offline + `stmf_deregister_local_port()` -> `nvmft_port_free()` |
 | `nvmfadm list-subsys`            | `NVMFT_IOC_SUBSYS_LIST`   | list registered SubNQNs |
+| `nvmfadm restore`                | `NVMFT_IOC_SUBSYS_CREATE` | create the saved subsystems |
 
 The request/reply payload is a packed `nvlist` carried in a `struct nvmf_ioc_nv`
 (the same carrier the Fabrics host control path uses). For create, only the
@@ -60,13 +61,14 @@ Optional flags:
   host id).
 - `-p <portid>` set the relative port id (default: 1).
 
-### 3. Online the target
+### 3. Check the target
 
-The port is created offline. Bring it online with the stock tool:
+The port comes online when it is created, unless STMF's default state for new
+target ports has been changed:
 
 ```bash
 stmfadm list-target -v                                    # SubNQN should appear
-stmfadm online-target nqn.2024-01.com.example:nvmf-target:disk0
+stmfadm online-target nqn.2024-01.com.example:nvmf-target:disk0   # if offline
 ```
 
 ### 4. Map the LU as namespace 1
@@ -82,17 +84,22 @@ stmfadm list-view -l <LU-GUID>       # confirm LUN 0
 To restrict the LU to just this subsystem instead of all targets, put the
 SubNQN in a target group and use `add-view -t <tg>`.
 
-### 5. Run the userland daemon (nvmfd)
+### 5. Start the target service
 
-`nvmft` does not listen on the network itself. The userland target daemon
-(`nvmfd`) accepts TCP connections on the Fabrics port (default 4420), runs the
-Fabrics CONNECT handshake with `libnvmf`, and hands the established queue pair to
-the kernel. That handoff path (`NVMFT_IOC_HANDOFF`, documented in
-`<sys/nvme/nvmf_ioctl.h>`) and `nvmfd` itself are out of scope for this minimal
-recipe; this recipe sets up everything the daemon needs on the kernel side.
+`nvmft` does not listen on the network itself. `nvmfd` accepts TCP connections
+on the discovery port (8009) and the I/O port (4420), runs the Fabrics CONNECT
+exchange, and hands each queue to the kernel:
+
+```bash
+svcadm enable svc:/system/nvmf/target:default
+```
 
 Once a host connects and issues `IDENTIFY`/`READ`/`WRITE` against NSID 1, the
 target translates to SCSI and runs it against the zvol via `stmf_sbd`.
+
+There is no authentication and no TLS. Any host that can reach the ports can
+connect; restrict them with the service's `config/listen_addresses` property
+and with STMF host groups.
 
 ## Teardown
 
@@ -111,21 +118,14 @@ is optional but makes the intent clear.
 ## Notes
 
 - The SubNQN must be a valid NQN (`nqn.YYYY-MM.` prefix or
-  `nqn.2014-08.org.nvmexpress:uuid:<uuid>`); the create ioctl rejects invalid
-  NQNs with `EINVAL`.
+  `nqn.2014-08.org.nvmexpress:uuid:<uuid>`); `nvmfadm` rejects others.
 - One subsystem, one namespace is the minimal shape. Additional view entries on
   the same LU map to additional NSIDs (LUN + 1); additional LUs add more
   namespaces to the same subsystem.
 
-## Alternative: STMF pp_cb-driven config
+## Persistence
 
-The heavier alternative is to drive subsystem creation through STMF provider
-configuration (`stmfadm`/`libstmf` -> `pp_cb(STMF_PROVIDER_DATA_UPDATED)` ->
-`nvmft_port_alloc()`), mirroring how `srptadm` configures the SRP target. That
-keeps the subsystem definition in the persistent STMF config (SMF
-`stmf:default`) so it survives reboot without a separate tool managing it. It is
-more code (a `libnvmf`-style config library plus the `pp_cb` parser) and is not
-required for the minimal "create one subsystem" goal, so this recipe uses the
-direct control ioctl instead. The `nvmft_pp_cb()` stub in `nvmft.c` is the seam
-where that flow would be wired.
-```
+`create-subsys` and `delete-subsys` also record the change in `nvmft`'s STMF
+provider data, which `svc:/system/stmf` keeps across reboots. The target
+service runs `nvmfadm restore` when it starts, which creates every saved
+subsystem that does not exist yet.
