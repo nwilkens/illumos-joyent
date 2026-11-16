@@ -697,7 +697,7 @@ nvmf_attach_association(nvmf_softc_t *sc, nvlist_t *nvl)
 	nvlist_t **io, *rparams, *dup;
 	uchar_t *cdata;
 	uint_t cdlen, num_io_queues;
-	uint64_t v64, cap, vs, max_xfer, qsize = 0;
+	uint64_t v64 = 0, cap = 0, vs = 0, max_xfer, qsize = 0;
 	int error;
 
 	VERIFY0(nvlist_lookup_byte_array(nvl, "cdata", &cdata, &cdlen));
@@ -775,7 +775,7 @@ nvmf_reconnect_association(nvmf_softc_t *sc, nvlist_t *nvl)
 	nvlist_t *rparams, *dup, *old;
 	uchar_t *bytes;
 	uint_t len;
-	uint64_t cap, max_xfer;
+	uint64_t cap = 0, max_xfer;
 	int error;
 
 	VERIFY0(nvlist_lookup_byte_array(nvl, "cdata", &bytes, &len));

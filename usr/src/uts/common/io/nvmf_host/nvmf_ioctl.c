@@ -121,7 +121,7 @@ nvmf_copyin_handoff(const struct nvmf_ioc_nv *nv, nvlist_t **nvlp)
 	nvlist_t **io;
 	uchar_t *cdata;
 	uint_t num_io_queues, i, cdlen;
-	uint64_t qsize, v64, trtype;
+	uint64_t qsize = 0, v64 = 0, trtype = 0;
 	uint64_t kato = 0, reconnect_delay = 0, loss_timeout = 0;
 	char *hostnqn;
 	uchar_t *dle;
@@ -233,9 +233,9 @@ static int
 nvmf_reconnect_host(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
 {
 	nvlist_t *nvl;
-	uchar_t *cdata;
+	uchar_t *cdata = NULL;
 	uint_t cdlen;
-	uint64_t trtype;
+	uint64_t trtype = 0;
 	int error;
 
 	error = nvmf_copyin_handoff(nv, &nvl);
