@@ -357,6 +357,7 @@ extern void nvmf_mpath_path_set_gone(struct nvmf_path *path);
 extern struct nvmf_path *nvmf_mpath_select(struct nvmf_ns_head *head);
 extern void nvmf_mpath_select_rele(struct nvmf_path *path);
 extern boolean_t nvmf_mpath_detach_all(nvmf_softc_t *sc);
+extern void nvmf_mpath_attach_all(nvmf_softc_t *sc);
 extern void nvmf_mpath_reap(nvmf_softc_t *sc);
 extern boolean_t nvmf_mpath_busy(nvmf_softc_t *sc);
 extern uint32_t nvmf_mpath_head_blksize(struct nvmf_ns_head *head);

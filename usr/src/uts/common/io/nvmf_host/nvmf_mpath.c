@@ -72,7 +72,6 @@ typedef struct nvmf_ns_head {
 	bd_handle_t		head_bdh;
 
 	boolean_t		head_attached;
-	boolean_t		head_rollback;
 
 	kmutex_t		head_lock;
 	nvmf_path_t		*head_path;
@@ -338,8 +337,13 @@ nvmf_mpath_path_update(struct nvmf_path *path,
 	head->head_nblks = nblks;
 	mutex_exit(&head->head_lock);
 
-	if (resized)
+	/* A disk that could not be attached again earlier gets another try. */
+	if (!head->head_attached) {
+		if (bd_attach_handle(sc->dip, head->head_bdh) == DDI_SUCCESS)
+			head->head_attached = B_TRUE;
+	} else if (resized) {
 		bd_state_change(head->head_bdh);
+	}
 	return (B_TRUE);
 }
 
@@ -369,6 +373,25 @@ nvmf_mpath_select_rele(struct nvmf_path *path)
 	mutex_exit(&head->head_lock);
 }
 
+/* Attach again each disk that nvmf_mpath_detach_all() detached. */
+void
+nvmf_mpath_attach_all(nvmf_softc_t *sc)
+{
+	nvmf_ns_head_t *head;
+
+	for (head = list_head(&sc->heads); head != NULL;
+	    head = list_next(&sc->heads, head)) {
+		if (head->head_path == NULL || head->head_attached)
+			continue;
+		if (bd_attach_handle(sc->dip, head->head_bdh) != DDI_SUCCESS) {
+			dev_err(sc->dip, CE_WARN, "!ns%u: failed to attach "
+			    "blkdev again", head->head_path->path_nsid);
+			continue;
+		}
+		head->head_attached = B_TRUE;
+	}
+}
+
 /*
  * Detach every disk of the association, or none.  Returns B_FALSE if a disk
  * is open, after attaching again those already detached.
@@ -377,36 +400,18 @@ boolean_t
 nvmf_mpath_detach_all(nvmf_softc_t *sc)
 {
 	nvmf_ns_head_t *head;
-	boolean_t busy = B_FALSE;
 
 	for (head = list_head(&sc->heads); head != NULL;
 	    head = list_next(&sc->heads, head)) {
-		head->head_rollback = B_FALSE;
 		if (head->head_path == NULL || !head->head_attached)
 			continue;
 		if (bd_detach_handle(head->head_bdh) != DDI_SUCCESS) {
-			busy = B_TRUE;
-			break;
+			nvmf_mpath_attach_all(sc);
+			return (B_FALSE);
 		}
 		head->head_attached = B_FALSE;
-		head->head_rollback = B_TRUE;
 	}
-	if (!busy)
-		return (B_TRUE);
-
-	for (head = list_head(&sc->heads); head != NULL;
-	    head = list_next(&sc->heads, head)) {
-		if (!head->head_rollback)
-			continue;
-		head->head_rollback = B_FALSE;
-		if (bd_attach_handle(sc->dip, head->head_bdh) != DDI_SUCCESS) {
-			dev_err(sc->dip, CE_WARN, "!ns%u: failed to attach "
-			    "blkdev again", head->head_path->path_nsid);
-			continue;
-		}
-		head->head_attached = B_TRUE;
-	}
-	return (B_FALSE);
+	return (B_TRUE);
 }
 
 /* Free the heads that have no path and whose disk is no longer open. */

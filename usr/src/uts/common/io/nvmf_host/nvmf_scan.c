@@ -244,12 +244,12 @@ nvmf_revalidate_namespaces(nvmf_softc_t *sc)
 /*
  * Detach every disk on behalf of the disconnect ioctl, which waits for the
  * answer.  If no disk is open the softc is handed to that ioctl in
- * NVMF_SC_DISCONNECTING.
+ * NVMF_SC_DISCONNECTING.  If the ioctl gave up meanwhile, the disks return.
  */
 static void
 nvmf_ns_detach(nvmf_softc_t *sc)
 {
-	boolean_t busy;
+	boolean_t busy, restore = B_FALSE;
 
 	mutex_enter(&sc->lock);
 	if (!sc->detach_req || sc->state != NVMF_SC_CONNECTED) {
@@ -270,8 +270,13 @@ nvmf_ns_detach(nvmf_softc_t *sc)
 			sc->detach_owned = B_TRUE;
 		}
 		cv_broadcast(&sc->cv);
+	} else {
+		restore = !busy;
 	}
 	mutex_exit(&sc->lock);
+
+	if (restore)
+		nvmf_mpath_attach_all(sc);
 }
 
 /* The namespace worker's own events.  AER tasks share its thread. */
