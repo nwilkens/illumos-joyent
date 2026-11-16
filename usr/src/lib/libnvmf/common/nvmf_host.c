@@ -336,7 +336,7 @@ nvmf_host_wait_for_response(struct nvmf_capsule *cc, struct nvmf_capsule **rcp)
 			return (error);
 
 		if (rc->nc_cqe.cqe_cid != cc->nc_sqe.sqe_cid) {
-			/* No more responses can be owed than the queue holds. */
+			/* No more can be owed than the queue holds. */
 			if (qp->nq_rx_count >= qp->nq_qsize) {
 				nvmf_free_capsule(rc);
 				return (EPROTO);
