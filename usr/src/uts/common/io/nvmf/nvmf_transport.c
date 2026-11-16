@@ -681,12 +681,6 @@ nvmf_pack_ioc_nvlist_mode(nvlist_t *nvl, struct nvmf_ioc_nv *nv, int mode)
 	return (error);
 }
 
-int
-nvmf_pack_ioc_nvlist(nvlist_t *nvl, struct nvmf_ioc_nv *nv)
-{
-	return (nvmf_pack_ioc_nvlist_mode(nvl, nv, 0));
-}
-
 /* Bounds the allocation that a caller's nv->size asks for. */
 #define	NVMF_IOC_NV_MAX	(64 * 1024)
 
@@ -714,12 +708,6 @@ nvmf_unpack_ioc_nvlist_mode(const struct nvmf_ioc_nv *nv, int mode,
 
 	*nvlp = nvl;
 	return (0);
-}
-
-int
-nvmf_unpack_ioc_nvlist(const struct nvmf_ioc_nv *nv, nvlist_t **nvlp)
-{
-	return (nvmf_unpack_ioc_nvlist_mode(nv, 0, nvlp));
 }
 
 boolean_t

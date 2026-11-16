@@ -115,7 +115,7 @@ nvmf_timeouts_valid(uint64_t kato, uint64_t reconnect_delay,
 
 /* Copy in a handoff nvlist and check everything the driver reads from it. */
 static int
-nvmf_copyin_handoff(const struct nvmf_ioc_nv *nv, nvlist_t **nvlp)
+nvmf_copyin_handoff(const struct nvmf_ioc_nv *nv, int mode, nvlist_t **nvlp)
 {
 	const nvmf_discovery_log_page_entry_t *dlep;
 	const nvme_identify_ctrl_t *cdp;
@@ -132,7 +132,7 @@ nvmf_copyin_handoff(const struct nvmf_ioc_nv *nv, nvlist_t **nvlp)
 	int error;
 	boolean_t admin_flag = B_FALSE;
 
-	error = nvmf_unpack_ioc_nvlist(nv, &nvl);
+	error = nvmf_unpack_ioc_nvlist_mode(nv, mode, &nvl);
 	if (error != 0)
 		return (error);
 
@@ -198,12 +198,12 @@ invalid:
 }
 
 static int
-nvmf_handoff_host(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
+nvmf_handoff_host(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv, int mode)
 {
 	nvlist_t *nvl;
 	int error;
 
-	error = nvmf_copyin_handoff(nv, &nvl);
+	error = nvmf_copyin_handoff(nv, mode, &nvl);
 	if (error != 0)
 		return (error);
 
@@ -233,7 +233,7 @@ nvmf_handoff_host(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
 }
 
 static int
-nvmf_reconnect_host(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
+nvmf_reconnect_host(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv, int mode)
 {
 	nvlist_t *nvl;
 	uchar_t *cdata = NULL;
@@ -241,7 +241,7 @@ nvmf_reconnect_host(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
 	uint64_t trtype = 0;
 	int error;
 
-	error = nvmf_copyin_handoff(nv, &nvl);
+	error = nvmf_copyin_handoff(nv, mode, &nvl);
 	if (error != 0)
 		return (error);
 
@@ -371,7 +371,7 @@ owned:
 }
 
 static int
-nvmf_reconnect_params(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
+nvmf_reconnect_params(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv, int mode)
 {
 	nvlist_t *rparams = NULL;
 	int error;
@@ -383,13 +383,13 @@ nvmf_reconnect_params(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
 	if (rparams == NULL)
 		return (ENXIO);
 
-	error = nvmf_pack_ioc_nvlist(rparams, nv);
+	error = nvmf_pack_ioc_nvlist_mode(rparams, nv, mode);
 	fnvlist_free(rparams);
 	return (error);
 }
 
 static int
-nvmf_connection_status(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
+nvmf_connection_status(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv, int mode)
 {
 	nvlist_t *nvl, *nvl_ts;
 	nvmf_sc_state_t state;
@@ -411,7 +411,7 @@ nvmf_connection_status(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
 	fnvlist_add_nvlist(nvl, "last_disconnect", nvl_ts);
 	fnvlist_free(nvl_ts);
 
-	error = nvmf_pack_ioc_nvlist(nvl, nv);
+	error = nvmf_pack_ioc_nvlist_mode(nvl, nv, mode);
 	fnvlist_free(nvl);
 	return (error);
 }
@@ -469,7 +469,7 @@ nvmf_list_add_namespaces(nvmf_softc_t *sc, nvlist_t *nvl, boolean_t connected)
 }
 
 static int
-nvmf_list_controller(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
+nvmf_list_controller(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv, int mode)
 {
 	const nvmf_discovery_log_page_entry_t *dle;
 	nvme_identify_ctrl_t *cdata;
@@ -530,7 +530,7 @@ nvmf_list_controller(nvmf_softc_t *sc, struct nvmf_ioc_nv *nv)
 pack:
 	nvlist_free(rparams);
 	kmem_free(cdata, sizeof (*cdata));
-	error = nvmf_pack_ioc_nvlist(nvl, nv);
+	error = nvmf_pack_ioc_nvlist_mode(nvl, nv, mode);
 	fnvlist_free(nvl);
 	return (error);
 }
@@ -545,7 +545,7 @@ nvmf_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *credp,
 
 	_NOTE(ARGUNUSED(rvalp));
 
-	/* The nvlist helpers copy from and to user addresses only. */
+	/* A handoff names its sockets by descriptors of the caller. */
 	if ((mode & FKIOCTL) != 0)
 		return (ENOTSUP);
 	if (secpolicy_sys_config(credp, B_FALSE) != 0 ||
@@ -582,17 +582,17 @@ nvmf_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *credp,
 
 	switch (cmd) {
 	case NVMF_HANDOFF_HOST:
-		return (nvmf_handoff_host(sc, &nv));
+		return (nvmf_handoff_host(sc, &nv, mode));
 	case NVMF_RECONNECT_HOST:
-		return (nvmf_reconnect_host(sc, &nv));
+		return (nvmf_reconnect_host(sc, &nv, mode));
 	case NVMF_RECONNECT_PARAMS:
-		error = nvmf_reconnect_params(sc, &nv);
+		error = nvmf_reconnect_params(sc, &nv, mode);
 		break;
 	case NVMF_CONNECTION_STATUS:
-		error = nvmf_connection_status(sc, &nv);
+		error = nvmf_connection_status(sc, &nv, mode);
 		break;
 	default:
-		error = nvmf_list_controller(sc, &nv);
+		error = nvmf_list_controller(sc, &nv, mode);
 		break;
 	}
 

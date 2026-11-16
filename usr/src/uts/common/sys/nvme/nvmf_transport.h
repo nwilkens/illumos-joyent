@@ -260,22 +260,21 @@ int	nvmf_send_controller_data_io(struct nvmf_capsule *nc,
     uint32_t data_offset, struct nvmf_memdesc *mem, size_t len,
     const void *final_cqe, nvmf_send_complete_t *complete_cb, void *cb_arg);
 
-/* Helper APIs for nvlists used in ioctls. */
+/*
+ * Helper APIs for nvlists used in ioctls.  mode is the ioctl's, so that the
+ * copies honor FKIOCTL.
+ */
 
 /*
  * Pack the nvlist nvl and copyout to the buffer described by nv.
  */
-int	nvmf_pack_ioc_nvlist(nvlist_t *nvl, struct nvmf_ioc_nv *nv);
+int	nvmf_pack_ioc_nvlist_mode(nvlist_t *nvl, struct nvmf_ioc_nv *nv,
+    int mode);
 
 /*
  * Copyin and unpack an nvlist described by nv.  The unpacked nvlist
  * is returned in *nvlp on success.
  */
-int	nvmf_unpack_ioc_nvlist(const struct nvmf_ioc_nv *nv, nvlist_t **nvlp);
-
-/* As above for a caller that has the ioctl mode flags. */
-int	nvmf_pack_ioc_nvlist_mode(nvlist_t *nvl, struct nvmf_ioc_nv *nv,
-    int mode);
 int	nvmf_unpack_ioc_nvlist_mode(const struct nvmf_ioc_nv *nv, int mode,
     nvlist_t **nvlp);
 

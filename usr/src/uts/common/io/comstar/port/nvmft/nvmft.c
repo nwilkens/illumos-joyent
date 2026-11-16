@@ -401,7 +401,7 @@ nvmft_ioc_subsys_create(intptr_t arg, int mode)
 	if (ddi_copyin((void *)arg, &ionv, sizeof (ionv), mode) != 0)
 		return (EFAULT);
 
-	if ((error = nvmf_unpack_ioc_nvlist(&ionv, &req)) != 0)
+	if ((error = nvmf_unpack_ioc_nvlist_mode(&ionv, mode, &req)) != 0)
 		return (error);
 
 	if (nvlist_lookup_string(req, NVMFT_NV_SUBNQN, &subnqn) != 0 ||
@@ -515,7 +515,7 @@ nvmft_ioc_subsys_delete(intptr_t arg, int mode)
 	if (ddi_copyin((void *)arg, &ionv, sizeof (ionv), mode) != 0)
 		return (EFAULT);
 
-	if ((error = nvmf_unpack_ioc_nvlist(&ionv, &req)) != 0)
+	if ((error = nvmf_unpack_ioc_nvlist_mode(&ionv, mode, &req)) != 0)
 		return (error);
 
 	if (nvlist_lookup_string(req, NVMFT_NV_SUBNQN, &subnqn) != 0) {
@@ -591,7 +591,7 @@ nvmft_ioc_subsys_list(intptr_t arg, int mode)
 
 	kmem_free(nqns, MAX(n, 1) * sizeof (char *));
 
-	error = nvmf_pack_ioc_nvlist(reply, &ionv);
+	error = nvmf_pack_ioc_nvlist_mode(reply, &ionv, mode);
 	nvlist_free(reply);
 	if (error != 0)
 		return (error);
@@ -654,7 +654,7 @@ nvmft_ioc_handoff(intptr_t arg, int mode)
 	if (ddi_copyin((void *)arg, &ionv, sizeof (ionv), mode) != 0)
 		return (EFAULT);
 
-	if ((error = nvmf_unpack_ioc_nvlist(&ionv, &req)) != 0)
+	if ((error = nvmf_unpack_ioc_nvlist_mode(&ionv, mode, &req)) != 0)
 		return (error);
 
 	if (nvlist_lookup_uint64(req, NVMFT_NV_TRTYPE, &trtype) != 0 ||
