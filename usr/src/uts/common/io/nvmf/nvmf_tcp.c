@@ -2211,6 +2211,9 @@ tcp_validate_command_capsule(struct nvmf_capsule *nc)
 
 	ASSERT3P(tc->tc_rx_pdu.rp_hdr, !=, NULL);
 
+	if (tc->tc_rx_pdu.rp_data_digest_mismatch)
+		return (NVME_CQE_SC_GEN_TRANSIENT);
+
 	sgl = &nc->nc_sqe.sqe_dptr.d_sgl;
 	sgl_type = (uint8_t)((sgl->sgl_type << 4) | sgl->sgl_zero);
 	switch (sgl_type) {
