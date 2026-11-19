@@ -80,7 +80,14 @@ typedef enum {
 	 * controller data. Controllers since NVMe 1.3 use NOIOB for this.
 	 */
 	NVME_QUIRK_INTEL_IO_BOUNDARY	= 1 << 1,
+	/*
+	 * The controller can hang when its registers are read too soon after
+	 * it has been disabled.
+	 */
+	NVME_QUIRK_DELAY_B4_CHK_RDY	= 1 << 2,
 } nvme_quirk_t;
+
+#define	NVME_QUIRK_RDY_DELAY_USEC	2300000
 
 #define	NVME_MIN_ADMIN_QUEUE_LEN	16
 #define	NVME_MIN_IO_QUEUE_LEN		16

@@ -3805,6 +3805,14 @@ nvme_reset(nvme_t *nvme, boolean_t quiesce)
 
 	nvme_put32(nvme, NVME_REG_CC, 0);
 
+	if (nvme->n_quirks & NVME_QUIRK_DELAY_B4_CHK_RDY) {
+		if (quiesce) {
+			drv_usecwait(NVME_QUIRK_RDY_DELAY_USEC);
+		} else {
+			delay(drv_usectohz(NVME_QUIRK_RDY_DELAY_USEC));
+		}
+	}
+
 	csts.r = nvme_get32(nvme, NVME_REG_CSTS);
 	if (csts.b.csts_rdy == 1) {
 		nvme_put32(nvme, NVME_REG_CC, 0);
@@ -4450,6 +4458,16 @@ static const nvme_quirk_table_t nvme_quirks[] = {
 	{ 0x8086, 0x0a53, NVME_QUIRK_INTEL_IO_BOUNDARY },
 	{ 0x8086, 0x0a54, NVME_QUIRK_INTEL_IO_BOUNDARY },
 	{ 0x8086, 0x0a55, NVME_QUIRK_INTEL_IO_BOUNDARY },
+	/* HGST SN100, WDC SN200 */
+	{ 0x1c58, 0x0003, NVME_QUIRK_DELAY_B4_CHK_RDY },
+	{ 0x1c58, 0x0023, NVME_QUIRK_DELAY_B4_CHK_RDY },
+	/* Memblaze Pblaze4 */
+	{ 0x1c5f, 0x0540, NVME_QUIRK_DELAY_B4_CHK_RDY },
+	/* Samsung PM1725, PM1725a */
+	{ 0x144d, 0xa821, NVME_QUIRK_DELAY_B4_CHK_RDY },
+	{ 0x144d, 0xa822, NVME_QUIRK_DELAY_B4_CHK_RDY },
+	/* Seagate Nytro */
+	{ 0x1bb1, 0x0100, NVME_QUIRK_DELAY_B4_CHK_RDY },
 };
 
 static void
