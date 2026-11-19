@@ -74,6 +74,12 @@ typedef enum {
 	 * a problem.
 	 */
 	NVME_QUIRK_START_CID		= 1 << 0,
+	/*
+	 * The controller is much slower with an I/O that crosses a multiple of
+	 * a boundary, which it gives in a vendor-specific byte of the identify
+	 * controller data. Controllers since NVMe 1.3 use NOIOB for this.
+	 */
+	NVME_QUIRK_INTEL_IO_BOUNDARY	= 1 << 1,
 } nvme_quirk_t;
 
 #define	NVME_MIN_ADMIN_QUEUE_LEN	16

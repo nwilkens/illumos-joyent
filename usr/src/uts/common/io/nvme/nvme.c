@@ -4445,6 +4445,11 @@ typedef struct nvme_quirk_table {
 
 static const nvme_quirk_table_t nvme_quirks[] = {
 	{ 0x1987, 0x5018, NVME_QUIRK_START_CID },	/* Phison E18 */
+	/* Intel 750, P3500, P3600 and P3700; P3520; P4500, P4510 and P4600 */
+	{ 0x8086, 0x0953, NVME_QUIRK_INTEL_IO_BOUNDARY },
+	{ 0x8086, 0x0a53, NVME_QUIRK_INTEL_IO_BOUNDARY },
+	{ 0x8086, 0x0a54, NVME_QUIRK_INTEL_IO_BOUNDARY },
+	{ 0x8086, 0x0a55, NVME_QUIRK_INTEL_IO_BOUNDARY },
 };
 
 static void
@@ -6003,6 +6008,32 @@ nvme_bd_xfer_done_inline(nvme_cmd_t *cmd)
 	bd_xfer_done_intr(xfer, error);
 }
 
+/*
+ * The I/O boundary of a namespace in bytes, or 0 when it has none. The
+ * vendor-specific byte of the older Intel controllers is in the units of
+ * MDTS.
+ */
+static uint64_t
+nvme_ns_io_boundary(nvme_namespace_t *ns)
+{
+	nvme_t *nvme = ns->ns_nvme;
+	uint64_t boundary = 0;
+
+	if (nvme->n_quirks & NVME_QUIRK_INTEL_IO_BOUNDARY) {
+		uint8_t shift = nvme->n_idctl->id_vs[3];
+
+		if (shift != 0 && shift <= 16)
+			boundary = 1ULL << (nvme->n_pageshift + shift);
+	} else if (NVME_VERSION_ATLEAST(&nvme->n_version, 1, 3) &&
+	    ns->ns_idns != NULL) {
+		boundary = (uint64_t)ns->ns_idns->id_noiob * ns->ns_block_size;
+	}
+
+	if (!ISP2(boundary) || boundary < ns->ns_block_size)
+		boundary = 0;
+	return (boundary);
+}
+
 static void
 nvme_bd_driveinfo(void *arg, bd_drive_t *drive)
 {
@@ -6075,6 +6106,8 @@ nvme_bd_driveinfo(void *arg, bd_drive_t *drive)
 	 */
 	if (nvme->n_idctl->id_oncs.on_dset_mgmt)
 		drive->d_max_free_seg = NVME_DSET_MGMT_MAX_RANGES;
+
+	drive->d_io_boundary = nvme_ns_io_boundary(ns);
 
 	nvme_mgmt_unlock(nvme);
 }
