@@ -151,6 +151,13 @@ struct bd_drive {
 	 * d_max_free_blks).
 	 */
 	uint64_t		d_max_free_seg_blks;
+
+	/*
+	 * A read or write that crosses a multiple of this many bytes on the
+	 * device is split there. Must be 0, for no boundary, or a power of
+	 * two.
+	 */
+	uint64_t		d_io_boundary;
 };
 
 struct bd_media {

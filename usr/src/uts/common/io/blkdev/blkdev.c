@@ -183,6 +183,7 @@ struct bd {
 	bd_queue_t	*d_queues;
 	taskq_t		*d_sched_tq;
 	hrtime_t	d_spin_ns;
+	uint64_t	d_io_boundary;
 	kstat_t		*d_ksp;
 	kstat_io_t	*d_kiop;
 	kstat_t		*d_errstats;
@@ -273,6 +274,8 @@ static int bd_detach(dev_info_t *, ddi_detach_cmd_t);
 static int bd_open(dev_t *, int, int, cred_t *);
 static int bd_close(dev_t, int, int, cred_t *);
 static int bd_strategy(struct buf *);
+static boolean_t bd_split(bd_t *, struct buf *, diskaddr_t);
+static void bd_start(bd_t *, struct buf *, diskaddr_t);
 static int bd_ioctl(dev_t, int, intptr_t, int, cred_t *, int *);
 static int bd_dump(dev_t, caddr_t, daddr_t, int);
 static int bd_read(dev_t, struct uio *, cred_t *);
@@ -360,6 +363,12 @@ static taskq_t *bd_taskq;
  * The "spin-wait-usec" property of a blkdev node overrides this at attach.
  */
 uint_t bd_spin_wait_usec = 0;
+
+/*
+ * Whether a transfer is split where it crosses the device's I/O boundary
+ * (d_io_boundary).
+ */
+int bd_io_boundary_split = 1;
 #define	BD_SPIN_WAIT_MAX_USEC	1000
 
 int
@@ -817,7 +826,11 @@ bd_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		goto fail_drive_info;
 	}
 
+	if (!ISP2(drive.d_io_boundary))
+		goto fail_drive_info;
+
 	bd->d_qcount = drive.d_qcount;
+	bd->d_io_boundary = drive.d_io_boundary;
 	bd->d_removable = drive.d_removable;
 	bd->d_hotpluggable = drive.d_hotpluggable;
 
@@ -1540,6 +1553,139 @@ bd_physio_strategy(struct buf *bp)
 	return (0);
 }
 
+/*
+ * Starts the transfer of a buf whose range has been checked.
+ */
+static void
+bd_start(bd_t *bd, struct buf *bp, diskaddr_t blkno)
+{
+	int		(*func)(void *, bd_xfer_t *);
+	bd_xfer_impl_t	*xi;
+
+	func = (bp->b_flags & B_READ) ? bd->d_ops.o_read : bd->d_ops.o_write;
+
+	xi = bd_xfer_alloc(bd, bp, func, KM_NOSLEEP);
+	if (xi == NULL) {
+		xi = bd_xfer_alloc(bd, bp, func, KM_PUSHPAGE);
+	}
+	if (xi == NULL) {
+		/* bd_xfer_alloc will have done bioerror */
+		biodone(bp);
+		return;
+	}
+	xi->i_blkno = blkno;
+
+	bd_submit(bd, xi);
+}
+
+/*
+ * A buf that crosses the device's I/O boundary is transferred as one child
+ * buf for each side of each boundary. The children run at the same time and
+ * the last one to finish completes the parent.
+ */
+typedef struct bd_split {
+	struct buf	*bs_bp;
+	uint_t		bs_pending;
+	uint_t		bs_error;
+	uint64_t	bs_good;	/* bytes before the first that failed */
+} bd_split_t;
+
+static int
+bd_split_done(struct buf *cbp)
+{
+	bd_split_t	*bs = cbp->b_private;
+	int		err = geterror(cbp);
+
+	if (err == 0 && cbp->b_resid != 0)
+		err = EIO;
+	if (err != 0) {
+		uint64_t good, old;
+
+		/* A child that failed before its transfer has no b_resid. */
+		good = (cbp->b_lblkno - bs->bs_bp->b_lblkno) << DEV_BSHIFT;
+		if (cbp->b_resid != 0 && cbp->b_resid <= cbp->b_bcount)
+			good += cbp->b_bcount - cbp->b_resid;
+		do {
+			old = bs->bs_good;
+		} while (good < old &&
+		    atomic_cas_64(&bs->bs_good, old, good) != old);
+		(void) atomic_cas_uint(&bs->bs_error, 0, (uint_t)err);
+	}
+	/* Mapped in by bd_xfer_alloc for a driver without DMA. */
+	bp_mapout(cbp);
+	freerbuf(cbp);
+
+	if (atomic_dec_uint_nv(&bs->bs_pending) == 0) {
+		struct buf *bp = bs->bs_bp;
+
+		err = (int)bs->bs_error;
+		if (err != 0) {
+			bp->b_resid += bp->b_bcount - bs->bs_good;
+			bioerror(bp, err);
+		}
+		kmem_free(bs, sizeof (*bs));
+		biodone(bp);
+	}
+	return (0);
+}
+
+/*
+ * Returns B_FALSE, with nothing started, when there is no memory for the
+ * children. The caller then transfers the buf whole.
+ */
+static boolean_t
+bd_split(bd_t *bd, struct buf *bp, diskaddr_t blkno)
+{
+	uint64_t	boundary = bd->d_io_boundary;
+	uint32_t	shift = bd->d_blkshift;
+	uint64_t	off = (uint64_t)blkno << shift;
+	size_t		bcount = bp->b_bcount;
+	size_t		boff, len;
+	struct buf	*head = NULL, **tailp = &head, *cbp;
+	bd_split_t	*bs;
+	uint_t		n = 0;
+
+	bs = kmem_alloc(sizeof (*bs), KM_NOSLEEP);
+	if (bs == NULL)
+		return (B_FALSE);
+
+	for (boff = 0; boff < bcount; boff += len) {
+		len = MIN(bcount - boff,
+		    boundary - P2PHASE(off + boff, boundary));
+
+		cbp = bioclone(bp, boff, len, bp->b_edev, 0, bd_split_done,
+		    NULL, KM_NOSLEEP);
+		if (cbp == NULL) {
+			while ((cbp = head) != NULL) {
+				head = cbp->av_forw;
+				freerbuf(cbp);
+			}
+			kmem_free(bs, sizeof (*bs));
+			return (B_FALSE);
+		}
+		cbp->b_lblkno = bp->b_lblkno + (boff >> DEV_BSHIFT);
+		cbp->b_private = bs;
+		cbp->av_forw = NULL;
+		*tailp = cbp;
+		tailp = &cbp->av_forw;
+		n++;
+	}
+
+	bs->bs_bp = bp;
+	bs->bs_pending = n;
+	bs->bs_error = 0;
+	bs->bs_good = bcount;
+
+	/* A child, and with the last one bp, can be gone once it is started. */
+	for (boff = 0; (cbp = head) != NULL; boff += len) {
+		head = cbp->av_forw;
+		cbp->av_forw = NULL;
+		len = cbp->b_bcount;
+		bd_start(bd, cbp, blkno + (boff >> shift));
+	}
+	return (B_TRUE);
+}
+
 static int
 bd_strategy(struct buf *bp)
 {
@@ -1549,10 +1695,9 @@ bd_strategy(struct buf *bp)
 	diskaddr_t	p_lba;
 	diskaddr_t	p_nblks;
 	diskaddr_t	b_nblks;
-	bd_xfer_impl_t	*xi;
 	uint32_t	shift;
-	int		(*func)(void *, bd_xfer_t *);
 	diskaddr_t	lblkno;
+	diskaddr_t	blkno;
 
 	part = BDPART(bp->b_edev);
 	inst = BDINST(bp->b_edev);
@@ -1595,20 +1740,16 @@ bd_strategy(struct buf *bp)
 	} else {
 		bp->b_resid = 0;
 	}
-	func = (bp->b_flags & B_READ) ? bd->d_ops.o_read : bd->d_ops.o_write;
-
-	xi = bd_xfer_alloc(bd, bp, func, KM_NOSLEEP);
-	if (xi == NULL) {
-		xi = bd_xfer_alloc(bd, bp, func, KM_PUSHPAGE);
-	}
-	if (xi == NULL) {
-		/* bd_request_alloc will have done bioerror */
-		biodone(bp);
+	blkno = lblkno + p_lba;
+	if (bd_io_boundary_split != 0 &&
+	    bd->d_io_boundary >= (1ULL << shift) &&
+	    P2PHASE((uint64_t)blkno << shift, bd->d_io_boundary) +
+	    bp->b_bcount > bd->d_io_boundary &&
+	    bd_split(bd, bp, blkno)) {
 		return (0);
 	}
-	xi->i_blkno = lblkno + p_lba;
 
-	bd_submit(bd, xi);
+	bd_start(bd, bp, blkno);
 
 	return (0);
 }
